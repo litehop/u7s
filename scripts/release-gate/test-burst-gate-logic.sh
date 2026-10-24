@@ -505,10 +505,11 @@ printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
   '  "config get-value project") echo p-secret ;;' \
   '  "config get-value compute/zone") echo z-1 ;;' \
   '  "compute instances create"*) echo "created p-secret" ;;' \
-  '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && exit 1; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
+  '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && { echo "ERROR: operations denied for p-secret" >&2; exit 1; }; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
   '  "compute instances describe"*) [ "${GCLOUD_DESCRIBE_ERR:-0}" = 1 ] && exit 1; echo 1 ;;' \
+  '  "compute ssh"*vm-gate.sh*) [ "${GCLOUD_SSH_HANG:-0}" = 1 ] || exit 0; sleep 300 & echo $! > "$GCLOUD_HANG_PID"; wait ;;' \
   '  "compute ssh"*) echo "ERROR: ssh to x.c.p-secret.internal failed" >&2; [ "${GCLOUD_SSH_OK:-0}" = 1 ] && exit 0; exit 1 ;;' \
-  '  "compute scp"*) for a; do d="$a"; done; case "$*" in *:/var/tmp/rg/out*) mkdir -p "$d"; echo "host x.c.p-secret.internal" > "$d/install.log" ;; esac; exit 0 ;;' \
+  '  "compute scp"*) for a; do d="$a"; done; case "$*" in *:/var/tmp/rg/out*) mkdir -p "$d"; echo "host x.c.p-secret.internal" > "$d/install.log"; [ -z "${GCLOUD_RESULTS:-}" ] || cp "$GCLOUD_RESULTS" "$d/results.env" ;; esac; exit 0 ;;' \
   'esac' 'exit 0' > "$TMP/bin/gcloud"
 chmod +x "$TMP/bin/gcloud"
 export GCLOUD_CALLS="$TMP/gcloud-calls" GCP_SSH_TRIES=1 GCP_SSH_SLEEP=0 GCP_OPS_SLEEP=0 GCP_DELETE_SLEEP=0
@@ -553,6 +554,8 @@ assert "a failed run whose preemption lookup keeps erroring -> INVALID exit 3, n
   "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gops/valid")" = 0 ] && ! grep -q 'GATE:.*FAIL' "$TMP/out-gops.out" && echo 1 || echo 0)"
 assert "the preemption lookup is retried before giving up (one IAP/API blip must not decide the verdict)" \
   "$([ "$(grep -c 'operations list' "$GCLOUD_CALLS")" -ge 3 ] && echo 1 || echo 0)"
+assert "the project id is scrubbed from the console stderr of a failing preemption lookup (pasted logs must not carry it)" \
+  "$(! grep -q 'p-secret' "$TMP/out-gops.out" && grep -q 'operations denied for <project>' "$TMP/out-gops.out" && echo 1 || echo 0)"
 unset GCLOUD_OPS_ERR
 export GCLOUD_DESCRIBE_ERR=1
 gcp_gate out-gdel --runs 2
@@ -560,7 +563,26 @@ assert "a VPS delete that keeps failing never aborts the gate: every attempt sti
   "$([ "$rc" = 1 ] && [ "$(grep -c 'instances create' "$GCLOUD_CALLS")" = 2 ] && grep -q 'LEAKED GCP VPS u7s-rg-' "$TMP/out-gdel.out" && grep -q 'GATE: 0/2' "$TMP/out-gdel.out" && [ -s "$TMP/out-gdel/leaked-vps.txt" ] && echo 1 || echo 0)"
 assert "a failed delete is retried (a transient describe error must not leak a billing VPS)" \
   "$([ "$(grep -c 'instances describe' "$GCLOUD_CALLS")" -ge 8 ] && echo 1 || echo 0)"
-unset GCLOUD_DESCRIBE_ERR GCLOUD_SSH_OK
+GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gleak --runs 1
+assert "a PASS verdict with a leaked VPS exits 4, not 0 (a green gate must not hide a billing VPS)" \
+  "$([ "$rc" = 4 ] && [ "$(cat "$TMP/out-gleak/passed")" = 1 ] && grep -q 'LEAKED VPS' "$TMP/out-gleak.out" && echo 1 || echo 0)"
+unset GCLOUD_DESCRIBE_ERR
+GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gpass --runs 1
+assert "a PASS verdict with no leak still exits 0" "$([ "$rc" = 0 ] && echo 1 || echo 0)"
+export GCLOUD_HANG_PID="$TMP/hang.pid"
+rm -f "$GCLOUD_HANG_PID"
+: > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/out-ghang"
+GCLOUD_SSH_HANG=1 RG_RUN_WALL_SECS=2 "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/out-ghang" --runs 1 >"$TMP/out-ghang.out" 2>&1 &
+gate_bg=$!
+# A watchdog that fails to kill the ssh client leaves the gate waiting forever; bound the test.
+for _ in $(seq 1 40); do kill -0 "$gate_bg" 2>/dev/null || break; sleep 1; done
+gate_ended=1; kill -0 "$gate_bg" 2>/dev/null && { gate_ended=0; pkill -P "$gate_bg" 2>/dev/null; kill "$gate_bg" 2>/dev/null; }
+hang_pid="$(cat "$GCLOUD_HANG_PID" 2>/dev/null || true)"
+alive=0; [ -z "$hang_pid" ] || ! kill -0 "$hang_pid" 2>/dev/null || alive=1
+[ -z "$hang_pid" ] || kill "$hang_pid" 2>/dev/null || true
+assert "the wall-clock watchdog kills the ssh client under the redaction pipe, so a hung run ends instead of waiting forever" \
+  "$([ -n "$hang_pid" ] && [ "$alive" = 0 ] && [ "$gate_ended" = 1 ] && grep -q 'wall-clock cap 2s hit' "$TMP/out-ghang.out" && echo 1 || echo 0)"
+unset GCLOUD_SSH_OK
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

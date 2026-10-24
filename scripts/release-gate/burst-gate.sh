@@ -33,6 +33,8 @@
 # (> RG_STEAL_MAX_PCT, 10%) plus the same in-guest calibration; a non-pass with either is
 # INVALID. A non-pass on an instance Google reclaimed (Spot preemption) is PREEMPTED, counted
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
+# Exit 4: the verdict is PASS but a VPS could not be deleted (listed in <out>/leaked-vps.txt) and
+# may still be billing; a FAIL or INVALID verdict keeps its own code.
 #
 # Usage: burst-gate.sh [--backend lima|gcp] [--release TAG] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
@@ -72,7 +74,7 @@ BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
 BURST_CAP_SECS=300
 BACKEND=lima; RELEASE=""
-RUN_WALL_SECS=3300
+RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
 MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
 RG_RETRY_WAIT_SECS="${RG_RETRY_WAIT_SECS:-300}"
 QUIET_RECHECK_SECS="${QUIET_RECHECK_SECS:-30}"
@@ -256,7 +258,8 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     fi
     if [ "$BACKEND" = gcp ]; then
       # The guest hostname embeds the project id.
-      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh 2>&1 | gcp_redact -u >"$RUN_OUT/vm-gate.log" &
+      # Process substitution, not a pipe: $! must be the ssh side so the watchdog can kill it.
+      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh > >(gcp_redact -u >"$RUN_OUT/vm-gate.log") 2>&1 &
     else
       vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
     fi
@@ -265,7 +268,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     # The host-side client dying leaves the workload running in the VM, so kill it there first.
     ( sleep "$RUN_WALL_SECS"; echo "run wall-clock cap ${RUN_WALL_SECS}s hit; killing" >&2
       vm_shell "$VM" sudo pkill -KILL -f "$RG_VM_KILL_PATTERN" 2>/dev/null
-      kill "$gate_pid" 2>/dev/null ) &
+      rg_kill_tree "$gate_pid" ) &
     wd_pid=$!
     wait "$gate_pid" 2>/dev/null
     kill "$wd_pid" "$tail_pid" 2>/dev/null
@@ -333,6 +336,9 @@ if [ "$BACKEND" = gcp ]; then
   echo "backend=gcp release=$RELEASE machine=e2-micro arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
   verdict="$verdict [release-authoritative: x86_64 GCP e2-micro Spot, mirror release $RELEASE]"
 fi
-[ ! -s "$OUT/leaked-vps.txt" ] || { echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"; }
+if [ -s "$OUT/leaked-vps.txt" ]; then
+  echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+  [ "$rc" != 0 ] || { rc=4; verdict="$verdict [LEAKED VPS: exit 4]"; }
+fi
 echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="
 exit "$rc"

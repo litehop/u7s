@@ -32,8 +32,8 @@ case "$*" in
   "config get-value compute/zone") echo "${CLOUDSDK_COMPUTE_ZONE:-${STUB_ZONE-us-west1-b}}"; exit 0 ;;
   "services list "*) echo "${STUB_SERVICES:-}"; exit 0 ;;
   "compute instances list "*) echo "${STUB_INSTANCES:-}"; exit 0 ;;
-  "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
-  "compute operations list "*) [ "${STUB_OPS_FAIL:-0}" = 1 ] && exit 1; echo "${STUB_OPS:-}"; exit 0 ;;
+  "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; *" ${STUB_NOTFOUND:-<none>} "*) echo "ERROR: (gcloud.compute.instances.describe) The resource was not found" >&2; exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
+  "compute operations list "*) [ "${STUB_OPS_FAIL:-0}" = 1 ] && { echo "ERROR: denied on proj" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
   "compute "*" list "*)
     [ "${STUB_LIST_FAIL:-0}" = 1 ] && exit 1
     for w in ${STUB_EXISTING:-}; do case "$* " in *"name=$w "*) echo "$w" ;; esac; done
@@ -193,6 +193,9 @@ assert "down refuses an unlabelled instance (it is not ours to delete)" \
 STUB_ZONE= run "$VPS" down t1
 assert "down without a configured zone fails instead of guessing" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances delete' "$LOG")"
+STUB_NOTFOUND=typo run "$VPS" down typo
+assert "down of a nonexistent name fails (a typo must not report success while the real VPS keeps billing)" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(has 'does not exist' "$OUT")"
 
 # --- list
 run "$VPS" list
@@ -210,6 +213,9 @@ assert "no preempted operation reads as not preempted" "$([ "$p" = 0 ] && echo 1
 : >"$STUB_LOG"
 STUB_OPS_FAIL=1 gcp_vps_was_preempted t1 && p=0 || p=$?
 assert "a lookup that keeps failing is 'unknown' (2), not 'not preempted' (1): gates must not score a reclaimed VPS as a u7s FAIL" "$([ "$p" = 2 ] && echo 1 || echo 0)"
+err="$(STUB_OPS_FAIL=1 gcp_vps_was_preempted t1 2>&1 >/dev/null || true)"
+assert "a failing preemption lookup scrubs the project id from its stderr (console output gets pasted into PRs)" \
+  "$(has 'denied on <project>' "$err")$(hasnt 'on proj' "$err")"
 assert "the preemption lookup is retried before giving up" \
   "$([ "$(grep -c 'compute operations list' "$STUB_LOG")" -ge 3 ] && echo 1 || echo 0)"
 
@@ -220,6 +226,10 @@ assert "a describe that keeps failing makes delete return non-zero, not exit the
   "$([ "$r" = 1 ] && echo 1 || echo 0)"
 assert "delete retries a failing describe (a transient API error must not leak a billing VPS)" \
   "$([ "$(grep -c 'instances describe' "$STUB_LOG")" = 4 ] && echo 1 || echo 0)"
+
+r=0; STUB_NOTFOUND=t1 gcp_vps_delete t1 us-west1-b 2>/dev/null || r=$?
+assert "a gate's delete of an already-gone VPS counts as deleted (a retried cleanup must not report a phantom leak)" \
+  "$([ "$r" = 0 ] && echo 1 || echo 0)"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

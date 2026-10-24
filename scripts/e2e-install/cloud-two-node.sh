@@ -11,7 +11,8 @@
 # pinned to w1 Running; logs/exec on it (apiserver -> InternalIP:10250); cross-node pod-to-pod;
 # webhook-smoke.sh; and, with beep, that a LoadBalancer Service answers from the client VPS
 # with its internal IP preserved. Without --keep only the VPSes this run created are deleted.
-# Exit: 0 PASS, 1 FAIL, 2 usage, 3 PREEMPTED. Results: temp/e2e-install/<ts>/.
+# Exit: 0 PASS, 1 FAIL, 2 usage, 3 PREEMPTED, 4 INVALID (a failure whose preemption lookup
+# kept erroring, so FAIL cannot be told from a reclaimed VPS). Results: temp/e2e-install/<ts>/.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -74,13 +75,18 @@ step() {
 }
 
 finish() {
-  local rc=$? v
+  local rc=$? v pre
   trap - EXIT
   if [ "$rc" = 0 ]; then
     RESULT=PASS
   else
     for v in ${CREATED[@]+"${CREATED[@]}"}; do
-      if gcp_vps_was_preempted "$v"; then RESULT=PREEMPTED; rc=3; break; fi
+      pre=0; gcp_vps_was_preempted "$v" || pre=$?
+      case "$pre" in
+        0) RESULT=PREEMPTED; rc=3; break ;;
+        1) ;;
+        *) RESULT=INVALID; rc=4 ;;
+      esac
     done
   fi
   echo "$RESULT" >"$OUT/result.txt"
