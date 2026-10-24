@@ -66,7 +66,7 @@ flags() { printf '%s\n' "$1" >"$SELF_DIR/f.sh"; [ -n "$(lint_file "$SELF_DIR/f.s
 assert_true "multi-stage pipeline into grep -q is rejected (SIGPIPE false-FAIL)" \
   flags 'a | b | grep -q x || fail y'
 assert_true "multi-stage pipeline into head -1 is rejected" \
-  flags 'X="$(pgrep -f p | sort | head -1)"'
+  flags 'X="$(ps -eo pid | sort | head -1)"'
 assert_true "grep -m1 sink is rejected" \
   flags 'a | b | grep -m1 x'
 assert_true "pipeline split across a trailing backslash is still seen" \
