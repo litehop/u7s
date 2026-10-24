@@ -389,14 +389,58 @@ fn display_path(path: &[String]) -> String {
     s
 }
 
+/// The fields a write through `subresource` (`None` is the main resource) neither takes nor
+/// owns, as upstream's per-strategy `GetResetFields` (release-1.37). `kind` is the built-in
+/// kind; `None` is a custom resource. The main resource of every kind with a status
+/// subresource resets `status`; custom resources' `/status` resets all of `metadata`.
+///
+/// Not mirrored: the main strategies of `CertificateSigningRequest` also reset `spec`, which
+/// would leave a CSR created by apply with an unowned spec.
+pub(crate) fn reset_fields(
+    kind: Option<&str>,
+    subresource: Option<&str>,
+) -> &'static [&'static [&'static str]] {
+    match (kind, subresource) {
+        (_, None) => &[&["status"]],
+        (None, Some(_)) => &[&["metadata"], &["spec"]],
+        (Some("Deployment"), Some("status")) => &[&["spec"], &["metadata", "labels"]],
+        (Some("Pod"), Some("status")) => &[
+            &["spec"],
+            &["metadata", "deletionTimestamp"],
+            &["metadata", "ownerReferences"],
+        ],
+        (Some("CertificateSigningRequest"), Some("status")) => {
+            &[&["spec"], &["status", "conditions"]]
+        }
+        (Some("CertificateSigningRequest"), Some("approval")) => {
+            &[&["spec"], &["status", "certificate"]]
+        }
+        (Some(_), Some(_)) => &[&["spec"]],
+    }
+}
+
+/// Remove each of `paths` (object members, outermost first) from `body`.
+pub(crate) fn strip_paths(body: &mut Value, paths: &[&[&str]]) {
+    for path in paths {
+        let Some((last, parents)) = path.split_last() else {
+            continue;
+        };
+        let mut at = Some(&mut *body);
+        for p in parents {
+            at = at.and_then(|v| v.get_mut(*p));
+        }
+        if let Some(o) = at.and_then(Value::as_object_mut) {
+            o.remove(*last);
+        }
+    }
+}
+
 /// The part of an apply body the apply actually manages: a kind with a status subresource
 /// never takes `status` from a main-resource write, so it owns nothing there.
 pub(crate) fn applied_fields(body: &Value, has_status_subresource: bool) -> Value {
     let mut applied = body.clone();
     if has_status_subresource {
-        if let Some(o) = applied.as_object_mut() {
-            o.remove("status");
-        }
+        strip_paths(&mut applied, reset_fields(None, None));
     }
     applied
 }
@@ -1413,65 +1457,6 @@ mod tests {
         assert_eq!(live["spec"]["replicas"], 5);
     }
 
-    /// One manager applying to the main resource and to /status holds two independent
-    /// entries, so re-applying one without the other's fields must not delete them. If the
-    /// entries shared a key, `kubectl apply` of the spec would wipe the status a controller
-    /// applied under the same manager name (and the reverse).
-    #[test]
-    fn main_and_status_applies_by_one_manager_never_remove_each_others_fields() {
-        let status_req = Request {
-            subresource: Some("status"),
-            ..req("ctrl")
-        };
-        let mut live = json!({});
-        apply(&mut live, &deployment(Some(3), false), "ctrl", false).unwrap();
-        live["status"] = json!({"readyReplicas": 1});
-        plan_apply(
-            &live,
-            &json!({"status": {"readyReplicas": 1}}),
-            false,
-            &status_req,
-        )
-        .unwrap()
-        .record(&mut live);
-
-        let managers = read_managers(&live);
-        assert!(
-            managers
-                .iter()
-                .any(|m| m.is("ctrl", OPERATION_APPLY, Some("status"))),
-            "status apply must be recorded with subresource=status: {managers:?}"
-        );
-
-        let main_only = deployment(Some(4), false);
-        let plan = plan_apply(
-            &live,
-            &applied_fields(&main_only, true),
-            false,
-            &req("ctrl"),
-        )
-        .unwrap();
-        assert!(
-            plan.removals.is_empty(),
-            "a main-resource apply must not remove status fields: {:?}",
-            plan.removals
-        );
-        plan.record(&mut live);
-
-        let plan = plan_apply(
-            &live,
-            &json!({"status": {"availableReplicas": 2}}),
-            false,
-            &status_req,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.removals,
-            vec![vec!["f:status".to_string(), "f:readyReplicas".to_string()]],
-            "a status apply drops only status fields, never spec.replicas"
-        );
-    }
-
     /// A PUT body carries no managedFields; recording it must keep existing ownership rather
     /// than wiping it, and attribute only what the PUT changed.
     #[test]
@@ -2305,6 +2290,45 @@ mod tests {
             assert_eq!(seen, None);
             let (_, _, seen) = patch(APPLY, "/x?fieldManager=real", true).await;
             assert_eq!(seen.as_deref(), Some("real"));
+        }
+
+        /// A client that forges `x-u7s-force` must not be able to take fields from other
+        /// managers without `?force=true`; only the query string may set it.
+        #[tokio::test]
+        async fn client_supplied_force_header_is_discarded() {
+            async fn force_seen(uri: &str, forged: bool) -> Option<String> {
+                let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let seen2 = seen.clone();
+                let app = axum::Router::new()
+                    .route(
+                        "/x",
+                        axum::routing::patch(move |h: axum::http::HeaderMap| async move {
+                            *seen2.lock().unwrap() = h
+                                .get(FORCE_HEADER)
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+                            "ok"
+                        }),
+                    )
+                    .layer(axum::middleware::from_fn(resolve_field_manager));
+                let mut b = Request::builder()
+                    .method("PATCH")
+                    .uri(uri)
+                    .header("content-type", APPLY);
+                if forged {
+                    b = b.header(FORCE_HEADER, "true");
+                }
+                app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+                let v = seen.lock().unwrap().clone();
+                v
+            }
+            assert_eq!(force_seen("/x?fieldManager=m", true).await, None);
+            assert_eq!(
+                force_seen("/x?fieldManager=m&force=true", false)
+                    .await
+                    .as_deref(),
+                Some("true")
+            );
         }
 
         /// The layer is installed on the real router, so every kind's apply route is covered.

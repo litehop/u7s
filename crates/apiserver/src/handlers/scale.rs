@@ -185,6 +185,10 @@ pub(crate) fn decode_scale_body(
     headers: &HeaderMap,
 ) -> Result<Scale, crate::status::StatusError> {
     let ct = content_type(headers);
+    if ct.contains("apply-patch+yaml") {
+        return Scale::deserialize(super::json_patch::ssa_body_to_json(body)?)
+            .map_err(|e| Status::bad_request(format!("invalid apply body: {e}")));
+    }
     // Try extract_body_quiet first: handles JSON-in-proto-envelope transparently. Its Err is
     // expected and ignored here — Scale has no decoder registered in
     // decode_proto_by_kind_and_version (it's a synthetic subresource view, not a stored kind),
@@ -470,24 +474,55 @@ fn write_scale_replicas(
     Ok(())
 }
 
+fn scale_api_version(group: &str) -> String {
+    if group.is_empty() {
+        "v1".to_string()
+    } else {
+        format!("{group}/v1")
+    }
+}
+
+/// Plan an apply to `scale`: the applier owns only the replicas field (`replicas_path`, a
+/// dotted path into the scaled object) its Scale body names, as the `scale` subresource
+/// manager; every other member of the object belongs to the main resource.
+pub(crate) fn plan_scale_apply(
+    headers: &HeaderMap,
+    live: &serde_json::Value,
+    replicas: Option<i64>,
+    replicas_path: &str,
+    api_version: &str,
+    schema: Option<&serde_json::Value>,
+) -> Result<crate::field_manager::ApplyPlan, crate::status::StatusError> {
+    let mut applied = serde_json::json!({});
+    if let Some(n) = replicas {
+        super::cr::scale_path_set_i64(&mut applied, replicas_path, n);
+    }
+    let top = replicas_path.split('.').next().unwrap_or(replicas_path);
+    crate::field_manager::WriteIdentity::new(None, headers).plan_subresource_apply(
+        live,
+        &applied,
+        &[top],
+        api_version,
+        "scale",
+        schema,
+    )
+}
+
 /// A scale write owns `spec.replicas` as the `scale` subresource manager, so an applier that
 /// later drops the field does not delete a count an HPA set.
 fn record_scale_write(
     headers: &HeaderMap,
+    plan: Option<&crate::field_manager::ApplyPlan>,
     before: &serde_json::Value,
     after: &mut serde_json::Value,
     group: &str,
 ) {
-    let api_version = if group.is_empty() {
-        "v1".to_string()
-    } else {
-        format!("{group}/v1")
-    };
-    crate::field_manager::WriteIdentity::new(None, headers).record(
+    crate::field_manager::WriteIdentity::new(None, headers).record_subresource_write(
+        plan,
         before,
         after,
-        &api_version,
-        Some("scale"),
+        &scale_api_version(group),
+        "scale",
         None,
     );
 }
@@ -561,7 +596,7 @@ async fn scale_put_impl<S: Store>(
     // Dry-run: spec.replicas was computed above; return the would-be Scale object
     // without persisting — this is the shared impl behind both apps/v1 and
     // ReplicationController scale PUT routes, so guarding here covers both.
-    record_scale_write(headers, &before_write, &mut obj.body, group);
+    record_scale_write(headers, None, &before_write, &mut obj.body, group);
     if is_dry_run_header(headers) {
         return Ok(Json(build_scale(
             name,
@@ -606,19 +641,21 @@ async fn scale_patch_impl<S: Store>(
     // extract_body_quiet's Err is expected and ignored here — see decode_scale_body's comment
     // on why Scale has no registered proto decoder of its own.
     let ct = content_type(headers);
+    let is_ssa = ct.contains("apply-patch+yaml");
     let decoded = extract_body_quiet(body, ct).unwrap_or_else(|_| body.clone());
-    let patch_body: serde_json::Value =
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
-            v
-        } else if let Some(scale) = try_decode_proto_scale_body(body) {
-            serde_json::to_value(scale).unwrap_or_default()
-        } else {
-            let e = serde_json::from_slice::<serde_json::Value>(body)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unrecognised body format".into());
-            return Err(Status::bad_request(format!("invalid JSON: {e}")));
-        };
+    let patch_body: serde_json::Value = if is_ssa {
+        super::json_patch::ssa_body_to_json(body)?
+    } else if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+        v
+    } else if let Some(scale) = try_decode_proto_scale_body(body) {
+        serde_json::to_value(scale).unwrap_or_default()
+    } else {
+        let e = serde_json::from_slice::<serde_json::Value>(body)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unrecognised body format".into());
+        return Err(Status::bad_request(format!("invalid JSON: {e}")));
+    };
     let patch_scale_spec: ScaleSpec =
         ScaleSpec::deserialize(&patch_body["spec"]).unwrap_or_default();
 
@@ -638,6 +675,18 @@ async fn scale_patch_impl<S: Store>(
     let status_replicas = extract_status_replicas(&obj.body);
     let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
     let before_write = obj.body.clone();
+    let ssa_plan = is_ssa
+        .then(|| {
+            plan_scale_apply(
+                headers,
+                &before_write,
+                patch_scale_spec.replicas.map(i64::from),
+                "spec.replicas",
+                &scale_api_version(group),
+                None,
+            )
+        })
+        .transpose()?;
 
     // Extract replicas from patch if present; otherwise keep current value (no write).
     let old_replicas = extract_replicas(&obj.body);
@@ -673,10 +722,19 @@ async fn scale_patch_impl<S: Store>(
     if patch_scale_spec.replicas.is_some() || new_replicas != old_replicas {
         write_scale_replicas(&mut obj, new_replicas as i32)?;
     }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut obj.body);
+    }
 
     // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
     // apps/v1 and ReplicationController scale PATCH routes.
-    record_scale_write(headers, &before_write, &mut obj.body, group);
+    record_scale_write(
+        headers,
+        ssa_plan.as_ref(),
+        &before_write,
+        &mut obj.body,
+        group,
+    );
     if is_dry_run_header(headers) {
         return Ok(Json(build_scale(
             name,
@@ -1769,6 +1827,86 @@ mod handler_tests {
     // -----------------------------------------------------------------------
     // patch_scale
     // -----------------------------------------------------------------------
+
+    async fn scale_apply(
+        state: &AppState,
+        manager: &str,
+        force: bool,
+        yaml: &str,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        patch_scale(
+            State(state.clone()),
+            Path((
+                "default".to_string(),
+                "deployments".to_string(),
+                "my-deploy".to_string(),
+            )),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml.to_owned()),
+        )
+        .await?;
+        let stored = state
+            .store
+            .get("/registry/apps/deployments/default/my-deploy")
+            .await
+            .unwrap()
+            .unwrap();
+        Ok(serde_json::from_slice(&stored.value).unwrap())
+    }
+
+    /// `kubectl apply --server-side --subresource=scale` must be an Apply scoped to `scale`
+    /// owning spec.replicas, not an Update: otherwise the applier can never delete the field
+    /// and conflicts with the main resource's owner go undetected.
+    #[tokio::test]
+    async fn scale_apply_records_scale_scoped_apply_manager_owning_replicas() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+        let out = scale_apply(&state, "ctrl", false, "spec:\n  replicas: 5\n")
+            .await
+            .unwrap_or_else(|e| panic!("scale apply must succeed: {e:?}"));
+        assert_eq!(out["spec"]["replicas"], 5);
+        let entry =
+            crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("scale"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "scale apply must record an Apply scoped to scale: {}",
+                        out["metadata"]["managedFields"]
+                    )
+                });
+        assert!(
+            entry["fieldsV1"]["f:spec"]["f:replicas"].is_object(),
+            "the applier must own spec.replicas: {entry}"
+        );
+    }
+
+    /// An applier owning spec.replicas on the main resource must not be silently overwritten
+    /// by another manager's scale apply (409 without force, as upstream).
+    #[tokio::test]
+    async fn scale_apply_over_main_resource_owner_conflicts_without_force() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let mut dep: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        dep["metadata"]["managedFields"] = serde_json::json!([{
+            "manager": "gitops", "operation": "Apply", "apiVersion": "apps/v1",
+            "time": "2026-01-01T00:00:00Z", "fieldsType": "FieldsV1",
+            "fieldsV1": {"f:spec": {"f:replicas": {}}}
+        }]);
+        store
+            .put(key, Bytes::from(dep.to_string()), None)
+            .await
+            .unwrap();
+        let err = scale_apply(&state, "ctrl", false, "spec:\n  replicas: 5\n")
+            .await
+            .expect_err("must conflict with the main resource's owner");
+        assert_eq!(err.0, StatusCode::CONFLICT, "{}", err.1.message);
+        let out = scale_apply(&state, "ctrl", true, "spec:\n  replicas: 5\n")
+            .await
+            .unwrap_or_else(|e| panic!("force must override: {e:?}"));
+        assert_eq!(out["spec"]["replicas"], 5);
+    }
 
     /// PATCH scale with spec.replicas updates the stored replica count.
     /// JSON merge-patch: only spec.replicas is extracted and applied.
