@@ -262,6 +262,33 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn source_connects_with_kubeconfig_referencing_relative_cert_files() {
+        let dir = std::env::temp_dir().join(format!("u7s-migrate-filepath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pki")).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        std::fs::write(dir.join("pki/ca.crt"), cert.pem()).unwrap();
+        std::fs::write(dir.join("pki/client.crt"), cert.pem()).unwrap();
+        std::fs::write(dir.join("pki/client.key"), key.serialize_pem()).unwrap();
+        let kc = dir.join("kubeconfig");
+        std::fs::write(
+            &kc,
+            "apiVersion: v1\nkind: Config\ncurrent-context: c\n\
+             clusters:\n- name: c\n  cluster:\n    server: https://127.0.0.1:6443\n    certificate-authority: pki/ca.crt\n\
+             users:\n- name: u\n  user:\n    client-certificate: pki/client.crt\n    client-key: pki/client.key\n\
+             contexts:\n- name: c\n  context: {cluster: c, user: u}\n",
+        )
+        .unwrap();
+        Source::connect(kc.to_str().unwrap()).map(|_| ()).expect(
+            "k3s/kubeadm kubeconfigs reference cert files by path; migrate must accept them",
+        );
+    }
+
+    #[test]
     fn only_listable_top_level_resources_are_enumerated() {
         let doc = json!({"resources": [
             {"name": "pods", "kind": "Pod", "verbs": ["get", "list"]},

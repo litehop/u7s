@@ -1957,8 +1957,8 @@ dependencies = [
 
 [[package]]
 name = "politeia"
-version = "0.3.1"
-source = "git+https://github.com/litehop/politeia?tag=v0.3.1#e2f787e8fd621a779db2ab89f7a03b43488ceb7a"
+version = "0.3.2"
+source = "git+https://github.com/litehop/politeia?tag=v0.3.2#ad8fecedd0fcd3d5164fff226e838fa027f53278"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3490,6 +3490,7 @@ dependencies = [
  "clap",
  "hyper",
  "politeia",
+ "rcgen",
  "serde",
  "serde_json",
  "tokio",
