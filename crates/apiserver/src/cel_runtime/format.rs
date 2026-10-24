@@ -161,7 +161,7 @@ fn uuid_re() -> &'static Regex {
     })
 }
 
-fn is_dns1123_label(v: &str) -> Vec<String> {
+pub(super) fn is_dns1123_label(v: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if v.len() > 63 {
         errs.push(max_len_error(63));
@@ -180,7 +180,7 @@ fn is_dns1123_label(v: &str) -> Vec<String> {
     errs
 }
 
-fn is_dns1123_subdomain(v: &str) -> Vec<String> {
+pub(super) fn is_dns1123_subdomain(v: &str) -> Vec<String> {
     let mut errs = Vec::new();
     if v.len() > 253 {
         errs.push(max_len_error(253));

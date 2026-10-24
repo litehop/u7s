@@ -569,6 +569,43 @@ async fn resolve_group_version_resources<S: Store>(
     }
 }
 
+/// Plural resource name and scope (`true` = namespaced) of the built-in or CRD-backed `kind`
+/// served at `group`/`version`; `None` when no such kind is served.
+pub(crate) async fn resolve_kind_resource<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+    kind: &str,
+) -> Option<(String, bool)> {
+    if group.is_empty() {
+        if version != "v1" {
+            return None;
+        }
+        return crate::types::ApiResourceList::v1()
+            .resources
+            .iter()
+            .find(|r| r.kind == kind && !r.name.contains('/'))
+            .map(|r| (r.name.to_string(), r.namespaced));
+    }
+    if let Some(list) = static_group_resources(group, version) {
+        return list["resources"]
+            .as_array()?
+            .iter()
+            .find(|r| r["kind"] == kind && r["name"].as_str().is_some_and(|n| !n.contains('/')))
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap_or_default().to_string(),
+                    r["namespaced"].as_bool().unwrap_or(false),
+                )
+            });
+    }
+    crd_group_resources(state, group, version)
+        .await
+        .into_iter()
+        .find(|r| r.response_kind.kind == kind)
+        .map(|r| (r.resource, r.scope == "Namespaced"))
+}
+
 /// True when a CRD version's `subresources` declares a non-null `status` key -- the same
 /// source of truth `find_crd` in `cr.rs` uses to decide whether the `/status` route is served,
 /// so discovery never advertises a `<plural>/status` entry the server can't actually handle.

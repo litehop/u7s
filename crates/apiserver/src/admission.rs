@@ -15,8 +15,12 @@ use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store};
 
 use crate::cel_runtime;
+use crate::node_authz::NodeGraph;
+use crate::rbac::RbacIndex;
 use crate::state::AppState;
 use crate::status::{Status, StatusError};
+
+mod policy_params;
 
 /// Maximum webhook response body size. Responses larger than this are treated as
 /// a failurePolicy failure — the webhook is unreachable from the apiserver's perspective.
@@ -1898,22 +1902,66 @@ fn vap_env<'a>(
     ])
 }
 
-/// [`vap_env`] with `spec.variables` as lazily evaluated `(name, expression)` pairs.
-fn vap_env_with_variables<'a>(
-    object: &'a serde_json::Value,
-    variables: Vec<(String, String)>,
+/// `params` for a policy that declares a `paramKind` but whose binding supplies no param.
+static NULL_PARAMS: serde_json::Value = serde_json::Value::Null;
+
+/// The request-scoped CEL roots of a ValidatingAdmissionPolicy or MutatingAdmissionPolicy
+/// evaluation besides `object` and `params`, and what backs its `authorizer`.
+struct PolicyInputs<'a> {
     request: &'a serde_json::Value,
     namespace_object: &'a serde_json::Value,
     old_object: &'a serde_json::Value,
-) -> cel_runtime::Env<'a> {
-    use cel_runtime::Value;
-    cel_runtime::Env::new(vec![
-        ("object", Value::from_json(object)),
-        ("oldObject", Value::from_json(old_object)),
-        ("request", Value::from_json(request)),
-        ("namespaceObject", Value::from_json(namespace_object)),
-    ])
-    .with_variables(variables)
+    request_resource: cel_runtime::RequestResource,
+    rbac: &'a RbacIndex,
+    graph: &'a NodeGraph,
+    user: &'a policy_params::RequestUser,
+}
+
+impl<'a> PolicyInputs<'a> {
+    /// The environment for one evaluation, with `spec.variables` as lazily evaluated
+    /// `(name, expression)` pairs. `params` is bound only when the policy declares a
+    /// `paramKind`.
+    fn env<'e>(
+        &'e self,
+        object: &'e serde_json::Value,
+        variables: Vec<(String, String)>,
+        params: Option<&'e serde_json::Value>,
+    ) -> cel_runtime::Env<'e>
+    where
+        'a: 'e,
+    {
+        use cel_runtime::Value;
+        let mut roots = vec![
+            ("object", Value::from_json(object)),
+            ("oldObject", Value::from_json(self.old_object)),
+            ("request", Value::from_json(self.request)),
+            ("namespaceObject", Value::from_json(self.namespace_object)),
+        ];
+        if let Some(params) = params {
+            roots.push(("params", Value::from_json(params)));
+        }
+        cel_runtime::Env::new(roots)
+            .with_variables(variables)
+            .with_authorizer(
+                self.request_resource.clone(),
+                policy_params::authorizer(self.rbac, self.graph, self.user),
+            )
+    }
+}
+
+/// The resource under admission, as `authorizer.requestResource` exposes it.
+fn request_resource(
+    ctx: &AdmissionContext<'_>,
+    object: &serde_json::Value,
+) -> cel_runtime::RequestResource {
+    let (_, resource, subresource) = request_kind_resource(ctx, object);
+    cel_runtime::RequestResource {
+        group: resource.group,
+        resource: resource.resource,
+        subresource: subresource.unwrap_or_default().to_string(),
+        namespace: ctx.namespace.unwrap_or_default().to_string(),
+        name: ctx.name.to_string(),
+    }
 }
 
 /// Evaluate a CEL boolean expression for ValidatingAdmissionPolicy validations.
@@ -2228,6 +2276,7 @@ pub async fn run_cel_mutating_policies<S: Store>(
         None => serde_json::Value::Null,
     };
     let old_object_val = old_object.cloned().unwrap_or(serde_json::Value::Null);
+    let request_user = policy_params::RequestUser::from_user_info(ctx.user_info.as_ref());
 
     // Index policies by name once so the binding loop below is O(N+M) instead of
     // re-scanning the full policy list (O(N*M)) for every binding.
@@ -2314,44 +2363,59 @@ pub async fn run_cel_mutating_policies<S: Store>(
         }
 
         let request_val = webhook_match_condition_request(ctx, &object);
-        let errors = apply_map_mutations(
-            policy,
-            &mut object,
-            &MapInputs {
-                request: &request_val,
-                namespace_object: &namespace_object_val,
-                old_object: &old_object_val,
-            },
-        );
-        // Upstream drops every error of an `Ignore` policy and otherwise denies with the
-        // first one, after the remaining mutations have run.
-        if policy["spec"]["failurePolicy"].as_str() == Some("Ignore") {
-            for e in &errors {
-                tracing::warn!(
-                    "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, ignoring \
-                     (failurePolicy=Ignore): {e}"
+        let inputs = PolicyInputs {
+            request: &request_val,
+            namespace_object: &namespace_object_val,
+            old_object: &old_object_val,
+            request_resource: request_resource(ctx, &object),
+            rbac: &state.rbac_index,
+            graph: &state.node_graph,
+            user: &request_user,
+        };
+        let ignore = policy["spec"]["failurePolicy"].as_str() == Some("Ignore");
+        let binding_name = binding["metadata"]["name"].as_str().unwrap_or("");
+        let params =
+            match policy_params::collect_params(state, policy, binding, ctx.namespace).await {
+                Ok(params) => params,
+                Err(e) if ignore => {
+                    tracing::warn!(
+                    "admission: MutatingAdmissionPolicy \"{policy_name}\" binding could not be \
+                     configured, ignoring (failurePolicy=Ignore): {e}"
                 );
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Status::forbidden(policy_params::config_error_message(
+                        policy_name,
+                        binding_name,
+                        &e,
+                    )));
+                }
+            };
+        for param in &params {
+            let errors = apply_map_mutations(policy, &mut object, &inputs, param.as_ref());
+            // Upstream drops every error of an `Ignore` policy and otherwise denies with the
+            // first one, after the remaining mutations have run.
+            if ignore {
+                for e in &errors {
+                    tracing::warn!(
+                        "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, ignoring \
+                         (failurePolicy=Ignore): {e}"
+                    );
+                }
+            } else if let Some(first) = errors.into_iter().next() {
+                tracing::warn!(
+                    "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, denying \
+                     (failurePolicy=Fail): {first}"
+                );
+                return Err(Status::unprocessable_entity(format!(
+                    "policy '{policy_name}' with binding '{binding_name}' denied request: {first}"
+                )));
             }
-        } else if let Some(first) = errors.into_iter().next() {
-            let binding_name = binding["metadata"]["name"].as_str().unwrap_or("");
-            tracing::warn!(
-                "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, denying \
-                 (failurePolicy=Fail): {first}"
-            );
-            return Err(Status::unprocessable_entity(format!(
-                "policy '{policy_name}' with binding '{binding_name}' denied request: {first}"
-            )));
         }
     }
 
     Ok(object)
-}
-
-/// The request-scoped CEL roots a MutatingAdmissionPolicy sees besides `object`.
-struct MapInputs<'a> {
-    request: &'a serde_json::Value,
-    namespace_object: &'a serde_json::Value,
-    old_object: &'a serde_json::Value,
 }
 
 /// Evaluate `policy`'s matchConditions and, when they hold, apply its mutations to `object`
@@ -2362,8 +2426,12 @@ struct MapInputs<'a> {
 fn apply_map_mutations(
     policy: &serde_json::Value,
     object: &mut serde_json::Value,
-    inputs: &MapInputs<'_>,
+    inputs: &PolicyInputs<'_>,
+    param: Option<&serde_json::Value>,
 ) -> Vec<String> {
+    let params_root = policy["spec"]["paramKind"]
+        .is_object()
+        .then(|| param.unwrap_or(&NULL_PARAMS));
     let variable_defs: Vec<(String, String)> = policy["spec"]["variables"]
         .as_array()
         .into_iter()
@@ -2381,7 +2449,7 @@ fn apply_map_mutations(
         return errors;
     }
 
-    let match_env = map_env(object, inputs, variable_defs.clone());
+    let match_env = inputs.env(object, variable_defs.clone(), params_root);
     for cond in policy["spec"]["matchConditions"]
         .as_array()
         .into_iter()
@@ -2420,7 +2488,7 @@ fn apply_map_mutations(
             continue;
         }
         // Each mutation sees the object as the previous ones left it.
-        let env = map_env(object, inputs, variable_defs.clone());
+        let env = inputs.env(object, variable_defs.clone(), params_root);
         if is_json_patch {
             let ops = eval_json_patch(&env, expr);
             drop(env);
@@ -2480,21 +2548,6 @@ fn eval_json_patch(env: &cel_runtime::Env<'_>, expr: &str) -> Result<serde_json:
         ops.push(serde_json::Value::Object(op));
     }
     Ok(serde_json::Value::Array(ops))
-}
-
-fn map_env<'a>(
-    object: &'a serde_json::Value,
-    inputs: &MapInputs<'a>,
-    variables: Vec<(String, String)>,
-) -> cel_runtime::Env<'a> {
-    use cel_runtime::Value;
-    cel_runtime::Env::new(vec![
-        ("object", Value::from_json(object)),
-        ("oldObject", Value::from_json(inputs.old_object)),
-        ("request", Value::from_json(inputs.request)),
-        ("namespaceObject", Value::from_json(inputs.namespace_object)),
-    ])
-    .with_variables(variables)
 }
 
 /// Evaluate an `applyConfiguration` expression, which must produce an object.
@@ -2771,6 +2824,7 @@ async fn run_validating_admission_policies<S: Store>(
     // Resolve the `oldObject` CEL root once per request: the pre-request state of the
     // admitted resource on UPDATE/DELETE, or Null on CREATE (upstream contract).
     let old_object_val = old_object.cloned().unwrap_or(serde_json::Value::Null);
+    let request_user = policy_params::RequestUser::from_user_info(ctx.user_info.as_ref());
 
     // Index policies by name once so the binding loop below is O(N+M) instead of
     // re-scanning the full policy list (O(N*M)) for every binding.
@@ -2861,189 +2915,228 @@ async fn run_validating_admission_policies<S: Store>(
         // This allows VAP expressions to reference request.userInfo.username,
         // request.operation, request.name, request.namespace, and request.dryRun.
         let request_val = webhook_match_condition_request(ctx, object);
+        let inputs = PolicyInputs {
+            request: &request_val,
+            namespace_object: &namespace_object_val,
+            old_object: &old_object_val,
+            request_resource: request_resource(ctx, object),
+            rbac: &state.rbac_index,
+            graph: &state.node_graph,
+            user: &request_user,
+        };
 
-        // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
-        // An eval error is governed by the policy's failurePolicy (matching upstream
-        // matchconditions/matcher.go), not treated as an unconditional pass: Ignore skips
-        // this binding like a false match; Fail (the default) denies the request outright.
-        let match_conditions = policy["spec"]["matchConditions"].as_array();
-        if let Some(conditions) = match_conditions {
-            let policy_failure_policy = policy["spec"]["failurePolicy"].as_str().unwrap_or("Fail");
-            let mut skip = false;
-            for cond in conditions {
-                let expr = cond["expression"].as_str().unwrap_or("");
-                if expr.is_empty() {
+        // A binding that cannot resolve its params is a configuration error, governed by the
+        // policy's failurePolicy like any other evaluation error (upstream policy dispatcher).
+        let params =
+            match policy_params::collect_params(state, policy, binding, ctx.namespace).await {
+                Ok(params) => params,
+                Err(e) if policy["spec"]["failurePolicy"].as_str() == Some("Ignore") => {
+                    tracing::warn!(
+                        "admission: VAP \"{policy_name}\" binding could not be configured, \
+                     ignoring (failurePolicy=Ignore): {e}"
+                    );
                     continue;
                 }
-                let vars = serde_json::Map::new();
-                match eval_cel_bool_expr(
-                    expr,
-                    object,
-                    &vars,
-                    &request_val,
-                    &namespace_object_val,
-                    &old_object_val,
-                ) {
-                    Some(true) => {} // condition passes, continue
-                    Some(false) => {
-                        // matchCondition returned false → skip this webhook (not deny)
-                        tracing::debug!(
-                            "admission: VAP \"{}\" matchCondition false, skipping",
-                            policy_name
-                        );
-                        skip = true;
-                        break;
-                    }
-                    None if policy_failure_policy == "Ignore" => {
-                        tracing::warn!(
-                            "admission: VAP \"{}\" matchCondition eval error, skipping \
-                             (failurePolicy=Ignore)",
-                            policy_name
-                        );
-                        skip = true;
-                        break;
-                    }
-                    None => {
-                        tracing::warn!(
-                            "admission: VAP \"{}\" matchCondition eval error, denying \
-                             (failurePolicy=Fail): {}",
-                            policy_name,
-                            expr
-                        );
-                        return Err(Status::internal(format!(
-                            "ValidatingAdmissionPolicy \"{policy_name}\" matchCondition \
-                             failed to evaluate (failurePolicy=Fail): {expr}: {}",
-                            cel_last_error()
-                        )));
-                    }
+                Err(e) => {
+                    let binding_name = binding["metadata"]["name"].as_str().unwrap_or("");
+                    return Err(Status::forbidden(policy_params::config_error_message(
+                        policy_name,
+                        binding_name,
+                        &e,
+                    )));
                 }
-            }
-            if skip {
+            };
+        // One evaluation per param; any failing denies.
+        for param in &params {
+            eval_vap_invocation(policy, binding, object, &inputs, param.as_ref())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Evaluate one policy x binding x param invocation: matchConditions, then variables and
+/// validations. Synchronous so no CEL environment is held across an await by the caller.
+fn eval_vap_invocation(
+    policy: &serde_json::Value,
+    binding: &serde_json::Value,
+    object: &serde_json::Value,
+    inputs: &PolicyInputs<'_>,
+    param: Option<&serde_json::Value>,
+) -> Result<(), StatusError> {
+    let policy_name = policy["metadata"]["name"].as_str().unwrap_or("");
+    let params_root = policy["spec"]["paramKind"]
+        .is_object()
+        .then(|| param.unwrap_or(&NULL_PARAMS));
+
+    // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
+    // An eval error is governed by the policy's failurePolicy (matching upstream
+    // matchconditions/matcher.go), not treated as an unconditional pass: Ignore skips
+    // this binding like a false match; Fail (the default) denies the request outright.
+    let match_conditions = policy["spec"]["matchConditions"].as_array();
+    if let Some(conditions) = match_conditions {
+        let policy_failure_policy = policy["spec"]["failurePolicy"].as_str().unwrap_or("Fail");
+        let mut skip = false;
+        let match_env = inputs.env(object, Vec::new(), params_root);
+        for cond in conditions {
+            let expr = cond["expression"].as_str().unwrap_or("");
+            if expr.is_empty() {
                 continue;
             }
-        }
-
-        // `spec.variables` are evaluated lazily, on first reference and in declaration
-        // order, as upstream does: an erroring variable fails only the expressions that
-        // read it.
-        let variable_defs: Vec<(String, String)> = policy["spec"]["variables"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| {
-                let name = v["name"].as_str().filter(|n| !n.is_empty())?;
-                let expr = v["expression"].as_str().filter(|e| !e.is_empty())?;
-                Some((name.to_string(), expr.to_string()))
-            })
-            .collect();
-        let env = vap_env_with_variables(
-            object,
-            variable_defs,
-            &request_val,
-            &namespace_object_val,
-            &old_object_val,
-        );
-
-        // Determine validation actions from binding.
-        let validation_actions: Vec<&str> = binding["spec"]["validationActions"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let should_deny = validation_actions.contains(&"Deny");
-
-        // Evaluate spec.validations.
-        let validations = policy["spec"]["validations"].as_array();
-        if let Some(val_list) = validations {
-            for validation in val_list {
-                let expr = validation["expression"].as_str().unwrap_or("");
-                if expr.is_empty() {
-                    continue;
+            match eval_cel_bool_in(&match_env, expr) {
+                Some(true) => {} // condition passes, continue
+                Some(false) => {
+                    // matchCondition returned false → skip this webhook (not deny)
+                    tracing::debug!(
+                        "admission: VAP \"{}\" matchCondition false, skipping",
+                        policy_name
+                    );
+                    skip = true;
+                    break;
                 }
-                let result = eval_cel_bool_in(&env, expr);
-                let passed = match result {
-                    Some(b) => b,
-                    None => {
-                        let ignore = policy["spec"]["failurePolicy"].as_str() == Some("Ignore");
-                        tracing::warn!(
-                            "admission: VAP \"{}\" validation expr eval failed ({}): {}",
-                            policy_name,
-                            if ignore {
-                                "failurePolicy=Ignore, admitting"
-                            } else {
-                                "denying"
-                            },
-                            expr
-                        );
-                        ignore
-                    }
+                None if policy_failure_policy == "Ignore" => {
+                    tracing::warn!(
+                        "admission: VAP \"{}\" matchCondition eval error, skipping \
+                             (failurePolicy=Ignore)",
+                        policy_name
+                    );
+                    skip = true;
+                    break;
+                }
+                None => {
+                    tracing::warn!(
+                        "admission: VAP \"{}\" matchCondition eval error, denying \
+                             (failurePolicy=Fail): {}",
+                        policy_name,
+                        expr
+                    );
+                    return Err(Status::internal(format!(
+                        "ValidatingAdmissionPolicy \"{policy_name}\" matchCondition \
+                             failed to evaluate (failurePolicy=Fail): {expr}: {}",
+                        cel_last_error()
+                    )));
+                }
+            }
+        }
+        if skip {
+            return Ok(());
+        }
+    }
+
+    // `spec.variables` are evaluated lazily, on first reference and in declaration
+    // order, as upstream does: an erroring variable fails only the expressions that
+    // read it.
+    let variable_defs: Vec<(String, String)> = policy["spec"]["variables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let name = v["name"].as_str().filter(|n| !n.is_empty())?;
+            let expr = v["expression"].as_str().filter(|e| !e.is_empty())?;
+            Some((name.to_string(), expr.to_string()))
+        })
+        .collect();
+    let env = inputs.env(object, variable_defs, params_root);
+
+    // Determine validation actions from binding.
+    let validation_actions: Vec<&str> = binding["spec"]["validationActions"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let should_deny = validation_actions.contains(&"Deny");
+
+    // Evaluate spec.validations.
+    let validations = policy["spec"]["validations"].as_array();
+    if let Some(val_list) = validations {
+        for validation in val_list {
+            let expr = validation["expression"].as_str().unwrap_or("");
+            if expr.is_empty() {
+                continue;
+            }
+            let result = eval_cel_bool_in(&env, expr);
+            let passed = match result {
+                Some(b) => b,
+                None => {
+                    let ignore = policy["spec"]["failurePolicy"].as_str() == Some("Ignore");
+                    tracing::warn!(
+                        "admission: VAP \"{}\" validation expr eval failed ({}): {}",
+                        policy_name,
+                        if ignore {
+                            "failurePolicy=Ignore, admitting"
+                        } else {
+                            "denying"
+                        },
+                        expr
+                    );
+                    ignore
+                }
+            };
+            if !passed {
+                // An eval error is never reported as a false result, and (as upstream)
+                // overrides message/messageExpression/reason.
+                let errored = result.is_none();
+                let reason = if errored {
+                    ""
+                } else {
+                    validation["reason"].as_str().unwrap_or("")
                 };
-                if !passed {
-                    // An eval error is never reported as a false result, and (as upstream)
-                    // overrides message/messageExpression/reason.
-                    let errored = result.is_none();
-                    let reason = if errored {
-                        ""
-                    } else {
-                        validation["reason"].as_str().unwrap_or("")
-                    };
-                    // messageExpression takes precedence over the static `message` field
-                    // (upstream contract) — it lets a validation report which specific
-                    // value caused the denial (e.g. the mismatched node/object names).
-                    let message_expr = validation["messageExpression"].as_str().unwrap_or("");
-                    let message = if errored {
-                        format!(
-                            "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
+                // messageExpression takes precedence over the static `message` field
+                // (upstream contract) — it lets a validation report which specific
+                // value caused the denial (e.g. the mismatched node/object names).
+                let message_expr = validation["messageExpression"].as_str().unwrap_or("");
+                let message = if errored {
+                    format!(
+                        "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
                              expression '{expr}' resulted in error: {}",
-                            cel_last_error()
-                        )
-                    } else if !message_expr.is_empty() {
-                        eval_cel_value_in(&env, message_expr)
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| {
-                                tracing::warn!(
-                                    "admission: VAP \"{}\" messageExpression eval failed: {}",
-                                    policy_name,
-                                    message_expr
-                                );
-                                format!(
+                        cel_last_error()
+                    )
+                } else if !message_expr.is_empty() {
+                    eval_cel_value_in(&env, message_expr)
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| {
+                            tracing::warn!(
+                                "admission: VAP \"{}\" messageExpression eval failed: {}",
+                                policy_name,
+                                message_expr
+                            );
+                            format!(
                                 "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
                              expression '{expr}' evaluated to false"
                             )
-                            })
-                    } else {
-                        validation["message"]
-                            .as_str()
-                            .map(|m| m.to_string())
-                            .unwrap_or_else(|| {
-                                format!(
-                                    "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
+                        })
+                } else {
+                    validation["message"]
+                        .as_str()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
                              expression '{expr}' evaluated to false"
-                                )
-                            })
-                    };
-                    if should_deny {
-                        tracing::debug!(
-                            "admission: VAP \"{}\" denied: {} (reason: {})",
-                            policy_name,
-                            message,
-                            reason
-                        );
-                        // Real Kubernetes: default reason is Invalid (422 Unprocessable Entity).
-                        // Only reason="Forbidden" maps to 403. The conformance test polls for
-                        // apierrors.IsInvalid (HTTP 422) — any other code fails the test.
-                        let err = if reason == "Forbidden" {
-                            Status::forbidden(message)
-                        } else {
-                            Status::unprocessable_entity(message)
-                        };
-                        return Err(err);
+                            )
+                        })
+                };
+                if should_deny {
+                    tracing::debug!(
+                        "admission: VAP \"{}\" denied: {} (reason: {})",
+                        policy_name,
+                        message,
+                        reason
+                    );
+                    // Real Kubernetes: default reason is Invalid (422 Unprocessable Entity).
+                    // Only reason="Forbidden" maps to 403. The conformance test polls for
+                    // apierrors.IsInvalid (HTTP 422) — any other code fails the test.
+                    let err = if reason == "Forbidden" {
+                        Status::forbidden(message)
                     } else {
-                        tracing::warn!(
-                            "admission: VAP \"{}\" validation failed (non-Deny action): {}",
-                            policy_name,
-                            message
-                        );
-                    }
+                        Status::unprocessable_entity(message)
+                    };
+                    return Err(err);
+                } else {
+                    tracing::warn!(
+                        "admission: VAP \"{}\" validation failed (non-Deny action): {}",
+                        policy_name,
+                        message
+                    );
                 }
             }
         }

@@ -146,6 +146,7 @@ pub(crate) enum Value<'a> {
     Semver(Arc<Semver>),
     Url(Arc<Url>),
     Format(Format),
+    Authz(Arc<super::authzlib::Authz>),
     /// The `variables` root: the policy variables declared before this index.
     Variables(usize),
 }
@@ -203,6 +204,7 @@ impl<'a> Value<'a> {
             Value::Semver(_) => "kubernetes.Semver",
             Value::Url(_) => "kubernetes.URL",
             Value::Format(_) => "kubernetes.format.Format",
+            Value::Authz(a) => a.type_name(),
         }
     }
 
@@ -316,6 +318,7 @@ impl<'a> Value<'a> {
             | Value::Semver(_)
             | Value::Url(_)
             | Value::Format(_)
+            | Value::Authz(_)
             | Value::Variables(_) => {
                 return Err(CelError::new(format!(
                     "unsupported type conversion to JSON from '{}'",
