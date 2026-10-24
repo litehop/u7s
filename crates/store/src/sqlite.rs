@@ -3913,7 +3913,7 @@ mod tests {
     /// difference between O(limit) and O(objects-under-prefix) memory/I/O per request.
     #[test]
     fn metadata_name_field_selector_pushes_sql_limit_not_a_full_scan() {
-        let conn = conn_with_objects_schema();
+        let mut conn = conn_with_objects_schema();
         for i in 0..20 {
             insert_pod(
                 &conn,
@@ -3928,7 +3928,8 @@ mod tests {
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
             Some(count_object_list_rows),
-        );
+        )
+        .expect("install row trace");
         let resp = list_sync(
             &conn,
             "/registry/pods/",
@@ -3972,7 +3973,7 @@ mod tests {
     /// this is the difference between ~2 MB and ~40 MB read per page.
     #[test]
     fn metadata_namespace_field_selector_pushes_sql_limit_not_a_full_scan() {
-        let conn = conn_with_objects_schema();
+        let mut conn = conn_with_objects_schema();
         for i in 0..20 {
             insert_pod(
                 &conn,
@@ -3987,7 +3988,8 @@ mod tests {
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
             Some(count_object_list_rows),
-        );
+        )
+        .expect("install row trace");
         let resp = list_sync(
             &conn,
             "/registry/pods/",
@@ -4030,7 +4032,7 @@ mod tests {
     /// pod list would otherwise cost O(pods-on-node) instead of O(limit).
     #[test]
     fn nodename_field_selector_pushes_sql_limit_not_a_full_scan() {
-        let conn = conn_with_objects_schema();
+        let mut conn = conn_with_objects_schema();
         for i in 0..20 {
             insert_pod(
                 &conn,
@@ -4045,7 +4047,8 @@ mod tests {
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
             Some(count_object_list_rows),
-        );
+        )
+        .expect("install row trace");
         let resp = list_sync(
             &conn,
             "/registry/pods/",
@@ -4096,7 +4099,7 @@ mod tests {
     /// all 20 rows scanned regardless of `limit`.
     #[test]
     fn generic_field_selector_batches_fetch_and_stops_once_page_is_filled() {
-        let conn = conn_with_objects_schema();
+        let mut conn = conn_with_objects_schema();
         for i in 0..20 {
             let phase = if i % 2 == 0 { "Succeeded" } else { "Running" };
             insert_pod_with_phase(
@@ -4112,7 +4115,8 @@ mod tests {
         conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
             Some(count_object_list_rows),
-        );
+        )
+        .expect("install row trace");
         let resp = list_sync(
             &conn,
             "/registry/pods/",
