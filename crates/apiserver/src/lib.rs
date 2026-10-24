@@ -29,6 +29,7 @@ mod health;
 mod inflight;
 mod keys;
 mod limit_range;
+mod log_limit;
 mod metrics;
 pub mod migrate_tables;
 mod namespace_guard;

@@ -1207,6 +1207,20 @@ fn log_denial(
     if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
+    let detail = if kind == "impersonation_denied" {
+        format!(
+            "{} -> {resource}",
+            user.map_or("system:unauthenticated", |u| u.username.as_str())
+        )
+    } else {
+        format!(
+            "{} {verb} {resource}",
+            user.map_or("system:unauthenticated", |u| u.username.as_str())
+        )
+    };
+    if !crate::log_limit::admit(kind, peer.map(|p| p.0.ip()), &detail) {
+        return resp;
+    }
     tracing::info!(
         kind,
         status = resp.status().as_u16(),
@@ -1227,7 +1241,7 @@ fn impersonation_denied(caller: &UserInfo, target: &str, peer: Option<PeerAddr>)
         .inc();
     log_denial(
         forbidden_response(&caller.username, "impersonate", target),
-        "forbidden",
+        "impersonation_denied",
         Some(caller),
         "impersonate",
         target,
@@ -1432,7 +1446,7 @@ where
                     "invalid_path_escape",
                     None,
                     verb,
-                    "",
+                    &escape,
                     peer,
                 ))
             });
