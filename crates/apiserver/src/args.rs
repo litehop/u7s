@@ -70,6 +70,14 @@ pub struct Args {
     #[arg(long, default_value = "10.96.0.0/12")]
     pub(crate) service_cluster_ip_range: String,
 
+    /// ClusterIP reserved for the kube-system/kube-dns Service. Must lie inside
+    /// `--service-cluster-ip-range` and must not be the network address, the broadcast
+    /// address or the `kubernetes` Service's first host. Defaults to the tenth host of the range
+    /// (kubeadm's `.10`). It must match the clusterIP in the applied CoreDNS manifest and
+    /// the kubelet's `clusterDNS`.
+    #[arg(long)]
+    pub(crate) kube_dns_cluster_ip: Option<String>,
+
     /// Hostname or IP to use for all kubelet proxy requests (log, exec, attach, port-forward).
     /// When set, overrides the node's InternalIP from status.addresses. Useful when the
     /// apiserver runs on a different host than the kubelet (e.g. Mac host + Lima VM) and

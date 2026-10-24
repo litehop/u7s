@@ -240,6 +240,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         &apiserver_ip,
         apiserver_port,
         &args.service_cluster_ip_range,
+        args.kube_dns_cluster_ip.as_deref(),
     )
     .await?;
     service_alloc::repair(&*store).await?;
@@ -2755,17 +2756,52 @@ fn bootstrap_service_ips(
     Ok((kubernetes_ip, kube_dns_ip))
 }
 
+/// Parse `--kube-dns-cluster-ip` and require it to be an allocatable host of the range that
+/// does not collide with the `kubernetes` Service. An IP outside the range would sit outside
+/// the ServiceCIDR and fail the startup coherence check; the network/broadcast addresses are
+/// never allocatable.
+fn validate_kube_dns_ip(
+    service_cluster_ip_range: &str,
+    kubernetes_ip: std::net::Ipv4Addr,
+    raw: &str,
+) -> anyhow::Result<std::net::Ipv4Addr> {
+    let ip: std::net::Ipv4Addr = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --kube-dns-cluster-ip '{raw}': {e}"))?;
+    let range = if service_cluster_ip_range.is_empty() {
+        "10.96.0.0/12"
+    } else {
+        service_cluster_ip_range
+    };
+    let alloc = state::ServiceIpAllocator::from_cidr(range)
+        .map_err(|e| anyhow::anyhow!("invalid --service-cluster-ip-range '{range}': {e}"))?;
+    let offset = u32::from(ip).wrapping_sub(u32::from(alloc.base));
+    if offset == 0 || offset >= alloc.size - 1 {
+        anyhow::bail!(
+            "--kube-dns-cluster-ip {ip} is not an allocatable host of --service-cluster-ip-range {range}"
+        );
+    }
+    if ip == kubernetes_ip {
+        anyhow::bail!("--kube-dns-cluster-ip {ip} collides with the kubernetes Service ClusterIP");
+    }
+    Ok(ip)
+}
+
 async fn seed_services(
     store: &SqliteStore,
     apiserver_ip: &str,
     apiserver_port: u16,
     service_cluster_ip_range: &str,
+    kube_dns_override: Option<&str>,
 ) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
-    let (kubernetes_cluster_ip, kube_dns_cluster_ip) =
-        bootstrap_service_ips(service_cluster_ip_range)?;
+    let (kubernetes_cluster_ip, derived_dns_ip) = bootstrap_service_ips(service_cluster_ip_range)?;
+    let kube_dns_cluster_ip = match kube_dns_override {
+        Some(ip) => validate_kube_dns_ip(service_cluster_ip_range, kubernetes_cluster_ip, ip)?,
+        None => derived_dns_ip,
+    };
 
     // default/kubernetes — reaches the API server from inside pods via
     // in-cluster DNS (kubernetes.default.svc.cluster.local:443 → 10.96.0.1).
@@ -7424,6 +7460,33 @@ mod tests {
         );
     }
 
+    /// An operator-chosen kube-dns IP is reserved instead of the derived tenth host, so a
+    /// migrated cluster can keep its source's DNS VIP; one outside the range, on the
+    /// network/broadcast address, or equal to the kubernetes VIP must fail loud at startup
+    /// instead of seeding a Service the ServiceCIDR does not own.
+    #[test]
+    fn kube_dns_override_must_be_an_allocatable_host_distinct_from_kubernetes() {
+        let k8s: std::net::Ipv4Addr = "10.43.0.1".parse().unwrap();
+        assert_eq!(
+            validate_kube_dns_ip("10.43.0.0/16", k8s, "10.43.0.53")
+                .unwrap()
+                .to_string(),
+            "10.43.0.53"
+        );
+        for bad in [
+            "10.44.0.10",
+            "10.43.0.0",
+            "10.43.255.255",
+            "10.43.0.1",
+            "nope",
+        ] {
+            assert!(
+                validate_kube_dns_ip("10.43.0.0/16", k8s, bad).is_err(),
+                "{bad} must be rejected as a kube-dns ClusterIP for 10.43.0.0/16"
+            );
+        }
+    }
+
     /// bootstrap_service_ips must derive both bootstrap ClusterIPs from whatever range
     /// is configured, falling back to the historical default only when the range is
     /// empty (disabled auto-allocation still needs concrete bootstrap IPs), and must
@@ -7475,7 +7538,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed must not fail");
 
@@ -7519,6 +7582,31 @@ mod tests {
         );
     }
 
+    /// With --kube-dns-cluster-ip the override, not the tenth host, is reserved: otherwise a
+    /// dynamic Service could be handed the migrated cluster's DNS VIP before CoreDNS applies.
+    #[tokio::test]
+    async fn seed_services_reserves_kube_dns_override_not_tenth_host() {
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces first");
+        seed_services(
+            &store,
+            "127.0.0.1",
+            6443,
+            "10.43.0.0/16",
+            Some("10.43.0.53"),
+        )
+        .await
+        .expect("seed must not fail");
+        for (ip, reserved) in [("10.43.0.53", true), ("10.43.0.10", false)] {
+            let key = format!("{}{ip}", state::SERVICE_IP_PREFIX);
+            assert_eq!(
+                store.get(&key).await.expect("get").is_some(),
+                reserved,
+                "sentinel for {ip} reserved={reserved}"
+            );
+        }
+    }
+
     /// seed_services must derive the bootstrap ClusterIPs from a non-default
     /// --service-cluster-ip-range, not hardcode 10.96.0.1/10.96.0.10.
     ///
@@ -7532,7 +7620,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "172.20.0.0/16")
+        seed_services(&store, "127.0.0.1", 6443, "172.20.0.0/16", None)
             .await
             .expect("seed must not fail");
 
@@ -7574,10 +7662,10 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("first seed must not fail");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("second seed must not fail");
 
@@ -7611,7 +7699,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed must not fail");
 
@@ -7669,7 +7757,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "192.168.5.2", 6443, "10.96.0.0/12")
+        seed_services(&store, "192.168.5.2", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed must not fail");
 
@@ -7763,7 +7851,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed must not fail");
 
@@ -7869,7 +7957,7 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed must not fail");
 
@@ -12348,6 +12436,7 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
+            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13164,6 +13253,7 @@ mod tests {
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
             service_cluster_ip_range: "10.96.0.0/12".into(),
+            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13364,6 +13454,7 @@ mod tests {
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
             service_cluster_ip_range: "10.96.0.0/12".into(),
+            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
