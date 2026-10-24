@@ -1643,6 +1643,7 @@ fn check_runtime_cost(
         data_node(self_value),
         old_self_value.map(data_node),
         None,
+        None,
     );
     if upper_bound_cost <= crate::handlers::cel_cost::CALL_COST_LIMIT {
         return RuntimeCost::Within;
@@ -1650,6 +1651,8 @@ fn check_runtime_cost(
     let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
     let replay_ctx = build_ctx();
     let rule_program = std::sync::Arc::clone(program);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let replay_cancelled = std::sync::Arc::clone(&cancelled);
     let within_limit = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
         let (self_json, old_json, schema) = &replay;
         let node = |value| crate::handlers::cel_cost::Node::Data {
@@ -1661,8 +1664,10 @@ fn check_runtime_cost(
             node(self_json),
             old_json.as_ref().map(node),
             Some(&replay_ctx),
+            Some(&replay_cancelled),
         ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
     });
+    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     classify_replay(within_limit)
 }
 
@@ -13166,6 +13171,69 @@ mod tests {
             "the quadratic messageExpression must be refused by its counted cost; any other \
              verdict means it was started and keeps running after the request returns"
         );
+    }
+
+    fn csv_scan_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{
+                    "rule": "self.csv.split(',').all(a, self.csv.contains(a))"
+                }],
+                "properties": { "csv": { "type": "string" } }
+            } }
+        })
+    }
+
+    /// Each step of this rule scans the whole payload, so the per-step count (a handful of
+    /// units) says nothing about the real work: 20k items over a 110KB string is two billion
+    /// byte-reads. It must be rejected by the cost the scans are billed, and the replay that
+    /// decides so must give its gate slot back instead of grinding on.
+    #[test]
+    fn rule_scanning_the_payload_per_split_item_is_rejected_by_cost_and_frees_its_gate_slot() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let csv = (0..20_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let obj = serde_json::json!({ "spec": { "csv": csv } });
+        let err = check_schema(&obj, csv_scan_schema()).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "got: {}",
+            err.1.message
+        );
+
+        let spec_schema = csv_scan_schema()["properties"]["spec"].clone();
+        let spec_value = obj["spec"].clone();
+        let program = std::sync::Arc::new(
+            cel::Program::compile("self.csv.split(',').all(a, self.csv.contains(a))").unwrap(),
+        );
+        let mut ctx = cel::Context::default();
+        register_cel_extensions(&mut ctx);
+        ctx.add_variable_from_value(
+            "self",
+            json_to_cel_value(&spec_schema, &spec_value).unwrap(),
+        );
+        let verdict = run_within_budget(CEL_COST_REPLAY_BUDGET, &GATE, move || {
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &spec_value,
+                schema: Some(&spec_schema),
+            };
+            crate::handlers::cel_cost::estimate_for_write(&program, node, None, Some(&ctx), None)
+                <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
+        assert!(matches!(verdict, Ok(false)), "counted verdict expected");
+        let mut spins = 0u64;
+        while !GATE.try_acquire() {
+            spins += 1;
+            assert!(
+                spins < 50_000_000,
+                "the replay thread never released its slot"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

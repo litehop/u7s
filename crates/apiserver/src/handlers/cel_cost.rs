@@ -11,6 +11,8 @@
 //! rule is never rejected for a collection the walk cannot see. Given a context holding the
 //! real values, the walk instead replays the rule and follows its short-circuits.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr};
 use serde_json::Value as J;
 
@@ -114,6 +116,17 @@ impl<'a> Node<'a> {
             Node::Sized(n) => n,
             Node::Schema(s) => max_elements(s),
             Node::Data { value, .. } => weight(value) as u64,
+        }
+    }
+
+    /// Bytes of the string this node holds, when the data says.
+    fn text_len(self) -> u64 {
+        match self {
+            Node::Data {
+                value: J::String(s),
+                ..
+            } => s.len() as u64,
+            _ => 0,
         }
     }
 
@@ -266,9 +279,75 @@ struct Coster<'a> {
     limit: u64,
     /// Element count billed for a comprehension range whose size cannot be traced.
     untraced_range_len: u64,
+    /// Set by the caller when it gives up waiting; the walk then stops iterating so a
+    /// replay does not outlive its caller.
+    cancelled: Option<&'a AtomicBool>,
+}
+
+/// Methods that traverse their receiver, billed by its length like cel-go's
+/// `StringTraversalCostFactor`.
+const RECEIVER_SCANNING_FUNCS: &[&str] = &[
+    "contains",
+    "startsWith",
+    "endsWith",
+    "matches",
+    "split",
+    "replace",
+    "indexOf",
+    "lastIndexOf",
+    "lowerAscii",
+    "upperAscii",
+    "trim",
+    "join",
+];
+
+fn traversal_cost(len: u64) -> u64 {
+    len.div_ceil(10)
+}
+
+fn value_len(v: &cel::Value) -> u64 {
+    match v {
+        cel::Value::String(s) => s.len() as u64,
+        cel::Value::Bytes(b) => b.len() as u64,
+        cel::Value::List(l) => l.len() as u64,
+        cel::Value::Map(m) => m.map.len() as u64,
+        _ => 0,
+    }
 }
 
 impl<'a> Coster<'a> {
+    /// What one call costs for walking its operand: a string method reads its whole
+    /// receiver and `+` builds its whole result, work no per-element count reflects.
+    fn traversal(
+        &self,
+        e: &IdedExpr,
+        call: &cel::common::ast::CallExpr,
+        target_node: Node<'a>,
+        ctx: Ctx<'_, '_>,
+    ) -> u64 {
+        let scans_receiver =
+            call.target.is_some() && RECEIVER_SCANNING_FUNCS.contains(&call.func_name.as_str());
+        if !scans_receiver && call.func_name != operators::ADD {
+            return 0;
+        }
+        let len = match (ctx, &call.target) {
+            (Some(ctx), Some(target)) if scans_receiver => ctx.resolve(target).ok(),
+            (Some(ctx), _) => ctx.resolve(e).ok(),
+            (None, _) => None,
+        }
+        .map_or_else(
+            || {
+                if scans_receiver {
+                    target_node.text_len()
+                } else {
+                    0
+                }
+            },
+            |v| value_len(&v),
+        );
+        traversal_cost(len)
+    }
+
     fn cost(&mut self, e: &IdedExpr, ctx: Ctx<'_, '_>) -> (u64, Node<'a>) {
         match &e.expr {
             Expr::Ident(name) => {
@@ -355,6 +434,9 @@ impl<'a> Coster<'a> {
                     arg_nodes.push(n);
                 }
                 total = total.saturating_add(branch_max);
+                if total <= self.limit {
+                    total = total.saturating_add(self.traversal(e, call, target_node, ctx));
+                }
                 let result = match call.func_name.as_str() {
                     operators::INDEX => arg_nodes.first().map_or(Node::Unknown, |n| n.elem()),
                     "isSorted" | "sum" | "min" | "max" => {
@@ -389,6 +471,10 @@ impl<'a> Coster<'a> {
                         let mut ran = 0u64;
                         let mut child = ctx.map(|ctx| ctx.new_inner_scope());
                         for pass in passes {
+                            if self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                                total = self.limit.saturating_add(1);
+                                break;
+                            }
                             let first_is_elem = c.iter_var2.is_none() && !is_map;
                             self.scope.truncate(depth + 1);
                             self.scope.push((
@@ -529,7 +615,7 @@ pub(crate) fn estimate(
     old_self_node: Option<Node<'_>>,
     ctx: Ctx<'_, '_>,
 ) -> u64 {
-    estimate_with(program, self_node, old_self_node, ctx, 0)
+    estimate_with(program, self_node, old_self_node, ctx, (0, None))
 }
 
 /// [`estimate`] for a rule about to run against a request: a comprehension over a range
@@ -542,13 +628,14 @@ pub(crate) fn estimate_for_write(
     self_node: Node<'_>,
     old_self_node: Option<Node<'_>>,
     ctx: Ctx<'_, '_>,
+    cancelled: Option<&AtomicBool>,
 ) -> u64 {
     estimate_with(
         program,
         self_node,
         old_self_node,
         ctx,
-        MAX_REQUEST_BYTES / 2,
+        (MAX_REQUEST_BYTES / 2, cancelled),
     )
 }
 
@@ -557,7 +644,7 @@ fn estimate_with(
     self_node: Node<'_>,
     old_self_node: Option<Node<'_>>,
     ctx: Ctx<'_, '_>,
-    untraced_range_len: u64,
+    (untraced_range_len, cancelled): (u64, Option<&AtomicBool>),
 ) -> u64 {
     let mut scope = vec![("self".to_string(), self_node)];
     if let Some(old) = old_self_node {
@@ -567,6 +654,7 @@ fn estimate_with(
         scope,
         limit: CALL_COST_LIMIT,
         untraced_range_len,
+        cancelled,
     }
     .cost(program.expression(), ctx)
     .0
@@ -747,6 +835,79 @@ mod tests {
         assert!(
             replayed < 100,
             "upstream stops at the first cell, so replaying must too: {replayed}"
+        );
+    }
+
+    fn big_text_schema() -> J {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "csv": { "type": "string" },
+                "items": { "type": "array", "items": { "type": "string" } }
+            }
+        })
+    }
+
+    /// A loop whose every step scans a 200KB string does 600M byte-reads over 3000 items yet
+    /// counts as ~5 units per item unless the scan itself is billed; the rule then runs
+    /// unmetered on a thread that outlives the request's timeout.
+    #[test]
+    fn string_scan_inside_a_loop_is_billed_by_the_receiver_size() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({
+            "csv": "a".repeat(200_000),
+            "items": vec!["a"; 3000],
+        });
+        let program = cel::Program::compile("self.items.all(x, self.csv.contains(x))").unwrap();
+        let node = Node::Data {
+            value: &data,
+            schema: Some(&schema),
+        };
+        let cost = estimate_for_write(&program, node, None, None, None);
+        assert!(
+            cost > CALL_COST_LIMIT,
+            "3000 scans of a 200KB string must exceed the per-call limit: {cost}"
+        );
+    }
+
+    #[test]
+    fn short_string_scans_stay_cheap_so_ordinary_rules_are_not_rejected() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "abc", "items": vec!["a"; 3000] });
+        let program = cel::Program::compile("self.items.all(x, self.csv.contains(x))").unwrap();
+        let node = Node::Data {
+            value: &data,
+            schema: Some(&schema),
+        };
+        let cost = estimate_for_write(&program, node, None, None, None);
+        assert!(cost < CALL_COST_LIMIT, "{cost}");
+    }
+
+    /// A replay whose caller has given up must stop iterating instead of finishing the
+    /// work on a thread nobody waits for.
+    #[test]
+    fn cancelled_replay_stops_iterating_and_reports_over_limit() {
+        let schema = int_list(Some(10));
+        let data = serde_json::json!([1, 2, 3, 4, 5]);
+        let program = cel::Program::compile("self.all(x, x > 0)").unwrap();
+        let mut ctx = cel::Context::default();
+        ctx.add_variable_from_value(
+            "self",
+            crate::handlers::cr::json_to_cel_value(&schema, &data).unwrap(),
+        );
+        let node = Node::Data {
+            value: &data,
+            schema: Some(&schema),
+        };
+        let live = AtomicBool::new(false);
+        assert!(
+            estimate_for_write(&program, node, None, Some(&ctx), Some(&live)) < CALL_COST_LIMIT
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            estimate_for_write(&program, node, None, Some(&ctx), Some(&cancelled))
+                > CALL_COST_LIMIT,
+            "a cancelled walk must not keep evaluating elements"
         );
     }
 
