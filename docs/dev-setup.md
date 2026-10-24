@@ -73,6 +73,20 @@ To run the Kubernetes conformance suite against u7s locally:
 
 ## Release gate: 1 GiB burst survival
 
+### Release-gate exit codes
+
+`burst-gate.sh` and `scripts/e2e-install/cloud-two-node.sh` share one table:
+
+| Code | Meaning |
+|------|---------|
+| 0 | PASS |
+| 1 | FAIL: a valid run failed (u7s is broken) |
+| 2 | usage error |
+| 3 | INVALID or PREEMPTED: infrastructure or contention, not a verdict |
+| 4 | PASS, but a VPS could not be deleted (`leaked-vps.txt`) and may still be billing; a FAIL or INVALID keeps its own code |
+
+With `burst-gate.sh --confirm`, leaks from every size's sub-gate are aggregated into the top-level `leaked-vps.txt`.
+
 Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 2026-10-15). It boots fresh 1 vCPU / 1 GiB arm64 Lima VMs from `scripts/release-gate/u7s-vps-1g.yaml`, installs a tarball built from the current checkout with the zero-argument `install.sh`, deploys WordPress+MariaDB, then runs a 20-pod and an N-pod burst (`--burst-pods`, default 50) and `scripts/e2e-workload/webhook-smoke.sh`. The gated size is the no-swap ceiling: the largest of 50, 40 that passes 3/3 on a quiet host, found with `--confirm` before cutting a minor release (patch releases skip it). Denser workloads need swap/zram (see the README).
 
 ```sh
@@ -121,7 +135,7 @@ scripts/gcp/vps.sh down t1
 
 The apiserver listens on the internal IP only, so run kubectl on the VPS. MariaDB's PVC stays Pending without csi-hostpath; use `emptyDir` instead, as the gate's rewrite does (`scripts/release-gate/burst-gate.sh`, "emptyDir").
 
-**Two-node install + join check.** `scripts/e2e-install/cloud-two-node.sh --release <tag> [--keep]` creates VPSes `cp` and `w1` under a run-unique `u7s-e2e-` prefix, installs from the mirror, joins `w1` with a token passed on stdin, and asserts both nodes Ready, a pod pinned to `w1`, `kubectl logs/exec`, cross-node pod traffic and `webhook-smoke.sh`. If the release bundles beep it also creates a client VPS and checks that a `type=LoadBalancer` Service answers from it with the client's internal IP preserved (otherwise `SKIPPED`). A preempted VPS reports `PREEMPTED` (exit 3), not `FAIL`; a failure whose preemption lookup keeps erroring is `INVALID` (exit 4). Without `--keep` it deletes only the VPSes it created. Results land in `temp/e2e-install/<timestamp>/`.
+**Two-node install + join check.** `scripts/e2e-install/cloud-two-node.sh --release <tag> [--keep]` creates VPSes `cp` and `w1` under a run-unique `u7s-e2e-` prefix, installs from the mirror, joins `w1` with a token passed on stdin, and asserts both nodes Ready, a pod pinned to `w1`, `kubectl logs/exec`, cross-node pod traffic and `webhook-smoke.sh`. If the release bundles beep it also creates a client VPS and checks that a `type=LoadBalancer` Service answers from it with the client's internal IP preserved (otherwise `SKIPPED`). A preempted VPS reports `PREEMPTED` (exit 3), not `FAIL`; a failure whose preemption lookup keeps erroring is `INVALID` (exit 3); a PASS whose VPS could not be deleted exits 4 (see "Release-gate exit codes"). Without `--keep` it deletes only the VPSes it created. Results land in `temp/e2e-install/<timestamp>/`.
 
 **Release-authoritative gate run.** `scripts/release-gate/burst-gate.sh --backend gcp --release <tag> [--runs N | --confirm]` runs the 1 GiB burst gate on a fresh Spot `e2-micro` per run (name `u7s-rg-<timestamp>-<n>`), installing `<tag>` from the mirror; nothing is built locally. It uses the same phases, collectors and verdict logic as the Lima gate (`scripts/release-gate/lib.sh`), and its x86_64 result is the one that gates a release; the Lima arm64 run is an advisory pre-check. Install-time signature verification only applies to releases whose `install.sh` was built after it was added; older prereleases carry the old `install.sh`. `--memory` and `--tarball-dir` are rejected (the VPS is fixed at 1 GiB and installs from the mirror). Each run's VPS is deleted at the end, also on interrupt.
 

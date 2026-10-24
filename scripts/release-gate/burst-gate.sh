@@ -13,7 +13,7 @@
 #   (d) after the burst settles, the WordPress page still responds and a marker row written to
 #       MariaDB before the bursts is still readable (a recreated emptyDir DB must not pass)
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
-# Exit status: 0 PASS, 1 a valid run FAILed, 3 INVALID (not enough valid runs).
+# Exit codes: see "Release-gate exit codes" in docs/dev-setup.md (3 = not enough valid runs).
 #
 # INVALID: a run that did not pass while the host was not quiet is neither PASS nor FAIL. Quiet
 # means no other Lima VM running and host CPU idle >= 70% over 30 s (the floor drops by the gate
@@ -33,8 +33,7 @@
 # (> RG_STEAL_MAX_PCT, 10%) plus the same in-guest calibration; a non-pass with either is
 # INVALID. A non-pass on an instance Google reclaimed (Spot preemption) is PREEMPTED, counted
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
-# Exit 4: the verdict is PASS but a VPS could not be deleted (listed in <out>/leaked-vps.txt) and
-# may still be billing; a FAIL or INVALID verdict keeps its own code.
+# A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
 #
 # Usage: burst-gate.sh [--backend lima|gcp] [--release TAG] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
@@ -177,7 +176,13 @@ if [ "$CONFIRM" = 1 ]; then
     [ "$n_passed" = "$RUNS" ] && break
     [ "$n_passed" = "$n_valid" ] && break
   done
-  rg_confirm_verdict "${tried[@]}"; exit $?
+  rg_confirm_verdict "${tried[@]}"; rc=$?
+  cat "$OUT"/burst-*/leaked-vps.txt > "$OUT/leaked-vps.txt" 2>/dev/null
+  if [ -s "$OUT/leaked-vps.txt" ]; then
+    echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+    [ "$rc" != 0 ] || { rc=4; echo "CONFIRM: PASS but LEAKED VPS: exit 4"; }
+  fi
+  exit "$rc"
 fi
 
 STAGE="$OUT/stage"
@@ -258,9 +263,13 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     fi
     if [ "$BACKEND" = gcp ]; then
       # The guest hostname embeds the project id.
-      # Process substitution, not a pipe: $! must be the ssh side so the watchdog can kill it.
-      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh > >(gcp_redact -u >"$RUN_OUT/vm-gate.log") 2>&1 &
+      # A fifo, not a pipe: $! must be the ssh side so the watchdog can kill it, and the
+      # redactor needs its own PID so it can be waited for (a process substitution outlives wait).
+      mkfifo "$RUN_OUT/vm-gate.fifo"
+      gcp_redact -u <"$RUN_OUT/vm-gate.fifo" >"$RUN_OUT/vm-gate.log" & redact_pid=$!
+      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.fifo" 2>&1 &
     else
+      redact_pid=""
       vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
     fi
     gate_pid=$!
@@ -271,6 +280,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       rg_kill_tree "$gate_pid" ) &
     wd_pid=$!
     wait "$gate_pid" 2>/dev/null
+    if [ -n "$redact_pid" ]; then wait "$redact_pid" 2>/dev/null; rm -f "$RUN_OUT/vm-gate.fifo"; sleep 1; fi
     kill "$wd_pid" "$tail_pid" 2>/dev/null
     if [ -n "$quiet_pid" ]; then touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null; fi
     vm_copy_from "$VM" /var/tmp/rg/out "$RUN_OUT/out" 2>/dev/null \

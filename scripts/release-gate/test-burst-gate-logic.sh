@@ -566,9 +566,16 @@ assert "a failed delete is retried (a transient describe error must not leak a b
 GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gleak --runs 1
 assert "a PASS verdict with a leaked VPS exits 4, not 0 (a green gate must not hide a billing VPS)" \
   "$([ "$rc" = 4 ] && [ "$(cat "$TMP/out-gleak/passed")" = 1 ] && grep -q 'LEAKED VPS' "$TMP/out-gleak.out" && echo 1 || echo 0)"
+GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gcleak --confirm --runs 1
+assert "--confirm PASS with a VPS leaked in a sub-gate exits 4 and the top-level leaked-vps.txt names it (a green confirm must not hide a billing VPS)" \
+  "$([ "$rc" = 4 ] && [ -s "$TMP/out-gcleak/leaked-vps.txt" ] && grep -q 'CONFIRM: PASS' "$TMP/out-gcleak.out" && grep -q 'LEAKED VPS' "$TMP/out-gcleak.out" && echo 1 || echo 0)"
 unset GCLOUD_DESCRIBE_ERR
 GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gpass --runs 1
 assert "a PASS verdict with no leak still exits 0" "$([ "$rc" = 0 ] && echo 1 || echo 0)"
+GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gcpass --confirm --runs 1
+assert "--confirm PASS with no leak still exits 0" "$([ "$rc" = 0 ] && [ ! -s "$TMP/out-gcpass/leaked-vps.txt" ] && echo 1 || echo 0)"
+assert "gcp vm-gate.log is fully written (redactor waited for) before the run proceeds" \
+  "$([ ! -e "$TMP/out-gpass/run-1/vm-gate.fifo" ] && [ -f "$TMP/out-gpass/run-1/vm-gate.log" ] && echo 1 || echo 0)"
 export GCLOUD_HANG_PID="$TMP/hang.pid"
 rm -f "$GCLOUD_HANG_PID"
 : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/out-ghang"
