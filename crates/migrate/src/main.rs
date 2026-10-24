@@ -38,8 +38,9 @@ enum Migrate {
         #[arg(long)]
         allow_unknown_k3s_version: bool,
         /// Where a real export writes the source objects. Created with mode
-        /// 0600 and refused if the path exists (the plan is then left untouched); it contains Secrets in clear
-        /// text, delete it after the migration.
+        /// 0600 and refused if the path exists (the plan is then left
+        /// untouched); it contains Secrets in clear text, delete it after the
+        /// migration.
         #[arg(long, default_value = "u7s-migrate-objects.json")]
         objects: String,
     },

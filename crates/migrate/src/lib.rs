@@ -36,7 +36,9 @@ pub fn refuse_existing(path: &str) -> anyhow::Result<()> {
 
 /// Writes the export files. The objects file is created first and refused if
 /// it exists, so a refused export leaves the plan untouched and the two files
-/// always describe the same export.
+/// always describe the same export. The plan is written to a sibling temp file
+/// and renamed into place; if that fails the objects file this run created is
+/// removed, so an old plan is never left next to new objects.
 pub fn write_export(
     plan_path: &str,
     plan_json: &str,
@@ -46,7 +48,17 @@ pub fn write_export(
     if let Some((path, data)) = objects {
         write_new_private(path, data)?;
     }
-    std::fs::write(plan_path, plan_json).with_context(|| format!("writing {plan_path}"))
+    let tmp = format!("{plan_path}.tmp");
+    let res = std::fs::write(&tmp, plan_json)
+        .and_then(|()| std::fs::rename(&tmp, plan_path))
+        .with_context(|| format!("writing {plan_path}"));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if let Some((path, _)) = objects {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    res
 }
 
 #[cfg(test)]
@@ -95,6 +107,23 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(std::fs::read(&plan).unwrap(), b"old-plan");
         assert_eq!(std::fs::read(&objs).unwrap(), b"old-objects");
+    }
+
+    #[test]
+    fn failed_plan_write_keeps_old_plan_and_leaves_no_new_objects_so_import_never_mixes_exports() {
+        let d = dir("plan-write-fails");
+        let plan = d.join("plan.json");
+        let objs = d.join("o.json");
+        std::fs::write(&plan, b"old-plan").unwrap();
+        std::fs::create_dir(d.join("plan.json.tmp")).unwrap();
+        let r = write_export(
+            plan.to_str().unwrap(),
+            "new-plan",
+            Some((objs.to_str().unwrap(), b"new-objects")),
+        );
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&plan).unwrap(), b"old-plan");
+        assert!(!objs.exists(), "new objects must not outlive a failed plan");
     }
 
     #[test]
