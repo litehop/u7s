@@ -426,3 +426,79 @@ async fn kcm_signed_client_cert_carries_the_chain_and_authenticates() {
          presents verbatim, must authenticate against a root-only trust store"
     );
 }
+
+#[test]
+fn restart_after_rotation_still_knows_the_previous_intermediate_so_its_leaves_get_a_chain() {
+    let h = Harness::new("int-restart-previous");
+    let r = start_before_intermediate_due(&h, CLIENT_CERT_LIFETIME);
+    let old_int = r.intermediate_der();
+    h.advance(INTERMEDIATE_DUE_AFTER);
+    r.rotate_due(&|_, _| {}).unwrap();
+    let new_int = r.intermediate_der();
+    assert_ne!(new_int, old_int);
+
+    let restarted = h
+        .start_with_intermediate(CLIENT_CERT_LIFETIME, INTERMEDIATE_LIFE)
+        .unwrap();
+    assert_eq!(
+        restarted.signing_intermediates(),
+        vec![new_int, old_int],
+        "KCM may still sign with the previous intermediate after the apiserver restarts; \
+         without it the CSR certificate is stored without its chain and the kubelet fails TLS"
+    );
+}
+
+/// kubeadm/client-go `NewSelfSignedCACert` set keyEncipherment|digitalSignature|keyCertSign
+/// on every CA; strict X.509 consumers reject a CA lacking keyCertSign when KeyUsage is
+/// absent in some profiles, and leaves must not inherit it.
+#[test]
+fn ca_certs_carry_critical_key_usage_like_kubeadm_and_leaves_do_not() {
+    use x509_cert::der::Decode as _;
+    use x509_cert::ext::pkix::{BasicConstraints as Bc, KeyUsage};
+    let h = Harness::new("key-usage");
+    let r = h.start(CLIENT_CERT_LIFETIME).unwrap();
+    let check = |der: &[u8], pathlen: Option<u8>| {
+        let cert = x509_cert::Certificate::from_der(der).unwrap();
+        let tbs = cert.tbs_certificate();
+        let (critical, ku) = tbs.get_extension::<KeyUsage>().unwrap().expect("KeyUsage");
+        assert!(critical, "KeyUsage must be critical");
+        assert!(ku.key_cert_sign() && ku.digital_signature() && ku.key_encipherment());
+        let (critical, bc) = tbs
+            .get_extension::<Bc>()
+            .unwrap()
+            .expect("BasicConstraints");
+        assert!(
+            critical && bc.ca,
+            "BasicConstraints must be critical CA:TRUE"
+        );
+        assert_eq!(bc.path_len_constraint, pathlen);
+        crate::pki::ensure_ca_cert(der).unwrap();
+    };
+    check(&h.cluster_ca().cert_der, None);
+    check(&r.intermediate_der(), Some(0));
+    let leaf = x509_cert::Certificate::from_der(&r.leaf("admin").cert_der).unwrap();
+    assert!(
+        leaf.tbs_certificate()
+            .get_extension::<KeyUsage>()
+            .unwrap()
+            .is_none(),
+        "a leaf must not carry keyCertSign"
+    );
+}
+
+#[test]
+fn an_expired_previous_intermediate_is_not_seeded() {
+    let h = Harness::new("int-previous-expired");
+    let r = start_before_intermediate_due(&h, CLIENT_CERT_LIFETIME);
+    h.advance(INTERMEDIATE_DUE_AFTER);
+    r.rotate_due(&|_, _| {}).unwrap();
+    h.advance(INTERMEDIATE_LIFE.as_secs() as i64);
+    let restarted = h
+        .start_with_intermediate(CLIENT_CERT_LIFETIME, INTERMEDIATE_LIFE)
+        .unwrap();
+    assert_eq!(
+        restarted.signing_intermediates().len(),
+        1,
+        "an intermediate past notAfter cannot have a valid leaf and must be dropped"
+    );
+}

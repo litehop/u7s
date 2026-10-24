@@ -403,7 +403,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .set(Some(Arc::new(proxy_client_identity_pem)));
     state
         .signing_intermediates
-        .set(Arc::new(vec![tls_material.rotator.intermediate_der()]));
+        .set(Arc::new(tls_material.rotator.signing_intermediates()));
 
     // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
     // the old one. KCM and the scheduler re-read the rewritten file without a restart.
