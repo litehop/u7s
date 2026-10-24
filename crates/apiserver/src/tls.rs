@@ -1,6 +1,7 @@
 use crate::pki::{
     cert_validity, ensure_ca_cert, CertInventory, CertRole, CertSpec, Pki, Swap,
-    CLIENT_CERT_LIFETIME, RENEW_FRACTION, ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
+    CLIENT_CERT_LIFETIME, INTERMEDIATE_CA_LIFETIME, RENEW_FRACTION, ROOT_CA_LIFETIME,
+    SERVING_CERT_LIFETIME,
 };
 use crate::rotation::{CaKind, CaSigner, LeafPlan, Rotator, SERVING_LEAF};
 use rcgen::{CertificateParams, Issuer, KeyPair, SanType};
@@ -69,7 +70,7 @@ const CA_REMEDY: &str = "restore from backup, or delete both files to deliberate
 /// diagnostic, they don't weaken the CA key). `rand` is not a direct dependency
 /// of this crate, so we mix wall-clock nanoseconds with the process ID rather
 /// than pull in a new crate for this.
-fn random_ca_suffix() -> String {
+pub(crate) fn random_ca_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -262,7 +263,7 @@ fn roll_forward_key_tmp(cert_path: &str, key_tmp: &str, key_path: &str) -> anyho
 }
 
 /// Err unless `cert_der` parses as X.509 and its public key is `key`'s public key.
-fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> anyhow::Result<()> {
     use x509_cert::der::Decode as _;
     let cert = x509_cert::Certificate::from_der(cert_der)
         .map_err(|e| anyhow::anyhow!("cert is not valid DER X.509: {e}"))?;
@@ -278,14 +279,16 @@ fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// True if `leaf_der` cryptographically chain-validates against `ca_der` as the sole trust
-/// anchor -- i.e. it was actually signed by the CA's private key -- using the same rustls
-/// webpki verification the live server runs on every mTLS handshake. A Name-string
-/// comparison of Issuer vs. Subject would wrongly trust a different-key CA that happens to
-/// share a Subject CN; this checks the signature, not just the claimed name.
+/// True if `leaf_der`, presenting `intermediates` after itself, cryptographically
+/// chain-validates against `ca_der` as the sole trust anchor -- i.e. it was actually signed
+/// by the CA's private key -- using the same rustls webpki verification the live server runs
+/// on every mTLS handshake. A Name-string comparison of Issuer vs. Subject would wrongly
+/// trust a different-key CA that happens to share a Subject CN; this checks the signature,
+/// not just the claimed name.
 pub(crate) fn leaf_cert_chain_validates_at(
     leaf_der: &[u8],
     ca_der: &[u8],
+    intermediates: &[Vec<u8>],
     now: time::OffsetDateTime,
 ) -> bool {
     let mut root_store = RootCertStore::empty();
@@ -301,10 +304,14 @@ pub(crate) fn leaf_cert_chain_validates_at(
     else {
         return false;
     };
+    let intermediates: Vec<CertificateDer<'static>> = intermediates
+        .iter()
+        .map(|der| CertificateDer::from(der.clone()))
+        .collect();
     verifier
         .verify_client_cert(
             &CertificateDer::from(leaf_der.to_vec()),
-            &[],
+            &intermediates,
             UnixTime::since_unix_epoch(std::time::Duration::from_secs(
                 now.unix_timestamp().max(0) as u64
             )),
@@ -313,8 +320,13 @@ pub(crate) fn leaf_cert_chain_validates_at(
 }
 
 #[cfg(test)]
-fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8]) -> bool {
-    leaf_cert_chain_validates_at(leaf_der, ca_der, time::OffsetDateTime::now_utc())
+fn leaf_cert_chain_validates(leaf_der: &[u8], ca_der: &[u8], intermediates: &[Vec<u8>]) -> bool {
+    leaf_cert_chain_validates_at(
+        leaf_der,
+        ca_der,
+        intermediates,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 /// On-disk home of a persisted leaf (admin, KCM, scheduler): the files later consumers
@@ -350,8 +362,7 @@ fn key_file_matches_cert_file(key_path: &std::path::Path, cert_path: &std::path:
 pub(crate) fn load_persisted_leaf(
     label: &str,
     files: &LeafFiles,
-    ca_cert_der: &[u8],
-    now: time::OffsetDateTime,
+    chains_to_current_ca: &dyn Fn(&[u8]) -> bool,
 ) -> anyhow::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let (key_path, cert_path) = (&files.key, &files.cert);
     let key_tmp = format!("{}.tmp", key_path.display());
@@ -406,11 +417,12 @@ pub(crate) fn load_persisted_leaf(
         )
     })?;
 
-    if !leaf_cert_chain_validates_at(&cert_der, ca_cert_der, now) {
-        // Signed by a CA that is no longer the one loaded, or already expired: the pair
+    if !chains_to_current_ca(&cert_der) {
+        // Signed by a CA that is no longer the current one (a replaced CA, or the previous
+        // intermediate after a rotation that was interrupted), or already expired: the pair
         // cannot authenticate against the current trust store.
-        tracing::error!(
-            "{label} cert at {} does not chain-validate against the CA now loaded from disk; \
+        tracing::warn!(
+            "{label} cert at {} does not chain-validate against the current signing CA; \
              replacing it",
             cert_path.display()
         );
@@ -578,22 +590,25 @@ fn build_server_sans(
     Ok(sans)
 }
 
-/// Serving config presenting only the leaf (see the comment at its call: the CA is already
-/// in every client's trust store) and verifying optional client certs against
+/// Serving config presenting the leaf and its signing intermediate (never the root: the root
+/// is already in every client's trust store) and verifying optional client certs against
 /// `client_ca_ders`. Rebuilt and swapped, never mutated, so a connection keeps the config
 /// it was accepted with.
 pub(crate) fn build_server_config(
-    server_cert_der: &[u8],
-    server_key_pem: &[u8],
+    server: &crate::rotation::Leaf,
     client_ca_ders: &[Vec<u8>],
 ) -> anyhow::Result<Arc<ServerConfig>> {
-    // Present only the leaf cert in the chain. The CA cert is already in the
-    // kubelet's trust store (via kubeconfig certificate-authority-data). Including
-    // the self-signed CA as an intermediate causes Go's TLS verifier to reject the
-    // chain on full re-handshake (after session cache expiry): it sees a chain where
-    // intermediate == trust anchor, which is invalid per RFC 5246 chain validation.
-    let server_cert_chain = vec![CertificateDer::from(server_cert_der.to_vec())];
-    let server_key = KeyPair::from_pem(&String::from_utf8_lossy(server_key_pem))
+    // The chain is leaf + intermediate. Including the self-signed root would make Go's TLS
+    // verifier reject the chain on full re-handshake (after session cache expiry): it sees
+    // a chain where an intermediate == trust anchor, which is invalid per RFC 5246 chain
+    // validation. A distinct intermediate is fine, and required: clients trust only the root
+    // and cannot build the path to a leaf without it.
+    let server_cert_chain: Vec<CertificateDer<'static>> = server
+        .chain_ders()
+        .into_iter()
+        .map(CertificateDer::from)
+        .collect();
+    let server_key = KeyPair::from_pem(&String::from_utf8_lossy(&server.key_pem))
         .map_err(|e| anyhow::anyhow!("serving key: {e}"))?;
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
@@ -672,7 +687,8 @@ fn generate_tls_with(
     // ca_params is used to construct an Issuer for signing leaf certs (rcgen 0.14 API).
     let (ca_key, ca_params, ca_cert_der) =
         load_or_generate_ca(pki, "ca", &args.ca_key, &args.ca_cert)?;
-    let cluster_ca = CaSigner {
+    let root_ca = CaSigner {
+        anchor_der: ca_cert_der.clone(),
         not_after: cert_validity(&ca_cert_der)?.1,
         issuer: Issuer::new(ca_params, ca_key),
         cert_der: ca_cert_der.clone(),
@@ -691,6 +707,7 @@ fn generate_tls_with(
             &args.proxy_client_ca_cert,
         )?;
     let front_proxy_ca = CaSigner {
+        anchor_der: proxy_client_ca_cert_der.clone(),
         not_after: cert_validity(&proxy_client_ca_cert_der)?.1,
         issuer: Issuer::new(proxy_client_ca_params, proxy_client_ca_key),
         cert_der: proxy_client_ca_cert_der,
@@ -792,8 +809,10 @@ fn generate_tls_with(
     let rotator = Rotator::new(
         pki.clone(),
         renew_fraction,
-        cluster_ca,
+        root_ca,
         front_proxy_ca,
+        files("intermediate"),
+        crate::pki::test_intermediate_lifetime().unwrap_or(INTERMEDIATE_CA_LIFETIME),
         plans,
     )?;
 
@@ -816,7 +835,7 @@ fn generate_tls_with(
         ("scheduler", &scheduler),
         ("bootstrap-installer", &bootstrap_installer),
     ] {
-        write_leaf_pem(&files(stem), &leaf.cert_der, &leaf.key_pem)?;
+        write_leaf_pem(&files(stem), leaf)?;
     }
     Ok(TlsMaterial {
         ca_cert_der,
@@ -824,7 +843,7 @@ fn generate_tls_with(
         server_cert_der: leaf(SERVING_LEAF).cert_der,
         admin_cert_der: admin.cert_der,
         admin_key_pem: admin.key_pem,
-        kubelet_client_cert_pem: pem_encode("CERTIFICATE", &kubelet_client.cert_der),
+        kubelet_client_cert_pem: kubelet_client.chain_pem(),
         kubelet_client_key_pem: kubelet_client.key_pem,
         kcm_cert_der: kcm.cert_der,
         scheduler_cert_der: scheduler.cert_der,
@@ -947,6 +966,13 @@ pub(crate) fn ca_bundle_path(ca_cert_path: &str) -> std::path::PathBuf {
     std::path::Path::new(ca_cert_path).with_file_name("ca-bundle.pem")
 }
 
+/// The signing intermediate's certificate as the single-certificate PEM that
+/// kube-controller-manager's `--cluster-signing-cert-file` requires (it refuses a file with
+/// more than one certificate). Paired with the intermediate's key file.
+pub(crate) fn intermediate_cert_pem_path(files: &LeafFiles) -> std::path::PathBuf {
+    files.cert.with_file_name("intermediate-cert.pem")
+}
+
 /// Files of a persisted leaf, next to ca.crt.
 pub(crate) fn leaf_files(args: &Args, stem: &str) -> LeafFiles {
     LeafFiles {
@@ -993,6 +1019,11 @@ pub(crate) fn parse_ca_bundle_pem(pem: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 
 /// The signing CA followed by every distinct extra CA from [`ca_extra_path`]. A present but
 /// empty or garbage extra file is an error rather than being ignored.
+///
+/// Operator contract for `ca-extra.pem`: write a temp file in the same directory and `rename`
+/// it into place. The two-poll debounce in [`settle_bundle`] is best-effort only; a writer
+/// stalled on a certificate boundary for about ten seconds still publishes a truncated,
+/// trust-narrowing bundle.
 pub(crate) fn load_trust_bundle(
     ca_cert_path: &str,
     signing_ca_der: &[u8],
@@ -1079,16 +1110,13 @@ pub(crate) fn write_ca_bundle(ca_cert_path: &str, ca_ders: &[Vec<u8>]) -> anyhow
     replace_file(&path.to_string_lossy(), &pem, false)
 }
 
-/// Write a leaf's cert and key as one PEM file at `files.pem()`, replaced by a single
+/// Write a leaf's chain and key as one PEM file at `files.pem()`, replaced by a single
 /// rename so a client re-reading it never pairs a new cert with an old key.
 pub(crate) fn write_leaf_pem(
     files: &LeafFiles,
-    cert_der: &[u8],
-    key_pem: &[u8],
+    leaf: &crate::rotation::Leaf,
 ) -> anyhow::Result<()> {
-    let mut identity = pem_encode("CERTIFICATE", cert_der);
-    identity.extend_from_slice(key_pem);
-    replace_file(&files.pem().to_string_lossy(), &identity, true)
+    replace_file(&files.pem().to_string_lossy(), &leaf.identity_pem(), true)
 }
 
 /// Write the admin kubeconfig to `path`.
@@ -1202,7 +1230,6 @@ mod tests {
                 .into_owned(),
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -1424,7 +1451,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -1497,7 +1523,11 @@ mod tests {
         );
 
         assert!(
-            leaf_cert_chain_validates(&tls1.admin_cert_der, &tls2.ca_cert_der),
+            leaf_cert_chain_validates(
+                &tls1.admin_cert_der,
+                &tls2.ca_cert_der,
+                &[tls2.rotator.intermediate_der()]
+            ),
             "an admin cert issued BEFORE a restart must still cryptographically \
              chain-validate against the CA loaded AFTER the restart, using the same rustls \
              verification the live server runs on every mTLS handshake"
@@ -1546,7 +1576,11 @@ mod tests {
         assert_ne!(second.admin_cert_der, stale_admin_cert.der().to_vec());
         assert_ne!(second.admin_cert_der, first.admin_cert_der);
         assert!(
-            leaf_cert_chain_validates(&second.admin_cert_der, &second.ca_cert_der),
+            leaf_cert_chain_validates(
+                &second.admin_cert_der,
+                &second.ca_cert_der,
+                &[second.rotator.intermediate_der()]
+            ),
             "a stale admin cert issued by a DIFFERENT CA must be discarded and replaced \
              with one actually issued by the CA now loaded from disk, or kubectl gets a \
              chain that fails real TLS validation"
@@ -1659,10 +1693,11 @@ mod tests {
         assert_ne!(second.admin_cert_der, legacy.der().to_vec());
         assert_ne!(second.admin_cert_der, first.admin_cert_der);
         let (nb, na) = cert_validity(&second.admin_cert_der).unwrap();
-        assert_eq!(
-            na - nb,
-            CLIENT_CERT_LIFETIME,
-            "the replacement must have a finite lifetime"
+        let window = na - nb;
+        assert!(
+            window <= CLIENT_CERT_LIFETIME
+                && window + time::Duration::seconds(5) >= CLIENT_CERT_LIFETIME,
+            "the replacement must have a finite lifetime (clamped to its intermediate's), got {window}"
         );
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
@@ -2101,7 +2136,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2184,7 +2218,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2248,7 +2281,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2628,6 +2660,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
+    /// A bundle that is valid for inbound trust but cannot be built into outbound clients must
+    /// not narrow or widen inbound client CAs: the garbage-DER test above fails on the inbound
+    /// step first, so only this one pins the build-before-set ordering.
+    #[test]
+    fn outbound_build_failure_leaves_inbound_client_cas_unchanged() {
+        let dir = test_temp_dir("swap-atomic");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let (issuer, extra) = extra_ca("successor");
+        let client = client_config_with_identity_from(&tls.ca_cert_der, &issuer);
+        let mut next = tls.ca_bundle_ders.clone();
+        next.push(extra);
+
+        let mut installed = false;
+        crate::swap_trust(
+            &next,
+            &tls.rotator,
+            |_| Err::<(), _>("outbound build refused".to_owned()),
+            |()| installed = true,
+        )
+        .expect_err("a failed outbound build fails the swap");
+        assert!(!installed, "nothing may be installed after a failed build");
+        assert!(
+            !crate::test_tls::handshake_completes(client.clone(), tls.server_config.get()),
+            "inbound client CAs must not change when the outbound build fails"
+        );
+
+        crate::swap_trust(&next, &tls.rotator, |_| Ok(()), |()| installed = true)
+            .expect("swap succeeds when every build succeeds");
+        assert!(installed);
+        assert!(crate::test_tls::handshake_completes(
+            client,
+            tls.server_config.get()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
     #[test]
     fn changed_trust_bundle_reports_only_real_changes() {
         let dir = test_temp_dir("changed-bundle");
@@ -2699,12 +2772,14 @@ mod tests {
 
         let new_key = KeyPair::generate().unwrap();
         let new_cert = CertificateParams::default().self_signed(&new_key).unwrap();
-        write_leaf_pem(
-            &leaf_files(&args, "kcm"),
-            new_cert.der(),
-            new_key.serialize_pem().as_bytes(),
-        )
-        .unwrap();
+        let rotated = crate::rotation::Leaf {
+            cert_der: new_cert.der().to_vec(),
+            key_pem: new_key.serialize_pem().into_bytes(),
+            not_before: time::OffsetDateTime::now_utc(),
+            not_after: time::OffsetDateTime::now_utc(),
+            issuer_der: None,
+        };
+        write_leaf_pem(&leaf_files(&args, "kcm"), &rotated).unwrap();
 
         assert_eq!(
             std::fs::read(&kubeconfig).unwrap(), // lgtm[rust/path-injection]
@@ -2885,7 +2960,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2941,7 +3015,6 @@ mod tests {
                 .into_owned(),
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2987,62 +3060,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// The server TLS chain must contain only the leaf cert, not the CA cert.
-    ///
-    /// Go's TLS verifier performs full chain validation on every reconnect after
-    /// session cache expiry (~70 min). When the CA cert appears as an intermediate
-    /// in the chain, the verifier sees intermediate == trust anchor, which violates
-    /// RFC 5246 chain building and produces "ECDSA verification failure". Initial
-    /// connections succeed via session resumption; reconnects fail. Sonobuoy runs
-    /// (90+ min) hit this window reliably. The fix is to present only the leaf cert —
-    /// the CA is already in the client's trust store via kubeconfig.
+    /// The served chain is leaf + signing intermediate, never the root. Clients pin only the
+    /// root, so without the intermediate they cannot build a path to the leaf; with the root
+    /// included, Go's verifier rejects the chain on a full re-handshake (after session cache
+    /// expiry) because an intermediate equals the trust anchor, which is invalid per RFC 5246.
     #[test]
-    fn server_cert_chain_does_not_include_ca() {
+    fn served_chain_is_leaf_plus_intermediate_and_never_the_root() {
         let dir = test_temp_dir("chain-no-ca");
         let args = Args {
-            db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
-            kubeconfig: "./kubeconfig".into(),
-            token_auth_file: None,
-            sa_key: "./sa.key".into(),
-            sa_pub: "./sa.pub".into(),
             ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
             ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: dir
-                .join("proxy-client-ca.key")
-                .to_string_lossy()
-                .into_owned(),
-            proxy_client_ca_cert: dir
-                .join("proxy-client-ca.crt")
-                .to_string_lossy()
-                .into_owned(),
-            advertise_address: None,
-            service_cluster_ip_range: "10.96.0.0/12".into(),
-            kube_dns_cluster_ip: None,
-            kubelet_preferred_address: None,
-            kubelet_port: 10250,
-            node_kubelet_port: vec![],
-            konnectivity_proxy_addr: None,
-            deny_service_external_ips: false,
-            sa_sig_cache_size: None,
-            manifest_dir: "/etc/u7s/manifests".into(),
-            embedded_scheduler: false,
-            admission_control_config_file: None,
+            ..args_with(None)
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
-
-        assert_ne!(
-            tls.server_cert_der, tls.ca_cert_der,
-            "server cert and CA cert must be distinct: the server must present a CA-signed \
-             leaf cert, not the CA cert itself"
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(tls.ca_cert_der.clone()))
+            .unwrap();
+        let client = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
         );
-
+        let chain = crate::test_tls::server_chain(client, tls.server_config.get())
+            .expect("a client pinning only the root must verify the served chain");
+        assert_eq!(
+            chain,
+            vec![tls.server_cert_der.clone(), tls.rotator.intermediate_der()],
+            "the server must present exactly leaf + intermediate"
+        );
         assert!(
-            !tls.server_cert_der.is_empty(),
-            "server_cert_der must not be empty"
+            !chain.contains(&tls.ca_cert_der),
+            "the root must not be presented: it is already in every client's trust store"
         );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The root's key may be online, but it must sign nothing except the intermediate: a leaf
+    /// signed straight off the root would survive every intermediate rotation and defeat the
+    /// point of the tiers. The front-proxy CA stays single-tier.
+    #[test]
+    fn root_signs_only_the_intermediate_and_the_intermediate_signs_every_cluster_leaf() {
+        use crate::pki::ensure_signed_by;
+        let dir = test_temp_dir("two-tier");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let intermediate = tls.rotator.intermediate_der();
+        ensure_signed_by(&intermediate, &tls.ca_cert_der).expect("root signs the intermediate");
+        for name in [
+            SERVING_LEAF,
+            "admin",
+            "kubelet-client",
+            "kcm-client",
+            "scheduler-client",
+            "bootstrap-installer-client",
+        ] {
+            let leaf = tls.rotator.leaf(name);
+            assert!(
+                ensure_signed_by(&leaf.cert_der, &intermediate).is_ok(),
+                "{name} must be signed by the intermediate"
+            );
+            assert!(
+                ensure_signed_by(&leaf.cert_der, &tls.ca_cert_der).is_err(),
+                "{name} must not be signed by the root"
+            );
+            assert_eq!(leaf.issuer_der.as_deref(), Some(intermediate.as_slice()));
+        }
+        let proxy = tls.rotator.leaf("proxy-client");
+        assert!(
+            proxy.issuer_der.is_none(),
+            "front-proxy leaves chain straight to their CA"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Every file a component presents as its client cert must carry the chain, because the
+    /// apiserver trusts only the root: a bare leaf in kcm.pem would lock KCM out.
+    #[test]
+    fn component_identity_files_and_kubelet_proxy_cert_carry_the_intermediate() {
+        use rustls::pki_types::pem::PemObject as _;
+        let dir = test_temp_dir("identity-chain");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let intermediate = tls.rotator.intermediate_der();
+        let chain_of = |pem: &[u8]| -> Vec<Vec<u8>> {
+            CertificateDer::pem_slice_iter(pem)
+                .map(|c| c.unwrap().to_vec())
+                .collect()
+        };
+        for stem in ["admin", "kcm", "scheduler", "bootstrap-installer"] {
+            let pem = std::fs::read(leaf_files(&args, stem).pem()).unwrap(); // lgtm[rust/path-injection]
+            let chain = chain_of(&pem);
+            assert_eq!(chain.len(), 2, "{stem}.pem must hold leaf + intermediate");
+            assert_eq!(chain[1], intermediate, "{stem}.pem intermediate");
+        }
+        let kubelet = chain_of(&tls.kubelet_client_cert_pem);
+        assert_eq!(kubelet.len(), 2);
+        assert_eq!(kubelet[1], intermediate);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// Extract the Issuer CN from a DER-encoded certificate (test-only). Mirrors
@@ -3237,6 +3360,11 @@ mod tests {
         vec![
             ("ca", CertRole::Root, ROOT_CA_LIFETIME),
             ("front-proxy-ca", CertRole::Root, ROOT_CA_LIFETIME),
+            (
+                "intermediate",
+                CertRole::Intermediate,
+                INTERMEDIATE_CA_LIFETIME,
+            ),
             ("admin", CertRole::Leaf, year),
             ("kcm-client", CertRole::Leaf, year),
             ("scheduler-client", CertRole::Leaf, year),
@@ -3256,10 +3384,17 @@ mod tests {
                 .find(|r| r.name == name)
                 .unwrap_or_else(|| panic!("inventory must list {name}: a cert the expiry beads cannot see is one nobody renews"));
             assert_eq!(r.role, role, "{name} role");
-            assert_eq!(
-                r.not_after - r.not_before,
-                lifetime,
-                "{name} must live exactly its decided lifetime, not rcgen's 1975..4096 default"
+            // A leaf never outlives its intermediate, so one issued a second after it can
+            // be a second short of its decided lifetime.
+            let window = r.not_after - r.not_before;
+            let slack = if role == CertRole::Leaf {
+                time::Duration::seconds(5)
+            } else {
+                time::Duration::ZERO
+            };
+            assert!(
+                window <= lifetime && window + slack >= lifetime,
+                "{name} must live its decided lifetime ({lifetime:?}), not rcgen's 1975..4096 default; got {window}"
             );
             assert!(r.not_before <= now, "{name} must already be valid");
             assert!(

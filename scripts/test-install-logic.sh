@@ -287,6 +287,13 @@ assert_false "install.sh mints no self-signed-by-script kubelet serving cert: a 
 assert_true "the KCM unit sets --cluster-signing-duration explicitly so kubelet serving and client cert lifetimes are a decision, not upstream's default" \
   grep -qF -- '--cluster-signing-duration=8760h' "$INSTALL"
 
+assert_true "the KCM unit signs with the intermediate (single-certificate PEM + its key), not the root: the root key signs only intermediates and KCM refuses a signing cert file holding more than one certificate" \
+  grep -qF -- '--cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key' "$INSTALL"
+assert_false "no KCM flag points the signing key at the root ca.key" \
+  grep -qE -- '--cluster-signing-key-file=\$STATE_DIR/ca\.key' "$INSTALL"
+assert_true "install.sh waits for the intermediate files the KCM unit reads before starting it" \
+  grep -qE 'for f in ca\.crt ca\.key intermediate-cert\.pem intermediate\.key ' "$INSTALL"
+
 assert_true "kubelet-config.yaml sets authentication.x509.clientCAFile to the CA bundle (apiserver-published ca-bundle.pem on the control plane, joined ca.pem on a worker; kubelet live-reloads it), so kubelet can authenticate apiserver's client cert instead of treating proxied requests as anonymous" \
   bash -c 'grep -qF "clientCAFile: \$client_ca" "$1" && grep -qF "local client_ca=\"\$STATE_DIR/ca-bundle.pem\"" "$1" && grep -qF "client_ca=\"\$STATE_DIR/ca.pem\"" "$1"' _ "$INSTALL"
 
@@ -1845,7 +1852,7 @@ WAITFILES_RUNNER="$WAITFILES_WORK/run.sh"
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
   echo 'dir="$1"; polls=0'
-  echo 'sleep() { polls=$((polls+1)); if [ "$polls" -ge "${APPEAR_AFTER:-999999}" ]; then for f in ca.crt ca.key sa.key kubeconfig kcm-kubeconfig; do [ "$f" = "${NEVER:-}" ] || echo x > "$dir/$f"; done; fi; }'
+  echo 'sleep() { polls=$((polls+1)); if [ "$polls" -ge "${APPEAR_AFTER:-999999}" ]; then for f in ca.crt ca.key intermediate-cert.pem intermediate.key sa.key kubeconfig kcm-kubeconfig; do [ "$f" = "${NEVER:-}" ] || echo x > "$dir/$f"; done; fi; }'
   awk '/^wait_for_apiserver_files\(\) \{/,/^\}/' "$INSTALL"
   echo 'wait_for_apiserver_files "$dir"; echo "polls=$polls"'
 } > "$WAITFILES_RUNNER"
@@ -1856,12 +1863,12 @@ assert "install waits for files the apiserver writes after its restart returns i
   "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=5' && echo 1 || echo 0)"
 
 wf_dir="$WAITFILES_WORK/present"; mkdir -p "$wf_dir"
-for f in ca.crt ca.key sa.key kubeconfig kcm-kubeconfig; do echo x > "$wf_dir/$f"; done
+for f in ca.crt ca.key intermediate-cert.pem intermediate.key sa.key kubeconfig kcm-kubeconfig; do echo x > "$wf_dir/$f"; done
 wf_out="$(bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
 assert "a re-run with the identity already on disk does not wait (upgrades must not pay the first-boot delay)" \
   "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=0' && echo 1 || echo 0)"
 
-for missing in ca.crt kcm-kubeconfig; do
+for missing in ca.crt kcm-kubeconfig intermediate.key; do
   wf_dir="$WAITFILES_WORK/never-$missing"; mkdir -p "$wf_dir"
   wf_out="$(APPEAR_AFTER=1 NEVER="$missing" bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
   assert "a $missing that never appears fails the install naming that file (an operator must see which artefact is missing, not a later unit failure)" \

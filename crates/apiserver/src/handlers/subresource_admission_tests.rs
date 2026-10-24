@@ -1532,9 +1532,10 @@ mod cases {
                         stored["spec"]["containers"][0]["image"], "nginx",
                         "{what} {verb}: a /status write must not change spec: {stored}"
                     );
-                    assert!(
-                        stored["metadata"]["labels"].is_null(),
-                        "{what} {verb}: a /status write must not set labels: {stored}"
+                    assert_eq!(
+                        stored["metadata"]["labels"]["owner"], "mallory",
+                        "{what} {verb}: pods/status resets spec, ownerReferences and \
+                         deletionTimestamp, not labels: {stored}"
                     );
                 } else {
                     assert_eq!(stored["status"]["replicas"], 5, "{what} {verb}");

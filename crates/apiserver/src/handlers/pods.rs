@@ -1499,7 +1499,7 @@ pub(crate) async fn patch_pod<S: Store>(
             super::json_patch::enforce_patch_identity(&mut obj.body, &name, Some(ns.as_str()))?;
             crate::field_manager::plan_apply(
                 &serde_json::Value::Null,
-                &crate::field_manager::applied_fields(&obj.body, true),
+                &crate::field_manager::applied_fields(&obj.body, Some("Pod"), true),
                 force,
                 &field_request,
             )
@@ -1518,7 +1518,7 @@ pub(crate) async fn patch_pod<S: Store>(
             Some(
                 crate::field_manager::plan_apply(
                     &current_obj.body,
-                    &crate::field_manager::applied_fields(&patch, true),
+                    &crate::field_manager::applied_fields(&patch, Some("Pod"), true),
                     force,
                     &field_request,
                 )
@@ -3419,7 +3419,8 @@ pub(crate) fn apply_resize_patch(
 
 /// What an apply to `pods/resize` owns: per container (init containers included) only
 /// `resources` and `resizePolicy`, as upstream's resize reset-fields filter. The container
-/// `name` stays because it is the list key.
+/// `name` stays in the body because it is the list key, but is not owned
+/// (see `owns_resize_field`).
 fn resize_applied_fields(incoming: &serde_json::Value) -> serde_json::Value {
     let mut spec = serde_json::Map::new();
     for list in ["containers", "initContainers"] {
@@ -3441,6 +3442,15 @@ fn resize_applied_fields(incoming: &serde_json::Value) -> serde_json::Value {
         spec.insert(list.into(), kept.into());
     }
     serde_json::json!({ "spec": spec })
+}
+
+/// Upstream's include filter for resize: below a container only `resources` and
+/// `resizePolicy` are owned, so the key field `f:name` is never in the managed set.
+fn owns_resize_field(path: &crate::field_manager::Path) -> bool {
+    match path.get(3) {
+        Some(member) => member == "f:resources" || member == "f:resizePolicy",
+        None => true,
+    }
 }
 
 /// What an apply to `pods/ephemeralcontainers` owns: `spec.ephemeralContainers` only.
@@ -3507,7 +3517,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
-    let resize_plan = is_ssa
+    let mut resize_plan = is_ssa
         .then(|| {
             plan_pod_subresource_apply(
                 &headers,
@@ -3517,6 +3527,9 @@ pub(crate) async fn patch_pod_resize<S: Store>(
             )
         })
         .transpose()?;
+    if let Some(plan) = &mut resize_plan {
+        plan.retain_owned(owns_resize_field);
+    }
     current_obj.body = admit_write(
         &state,
         &pod_target(
@@ -16153,6 +16166,11 @@ mod handler_tests {
             item["f:resources"].is_object() && item.get("f:image").is_none(),
             "resize owns resources, never the rest of the container: {entry}"
         );
+        assert!(
+            item.get("f:name").is_none(),
+            "the container name is only the list key, never owned by a resize apply \
+             (upstream's include filter keeps resources/resizePolicy): {entry}"
+        );
 
         let ec = patch_ephemeral_containers(
             State(state.clone()),
@@ -16506,14 +16524,11 @@ mod handler_tests {
         );
     }
 
-    /// PATCH /status must reject a smuggled metadata.labels change while still applying a
-    /// legitimate status update. A caller granted only `pods/status` RBAC rights
-    /// (e.g. the kubelet) must not be able to rewrite a pod's labels through this endpoint —
-    /// labels gate Service/selector membership and scheduling, so this is a privilege-escalation
-    /// path, not just a data-integrity bug. This exercises the real HTTP handler end to end
-    /// (not just the pure merge function) so it fails if the guard is wired to the wrong call site.
+    /// PATCH /status applies metadata.labels alongside the status update, as upstream's pod
+    /// status strategy leaves labels alone. Exercises the real HTTP handler end to end so it
+    /// fails if the merge is wired to the wrong call site.
     #[tokio::test]
-    async fn patch_pod_status_does_not_persist_smuggled_labels() {
+    async fn patch_pod_status_persists_labels() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
         seed_pod(
@@ -16564,10 +16579,9 @@ mod handler_tests {
 
         assert_eq!(
             v["metadata"]["labels"],
-            serde_json::json!({ "app": "web" }),
-            "labels must be unchanged in the store after a /status PATCH — a status-only \
-             RBAC grant must not be able to rewrite labels that gate selector-based \
-             scheduling and Service membership"
+            serde_json::json!({ "app": "evil", "escalated": "true" }),
+            "pods/status resets spec, ownerReferences and deletionTimestamp only, so labels \
+             in a /status PATCH are applied"
         );
         assert_eq!(
             v["status"]["phase"], "Running",
@@ -24727,16 +24741,10 @@ mod status_patch_metadata_tests {
         );
     }
 
-    /// PATCH /pods/{name}/status must NOT change metadata.labels even if the patch carries them.
-    /// Labels drive selector-based scheduling and service membership; a caller
-    /// holding only pods/status RBAC rights (e.g. the kubelet) must not be able to smuggle a
-    /// label change through a status merge-patch, the same guard merge_incoming_metadata already
-    /// enforces for the generic status handlers. Without this guard, an attacker with
-    /// only status-write rights could flip a pod's labels to escape a NetworkPolicy or Service
-    /// selector, or add/remove itself from a controller's label selector — a privilege escalation
-    /// beyond what the status subresource is meant to allow.
+    /// PATCH /pods/{name}/status applies metadata.labels: upstream's `podStatusStrategy`
+    /// resets only spec, deletionTimestamp and ownerReferences.
     #[test]
-    fn apply_status_patch_does_not_change_labels() {
+    fn apply_status_patch_applies_labels() {
         let stored = serde_json::json!({
             "metadata": { "name": "mypod", "namespace": "default", "uid": "uid-1",
                           "labels": { "app": "web" } },
@@ -24750,9 +24758,8 @@ mod status_patch_metadata_tests {
         let result = apply_status_patch(&stored, &patch).unwrap();
         assert_eq!(
             result["metadata"]["labels"],
-            serde_json::json!({ "app": "web" }),
-            "labels must not change via a status patch; a status-only RBAC grant must not be \
-             able to rewrite labels that gate selector-based scheduling and service membership"
+            serde_json::json!({ "app": "evil", "escalated": "true" }),
+            "a pod status patch does not reset labels"
         );
         assert_eq!(
             result["status"]["phase"], "Running",

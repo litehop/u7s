@@ -301,26 +301,58 @@ enum Kind {
     Other,
 }
 
-/// One operand of a call as cel-go's `actualSize` sees it: its size and kind.
+/// One operand of a call as cel-go's `actualSize` sees it: its size and kind. `traversal`
+/// and `text_chars` are only filled for the functions that bill by them (`DEEP_FUNCS`).
 #[derive(Clone, Copy)]
 struct Operand {
     size: u64,
     kind: Kind,
+    /// k8s `traversalCost`: 0.1 per byte of every string or bytes value nested in it.
+    traversal: u64,
+    /// Characters of the string elements of a list.
+    text_chars: u64,
 }
 
 impl Operand {
+    const fn new(size: u64, kind: Kind) -> Self {
+        Operand {
+            size,
+            kind,
+            traversal: 0,
+            text_chars: 0,
+        }
+    }
+
     /// An operand whose size the walk cannot see: one unit, like any non-sizer.
-    const UNKNOWN: Operand = Operand {
-        size: 1,
-        kind: Kind::Other,
-    };
+    const UNKNOWN: Operand = Operand::new(1, Kind::Other);
 }
 
 fn scaled_ceil(n: u64, factor: f64) -> u64 {
     (n as f64 * factor).ceil() as u64
 }
 
-fn operand_of_value(v: &cel::Value) -> Operand {
+/// k8s `library/cost.go` `traversalCost`.
+fn traversal_cost(v: &cel::Value) -> u64 {
+    match v {
+        cel::Value::String(s) => (s.len() as f64 * STRING_TRAVERSAL_COST_FACTOR) as u64,
+        cel::Value::Bytes(b) => (b.len() as f64 * STRING_TRAVERSAL_COST_FACTOR) as u64,
+        cel::Value::List(l) => l.iter().map(traversal_cost).sum(),
+        cel::Value::Map(m) => m
+            .map
+            .iter()
+            .map(|(k, v)| traversal_cost(&k.into()) + traversal_cost(v))
+            .sum(),
+        _ => 1,
+    }
+}
+
+/// cel-go `actualSize`: an optional holding a value is as big as the value.
+fn operand_of_value(v: &cel::Value, deep: bool) -> Operand {
+    if let Ok(opt) = <&cel::objects::OptionalValue>::try_from(v) {
+        if let Some(inner) = opt.value() {
+            return operand_of_value(inner, deep);
+        }
+    }
     let (size, kind) = match v {
         cel::Value::String(s) => (s.chars().count() as u64, Kind::Str),
         cel::Value::Bytes(b) => (b.len() as u64, Kind::Bytes),
@@ -328,7 +360,20 @@ fn operand_of_value(v: &cel::Value) -> Operand {
         cel::Value::Map(m) => (m.map.len() as u64, Kind::Other),
         _ => (1, Kind::Other),
     };
-    Operand { size, kind }
+    let mut operand = Operand::new(size, kind);
+    if deep {
+        operand.traversal = traversal_cost(v);
+        if let cel::Value::List(l) = v {
+            operand.text_chars = l
+                .iter()
+                .map(|e| match e {
+                    cel::Value::String(s) => s.chars().count() as u64,
+                    _ => 0,
+                })
+                .sum();
+        }
+    }
+    operand
 }
 
 /// Functions `call_cost_from_table` bills by size; every other call is one unit, so its
@@ -342,6 +387,24 @@ const TABLE_FUNCS: &[&str] = &[
     "string",
     "format",
     "quote",
+    "size",
+    "trim",
+    "lowerAscii",
+    "upperAscii",
+    "substring",
+    "url",
+    "replace",
+    "split",
+    "find",
+    "findAll",
+    "join",
+    "isSorted",
+    "sum",
+    "min",
+    "max",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
     operators::LESS,
     operators::LESS_EQUALS,
     operators::GREATER,
@@ -352,8 +415,22 @@ const TABLE_FUNCS: &[&str] = &[
     operators::IN,
 ];
 
+/// Functions whose bill needs `Operand::traversal` or `Operand::text_chars`.
+const DEEP_FUNCS: &[&str] = &[
+    "join",
+    "isSorted",
+    "sum",
+    "min",
+    "max",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+];
+
 /// What cel-go's runtime cost tracker bills one call with these operands, receiver first
-/// (`interpreter/runtimecost.go` `costCall`, v0.29.2). `None` is the default of one unit.
+/// (`interpreter/runtimecost.go` `costCall`, v0.29.2), or the Kubernetes extension library
+/// does (`k8s.io/apiserver/pkg/cel/library/cost.go` `CallCost`, which takes precedence).
+/// `None` is the default of one unit.
 fn call_cost_from_table(func: &str, operands: &[Operand], is_member: bool) -> Option<u64> {
     let traversal = |n: u64| scaled_ceil(n, STRING_TRAVERSAL_COST_FACTOR);
     match (func, operands) {
@@ -366,6 +443,25 @@ fn call_cost_from_table(func: &str, operands: &[Operand], is_member: bool) -> Op
         ("string", [arg]) if !is_member && arg.kind == Kind::Bytes => Some(traversal(arg.size)),
         ("format", [recv, _]) if is_member => Some(traversal(recv.size)),
         ("quote", [arg]) if !is_member => Some(traversal(arg.size)),
+        // cel-go bills `size` as one unit, but the `cel` crate counts a string's
+        // characters on every call, so a loop calling it on a large payload string is
+        // real work. Billing the traversal keeps that loop inside the limit.
+        ("size", [arg]) if arg.kind == Kind::Str => Some(traversal(arg.size).max(1)),
+        ("trim" | "lowerAscii" | "upperAscii" | "substring" | "url", [recv, ..]) => {
+            Some(traversal(recv.size))
+        }
+        ("replace" | "split", [recv, ..]) => Some(traversal(recv.size * 2)),
+        ("join", [recv, rest @ ..]) => {
+            let separators = recv.size.saturating_sub(1) * rest.first().map_or(0, |s| s.size);
+            Some(traversal((recv.text_chars + separators) * 2))
+        }
+        ("find" | "findAll", [subject, regex, ..]) => Some(
+            traversal(1 + subject.size) * scaled_ceil(regex.size, REGEX_STRING_LENGTH_COST_FACTOR),
+        ),
+        (
+            "isSorted" | "sum" | "min" | "max" | "indexOf" | "lastIndexOf" | "includes",
+            [recv, ..],
+        ) => Some(recv.traversal),
         (
             operators::LESS
             | operators::LESS_EQUALS
@@ -390,15 +486,9 @@ impl<'a> Coster<'a> {
     /// the data string the node holds. `None` when the walk cannot tell.
     fn static_operand(e: &IdedExpr, node: Node<'a>) -> Option<Operand> {
         if let Expr::Literal(LiteralValue::String(s)) = &e.expr {
-            return Some(Operand {
-                size: s.inner().chars().count() as u64,
-                kind: Kind::Str,
-            });
+            return Some(Operand::new(s.inner().chars().count() as u64, Kind::Str));
         }
-        node.text_chars().map(|size| Operand {
-            size,
-            kind: Kind::Str,
-        })
+        node.text_chars().map(|size| Operand::new(size, Kind::Str))
     }
 
     /// What one call costs per cel-go's table, replacing the unit a bare call is billed
@@ -417,13 +507,14 @@ impl<'a> Coster<'a> {
             return None;
         }
         let is_member = call.target.is_some();
+        let deep = DEEP_FUNCS.contains(&call.func_name.as_str());
         let mut operands = Vec::with_capacity(call.args.len() + 1);
         if let Some(ctx) = ctx {
             for expr in call.target.iter().map(|t| &**t).chain(&call.args) {
-                if self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                if self.is_cancelled() {
                     return Some(self.limit.saturating_add(1));
                 }
-                operands.push(operand_of_value(&ctx.resolve(expr).ok()?));
+                operands.push(operand_of_value(&ctx.resolve(expr).ok()?, deep));
             }
         } else {
             if let Some(target) = &call.target {
@@ -436,7 +527,16 @@ impl<'a> Coster<'a> {
         call_cost_from_table(&call.func_name, &operands, is_member)
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
     fn cost(&mut self, e: &IdedExpr, ctx: Ctx<'_, '_>) -> (u64, Node<'a>) {
+        // Every loop in the walk recurses through here, so a cancelled walk unwinds without
+        // visiting or evaluating anything further.
+        if self.is_cancelled() {
+            return (self.limit.saturating_add(1), Node::Unknown);
+        }
         match &e.expr {
             Expr::Ident(name) => {
                 let node = self
@@ -529,7 +629,7 @@ impl<'a> Coster<'a> {
                 }
                 let result = match call.func_name.as_str() {
                     operators::INDEX => arg_nodes.first().map_or(Node::Unknown, |n| n.elem()),
-                    "isSorted" | "sum" | "min" | "max" => {
+                    "isSorted" | "sum" | "min" | "max" if ctx.is_none() => {
                         total = total.saturating_add(target_node.len());
                         Node::Unknown
                     }
@@ -561,7 +661,7 @@ impl<'a> Coster<'a> {
                         let mut ran = 0u64;
                         let mut child = ctx.map(|ctx| ctx.new_inner_scope());
                         for pass in passes {
-                            if self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                            if self.is_cancelled() {
                                 total = self.limit.saturating_add(1);
                                 break;
                             }
@@ -1002,7 +1102,7 @@ mod tests {
     }
 
     fn op(size: u64, kind: Kind) -> Operand {
-        Operand { size, kind }
+        Operand::new(size, kind)
     }
 
     /// Expected costs are hand-computed from cel-go v0.29.2 `interpreter/runtimecost.go`
@@ -1061,9 +1161,48 @@ mod tests {
             (operators::ADD, &[op(1, Other), op(1, Other)], false, None),
             (operators::IN, &[op(1, Other), op(7, List)], false, Some(7)),
             (operators::IN, &[op(1, Other), op(7, Other)], false, None),
-            ("split", &[op(1000, Str), op(1, Str)], true, None),
-            ("trim", &[op(1000, Str)], true, None),
-            ("size", &[op(1000, Str)], true, None),
+            ("size", &[op(1000, Str)], true, Some(100)),
+            ("size", &[op(1000, Str)], false, Some(100)),
+            ("size", &[op(3, Str)], true, Some(1)),
+            ("size", &[op(1000, List)], true, None),
+            ("size", &[op(1000, Bytes)], true, None),
+            // Kubernetes library `CallCost`: 0.1 per receiver char, 0.2 where a result is built.
+            ("trim", &[op(1000, Str)], true, Some(100)),
+            ("lowerAscii", &[op(1000, Str)], true, Some(100)),
+            ("upperAscii", &[op(1001, Str)], true, Some(101)),
+            ("substring", &[op(1000, Str), op(1, Other)], true, Some(100)),
+            ("url", &[op(1000, Str)], false, Some(100)),
+            ("split", &[op(1000, Str), op(1, Str)], true, Some(200)),
+            (
+                "replace",
+                &[op(1000, Str), op(1, Str), op(1, Str)],
+                true,
+                Some(200),
+            ),
+            ("find", &[op(99, Str), op(40, Str)], true, Some(100)),
+            ("findAll", &[op(99, Str), op(40, Str)], true, Some(100)),
+            // 3 strings of 10 chars joined by a 2-char separator: 34 chars, doubled.
+            (
+                "join",
+                &[
+                    Operand {
+                        text_chars: 30,
+                        ..op(3, List)
+                    },
+                    op(2, Str),
+                ],
+                true,
+                Some(7),
+            ),
+            (
+                "sum",
+                &[Operand {
+                    traversal: 7,
+                    ..op(3, List)
+                }],
+                true,
+                Some(7),
+            ),
         ];
         for (func, operands, is_member, expected) in cases {
             assert_eq!(
@@ -1078,6 +1217,7 @@ mod tests {
     fn live_cost(rule: &str, schema: &J, data: &J, cancelled: Option<&AtomicBool>) -> u64 {
         let program = cel::Program::compile(rule).unwrap();
         let mut ctx = cel::Context::default();
+        crate::handlers::cr::register_cel_extensions(&mut ctx);
         ctx.add_variable_from_value(
             "self",
             crate::handlers::cr::json_to_cel_value(schema, data).unwrap(),
@@ -1123,6 +1263,84 @@ mod tests {
             None,
         );
         assert!(cost > CALL_COST_LIMIT, "{cost}");
+    }
+
+    /// `size(string)` counts characters on every call, so one per list item over a payload
+    /// string is items x payload bytes of work. Billed as a unit it stayed far under the
+    /// limit; it must be refused by its counted cost.
+    #[test]
+    fn size_of_a_large_string_per_item_exceeds_the_limit() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "a".repeat(110_000), "items": vec!["a"; 20_000] });
+        let cost = live_cost(
+            "self.items.all(a, self.csv.size() > 0)",
+            &schema,
+            &data,
+            None,
+        );
+        assert!(cost > CALL_COST_LIMIT, "{cost}");
+        let cheap = serde_json::json!({ "csv": "abc", "items": vec!["a"; 20_000] });
+        let cost = live_cost(
+            "self.items.all(a, self.csv.size() > 0)",
+            &schema,
+            &cheap,
+            None,
+        );
+        assert!(cost < CALL_COST_LIMIT, "short strings stay cheap: {cost}");
+    }
+
+    /// `trim`, `split`, `join` and friends allocate or traverse their receiver, so a loop
+    /// calling one on a payload string per item is real work that billing a unit hides.
+    #[test]
+    fn extension_string_functions_in_a_loop_are_billed_by_the_receiver_size() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "a,".repeat(55_000), "items": vec!["a"; 20_000] });
+        for rule in [
+            "self.items.all(a, self.csv.trim() != '')",
+            "self.items.all(a, self.csv.split(',').size() > 0)",
+            "self.items.all(a, self.csv.replace('a', 'b') != '')",
+            "self.items.all(a, self.csv.lowerAscii() != '')",
+            "self.items.all(a, self.items.join(',') != '')",
+        ] {
+            let cost = live_cost(rule, &schema, &data, None);
+            assert!(cost > CALL_COST_LIMIT, "{rule}: {cost}");
+        }
+        let small = serde_json::json!({ "csv": "a,b", "items": vec!["a"; 20] });
+        let cost = live_cost(
+            "self.items.all(a, self.csv.split(',').size() > 0)",
+            &schema,
+            &small,
+            None,
+        );
+        assert!(cost < CALL_COST_LIMIT, "ordinary rules stay cheap: {cost}");
+    }
+
+    /// cel-go `actualSize` looks through an optional, so billing `optional.of(big)` as one
+    /// unit would let a payload string hide inside an optional.
+    #[test]
+    fn optional_operands_are_sized_by_their_content() {
+        let big = cel::Value::String(std::sync::Arc::new("a".repeat(1000)));
+        let some = cel::Value::Opaque(std::sync::Arc::new(cel::objects::OptionalValue::of(big)));
+        assert_eq!(operand_of_value(&some, false).size, 1000);
+        let none = cel::Value::Opaque(std::sync::Arc::new(cel::objects::OptionalValue::none()));
+        assert_eq!(operand_of_value(&none, false).size, 1);
+    }
+
+    /// Cancellation must reach every kind of work in the walk, not only comprehension passes:
+    /// a flat expression of many calls (no loop at all) used to be walked to the end, so an
+    /// abandoned replay held its gate slot for as long as the walk takes.
+    #[test]
+    fn cancelled_walk_stops_in_expressions_without_a_comprehension() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "abc", "items": [] });
+        let rule = format!("[{}][0]", vec!["self.csv"; 40].join(", "));
+        let cost = live_cost(&rule, &schema, &data, Some(&AtomicBool::new(false)));
+        assert!(cost < CALL_COST_LIMIT, "uncancelled walk is cheap: {cost}");
+        let cost = live_cost(&rule, &schema, &data, Some(&AtomicBool::new(true)));
+        assert!(
+            cost > CALL_COST_LIMIT,
+            "a cancelled walk must stop at the next node, not finish the expression: {cost}"
+        );
     }
 
     /// A deep method chain is re-evaluated by the call that bills its receiver; once the

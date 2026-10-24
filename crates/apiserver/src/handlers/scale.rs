@@ -457,9 +457,9 @@ async fn scale_get_impl<S: Store>(
 /// type) than the read would make HPA see a stale replica count.
 fn write_scale_replicas(
     obj: &mut Object,
+    old_replicas: i64,
     new_replicas: i32,
 ) -> Result<(), crate::status::StatusError> {
-    let old_replicas = extract_replicas(&obj.body);
     obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
 
     // Increment generation when spec.replicas changes — controllers use
@@ -506,6 +506,20 @@ pub(crate) fn plan_scale_apply(
         "scale",
         schema,
     )
+}
+
+/// The replica count an apply to `scale` writes. Upstream's Scale carries `replicas` as a
+/// non-optional int32, so an applier that owned the field and stops sending it writes 0
+/// (it is not left unset for the API default to refill); `None` is a no-op apply.
+pub(crate) fn scale_apply_replicas(
+    plan: Option<&crate::field_manager::ApplyPlan>,
+    sent: Option<i64>,
+    replicas_path: &str,
+) -> Option<i64> {
+    sent.or_else(|| {
+        let fields: Vec<&str> = replicas_path.split('.').collect();
+        plan.is_some_and(|p| p.removes(&fields)).then_some(0)
+    })
 }
 
 /// A scale write owns `spec.replicas` as the `scale` subresource manager, so an applier that
@@ -591,7 +605,8 @@ async fn scale_put_impl<S: Store>(
         ),
     )
     .await? as i32;
-    write_scale_replicas(&mut obj, new_replicas)?;
+    let old_replicas = extract_replicas(&obj.body);
+    write_scale_replicas(&mut obj, old_replicas, new_replicas)?;
 
     // Dry-run: spec.replicas was computed above; return the would-be Scale object
     // without persisting — this is the shared impl behind both apps/v1 and
@@ -690,6 +705,11 @@ async fn scale_patch_impl<S: Store>(
 
     // Extract replicas from patch if present; otherwise keep current value (no write).
     let old_replicas = extract_replicas(&obj.body);
+    let sent_replicas = scale_apply_replicas(
+        ssa_plan.as_ref(),
+        patch_scale_spec.replicas.map(i64::from),
+        "spec.replicas",
+    );
     let new_replicas = admit_scale_write(
         &state,
         &AdmissionTarget {
@@ -712,18 +732,18 @@ async fn scale_patch_impl<S: Store>(
         build_scale(
             name,
             ns,
-            patch_scale_spec.replicas.map_or(old_replicas, |r| r as i64),
+            sent_replicas.unwrap_or(old_replicas),
             status_replicas,
             obj.resource_version().unwrap_or(""),
             &selector,
         ),
     )
     .await?;
-    if patch_scale_spec.replicas.is_some() || new_replicas != old_replicas {
-        write_scale_replicas(&mut obj, new_replicas as i32)?;
-    }
     if let Some(plan) = &ssa_plan {
         plan.remove_dropped_fields(&mut obj.body);
+    }
+    if sent_replicas.is_some() || new_replicas != old_replicas {
+        write_scale_replicas(&mut obj, old_replicas, new_replicas as i32)?;
     }
 
     // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
@@ -1877,6 +1897,41 @@ mod handler_tests {
         assert!(
             entry["fieldsV1"]["f:spec"]["f:replicas"].is_object(),
             "the applier must own spec.replicas: {entry}"
+        );
+    }
+
+    /// Upstream's Scale has a non-optional int32 `replicas`, so an applier that owned it and
+    /// stops sending it scales to 0 rather than leaving the field unset for the API default
+    /// (1) to refill; an applier that never owned it changes nothing. Pins that the drop is
+    /// written as a count, and that it is a real spec change (generation bump).
+    #[tokio::test]
+    async fn scale_apply_dropping_owned_replicas_writes_zero_not_unset() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 3).await;
+        scale_apply(&state, "ctrl", false, "spec:\n  replicas: 5\n")
+            .await
+            .unwrap_or_else(|e| panic!("scale apply must succeed: {e:?}"));
+
+        let bystander = scale_apply(&state, "other", false, "{}\n")
+            .await
+            .unwrap_or_else(|e| panic!("empty apply must succeed: {e:?}"));
+        assert_eq!(
+            bystander["spec"]["replicas"], 5,
+            "an applier that never owned replicas must not change them"
+        );
+
+        let before_gen = bystander["metadata"]["generation"].as_i64().unwrap_or(1);
+        let out = scale_apply(&state, "ctrl", false, "{}\n")
+            .await
+            .unwrap_or_else(|e| panic!("dropping apply must succeed: {e:?}"));
+        assert_eq!(
+            out["spec"]["replicas"], 0,
+            "dropped replicas must be written as 0, never removed (API default would be 1): {out}"
+        );
+        assert_eq!(
+            out["metadata"]["generation"].as_i64().unwrap_or(1),
+            before_gen + 1,
+            "scaling 5 -> 0 is a spec change controllers must observe"
         );
     }
 

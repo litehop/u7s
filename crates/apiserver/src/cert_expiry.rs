@@ -35,17 +35,18 @@ pub struct CertWatch {
     pub(crate) clock: Clock,
 }
 
-/// How long before expiry a record counts as at risk. CAs are never rotated automatically.
-/// A leaf is renewed with a third of its lifetime left, so it is at risk once half of that
-/// lead is gone (renewal overdue), capped at the 120-day node-cert window.
+/// How long before expiry a record counts as at risk. A root CA is never rotated
+/// automatically. A leaf or an intermediate is renewed with a third of its lifetime left, so
+/// it is at risk once half of that lead is gone (renewal overdue), capped at the 120-day
+/// node-cert window.
 fn leaf_window(lifetime: Duration) -> Duration {
     NODE_CERT_WINDOW.min(lifetime * ((1.0 - RENEW_FRACTION) / 2.0))
 }
 
 fn window(rec: &CertRecord) -> Duration {
     match rec.role {
-        CertRole::Leaf => leaf_window(rec.not_after - rec.not_before),
-        CertRole::Root | CertRole::Intermediate => CA_WINDOW,
+        CertRole::Leaf | CertRole::Intermediate => leaf_window(rec.not_after - rec.not_before),
+        CertRole::Root => CA_WINDOW,
     }
 }
 
