@@ -209,7 +209,7 @@ pub(crate) fn compile_rule(
     schema: &J,
     is_root: bool,
 ) -> Result<cel::Program, String> {
-    let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
+    let program = crate::cel_runtime::compile_program(source)?;
     let self_ty = ty_of(schema, is_root);
     let mut checker = Checker {
         program: &program,

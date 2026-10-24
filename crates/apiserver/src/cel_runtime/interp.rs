@@ -20,6 +20,18 @@ pub(crate) const COST_LIMIT: u64 = 1_000_000;
 /// Deepest evaluator recursion; the parser's own cap keeps real expressions far below it.
 const MAX_DEPTH: u32 = 512;
 
+/// Most stack an evaluation may use below its `Evaluator`. Evaluation runs on request and
+/// blocking threads of 512 KiB, and a 250-level expression that compilation accepts
+/// overflows 160 KiB in a release build and 512 KiB in a debug one; the frames already
+/// on the stack take part of the rest. Counting levels cannot bound this, as frame sizes
+/// differ per node kind and build profile, and a stack overflow aborts the whole process.
+const MAX_STACK_BYTES: usize = 192 * 1024;
+
+fn stack_position() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
 /// Roots and lazily evaluated policy variables an expression is evaluated against.
 pub(crate) struct Env<'a> {
     pub(crate) roots: Vec<(&'static str, Value<'a>)>,
@@ -57,6 +69,7 @@ pub(crate) struct Evaluator<'a, 'p> {
     env: &'p Env<'a>,
     cost: Cell<u64>,
     depth: Cell<u32>,
+    stack_base: usize,
     locals: RefCell<Vec<(String, R<Value<'a>>)>>,
     var_limit: Cell<usize>,
 }
@@ -101,6 +114,7 @@ impl<'a, 'p> Evaluator<'a, 'p> {
             env,
             cost: Cell::new(COST_LIMIT),
             depth: Cell::new(0),
+            stack_base: stack_position(),
             locals: RefCell::new(Vec::new()),
             var_limit: Cell::new(env.variables.len()),
         }
@@ -145,7 +159,7 @@ impl<'a, 'p> Evaluator<'a, 'p> {
 
     fn enter(&self) -> R<DepthGuard<'_>> {
         let d = self.depth.get();
-        if d >= MAX_DEPTH {
+        if d >= MAX_DEPTH || stack_position().abs_diff(self.stack_base) > MAX_STACK_BYTES {
             return Err(CelError::new("expression nests too deeply"));
         }
         self.depth.set(d + 1);
