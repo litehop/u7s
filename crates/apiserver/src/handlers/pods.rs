@@ -3417,6 +3417,59 @@ pub(crate) fn apply_resize_patch(
     result
 }
 
+/// What an apply to `pods/resize` owns: per container (init containers included) only
+/// `resources` and `resizePolicy`, as upstream's resize reset-fields filter. The container
+/// `name` stays because it is the list key.
+fn resize_applied_fields(incoming: &serde_json::Value) -> serde_json::Value {
+    let mut spec = serde_json::Map::new();
+    for list in ["containers", "initContainers"] {
+        let Some(items) = incoming["spec"][list].as_array() else {
+            continue;
+        };
+        let kept: Vec<_> = items
+            .iter()
+            .map(|c| {
+                let mut kept = serde_json::Map::new();
+                for f in ["name", "resources", "resizePolicy"] {
+                    if let Some(v) = c.get(f) {
+                        kept.insert(f.into(), v.clone());
+                    }
+                }
+                serde_json::Value::Object(kept)
+            })
+            .collect();
+        spec.insert(list.into(), kept.into());
+    }
+    serde_json::json!({ "spec": spec })
+}
+
+/// What an apply to `pods/ephemeralcontainers` owns: `spec.ephemeralContainers` only.
+fn ephemeral_containers_applied_fields(incoming: &serde_json::Value) -> serde_json::Value {
+    match incoming["spec"].get("ephemeralContainers") {
+        Some(ec) => serde_json::json!({ "spec": { "ephemeralContainers": ec } }),
+        None => serde_json::json!({}),
+    }
+}
+
+/// Plan an apply to a pod subresource that owns `applied` (everything else in the pod
+/// belongs to the main resource). Neither resize nor ephemeralcontainers can remove what
+/// was applied earlier, so the plan is only recorded, never used to remove fields.
+fn plan_pod_subresource_apply(
+    headers: &HeaderMap,
+    live: &serde_json::Value,
+    applied: &serde_json::Value,
+    subresource: &str,
+) -> Result<crate::field_manager::ApplyPlan, crate::status::StatusError> {
+    crate::field_manager::WriteIdentity::new(None, headers).plan_subresource_apply(
+        live,
+        applied,
+        &["spec"],
+        "v1",
+        subresource,
+        None,
+    )
+}
+
 pub(crate) async fn patch_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -3430,9 +3483,14 @@ pub(crate) async fn patch_pod_resize<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let is_ssa = ct.contains("apply-patch+yaml");
     let body = extract_body(&body, ct)?;
-    let incoming: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let incoming: serde_json::Value = if is_ssa {
+        super::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+    };
 
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state
@@ -3449,6 +3507,16 @@ pub(crate) async fn patch_pod_resize<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
+    let resize_plan = is_ssa
+        .then(|| {
+            plan_pod_subresource_apply(
+                &headers,
+                &before_write,
+                &resize_applied_fields(&incoming),
+                "resize",
+            )
+        })
+        .transpose()?;
     current_obj.body = admit_write(
         &state,
         &pod_target(
@@ -3468,11 +3536,12 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     )
     .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-    crate::field_manager::WriteIdentity::new(None, &headers).record(
+    crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
+        resize_plan.as_ref(),
         &before_write,
         &mut current_obj.body,
         "v1",
-        Some("resize"),
+        "resize",
         None,
     );
 
@@ -3798,9 +3867,14 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let is_ssa = ct.contains("apply-patch+yaml");
     let body = extract_body(&body, ct)?;
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let patch: serde_json::Value = if is_ssa {
+        super::json_patch::ssa_body_to_json(&body)?
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+    };
 
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state
@@ -3815,6 +3889,16 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
 
     let spec_before = current_obj.body["spec"].clone();
     let before_write = current_obj.body.clone();
+    let ec_plan = is_ssa
+        .then(|| {
+            plan_pod_subresource_apply(
+                &headers,
+                &before_write,
+                &ephemeral_containers_applied_fields(&patch),
+                "ephemeralcontainers",
+            )
+        })
+        .transpose()?;
     current_obj.body = admit_ephemeral_containers_update(
         &state,
         ns.as_str(),
@@ -3826,11 +3910,12 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
     )
     .await?;
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-    crate::field_manager::WriteIdentity::new(None, &headers).record(
+    crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
+        ec_plan.as_ref(),
         &before_write,
         &mut current_obj.body,
         "v1",
-        Some("ephemeralcontainers"),
+        "ephemeralcontainers",
         None,
     );
 
@@ -16016,6 +16101,85 @@ mod handler_tests {
             owned["f:metadata"]["f:annotations"]["f:note"].is_object()
                 && owned["f:metadata"].get("f:ownerReferences").is_none(),
             "the annotation is owned, ownerReferences never: {owned}"
+        );
+    }
+
+    /// An apply to pods/resize or pods/ephemeralcontainers is recorded as an Apply scoped to
+    /// that subresource owning only what its strategy accepts, not as an Update: otherwise
+    /// `kubectl apply --server-side --subresource=resize` is indistinguishable from a
+    /// kubelet write and a conflicting main-resource owner is never reported.
+    #[tokio::test]
+    async fn resize_and_ephemeralcontainers_apply_record_subresource_scoped_apply_manager() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"spec": {"containers": [{
+                "name": "app", "image": "nginx",
+                "resources": {"requests": {"cpu": "100m"}, "limits": {"cpu": "200m"}}
+            }]}}),
+        )
+        .await;
+        let resize = patch_pod_resize(
+            State(state.clone()),
+            Path(("default".to_string(), "my-pod".to_string())),
+            None,
+            crate::handlers::test_support::apply_headers("ctrl", false),
+            Bytes::from(
+                "spec:\n  containers:\n  - name: app\n    image: ignored\n    resources:\n      requests:\n        cpu: 150m\n      limits:\n        cpu: 300m\n",
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("resize apply must succeed: {e:?}"))
+        .into_response();
+        let out = crate::handlers::test_support::response_json(resize).await;
+        assert_eq!(
+            out["spec"]["containers"][0]["resources"]["limits"]["cpu"],
+            "300m"
+        );
+        let entry =
+            crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("resize"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "resize apply must be scoped: {}",
+                        out["metadata"]["managedFields"]
+                    )
+                });
+        let container = &entry["fieldsV1"]["f:spec"]["f:containers"];
+        let item = container.as_object().unwrap().values().next().unwrap();
+        assert!(
+            item["f:resources"].is_object() && item.get("f:image").is_none(),
+            "resize owns resources, never the rest of the container: {entry}"
+        );
+
+        let ec = patch_ephemeral_containers(
+            State(state.clone()),
+            Path(("default".to_string(), "my-pod".to_string())),
+            None,
+            crate::handlers::test_support::apply_headers("ctrl", false),
+            Bytes::from("spec:\n  ephemeralContainers:\n  - name: dbg\n    image: busybox\n"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ephemeralcontainers apply must succeed: {e:?}"))
+        .into_response();
+        let out = crate::handlers::test_support::response_json(ec).await;
+        let entry = crate::handlers::test_support::managed_entry(
+            &out,
+            "ctrl",
+            "Apply",
+            Some("ephemeralcontainers"),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "ephemeralcontainers apply must be scoped: {}",
+                out["metadata"]["managedFields"]
+            )
+        });
+        assert!(
+            entry["fieldsV1"]["f:spec"]["f:ephemeralContainers"].is_object(),
+            "owns spec.ephemeralContainers: {entry}"
         );
     }
 

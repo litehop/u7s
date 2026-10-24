@@ -4581,17 +4581,19 @@ fn record_cr_write(
 
 fn record_cr_scale_write(
     headers: &HeaderMap,
+    plan: Option<&crate::field_manager::ApplyPlan>,
     before: &serde_json::Value,
     obj: &mut serde_json::Value,
     group: &str,
     version: &str,
     ctx: &CrContext,
 ) {
-    crate::field_manager::WriteIdentity::new(None, headers).record(
+    crate::field_manager::WriteIdentity::new(None, headers).record_subresource_write(
+        plan,
         before,
         obj,
         &format!("{group}/{version}"),
-        Some("scale"),
+        "scale",
         ctx.schema.as_deref(),
     );
 }
@@ -5762,7 +5764,7 @@ fn scale_path_get_str<'a>(obj: &'a serde_json::Value, path: &str) -> &'a str {
 /// matching upstream's `unstructured.SetNestedField`). Only ever called with
 /// `specReplicasPath` — `statusReplicasPath`/`labelSelectorPath` are read-only from the scale
 /// subresource's perspective; the CR's own controller owns writing those.
-fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
+pub(super) fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
     let segs: Vec<&str> = path.split('.').collect();
     let Some((last, parents)) = segs.split_last() else {
         return;
@@ -5915,6 +5917,7 @@ async fn cr_scale_put_impl<S: Store>(
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
+        None,
         &before,
         &mut obj,
         target.group,
@@ -5994,6 +5997,19 @@ async fn cr_scale_patch_impl<S: Store>(
     // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
     // is a no-op write, not an error).
     let before = obj.clone();
+    let ssa_plan = content_type(headers)
+        .contains("apply-patch+yaml")
+        .then(|| {
+            super::scale::plan_scale_apply(
+                headers,
+                &before,
+                scale_body.spec.replicas.map(i64::from),
+                &scale_cfg.spec_replicas_path,
+                &format!("{}/{}", target.group, target.version),
+                ctx.schema.as_deref(),
+            )
+        })
+        .transpose()?;
     let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
     let new_replicas = admit_cr_scale(
         state,
@@ -6014,9 +6030,13 @@ async fn cr_scale_patch_impl<S: Store>(
     if scale_body.spec.replicas.is_some() || new_replicas != old_replicas {
         scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
     }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut obj);
+    }
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
+        ssa_plan.as_ref(),
         &before,
         &mut obj,
         target.group,
@@ -26195,6 +26215,71 @@ mod tests {
             scale["status"]["selector"], "app=gizmo",
             "status.selector must come from the CRD-declared labelSelectorPath — the HPA \
              controller treats an empty selector as a hard, unrecoverable error"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_cr_scale_apply_owns_the_crd_declared_replicas_path_under_scale() {
+        let state = make_state();
+        install_namespaced_crd_with_scale_subresource(&state).await;
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Gizmo",
+                "metadata": { "name": "g", "namespace": "default" },
+                "spec": { "desiredReplicas": 2, "color": "blue" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed: {e:?}"));
+
+        patch_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+                "g".to_string(),
+            )),
+            None,
+            crate::handlers::test_support::apply_headers("ctrl", true),
+            Bytes::from("spec:\n  replicas: 7\n"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("scale apply must succeed: {e:?}"));
+
+        let stored = state
+            .store
+            .get("/registry/cr/example.io/gizmos/default/g")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(obj["spec"]["desiredReplicas"], 7);
+        let entry =
+            crate::handlers::test_support::managed_entry(&obj, "ctrl", "Apply", Some("scale"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "scale apply must record an Apply scoped to scale: {}",
+                        obj["metadata"]["managedFields"]
+                    )
+                });
+        assert!(
+            entry["fieldsV1"]["f:spec"]["f:desiredReplicas"].is_object(),
+            "the applier must own the CRD-declared replicas path, not spec.replicas: {entry}"
         );
     }
 
