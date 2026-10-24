@@ -25,9 +25,33 @@ pub fn write_new_private(path: &str, data: &[u8]) -> anyhow::Result<()> {
     f.write_all(data).with_context(|| format!("writing {path}"))
 }
 
+/// Fails if `path` exists (a dangling symlink counts), so a doomed export is
+/// refused before any network work or file write.
+pub fn refuse_existing(path: &str) -> anyhow::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        anyhow::bail!("{path} already exists; remove or rename the old file first");
+    }
+    Ok(())
+}
+
+/// Writes the export files. The objects file is created first and refused if
+/// it exists, so a refused export leaves the plan untouched and the two files
+/// always describe the same export.
+pub fn write_export(
+    plan_path: &str,
+    plan_json: &str,
+    objects: Option<(&str, &[u8])>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if let Some((path, data)) = objects {
+        write_new_private(path, data)?;
+    }
+    std::fs::write(plan_path, plan_json).with_context(|| format!("writing {plan_path}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_new_private;
+    use super::{refuse_existing, write_export, write_new_private};
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn dir(tag: &str) -> std::path::PathBuf {
@@ -54,6 +78,47 @@ mod tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(write_new_private(p.to_str().unwrap(), b"secrets").is_err());
         assert_eq!(std::fs::read(&p).unwrap(), b"old");
+    }
+
+    #[test]
+    fn refused_export_leaves_plan_and_objects_byte_identical_so_import_never_mixes_exports() {
+        let d = dir("refused-export");
+        let plan = d.join("plan.json");
+        let objs = d.join("o.json");
+        std::fs::write(&plan, b"old-plan").unwrap();
+        std::fs::write(&objs, b"old-objects").unwrap();
+        let r = write_export(
+            plan.to_str().unwrap(),
+            "new-plan",
+            Some((objs.to_str().unwrap(), b"new-objects")),
+        );
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&plan).unwrap(), b"old-plan");
+        assert_eq!(std::fs::read(&objs).unwrap(), b"old-objects");
+    }
+
+    #[test]
+    fn successful_export_writes_both_files() {
+        let d = dir("ok-export");
+        let plan = d.join("plan.json");
+        let objs = d.join("o.json");
+        write_export(
+            plan.to_str().unwrap(),
+            "p",
+            Some((objs.to_str().unwrap(), b"o")),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&plan).unwrap(), b"p");
+        assert_eq!(std::fs::read(&objs).unwrap(), b"o");
+    }
+
+    #[test]
+    fn existing_path_is_refused_up_front() {
+        let d = dir("preflight");
+        let p = d.join("o.json");
+        assert!(refuse_existing(p.to_str().unwrap()).is_ok());
+        std::fs::write(&p, b"x").unwrap();
+        assert!(refuse_existing(p.to_str().unwrap()).is_err());
     }
 
     #[test]

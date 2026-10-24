@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use u7s_apiserver::migrate_tables::{shipped_addons, strippable_finalizers};
@@ -38,7 +38,7 @@ enum Migrate {
         #[arg(long)]
         allow_unknown_k3s_version: bool,
         /// Where a real export writes the source objects. Created with mode
-        /// 0600 and refused if the path exists; it contains Secrets in clear
+        /// 0600 and refused if the path exists (the plan is then left untouched); it contains Secrets in clear
         /// text, delete it after the migration.
         #[arg(long, default_value = "u7s-migrate-objects.json")]
         objects: String,
@@ -109,6 +109,9 @@ async fn export(
     allow_unknown: bool,
     objects: Option<&str>,
 ) -> anyhow::Result<()> {
+    if let Some(path) = objects {
+        u7s_migrate::refuse_existing(path)?;
+    }
     let src = discover::Source::connect(kubeconfig)?;
     let (types, mut failures) = src.resource_types().await?;
     let listing = src.list_all(&types).await;
@@ -148,8 +151,14 @@ async fn export(
     }
 
     plan.validate().map_err(anyhow::Error::msg)?;
-    std::fs::write(plan_path, serde_json::to_string_pretty(&plan)?)
-        .with_context(|| format!("writing {plan_path}"))?;
+    let plan_json = serde_json::to_string_pretty(&plan)?;
+    let objects_json = serde_json::to_string(&objs)?;
+    let objects = objects.filter(|_| failures.is_empty());
+    u7s_migrate::write_export(
+        plan_path,
+        &plan_json,
+        objects.map(|p| (p, objects_json.as_bytes())),
+    )?;
     print!("{}", plan::render_report(&plan, &warnings));
     println!("plan written to {plan_path}");
     if !failures.is_empty() {
@@ -159,7 +168,6 @@ async fn export(
         );
     }
     if let Some(path) = objects {
-        u7s_migrate::write_new_private(path, serde_json::to_string(&objs)?.as_bytes())?;
         println!("objects written to {path}");
         println!(
             "WARNING: {path} contains every exported object including Secrets in clear text \
