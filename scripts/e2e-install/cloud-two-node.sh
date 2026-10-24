@@ -11,7 +11,8 @@
 # pinned to w1 Running; logs/exec on it (apiserver -> InternalIP:10250); cross-node pod-to-pod;
 # webhook-smoke.sh; and, with beep, that a LoadBalancer Service answers from the client VPS
 # with its internal IP preserved. Without --keep only the VPSes this run created are deleted.
-# Exit: 0 PASS, 1 FAIL, 2 usage, 3 PREEMPTED. Results: temp/e2e-install/<ts>/.
+# Exit codes: see "Release-gate exit codes" in docs/dev-setup.md. INVALID here is a failure whose
+# preemption lookup kept erroring. Results: temp/e2e-install/<ts>/.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -74,13 +75,18 @@ step() {
 }
 
 finish() {
-  local rc=$? v
+  local rc=$? v pre
   trap - EXIT
   if [ "$rc" = 0 ]; then
     RESULT=PASS
   else
     for v in ${CREATED[@]+"${CREATED[@]}"}; do
-      if gcp_vps_was_preempted "$v"; then RESULT=PREEMPTED; rc=3; break; fi
+      pre=0; gcp_vps_was_preempted "$v" || pre=$?
+      case "$pre" in
+        0) RESULT=PREEMPTED; rc=3; break ;;
+        1) ;;
+        *) RESULT=INVALID; rc=3 ;;
+      esac
     done
   fi
   echo "$RESULT" >"$OUT/result.txt"
@@ -89,9 +95,10 @@ finish() {
     if [ "$KEEP" = 1 ]; then
       echo "kept: scripts/gcp/vps.sh ssh $v"
     else
-      vps down "$v" || echo "warning: could not delete $v; check scripts/gcp/vps.sh list" >&2
+      vps down "$v" || { echo "LEAKED VPS $v: could not delete; check scripts/gcp/vps.sh list" >&2; echo "$v" >>"$OUT/leaked-vps.txt"; }
     fi
   done
+  [ ! -s "$OUT/leaked-vps.txt" ] || [ "$rc" != 0 ] || { rc=4; echo "RESULT: PASS but LEAKED VPS: exit 4"; }
   [ "$KEEP" = 0 ] || echo "kubeconfig on $CP: /var/lib/u7s/kubeconfig (sudo kubectl --kubeconfig /var/lib/u7s/kubeconfig ...)"
   exit "$rc"
 }
