@@ -16,7 +16,7 @@ use base64::Engine as _;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use u7s_store::{ListOptions, Store};
-use x509_cert::der::{oid::AssociatedOid as _, Decode as _, DecodePem as _};
+use x509_cert::der::{oid::AssociatedOid as _, Decode as _};
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::ext::Extension;
@@ -73,7 +73,8 @@ pub(crate) fn evaluate(
     let pem = base64::engine::general_purpose::STANDARD
         .decode(spec["request"].as_str().unwrap_or(""))
         .map_err(|e| format!("request is not base64: {e}"))?;
-    let req = CertReq::from_pem(&pem).map_err(|e| format!("request is not a PKCS#10 PEM: {e}"))?;
+    let req = crate::handlers::csr::parse_csr_pem(&pem)
+        .map_err(|e| format!("request is not a PKCS#10 PEM: {e}"))?;
 
     let (mut cn, mut orgs) = (Vec::new(), Vec::new());
     for atv in req.info.subject.iter() {
