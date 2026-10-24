@@ -59,24 +59,25 @@ fn record_approval_write(
     );
 }
 
-/// An apply to `/approval` owns the conditions it names; the rest of `status` and `spec`
-/// belong to other subresources.
+/// An apply to `/approval` owns the conditions and the metadata it writes; the rest of
+/// `status` and `spec` belong to other subresources.
 fn plan_approval_apply(
     headers: &HeaderMap,
     live: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<crate::field_manager::ApplyPlan, crate::status::StatusError> {
-    let mut applied = serde_json::Map::new();
-    if let Some(conditions) = patch.get("status").and_then(|s| s.get("conditions")) {
-        applied.insert(
-            "status".into(),
-            serde_json::json!({ "conditions": conditions }),
-        );
+    let mut applied = crate::handlers::status::status_write_fields(patch, Some(KIND), "approval");
+    let conditions = applied["status"].get("conditions").cloned();
+    match conditions {
+        Some(c) => applied["status"] = serde_json::json!({ "conditions": c }),
+        None => {
+            applied.as_object_mut().map(|o| o.remove("status"));
+        }
     }
     crate::field_manager::WriteIdentity::new(None, headers).plan_subresource_apply(
         live,
-        &serde_json::Value::Object(applied),
-        &["status"],
+        &applied,
+        &["status", "metadata"],
         "certificates.k8s.io/v1",
         "approval",
         None,
@@ -166,7 +167,7 @@ pub async fn put_approval<S: Store>(
         &old_body,
         &crate::util::utc_now_rfc3339(),
     );
-    merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
     current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
     record_approval_write(&headers, &old_body, &mut current.body, None);
 
@@ -266,7 +267,7 @@ pub async fn patch_approval<S: Store>(
             }
             // Merge metadata (labels/annotations) from the patch — kubectl certificate
             // approve/deny and this conformance test also patch annotations via /approval.
-            merge_incoming_metadata(&mut current.body, &patch, KIND);
+            merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
         }
     }
 
@@ -905,6 +906,116 @@ mod tests {
              patch_approval's dry-run guard was removed and the CSR was actually \
              approved in the store"
         );
+    }
+
+    async fn approval_apply(
+        state: &crate::state::AppState,
+        name: &str,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_approval(
+            axum::extract::State(state.clone()),
+            approver(state),
+            axum::extract::Path(name.to_owned()),
+            crate::handlers::test_support::apply_headers(manager, force),
+            bytes::Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    const APPROVE_YAML: &str = "status:\n  conditions:\n  - type: Approved\n    status: \"True\"\n    reason: ManualApproval\n    message: approved\n";
+
+    /// An apply to /approval must be recorded as an Apply scoped to `approval` owning the
+    /// conditions it named, and never as a main-resource entry: a later apply of the CSR's
+    /// own spec must not be able to delete the approval.
+    #[tokio::test]
+    async fn approval_apply_records_approval_scoped_apply_manager() {
+        use crate::handlers::test_support::managed_entry;
+        let state = make_state();
+        seed_csr(&state.store, "scoped-csr", None).await;
+        let out = approval_apply(&state, "scoped-csr", "ctrl", false, APPROVE_YAML.into())
+            .await
+            .unwrap_or_else(|e| panic!("approval apply must succeed: {e:?}"));
+        let entry = managed_entry(&out, "ctrl", "Apply", Some("approval")).unwrap_or_else(|| {
+            panic!(
+                "approval apply must record an Apply scoped to approval: {}",
+                out["metadata"]["managedFields"]
+            )
+        });
+        assert!(
+            entry["fieldsV1"]["f:status"]["f:conditions"].is_object(),
+            "the approver must own the conditions it applied: {entry}"
+        );
+        assert!(
+            managed_entry(&out, "ctrl", "Apply", None).is_none()
+                && managed_entry(&out, "ctrl", "Apply", Some("status")).is_none(),
+            "approval must not be recorded under the main or status entry"
+        );
+    }
+
+    /// /approval takes annotations from an apply as well as conditions (upstream resets only
+    /// `spec` and `status.certificate`), so the approver must own the annotation it wrote.
+    #[tokio::test]
+    async fn approval_apply_owns_annotation_it_writes() {
+        let state = make_state();
+        seed_csr(&state.store, "annotated-csr", None).await;
+        let yaml = format!("metadata:\n  annotations:\n    note: \"1\"\n{APPROVE_YAML}");
+        let out = approval_apply(&state, "annotated-csr", "ctrl", false, yaml)
+            .await
+            .unwrap_or_else(|e| panic!("approval apply must succeed: {e:?}"));
+        assert_eq!(out["metadata"]["annotations"]["note"], "1");
+        let entry =
+            crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("approval"))
+                .unwrap();
+        assert!(
+            entry["fieldsV1"]["f:metadata"]["f:annotations"]["f:note"].is_object(),
+            "annotation landed through /approval must be owned: {entry}"
+        );
+    }
+
+    /// Approving over a condition another manager set (Update) is a 409 without force, as
+    /// upstream, so two approvers cannot silently overwrite each other.
+    #[tokio::test]
+    async fn approval_apply_over_update_owner_conflicts_without_force() {
+        let state = make_state();
+        let key = seed_csr(&state.store, "owned-csr", None).await;
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let mut csr: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        csr["status"]["conditions"] = json!([{
+            "type": "Approved", "status": "True", "reason": "Other", "message": "other",
+            "lastUpdateTime": "2026-01-01T00:00:00Z"
+        }]);
+        csr["metadata"]["managedFields"] = json!([crate::handlers::test_support::update_entry(
+            "other-approver",
+            "certificates.k8s.io/v1",
+            Some("approval"),
+            json!({"f:status": {"f:conditions": {"k:{\"type\":\"Approved\"}": {
+                ".": {}, "f:reason": {}, "f:message": {}, "f:status": {}, "f:type": {}
+            }}}}),
+        )]);
+        state
+            .store
+            .put(&key, bytes::Bytes::from(csr.to_string()), None)
+            .await
+            .unwrap();
+        let err = approval_apply(&state, "owned-csr", "ctrl", false, APPROVE_YAML.into())
+            .await
+            .expect_err("applying over another manager's condition must conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT, "{}", err.1.message);
+        let forced = approval_apply(&state, "owned-csr", "ctrl", true, APPROVE_YAML.into())
+            .await
+            .unwrap_or_else(|e| panic!("force must override the conflict: {e:?}"));
+        assert!(crate::handlers::test_support::managed_entry(
+            &forced,
+            "ctrl",
+            "Apply",
+            Some("approval")
+        )
+        .is_some());
     }
 
     /// PATCH /approval with a genuine multi-line YAML apply-patch+yaml body must succeed,

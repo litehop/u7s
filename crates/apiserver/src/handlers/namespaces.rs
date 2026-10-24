@@ -886,7 +886,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
     crate::handlers::status::merge_incoming_metadata(
         &mut current.body,
         &incoming.body,
-        "Namespace",
+        Some("Namespace"),
     );
 
     current.body = admit_namespace_status(
@@ -953,8 +953,15 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, Some(&name))?;
-    let ssa_plan =
-        super::status::plan_status_apply(&headers, is_ssa, &current.body, &patch, "", "v1")?;
+    let ssa_plan = super::status::plan_status_apply(
+        &headers,
+        is_ssa,
+        &current.body,
+        &patch,
+        "",
+        "v1",
+        Some("Namespace"),
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -985,7 +992,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             crate::handlers::status::merge_incoming_metadata(
                 &mut current.body,
                 &patch,
-                "Namespace",
+                Some("Namespace"),
             );
         }
     }
@@ -5266,6 +5273,100 @@ mod tests {
             body["status"]["phase"], 5,
             "the rejected patch must not have been persisted"
         );
+    }
+
+    async fn namespace_status_apply(
+        state: &AppState,
+        name: &str,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_namespace_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// The namespace controller applies conditions through /status: they must be owned under a
+    /// status-scoped Apply entry so a later apply can delete a condition it stops sending.
+    #[tokio::test]
+    async fn namespace_status_apply_is_scoped_and_prunes() {
+        let state = make_state();
+        assert!(create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("scoped-ns"),
+        )
+        .await
+        .is_ok());
+        let cond =
+            |t: &str| format!("status:\n  conditions:\n  - type: {t}\n    status: \"False\"\n");
+        let (first, second) =
+            crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+                |m, f, y| namespace_status_apply(&state, "scoped-ns", m, f, y),
+                &cond("NamespaceDeletionContentFailure"),
+                &cond("NamespaceContentRemaining"),
+            )
+            .await;
+        assert_eq!(
+            first["status"]["conditions"][0]["type"],
+            "NamespaceDeletionContentFailure"
+        );
+        let types: Vec<_> = second["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            types,
+            ["NamespaceContentRemaining"],
+            "a condition the applier stopped sending must be removed"
+        );
+        assert_eq!(
+            second["status"]["phase"], "Active",
+            "unowned status must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_status_apply_over_update_owner_conflicts_without_force() {
+        use crate::handlers::test_support::update_entry;
+        let state = make_state();
+        let ns = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {
+                "name": "owned-ns",
+                "managedFields": [update_entry(
+                    "kcm", "v1", Some("status"),
+                    serde_json::json!({"f:status": {"f:phase": {}}}),
+                )]
+            },
+            "status": {"phase": "Active"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("namespaces", "owned-ns"),
+                Bytes::from(ns.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        crate::handlers::test_support::assert_status_apply_conflicts_without_force(
+            |m, f, y| namespace_status_apply(&state, "owned-ns", m, f, y),
+            "status:\n  phase: Terminating\n",
+            "phase",
+        )
+        .await;
     }
 
     /// patch_namespace_status must accept a genuine multi-line YAML apply-patch+yaml body,

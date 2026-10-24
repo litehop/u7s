@@ -1718,7 +1718,7 @@ pub async fn put_crd_status<S: Store>(
         &incoming.body["status"],
     )?;
 
-    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
     current.body = admit_crd_status(
         &state,
         &name,
@@ -1797,6 +1797,7 @@ pub async fn patch_crd_status<S: Store>(
         &patch,
         GROUP,
         "v1",
+        Some(KIND),
     )?;
 
     match patch_type {
@@ -1824,7 +1825,7 @@ pub async fn patch_crd_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, KIND);
+            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -2431,6 +2432,64 @@ mod tests {
             stored.is_none(),
             "dryRun=All must NOT persist the CRD — if this fails, create_crd's dry-run \
              guard was removed and the CRD was actually written to the store"
+        );
+    }
+
+    async fn crd_status_apply(
+        state: &crate::state::AppState,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_crd_status(
+            State(state.clone()),
+            Path("widgets.example.io".to_string()),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// An apply to a CRD's /status must be owned under a status-scoped Apply entry and a later
+    /// apply must delete what it stops sending; a CRD's spec is never taken from /status.
+    #[tokio::test]
+    async fn crd_status_apply_is_scoped_and_prunes() {
+        let state = make_state();
+        crate::handlers::test_support::install_namespaced_crd(
+            &state,
+            "example.io",
+            "v1",
+            "widgets",
+            "Widget",
+        )
+        .await;
+        let cond = |t: &str| {
+            format!(
+                "status:\n  conditions:\n  - type: {t}\n    status: \"True\"\n    reason: r\n    message: m\n    lastTransitionTime: \"2026-01-01T00:00:00Z\"\n"
+            )
+        };
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            |m, f, y| crd_status_apply(&state, m, f, y),
+            &cond("Custom1"),
+            &cond("Custom2"),
+        )
+        .await;
+        let types: Vec<&str> = second["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["type"].as_str())
+            .collect();
+        assert!(
+            types.contains(&"Custom2") && !types.contains(&"Custom1"),
+            "a condition the applier stopped sending must be removed: {types:?}"
+        );
+        assert_eq!(
+            second["spec"]["group"], "example.io",
+            "/status must not touch spec"
         );
     }
 

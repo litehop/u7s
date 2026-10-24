@@ -200,10 +200,10 @@ watch_saw() { grep -q "configmap/$1" "$TMP/watch.out"; }
 cert_expired() { ! cert_has_life "$1" 0; }
 scheduled() { [ -n "$(k -n "$NS" get pods -l "app=$NAME" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)" ]; }
 
-kcm_pid() { limactl shell "$VM" pgrep -x kube-controller 2>/dev/null | head -1; }
+kcm_pid() { limactl shell "$VM" pgrep -x kube-controller 2>/dev/null | sed -n 1p; }
 # Kernel start tick (field 22 of /proc/PID/stat): ps lstart is derived from boot time and drifts by a second between calls.
 kcm_start() { stat_start_ticks "$(limactl shell "$VM" cat "/proc/$1/stat" 2>/dev/null)"; }
-sched_pid() { pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | head -1; }
+sched_pid() { pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | sed -n 1p; }
 # The scheduler runs on this host: /proc on Linux; a macOS host has no /proc, and its ps lstart is the stored start time (stable).
 sched_start() {
   if [ -r "/proc/$1/stat" ]; then stat_start_ticks "$(cat "/proc/$1/stat")"; else ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; fi
