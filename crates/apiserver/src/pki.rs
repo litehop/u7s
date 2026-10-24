@@ -2,7 +2,7 @@
 //! what was issued. rcgen's `CertificateParams::default()` validity is 1975..4096, so no
 //! `CertificateParams` is built anywhere except `Pki::params`.
 
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -255,6 +255,13 @@ impl Pki {
             CertRole::Intermediate => IsCa::Ca(BasicConstraints::Constrained(0)),
             CertRole::Root => IsCa::Ca(BasicConstraints::Unconstrained),
         };
+        if !matches!(spec.role, CertRole::Leaf) {
+            params.key_usages = vec![
+                KeyUsagePurpose::KeyCertSign,
+                KeyUsagePurpose::DigitalSignature,
+                KeyUsagePurpose::KeyEncipherment,
+            ];
+        }
         params.subject_alt_names = spec.sans.clone();
         params
             .distinguished_name
