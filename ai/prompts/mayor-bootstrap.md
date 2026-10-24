@@ -12,8 +12,8 @@ diagnosis needed; (2) no test to run to verify it; (3) you can state the full
 diff before opening the file; (4) you have not already read more than two files
 trying to understand the problem. If any condition fails, dispatch a worker.
 The trap: "I already read the file — I may as well fix it" is not an exception.
-Workers have every tool the mayor has, including the lima-node MCP server
-(`mcp__lima-node__*`) for live VM debugging. Write a better brief.
+Workers have every tool the mayor has, including `limactl shell` into their
+assigned VM for live debugging. Write a better brief.
 
 **Beads is the spine.** Track all real work in `bd` — no TodoWrite, no markdown
 TODOs, no parallel trackers. Run `bd prime` for the canonical commands. A

@@ -821,8 +821,8 @@ Pass `--kubelet-port <N>` to `run-all.sh` — `run-all.sh` (via `lima-start.sh`)
 the VM with the assigned `--kubelet-port` automatically on first run; no separate
 provisioning step is needed.
 
-The MCP server name mirrors the VM name: `mcp__lima-node-smoke__run_shell_command`
-for `lima-node-smoke`, etc.
+Only `lima-node` has an MCP server (`mcp__lima-node__*`, connected only if the VM was
+running at session start). Inspect any VM with `limactl shell <VM_NAME>`.
 
 **Mayor assigns VM and port at dispatch time.** Run `limactl list` to see which VMs are
 running; pick an unused or stopped one. Pass the VM name, port, and kubelet port in the
@@ -969,7 +969,7 @@ without both will be rejected.
 
 For script-only beads (no server restart needed): run the commands via
 `limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
-and include at least one `limactl shell` / mcp tool output in your return.
+and include at least one `limactl shell` output in your return.
 
 **Final step:** after `reset.sh --host-only --port <PORT>`, run `limactl stop <VM_NAME>`
 (skip only if the brief says to leave the VM up for an immediate continuation round).
@@ -978,7 +978,7 @@ and include at least one `limactl shell` / mcp tool output in your return.
 ### Mayor enforcement at return-review time
 
 When a worker returns from a VM/sonobuoy-touching bead:
-- Check the return for sonobuoy delete output or `mcp__<VM_NAME>__run_shell_command` evidence.
+- Check the return for sonobuoy delete output or `limactl shell <VM_NAME>` evidence.
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
   evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
 - Confirm evacuation and inline facts per "Final step". If a return's evidence exists
@@ -1100,10 +1100,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - **Mayor "gets into the flow" and codes instead of dispatching.** The
   four-condition exception test is easy to rationalize past once the mayor has
   already read several files. The fourth condition (≤2 files read) is the
-  circuit breaker. Workers have their own assigned VM with MCP access and can
+  circuit breaker. Workers have their own assigned VM and can
   debug live. Write a better brief.
 - **Workers guess at VM behaviour instead of observing it.**
-  `mcp__<VM_NAME>__*` and `limactl shell <VM_NAME>` are both available. Inject
+  `limactl shell <VM_NAME>` is the tool. Inject
   the Lima VM protocol block for any bead touching `scripts/conformance/`,
   `scripts/*-start.sh`, or sonobuoy-exercised handlers.
 - **Workers hard-code `lima-node`, port `6443`, or kubelet port `10250`.** Each worker gets an
