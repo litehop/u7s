@@ -24,6 +24,7 @@ pub struct ResourceType {
     pub version: String,
     pub plural: String,
     pub kind: String,
+    pub namespaced: bool,
 }
 
 impl ResourceType {
@@ -70,6 +71,7 @@ pub fn parse_resources(group: &str, version: &str, doc: &Value) -> Vec<ResourceT
                 version: version.to_string(),
                 plural: r["name"].as_str()?.to_string(),
                 kind: r["kind"].as_str()?.to_string(),
+                namespaced: r["namespaced"].as_bool().unwrap_or(false),
             })
         })
         .collect()
@@ -130,7 +132,7 @@ pub fn k3s_version(nodes: &[Value]) -> anyhow::Result<String> {
 }
 
 pub struct Source {
-    client: HyperApiClient,
+    pub(crate) client: HyperApiClient,
 }
 
 pub struct Listing {

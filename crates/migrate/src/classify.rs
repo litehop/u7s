@@ -170,7 +170,7 @@ pub fn namespace(o: &Value) -> Option<&str> {
     o["metadata"]["namespace"].as_str()
 }
 
-fn group_of(o: &Value) -> &str {
+pub fn group_of(o: &Value) -> &str {
     api_version(o).split_once('/').map_or("", |(g, _)| g)
 }
 
