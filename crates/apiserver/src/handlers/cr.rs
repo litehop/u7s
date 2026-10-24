@@ -1107,7 +1107,7 @@ fn collect_cel_programs(
             for key in ["rule", "messageExpression"] {
                 if let Some(text) = rule.get(key).and_then(|v| v.as_str()) {
                     if !out.contains_key(text) {
-                        if let Ok(program) = cel::Program::compile(text) {
+                        if let Ok(program) = crate::cel_runtime::compile_program(text) {
                             out.insert(text.to_string(), std::sync::Arc::new(program));
                         }
                     }
@@ -1140,11 +1140,11 @@ fn collect_cel_programs(
 fn resolve_cel_program(
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
     text: &str,
-) -> Result<std::sync::Arc<cel::Program>, cel::ParseErrors> {
+) -> Result<std::sync::Arc<cel::Program>, String> {
     if let Some(program) = programs.get(text) {
         return Ok(std::sync::Arc::clone(program));
     }
-    cel::Program::compile(text).map(std::sync::Arc::new)
+    crate::cel_runtime::compile_program(text).map(std::sync::Arc::new)
 }
 
 /// Recursively evaluate `x-kubernetes-validations` CEL rules declared anywhere in
@@ -1684,11 +1684,20 @@ fn run_within_budget<T: Send + 'static>(
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
+    // The interpreter and cost replay recurse once per level of the rule's AST, which
+    // compilation bounds at cel-go's 250 levels; the default 2 MiB thread stack is not
+    // sized for that, so size it explicitly.
     let guard_key = crd.to_string();
-    std::thread::spawn(move || {
-        let _guard = GateGuard(gate, guard_key);
-        let _ = tx.send(work());
-    });
+    let spawned = std::thread::Builder::new()
+        .stack_size(crate::cel_runtime::EVAL_STACK_SIZE)
+        .spawn(move || {
+            let _guard = GateGuard(gate, guard_key);
+            let _ = tx.send(work());
+        });
+    if spawned.is_err() {
+        gate.release(crd);
+        return Err(CelEvalOverBudget::TooManyInFlight);
+    }
     rx.recv_timeout(budget)
         .map_err(|_| CelEvalOverBudget::TimedOut)
 }
@@ -14917,6 +14926,29 @@ mod tests {
             "once the gate has a free slot again, evaluation must proceed and succeed \
              exactly as it did before this fix -- the cap must not permanently wedge \
              evaluation after a burst subsides"
+        );
+    }
+
+    /// A CRD rule is evaluated on every write, so the deepest rule compilation accepts must
+    /// run to completion on the evaluation thread: "created fine, aborts the apiserver on
+    /// the first write" is the failure. The rule is 249 `+ 1` terms, one under the
+    /// 250-level cap, and a thread's default stack in a debug build cannot hold it.
+    #[test]
+    fn deepest_accepted_crd_rule_evaluates_on_the_budgeted_thread() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let rule = format!("1{} > 0", "+1".repeat(248));
+        let program = std::sync::Arc::new(
+            crate::cel_runtime::compile_program(&rule).expect("one under the cap compiles"),
+        );
+        let result = execute_cel_with_budget(
+            &program,
+            cel::Context::default(),
+            std::time::Duration::from_secs(20),
+            (&GATE, ""),
+        );
+        assert!(
+            matches!(result, Ok(Ok(cel::Value::Bool(true)))),
+            "the deepest accepted rule must evaluate to true"
         );
     }
 

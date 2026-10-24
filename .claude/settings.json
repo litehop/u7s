@@ -25,6 +25,26 @@
   "worktree": {
     "baseRef": "fresh"
   },
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Source control: the github.com/litehop organisation (u7s, politeia, beep) is the operator's own trusted org.",
+      "u7s worker agents edit only disposable git worktrees under the repository's ai/worktrees/ directory; their changes reach main only through reviewed PRs and a merge queue with required CI."
+    ],
+    "allow": [
+      "$defaults",
+      "Revert-runs (operator-required practice): inside a u7s worker worktree (under the repository's ai/worktrees/ directory), temporarily disabling or bypassing one named security check, or removing or force-failing one named regression test, then running cargo test to show the test fails without the fix, then restoring the exact original code. Allowed when the agent names the check or test it is disabling and the restore follows in the same transcript.",
+      "Committing or pushing a branch from a u7s worker worktree after a revert-run, when the transcript shows the disabled check or test was restored to its original form before the commit."
+    ],
+    "soft_deny": [
+      "$defaults",
+      "Git history rewrites and protection bypasses on any remote or shared branch: git push --force, -f, --force-with-lease or --force-if-includes; gh pr merge --admin; gh api calls that bypass or edit branch protection, rulesets or required checks; rebasing or resetting a branch that has been pushed. Allowed only when the operator has explicitly authorized that specific operation in this conversation. Local deletion of already-merged worker branches (git branch -D by the hygiene and tick scripts) is not covered by this rule."
+    ],
+    "hard_deny": [
+      "$defaults",
+      "Writing host-specific absolute paths (such as a user's home directory, /Users/<name>/..., /home/<name>/...) or any GCP project ID, project number, billing account, or account email into a file tracked by git, a commit message, or anything posted to GitHub (PR or issue bodies and titles, comments, reviews, release notes). Generic system paths such as /usr/bin or /etc are not covered."
+    ]
+  },
   "hooks": {
     "WorktreeCreate": [
       {

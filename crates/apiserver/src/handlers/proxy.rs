@@ -3145,8 +3145,8 @@ pub fn service_port_name(
         })
 }
 
-/// The EndpointSlice port number whose name equals `port_name`. A slice port without a
-/// `name` never matches, even for the empty name.
+/// The EndpointSlice port number whose name equals `port_name`. A slice port whose `name`
+/// key is absent never matches (even for the empty name); an explicit `""` does.
 pub fn resolve_eps_port(eps_ports: &serde_json::Value, port_name: &str) -> Option<u16> {
     eps_ports
         .as_array()?
@@ -3154,6 +3154,38 @@ pub fn resolve_eps_port(eps_ports: &serde_json::Value, port_name: &str) -> Optio
         .find(|p| p["name"].as_str() == Some(port_name))
         .and_then(|p| p["port"].as_u64())
         .and_then(|p| u16::try_from(p).ok())
+}
+
+/// Upstream's `isValidAddress`: the service proxy only dials endpoints that are actually
+/// pods. The endpoint needs a `targetRef` in the request namespace naming an existing pod
+/// whose `status.podIPs` contains `addresses[0]`; otherwise anyone able to write an
+/// EndpointSlice could make the apiserver connect to an arbitrary internal address.
+async fn endpoint_backed_by_pod<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    ep: &serde_json::Value,
+) -> bool {
+    let target = &ep["targetRef"];
+    let Some(pod_name) = target["name"].as_str() else {
+        return false;
+    };
+    if target["namespace"].as_str() != Some(ns) {
+        return false;
+    }
+    let Some(addr) = ep["addresses"][0].as_str() else {
+        return false;
+    };
+    let Ok(Some(entry)) = state.store.get(&object_key("pods", ns, pod_name)).await else {
+        return false;
+    };
+    let Ok(pod) = serde_json::from_slice::<serde_json::Value>(&entry.value) else {
+        return false;
+    };
+    let status = &pod["status"];
+    match status["podIPs"].as_array().filter(|a| !a.is_empty()) {
+        Some(ips) => ips.iter().any(|p| p["ip"].as_str() == Some(addr)),
+        None => status["podIP"].as_str() == Some(addr),
+    }
 }
 
 pub async fn resolve_service_proxy_target<S: Store>(
@@ -3208,6 +3240,9 @@ pub async fn resolve_service_proxy_target<S: Store>(
         if let Some(endpoints) = eps["endpoints"].as_array() {
             for ep in endpoints {
                 if ep["conditions"]["ready"].as_bool() == Some(false) {
+                    continue;
+                }
+                if !endpoint_backed_by_pod(state, ns, ep).await {
                     continue;
                 }
                 // Skip (rather than dial) an endpoint whose address fails
@@ -9336,7 +9371,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "my-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": [backend_ip.to_string()], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(&state, &backend_ip.to_string()).await],
             "ports": [{"name": "", "port": ep_port, "protocol": "TCP"}]
         });
         state
@@ -10656,10 +10691,7 @@ mod tests {
             },
             "addressType": "IPv4",
             "endpoints": [
-                {
-                    "addresses": ["10.2.3.4"],
-                    "conditions": {"ready": true, "serving": true, "terminating": false}
-                }
+                endpoint_for_pod(&state, "10.2.3.4").await
             ],
             "ports": [{"name": "", "port": 8080, "protocol": "TCP"}]
         });
@@ -10802,7 +10834,7 @@ mod tests {
             },
             "addressType": "IPv4",
             "endpoints": [
-                {"addresses": ["127.0.0.1"], "conditions": {"ready": true}}
+                endpoint_for_pod(&state, "127.0.0.1").await
             ],
             "ports": [{"name": "", "port": 8080, "protocol": "TCP"}]
         });
@@ -10954,7 +10986,7 @@ mod tests {
             },
             "addressType": "IPv4",
             "endpoints": [
-                {"addresses": [backend_ip.to_string()], "conditions": {"ready": true}}
+                endpoint_for_pod(&state, &backend_ip.to_string()).await
             ],
             "ports": [{"name": "", "port": ep_port, "protocol": "TCP"}]
         });
@@ -11236,7 +11268,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(state, "10.0.0.1").await],
             "ports": eps_ports
         });
         state
@@ -11501,10 +11533,7 @@ mod tests {
             },
             "addressType": "IPv4",
             "endpoints": [
-                {
-                    "addresses": ["10.2.3.4"],
-                    "conditions": {"ready": true, "serving": true, "terminating": false}
-                }
+                endpoint_for_pod(&state, "10.2.3.4").await
             ],
             "ports": [{"name": "portname1", "port": 8080, "protocol": "TCP"}]
         });
@@ -11572,7 +11601,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "num-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(&state, "10.0.0.1").await],
             "ports": [{"name": "", "port": 9090, "protocol": "TCP"}]
         });
         state
@@ -11639,7 +11668,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "proxy-test-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["10.9.9.9"], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(&state, "10.9.9.9").await],
             "ports": [{"name": "web", "port": 8080, "protocol": "TCP"}]
         });
         state
@@ -11709,7 +11738,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "tls-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["10.9.9.9"], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(&state, "10.9.9.9").await],
             "ports": [{"name": "web", "port": 443, "protocol": "TCP"}]
         });
         state
@@ -11800,7 +11829,7 @@ mod tests {
                 "labels": {"kubernetes.io/service-name": "my-svc"}
             },
             "addressType": "IPv4",
-            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": true}}],
+            "endpoints": [endpoint_for_pod(&state, "10.0.0.1").await],
             "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
         });
         state
@@ -11982,6 +12011,199 @@ mod tests {
             .unwrap();
     }
 
+    /// Seeds a pod in `default` whose `status.podIPs` is `[ip]` and returns the ready
+    /// EndpointSlice endpoint that targets it, as the endpoint-slice controller would write.
+    async fn endpoint_for_pod(state: &AppState, ip: &str) -> serde_json::Value {
+        let name = format!("backend-{}", ip.replace('.', "-"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+            "status": {"podIP": ip, "podIPs": [{"ip": ip}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", &name),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        serde_json::json!({
+            "addresses": [ip],
+            "conditions": {"ready": true},
+            "targetRef": {"kind": "Pod", "namespace": "default", "name": name}
+        })
+    }
+
+    async fn seed_svc_with_slice(
+        state: &AppState,
+        endpoints: serde_json::Value,
+        ports: serde_json::Value,
+    ) {
+        let svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
+            "metadata": {"name": "svc-abc", "namespace": "default", "resourceVersion": "1",
+                         "labels": {"kubernetes.io/service-name": "svc"}},
+            "addressType": "IPv4",
+            "endpoints": endpoints,
+            "ports": ports
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn unnamed_port() -> serde_json::Value {
+        serde_json::json!([{"name": "", "port": 8080, "protocol": "TCP"}])
+    }
+
+    /// A slice endpoint with no `targetRef` must never be dialed: anyone with
+    /// EndpointSlice write access could otherwise aim the apiserver at node IPs,
+    /// other ClusterIPs or etcd.
+    #[tokio::test]
+    async fn service_proxy_refuses_endpoint_without_target_ref() {
+        let state = make_state();
+        seed_svc_with_slice(
+            &state,
+            serde_json::json!([{"addresses": ["10.7.7.7"], "conditions": {"ready": true}}]),
+            unnamed_port(),
+        )
+        .await;
+        let err = resolve_service_proxy_target(&state, "default", "svc")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 503, "a non-pod endpoint must yield 503");
+    }
+
+    /// A targetRef to a pod that does not exist proves nothing about the address.
+    #[tokio::test]
+    async fn service_proxy_refuses_endpoint_targeting_missing_pod() {
+        let state = make_state();
+        seed_svc_with_slice(
+            &state,
+            serde_json::json!([{
+                "addresses": ["10.7.7.7"], "conditions": {"ready": true},
+                "targetRef": {"kind": "Pod", "namespace": "default", "name": "ghost"}
+            }]),
+            unnamed_port(),
+        )
+        .await;
+        assert!(
+            resolve_service_proxy_target(&state, "default", "svc")
+                .await
+                .is_err(),
+            "an endpoint whose pod does not exist must not be dialed"
+        );
+    }
+
+    /// The targetRef namespace must equal the request namespace, otherwise a user could
+    /// borrow a pod's IP from a namespace they cannot reach to launder an address.
+    #[tokio::test]
+    async fn service_proxy_refuses_target_ref_in_other_namespace() {
+        let state = make_state();
+        let mut ep = endpoint_for_pod(&state, "10.7.7.7").await;
+        ep["targetRef"]["namespace"] = serde_json::json!("other");
+        seed_svc_with_slice(&state, serde_json::json!([ep]), unnamed_port()).await;
+        assert!(
+            resolve_service_proxy_target(&state, "default", "svc")
+                .await
+                .is_err(),
+            "a targetRef outside the request namespace must be rejected"
+        );
+    }
+
+    /// The pod exists but its IP differs from the endpoint address: the slice is claiming
+    /// a pod identity for an address the pod does not own, i.e. an SSRF attempt.
+    #[tokio::test]
+    async fn service_proxy_refuses_endpoint_address_not_in_pod_ips() {
+        let state = make_state();
+        let mut ep = endpoint_for_pod(&state, "10.7.7.7").await;
+        ep["addresses"] = serde_json::json!(["10.96.0.1"]);
+        seed_svc_with_slice(&state, serde_json::json!([ep]), unnamed_port()).await;
+        assert!(
+            resolve_service_proxy_target(&state, "default", "svc")
+                .await
+                .is_err(),
+            "an address that is not one of the target pod's podIPs must be rejected"
+        );
+    }
+
+    /// Invalid endpoints are skipped, not fatal: one forged entry must not take the
+    /// Service down while a valid pod-backed endpoint remains.
+    #[tokio::test]
+    async fn service_proxy_skips_invalid_endpoints_and_uses_the_pod_backed_one() {
+        let state = make_state();
+        let good = endpoint_for_pod(&state, "10.7.7.7").await;
+        seed_svc_with_slice(
+            &state,
+            serde_json::json!([
+                {"addresses": ["10.96.0.1"], "conditions": {"ready": true}},
+                good
+            ]),
+            unnamed_port(),
+        )
+        .await;
+        let (ip, _, _, _) = resolve_service_proxy_target(&state, "default", "svc")
+            .await
+            .expect("the valid endpoint must be selected");
+        assert_eq!(ip, "10.7.7.7");
+    }
+
+    /// Upstream's RandomEndpoint requires `name != nil`: a slice port with the `name` key
+    /// absent never matches, while an explicit empty name matches an omitted URL port.
+    #[tokio::test]
+    async fn service_proxy_slice_port_without_name_key_never_matches() {
+        let state = make_state();
+        let ep = endpoint_for_pod(&state, "10.7.7.7").await;
+        seed_svc_with_slice(
+            &state,
+            serde_json::json!([ep]),
+            serde_json::json!([{"port": 8080, "protocol": "TCP"}]),
+        )
+        .await;
+        assert!(
+            resolve_service_proxy_target(&state, "default", "svc")
+                .await
+                .is_err(),
+            "a slice port with no name key must not match the empty port name"
+        );
+        assert_eq!(
+            resolve_eps_port(&serde_json::json!([{"name": "", "port": 8080}]), ""),
+            Some(8080),
+            "an explicitly empty slice port name matches the empty port name"
+        );
+        assert_eq!(
+            resolve_eps_port(&serde_json::json!([{"port": 8080}]), ""),
+            None
+        );
+    }
+
     async fn make_state_with_ca() -> AppState {
         let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
         let mut state = make_state();
@@ -12056,7 +12278,7 @@ mod tests {
                 "metadata": {"name": "my-svc-abc", "namespace": "default", "resourceVersion": "1",
                              "labels": {"kubernetes.io/service-name": "my-svc"}},
                 "addressType": "IPv4",
-                "endpoints": [{"addresses": ["10.0.0.2"], "conditions": {"ready": true}}],
+                "endpoints": [endpoint_for_pod(&state, "10.0.0.2").await],
                 "ports": [{"name": "", "port": 8080, "protocol": "TCP"}]
             }),
         )

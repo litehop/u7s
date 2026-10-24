@@ -557,6 +557,87 @@ fn deeply_nested_expressions_error_instead_of_overflowing_the_stack() {
     assert_eq!(eval(&ok), "1");
 }
 
+/// The shapes that nest an AST without nesting the parser's `expr` rule, which the
+/// parser's own cap counts: member-call chains, field selections, and left-associated
+/// binary operators.
+fn nesting_shapes(n: usize) -> Vec<(&'static str, String)> {
+    vec![
+        ("call chain", format!("'x'{}", ".lowerAscii()".repeat(n))),
+        ("ternary chain", format!("{}1", "true ? 2 : ".repeat(n))),
+        ("left-assoc sum", format!("1{}", "+1".repeat(n))),
+        ("list nest", format!("{}1{}", "[".repeat(n), "]".repeat(n))),
+        (
+            "map nest",
+            format!("{}1{}", "{'a':".repeat(n), "}".repeat(n)),
+        ),
+    ]
+}
+
+/// A rule nested past cel-go's `MaxRecursionDepth` must be rejected at compile time with
+/// upstream's text. Without the bound it is accepted, and evaluating or dropping it
+/// recurses once per level on a request thread's 512 KiB stack: the process aborts.
+#[test]
+fn expression_nesting_past_upstream_limit_is_rejected_with_upstream_message() {
+    for (shape, expr) in nesting_shapes(1000) {
+        let err = super::parse::parse(&expr).expect_err(shape);
+        assert!(
+            err.contains("max recursion depth exceeded") || err.contains("Recursion limit"),
+            "{shape}: {err}"
+        );
+        let err = super::compile_program(&expr).expect_err(shape);
+        assert!(
+            err.contains("max recursion depth exceeded") || err.contains("Recursion limit"),
+            "{shape} (CRD path): {err}"
+        );
+    }
+    let err =
+        super::compile_program(&format!("'x'{}", ".lowerAscii()".repeat(300))).expect_err("depth");
+    assert_eq!(
+        err,
+        "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded"
+    );
+}
+
+/// cel-go counts code points, not bytes: a 100k-character rule of 3-byte characters is
+/// within the limit, one more character is not. A byte count would reject legitimate
+/// non-ASCII rules; no count would let a megabyte rule through to the parser.
+#[test]
+fn expression_size_limit_counts_code_points_like_upstream() {
+    let inside = format!("'{}'", "あ".repeat(99_998));
+    assert!(super::compile_program(&inside).is_ok());
+    let over = format!("'{}'", "あ".repeat(99_999));
+    assert_eq!(
+        super::compile_program(&over).expect_err("over limit"),
+        "compilation failed: ERROR: <input>:-1:0: expression code point size exceeds limit: \
+         size: 100001, limit 100000"
+    );
+}
+
+/// Whatever the compiler accepts must evaluate on the stack a request or blocking thread
+/// really has (`main.rs` `thread_stack_size`): "accepted at create, aborts at write" is
+/// the failure this guards. A debug build's frames are too large to finish the deepest
+/// shapes there, so the evaluator may refuse them, but only with an error.
+#[test]
+fn deepest_accepted_expression_evaluates_on_a_production_sized_stack() {
+    for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
+        let deepest = (1..=super::parse::MAX_RECURSION_DEPTH)
+            .rev()
+            .map(|n| nesting_shapes(n).swap_remove(i).1)
+            .find(|e| super::parse::parse(e).is_ok())
+            .expect(shape);
+        assert!(deepest.len() > 100, "{shape}: not deep enough to matter");
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || eval(&deepest))
+            .unwrap();
+        let out = handle.join().unwrap_or_else(|_| panic!("{shape} panicked"));
+        assert!(
+            !out.starts_with("error") || out == "error: expression nests too deeply",
+            "{shape}: {out}"
+        );
+    }
+}
+
 #[test]
 fn maps_built_by_expressions_round_trip_to_json() {
     let env = Env::new(vec![]);
