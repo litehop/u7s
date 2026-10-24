@@ -5377,7 +5377,11 @@ pub async fn put_cr_status<S: Store>(
         }
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
+    crate::handlers::status::merge_incoming_metadata(
+        &mut current,
+        &incoming,
+        cr_ctx.is_none().then_some(kind.as_str()),
+    );
 
     if let Some(old) = &csr_before {
         crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
@@ -5579,7 +5583,13 @@ pub async fn patch_cr_status<S: Store>(
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
     let ssa_plan = crate::handlers::status::plan_status_apply(
-        &headers, is_ssa, &current, &patch, &group, &version,
+        &headers,
+        is_ssa,
+        &current,
+        &patch,
+        &group,
+        &version,
+        cr_ctx.is_none().then_some(kind.as_str()),
     )?;
 
     match patch_type {
@@ -5605,7 +5615,11 @@ pub async fn patch_cr_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
+            crate::handlers::status::merge_incoming_metadata(
+                &mut current,
+                &patch,
+                cr_ctx.is_none().then_some(kind.as_str()),
+            );
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -15894,6 +15908,40 @@ mod tests {
         assert_eq!(
             second["spec"]["color"], "blue",
             "/status must not touch spec"
+        );
+    }
+
+    /// Upstream's custom-resource status strategy resets all of `metadata` and `spec`: a
+    /// status apply carrying an annotation and a spec change must land only the status, and
+    /// own nothing but it. Before, the annotation landed under no manager.
+    #[tokio::test]
+    async fn cr_status_apply_drops_metadata_and_spec() {
+        let state = make_state();
+        seed_ssa_widget(&state).await;
+        let out = cr_status_apply(
+            &state,
+            "ctrl",
+            false,
+            "metadata:\n  annotations:\n    sneaked: \"1\"\nspec:\n  color: red\nstatus:\n  readyToUse: true\n".into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status apply must succeed: {e:?}"));
+        assert_eq!(out["status"]["readyToUse"], true);
+        assert_eq!(
+            out["spec"]["color"], "blue",
+            "status apply must not change spec"
+        );
+        assert!(
+            out["metadata"].get("annotations").is_none(),
+            "a CR status apply must not land metadata: {}",
+            out["metadata"]
+        );
+        let owned =
+            &crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("status"))
+                .unwrap()["fieldsV1"];
+        assert!(
+            owned.get("f:metadata").is_none() && owned.get("f:spec").is_none(),
+            "reset fields must never be owned: {owned}"
         );
     }
 

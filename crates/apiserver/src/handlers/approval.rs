@@ -59,24 +59,25 @@ fn record_approval_write(
     );
 }
 
-/// An apply to `/approval` owns the conditions it names; the rest of `status` and `spec`
-/// belong to other subresources.
+/// An apply to `/approval` owns the conditions and the metadata it writes; the rest of
+/// `status` and `spec` belong to other subresources.
 fn plan_approval_apply(
     headers: &HeaderMap,
     live: &serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<crate::field_manager::ApplyPlan, crate::status::StatusError> {
-    let mut applied = serde_json::Map::new();
-    if let Some(conditions) = patch.get("status").and_then(|s| s.get("conditions")) {
-        applied.insert(
-            "status".into(),
-            serde_json::json!({ "conditions": conditions }),
-        );
+    let mut applied = crate::handlers::status::status_write_fields(patch, Some(KIND), "approval");
+    let conditions = applied["status"].get("conditions").cloned();
+    match conditions {
+        Some(c) => applied["status"] = serde_json::json!({ "conditions": c }),
+        None => {
+            applied.as_object_mut().map(|o| o.remove("status"));
+        }
     }
     crate::field_manager::WriteIdentity::new(None, headers).plan_subresource_apply(
         live,
-        &serde_json::Value::Object(applied),
-        &["status"],
+        &applied,
+        &["status", "metadata"],
         "certificates.k8s.io/v1",
         "approval",
         None,
@@ -166,7 +167,7 @@ pub async fn put_approval<S: Store>(
         &old_body,
         &crate::util::utc_now_rfc3339(),
     );
-    merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
     current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
     record_approval_write(&headers, &old_body, &mut current.body, None);
 
@@ -266,7 +267,7 @@ pub async fn patch_approval<S: Store>(
             }
             // Merge metadata (labels/annotations) from the patch — kubectl certificate
             // approve/deny and this conformance test also patch annotations via /approval.
-            merge_incoming_metadata(&mut current.body, &patch, KIND);
+            merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
         }
     }
 
@@ -953,6 +954,26 @@ mod tests {
             managed_entry(&out, "ctrl", "Apply", None).is_none()
                 && managed_entry(&out, "ctrl", "Apply", Some("status")).is_none(),
             "approval must not be recorded under the main or status entry"
+        );
+    }
+
+    /// /approval takes annotations from an apply as well as conditions (upstream resets only
+    /// `spec` and `status.certificate`), so the approver must own the annotation it wrote.
+    #[tokio::test]
+    async fn approval_apply_owns_annotation_it_writes() {
+        let state = make_state();
+        seed_csr(&state.store, "annotated-csr", None).await;
+        let yaml = format!("metadata:\n  annotations:\n    note: \"1\"\n{APPROVE_YAML}");
+        let out = approval_apply(&state, "annotated-csr", "ctrl", false, yaml)
+            .await
+            .unwrap_or_else(|e| panic!("approval apply must succeed: {e:?}"));
+        assert_eq!(out["metadata"]["annotations"]["note"], "1");
+        let entry =
+            crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("approval"))
+                .unwrap();
+        assert!(
+            entry["fieldsV1"]["f:metadata"]["f:annotations"]["f:note"].is_object(),
+            "annotation landed through /approval must be owned: {entry}"
         );
     }
 

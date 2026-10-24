@@ -886,7 +886,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
     crate::handlers::status::merge_incoming_metadata(
         &mut current.body,
         &incoming.body,
-        "Namespace",
+        Some("Namespace"),
     );
 
     current.body = admit_namespace_status(
@@ -953,8 +953,15 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, Some(&name))?;
-    let ssa_plan =
-        super::status::plan_status_apply(&headers, is_ssa, &current.body, &patch, "", "v1")?;
+    let ssa_plan = super::status::plan_status_apply(
+        &headers,
+        is_ssa,
+        &current.body,
+        &patch,
+        "",
+        "v1",
+        Some("Namespace"),
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -985,7 +992,7 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             crate::handlers::status::merge_incoming_metadata(
                 &mut current.body,
                 &patch,
-                "Namespace",
+                Some("Namespace"),
             );
         }
     }

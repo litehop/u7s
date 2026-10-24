@@ -389,14 +389,58 @@ fn display_path(path: &[String]) -> String {
     s
 }
 
+/// The fields a write through `subresource` (`None` is the main resource) neither takes nor
+/// owns, as upstream's per-strategy `GetResetFields` (release-1.37). `kind` is the built-in
+/// kind; `None` is a custom resource. The main resource of every kind with a status
+/// subresource resets `status`; custom resources' `/status` resets all of `metadata`.
+///
+/// Not mirrored: the main strategies of `CertificateSigningRequest` also reset `spec`, which
+/// would leave a CSR created by apply with an unowned spec.
+pub(crate) fn reset_fields(
+    kind: Option<&str>,
+    subresource: Option<&str>,
+) -> &'static [&'static [&'static str]] {
+    match (kind, subresource) {
+        (_, None) => &[&["status"]],
+        (None, Some(_)) => &[&["metadata"], &["spec"]],
+        (Some("Deployment"), Some("status")) => &[&["spec"], &["metadata", "labels"]],
+        (Some("Pod"), Some("status")) => &[
+            &["spec"],
+            &["metadata", "deletionTimestamp"],
+            &["metadata", "ownerReferences"],
+        ],
+        (Some("CertificateSigningRequest"), Some("status")) => {
+            &[&["spec"], &["status", "conditions"]]
+        }
+        (Some("CertificateSigningRequest"), Some("approval")) => {
+            &[&["spec"], &["status", "certificate"]]
+        }
+        (Some(_), Some(_)) => &[&["spec"]],
+    }
+}
+
+/// Remove each of `paths` (object members, outermost first) from `body`.
+pub(crate) fn strip_paths(body: &mut Value, paths: &[&[&str]]) {
+    for path in paths {
+        let Some((last, parents)) = path.split_last() else {
+            continue;
+        };
+        let mut at = Some(&mut *body);
+        for p in parents {
+            at = at.and_then(|v| v.get_mut(*p));
+        }
+        if let Some(o) = at.and_then(Value::as_object_mut) {
+            o.remove(*last);
+        }
+    }
+}
+
 /// The part of an apply body the apply actually manages: a kind with a status subresource
 /// never takes `status` from a main-resource write, so it owns nothing there.
 pub(crate) fn applied_fields(body: &Value, has_status_subresource: bool) -> Value {
     let mut applied = body.clone();
     if has_status_subresource {
-        if let Some(o) = applied.as_object_mut() {
-            o.remove("status");
-        }
+        strip_paths(&mut applied, reset_fields(None, None));
     }
     applied
 }

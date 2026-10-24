@@ -2634,7 +2634,7 @@ pub(crate) async fn replace_pod_status<S: Store>(
                 .expect("Pod is always registered in status_dispatch")?;
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, "Pod");
+    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, Some("Pod"));
     current_obj.body = admit_pod_status_update(
         &state,
         ns.as_str(),
@@ -2805,7 +2805,7 @@ pub(crate) fn apply_status_patch(
     // finalizer), so without this guard every kubelet status update would restore the
     // finalizer that KCM just removed, causing a livelock where the finalizer is never
     // permanently removed and pods stay Terminating forever.
-    crate::handlers::status::merge_incoming_metadata(&mut result, patch, "Pod");
+    crate::handlers::status::merge_incoming_metadata(&mut result, patch, Some("Pod"));
 
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
@@ -2943,6 +2943,7 @@ pub(crate) async fn patch_pod_status<S: Store>(
             &patch,
             "",
             "v1",
+            Some("Pod"),
         )?;
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
         if let Some(plan) = &ssa_plan {
@@ -15975,6 +15976,46 @@ mod handler_tests {
         assert_eq!(
             second["spec"]["containers"][0]["image"], "nginx",
             "pods/status must never touch spec"
+        );
+    }
+
+    /// Upstream's pod status strategy resets `ownerReferences` (old kubelets corrupt them and
+    /// break garbage collection) but lets annotations through: the applier lands and owns
+    /// the annotation and never the owner references.
+    #[tokio::test]
+    async fn pod_status_apply_keeps_owner_references_and_owns_annotations() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1",
+                "ownerReferences": [{"apiVersion": "v1", "kind": "ReplicaSet", "name": "rs", "uid": "u1"}]
+            }}),
+        )
+        .await;
+        let out = pod_status_apply(
+            &state,
+            "ctrl",
+            false,
+            "metadata:\n  annotations:\n    note: \"1\"\n  ownerReferences:\n  - apiVersion: v1\n    kind: ReplicaSet\n    name: other\n    uid: u2\nstatus:\n  message: m\n".into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status apply must succeed: {e:?}"));
+        assert_eq!(
+            out["metadata"]["ownerReferences"][0]["name"], "rs",
+            "pods/status must not rewrite ownerReferences"
+        );
+        assert_eq!(out["metadata"]["annotations"]["note"], "1");
+        let owned =
+            &crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("status"))
+                .unwrap()["fieldsV1"];
+        assert!(
+            owned["f:metadata"]["f:annotations"]["f:note"].is_object()
+                && owned["f:metadata"].get("f:ownerReferences").is_none(),
+            "the annotation is owned, ownerReferences never: {owned}"
         );
     }
 

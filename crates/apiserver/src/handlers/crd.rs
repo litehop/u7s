@@ -1718,7 +1718,7 @@ pub async fn put_crd_status<S: Store>(
         &incoming.body["status"],
     )?;
 
-    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, KIND);
+    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
     current.body = admit_crd_status(
         &state,
         &name,
@@ -1797,6 +1797,7 @@ pub async fn patch_crd_status<S: Store>(
         &patch,
         GROUP,
         "v1",
+        Some(KIND),
     )?;
 
     match patch_type {
@@ -1824,7 +1825,7 @@ pub async fn patch_crd_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, KIND);
+            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
         }
     }
     if let Some(plan) = &ssa_plan {
