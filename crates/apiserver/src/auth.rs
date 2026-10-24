@@ -1,7 +1,7 @@
 // Authentication + Authorization tower middleware layer.
 //
 // Implements static bearer-token authentication (--token-auth-file),
-// RS256 JWT verification for service-account tokens, and x509 client
+// ES256 JWT verification for service-account tokens, and x509 client
 // certificate authentication.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, Validation};
 use serde::Deserialize;
 use tower::Layer;
 use tower_service::Service;
@@ -24,6 +24,7 @@ use crate::keys::object_key;
 use crate::metrics::record_request_total;
 use crate::node_authz::{self, NodeGraph};
 use crate::rbac::{AuthzRequest, RbacIndex};
+use crate::sa_keys::SaKeyring;
 use crate::sa_sig_cache::{self, SigCache};
 use crate::state::{DiscoveryCache, FlowControlCache};
 use crate::status::Status;
@@ -280,7 +281,7 @@ pub(crate) fn begin_token_verification<'a>(
 pub(crate) async fn authenticate<S: Store>(
     auth_header: Option<&str>,
     token_map: &HashMap<String, UserInfo>,
-    sa_decoding_key: Option<&DecodingKey>,
+    sa_keys: Option<&SaKeyring>,
     peer_cert: Option<&PeerCertificate>,
     store: &S,
     sig_cache: &SigCache,
@@ -326,8 +327,8 @@ pub(crate) async fn authenticate<S: Store>(
         return AuthnResult::Identified(user);
     }
     // 2. If a SA decoding key is available, attempt JWT verification.
-    if let Some(key) = sa_decoding_key {
-        if let Some(user) = try_verify_sa_jwt(token, key, &[], store, sig_cache).await {
+    if let Some(keys) = sa_keys {
+        if let Some(user) = try_verify_sa_jwt(token, keys, &[], store, sig_cache).await {
             return AuthnResult::Identified(user);
         }
     }
@@ -427,7 +428,7 @@ pub(crate) fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
 pub async fn authenticate_token_with_audiences<S: Store>(
     token: &str,
     token_map: &HashMap<String, UserInfo>,
-    sa_decoding_key: Option<&DecodingKey>,
+    sa_keys: Option<&SaKeyring>,
     audiences: &[String],
     store: &S,
     sig_cache: &SigCache,
@@ -442,7 +443,7 @@ pub async fn authenticate_token_with_audiences<S: Store>(
         }
         return Some(user);
     }
-    if let Some(key) = sa_decoding_key {
+    if let Some(key) = sa_keys {
         // try_verify_sa_jwt already appends system:authenticated.
         if let Some(user) = try_verify_sa_jwt(token, key, audiences, store, sig_cache).await {
             return Some(user);
@@ -553,35 +554,40 @@ async fn object_is_live_cached<S: Store>(
     live
 }
 
-/// Attempt to decode and verify a bearer token as an RS256 SA JWT.
+/// Attempt to decode and verify a bearer token as an ES256 SA JWT whose `kid` names a key in
+/// the keyring.
 /// Returns `Some(UserInfo)` on success, `None` if the token is invalid, expired, or bound to
 /// a ServiceAccount/Pod that is no longer live.
 /// `audiences` is the list of acceptable audiences; defaults to
 /// ["https://kubernetes.default.svc"] when empty.
 pub(crate) async fn try_verify_sa_jwt<S: Store>(
     token: &str,
-    key: &DecodingKey,
+    keys: &SaKeyring,
     audiences: &[String],
     store: &S,
     sig_cache: &SigCache,
 ) -> Option<UserInfo> {
-    let mut validation = Validation::new(Algorithm::RS256);
+    let Some(key) = keys.decoding_key_for(token) else {
+        tracing::debug!("SA JWT rejected: missing, unknown or non-ES256 kid/alg");
+        return None;
+    };
+    let mut validation = Validation::new(Algorithm::ES256);
     validation.set_issuer(&["https://kubernetes.default.svc"]);
     // Audience is validated manually below (against `SaClaims::aud`) rather than through
     // jsonwebtoken's own `Validation`, so the identical check runs whether the claims came
-    // from a fresh RSA verify or a signature-cache hit — see the audience check below and
+    // from a fresh signature verify or a signature-cache hit — see the audience check below and
     // `SaClaims::aud`'s doc for why a cache hit must never skip it.
     validation.validate_aud = false;
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
-    // Whole-token verify cache: skip the RSA modexp when this exact token — header, payload,
+    // Whole-token verify cache: skip the signature verification when this exact token — header, payload,
     // AND signature together — was already verified valid and the cached entry hasn't
     // reached the token's real `exp` yet (see `sa_sig_cache` module doc for the full
     // design). Keying on the whole token, not just the signature segment, is what makes a
     // cache hit trustworthy: it is only reachable by presenting byte-for-byte the same token
     // that was verified before, so a token built from a copied signature and
-    // attacker-chosen header/payload always misses and falls through to a real RSA verify.
+    // attacker-chosen header/payload always misses and falls through to a real signature verify.
     let token_key = sa_sig_cache::token_hash(token);
     let cache_hit = sig_cache.get(&token_key, std::time::Instant::now()) == Some(true);
 
@@ -589,7 +595,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
         // Cache key is sha256(whole_token), so a hit proves this exact byte-for-byte token
         // was already verified in full before — no cryptographic argument about signature
         // uniqueness is needed or trusted; the claims decoded here are the ones that were
-        // already RSA-verified the first time this token was seen. Skips the RSA verify, not
+        // already signature-verified the first time this token was seen. Skips the signature verify, not
         // claim decoding.
         match jsonwebtoken::dangerous::insecure_decode::<SaClaims>(token) {
             Ok(data) => data.claims,
@@ -600,7 +606,7 @@ pub(crate) async fn try_verify_sa_jwt<S: Store>(
         }
     } else {
         sig_cache.record_verify_attempt();
-        let data = match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
+        let data = match jsonwebtoken::decode::<SaClaims>(token, &key, &validation) {
             Ok(data) => data,
             Err(e) => {
                 tracing::debug!("SA JWT verification failed: {e}");
@@ -1017,22 +1023,24 @@ fn parse_path(path: &str) -> ParsedPath {
     // /api/v1/namespaces/{name} would be mis-classified as namespaced operations
     // with resource="" instead of cluster-scoped operations on the "namespaces"
     // resource, causing RBAC wildcard rules to never match.
-    let (namespace, resource, name, subresource) =
-        if rest.first().copied() == Some("namespaces") && rest.len() >= 3 {
-            // /namespaces/<ns>/<resource>[/<name>[/<sub>]]
-            let ns = rest.get(1).copied().unwrap_or("").to_owned();
-            let resource = rest.get(2).copied().unwrap_or("").to_owned();
-            let name = rest.get(3).map(|s| s.to_string());
-            let subresource = rest.get(4).copied().unwrap_or("").to_owned();
-            (Some(ns), resource, name, subresource)
-        } else {
-            // cluster-scoped: <resource>[/<name>[/<sub>]]
-            // Handles /namespaces, /namespaces/<name>, /nodes/<name>, etc.
-            let resource = rest.first().copied().unwrap_or("").to_owned();
-            let name = rest.get(1).map(|s| s.to_string());
-            let subresource = rest.get(2).copied().unwrap_or("").to_owned();
-            (None, resource, name, subresource)
-        };
+    let (namespace, resource, name, subresource) = if rest.first().copied() == Some("namespaces")
+        && rest.len() >= 3
+        && !(rest.len() == 3 && matches!(rest[2], "status" | "finalize"))
+    {
+        // /namespaces/<ns>/<resource>[/<name>[/<sub>]]
+        let ns = rest.get(1).copied().unwrap_or("").to_owned();
+        let resource = rest.get(2).copied().unwrap_or("").to_owned();
+        let name = rest.get(3).map(|s| s.to_string());
+        let subresource = rest.get(4).copied().unwrap_or("").to_owned();
+        (Some(ns), resource, name, subresource)
+    } else {
+        // cluster-scoped: <resource>[/<name>[/<sub>]]
+        // Handles /namespaces, /namespaces/<name>, /nodes/<name>, etc.
+        let resource = rest.first().copied().unwrap_or("").to_owned();
+        let name = rest.get(1).map(|s| s.to_string());
+        let subresource = rest.get(2).copied().unwrap_or("").to_owned();
+        (None, resource, name, subresource)
+    };
 
     ParsedPath {
         api_group,
@@ -1221,7 +1229,7 @@ fn split_service_account_username(username: &str) -> Option<(&str, &str)> {
 pub struct AuthLayer {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
-    sa_decoding_key: Option<Arc<DecodingKey>>,
+    sa_keys: Option<SaKeyring>,
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
@@ -1235,7 +1243,7 @@ impl AuthLayer {
     pub fn new(
         rbac_index: Arc<RbacIndex>,
         token_map: HashMap<String, UserInfo>,
-        sa_decoding_key: Option<Arc<DecodingKey>>,
+        sa_keys: Option<SaKeyring>,
         store: Arc<SqliteStore>,
         sig_cache: Arc<SigCache>,
         flowcontrol_cache: Arc<FlowControlCache>,
@@ -1246,7 +1254,7 @@ impl AuthLayer {
         AuthLayer {
             rbac_index,
             token_map: Arc::new(token_map),
-            sa_decoding_key,
+            sa_keys,
             store,
             sig_cache,
             flowcontrol_cache,
@@ -1265,7 +1273,7 @@ impl<S> Layer<S> for AuthLayer {
             inner,
             rbac_index: Arc::clone(&self.rbac_index),
             token_map: Arc::clone(&self.token_map),
-            sa_decoding_key: self.sa_decoding_key.clone(),
+            sa_keys: self.sa_keys.clone(),
             store: Arc::clone(&self.store),
             sig_cache: Arc::clone(&self.sig_cache),
             flowcontrol_cache: Arc::clone(&self.flowcontrol_cache),
@@ -1285,7 +1293,7 @@ pub struct AuthService<S> {
     inner: S,
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
-    sa_decoding_key: Option<Arc<DecodingKey>>,
+    sa_keys: Option<SaKeyring>,
     store: Arc<SqliteStore>,
     sig_cache: Arc<SigCache>,
     flowcontrol_cache: Arc<FlowControlCache>,
@@ -1363,7 +1371,7 @@ where
         let rbac_index = Arc::clone(&self.rbac_index);
         let node_graph = Arc::clone(&self.node_graph);
         let token_map = Arc::clone(&self.token_map);
-        let sa_decoding_key = self.sa_decoding_key.clone();
+        let sa_keys = self.sa_keys.clone();
         let store = Arc::clone(&self.store);
         let flowcontrol_cache = Arc::clone(&self.flowcontrol_cache);
         let sig_cache = Arc::clone(&self.sig_cache);
@@ -1393,7 +1401,7 @@ where
             let authenticated_user = match authenticate(
                 auth_header,
                 &token_map,
-                sa_decoding_key.as_deref(),
+                sa_keys.as_ref(),
                 peer_cert.as_ref(),
                 store.as_ref(),
                 sig_cache.as_ref(),
@@ -2190,6 +2198,23 @@ mod tests {
         assert_eq!(p.name.as_deref(), Some("mypod"));
     }
 
+    /// `/namespaces/<name>/status|finalize` are subresources of the Namespace, not a
+    /// collection named "status" inside it (upstream's namespace-subresource special case).
+    /// Misparsed, the namespace controller's `update namespaces/finalize` grant never
+    /// matches and every namespace deletion hangs in Terminating.
+    #[test]
+    fn parse_path_treats_namespace_status_and_finalize_as_subresources() {
+        for sub in ["status", "finalize"] {
+            let p = parse_path(&format!("/api/v1/namespaces/ns1/{sub}"));
+            assert_eq!(p.resource, "namespaces", "{sub}");
+            assert_eq!(p.name.as_deref(), Some("ns1"), "{sub}");
+            assert_eq!(p.subresource, sub);
+        }
+        let p = parse_path("/api/v1/namespaces/ns1/pods");
+        assert_eq!(p.resource, "pods");
+        assert_eq!(p.namespace.as_deref(), Some("ns1"));
+    }
+
     /// An encoded `/` becomes a segment boundary for the router's decoded names, so authz
     /// must split the decoded path or `n%2Fstatus` is authorized as a plain get on `n`
     /// while the backend serves `n/status`.
@@ -2775,24 +2800,58 @@ mod tests {
 
     // --- SA JWT authentication ---
 
-    /// Generate a minimal in-memory RSA-2048 key pair for use in tests.
-    fn test_rsa_keypair() -> (jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey) {
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-        let mut rng = rsa::rand_core::OsRng;
-        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
-        let priv_pem = private_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("priv pem")
-            .as_bytes()
-            .to_vec();
-        let pub_pem = private_key
-            .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
-            .expect("pub pem")
-            .into_bytes();
-        let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("enc key");
-        let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("dec key");
-        (enc, dec)
+    /// A fresh ES256 keyring for tests; returned twice (signer, verifier) because the same
+    /// ring does both.
+    fn test_rsa_keypair() -> (SaKeyring, SaKeyring) {
+        let ring = SaKeyring::for_test();
+        (ring.clone(), ring)
+    }
+
+    /// A token whose signing key has been retired must stop authenticating even though its
+    /// signature check result is cached and its `exp` is still in the future. If the cache
+    /// were consulted before the keyring, a leaked or compromised retired key's tokens would
+    /// keep working for as long as clients kept presenting them.
+    #[tokio::test]
+    async fn retired_key_token_is_rejected_even_when_its_verification_is_cached() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let now = Arc::new(AtomicI64::new(1_000_000));
+        let c = Arc::clone(&now);
+        let clock = crate::pki::Clock::new(move || {
+            time::OffsetDateTime::from_unix_timestamp(c.load(Ordering::SeqCst)).unwrap()
+        });
+        let policy = crate::sa_keys::RotationPolicy::default();
+        let ring = SaKeyring::for_test_with(policy, clock);
+        let store = make_test_store();
+        seed_service_account(&store, "default", "rot-sa", TEST_SA_UID).await;
+        let sig_cache = make_test_sig_cache();
+        let token = mint_sa_jwt(&ring, "system:serviceaccount:default:rot-sa", 3600);
+
+        assert!(try_verify_sa_jwt(&token, &ring, &[], &store, &sig_cache)
+            .await
+            .is_some());
+
+        now.fetch_add(
+            (policy.rotate_after - policy.prepublish).as_secs() as i64,
+            Ordering::SeqCst,
+        );
+        ring.tick().unwrap();
+        now.fetch_add(policy.prepublish.as_secs() as i64, Ordering::SeqCst);
+        ring.tick().unwrap();
+        assert!(
+            try_verify_sa_jwt(&token, &ring, &[], &store, &sig_cache)
+                .await
+                .is_some(),
+            "overlap: the replaced key's token must still authenticate"
+        );
+
+        now.fetch_add(policy.retire_after(), Ordering::SeqCst);
+        ring.tick().unwrap();
+        assert!(
+            try_verify_sa_jwt(&token, &ring, &[], &store, &sig_cache)
+                .await
+                .is_none(),
+            "a token from a retired key must be rejected despite a cached verification"
+        );
     }
 
     /// UID embedded in every ServiceAccount `mint_sa_jwt`/`mint_sa_jwt_with_jti` mint — tests
@@ -2805,7 +2864,7 @@ mod tests {
     /// namespace/serviceaccount claim derived from `sub` (using `TEST_SA_UID`) so the
     /// resulting token can pass the ServiceAccount liveness check once the caller seeds a
     /// matching ServiceAccount object via `seed_service_account`.
-    fn mint_sa_jwt(enc: &jsonwebtoken::EncodingKey, sub: &str, exp_offset_secs: i64) -> String {
+    fn mint_sa_jwt(enc: &SaKeyring, sub: &str, exp_offset_secs: i64) -> String {
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -2829,8 +2888,7 @@ mod tests {
                 "serviceaccount": {"name": name, "uid": TEST_SA_UID},
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT")
+        enc.sign(&claims).expect("mint JWT")
     }
 
     #[tokio::test]
@@ -2909,7 +2967,7 @@ mod tests {
 
     async fn authn_sa(
         store: &SqliteStore,
-        dec: &DecodingKey,
+        dec: &SaKeyring,
         sig_cache: &SigCache,
         token: &str,
     ) -> bool {
@@ -3100,8 +3158,7 @@ mod tests {
                 "serviceaccount": {"name": "konnectivity-agent", "uid": "ka-uid"},
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+        let token = enc.sign(&claims).expect("mint JWT");
 
         // Must fail with default (https://kubernetes.default.svc) audience.
         let result_default = authenticate_token_with_audiences(
@@ -3152,7 +3209,7 @@ mod tests {
     // fail-on-revert per Rule 9: reverting the cache-check in try_verify_sa_jwt to always
     // fall through to a full decode makes `verify_count` assertions below fail immediately.
 
-    /// The whole point of this cache is to avoid re-running the RSA modexp
+    /// The whole point of this cache is to avoid re-running the signature verification
     /// (`num_bigint_dig::biguint::monty::montgomery`, 4.4% of apiserver self-time per the
     /// 2026-08-06 samply triage) for a client that reuses the same token across many
     /// requests — this proves that actually happens, not just that auth still works.
@@ -3172,7 +3229,7 @@ mod tests {
         assert_eq!(
             sig_cache.verify_count(),
             1,
-            "the first presentation of a token must run the real RSA signature verification"
+            "the first presentation of a token must run the real signature verification"
         );
 
         for _ in 0..100 {
@@ -3187,7 +3244,7 @@ mod tests {
             1,
             "100 repeat presentations of the identical token must all hit the signature \
              cache — if this regresses, every request from a long-lived client re-pays the \
-             RSA modexp cost this cache exists to eliminate"
+             signature verification cost this cache exists to eliminate"
         );
     }
 
@@ -3225,7 +3282,7 @@ mod tests {
         assert_eq!(
             sig_cache.verify_count(),
             1,
-            "first verify must run the real RSA check"
+            "first verify must run the real signature check"
         );
 
         // Well before exp: this MUST be a cache hit. A "cache check always falls through"
@@ -3240,7 +3297,7 @@ mod tests {
             sig_cache.verify_count(),
             1,
             "a repeat call well within the token's exp must hit the signature cache, not \
-             re-run the RSA verify — if this fails, the cache is never actually being \
+             re-run the signature verify — if this fails, the cache is never actually being \
              consulted regardless of what exp does"
         );
 
@@ -3265,7 +3322,7 @@ mod tests {
 
     /// A cache keyed on the whole token must never let a tampered token piggyback on a
     /// different (valid) token's cached result — otherwise, once ANY valid token has warmed
-    /// the cache, an attacker able to flip bits in a signature could bypass RSA verification
+    /// the cache, an attacker able to flip bits in a signature could bypass signature verification
     /// entirely as long as some unrelated valid entry happens to occupy the cache. Now that
     /// the cache key covers the whole token, this passes because the changed signature bytes
     /// alone already change the key; see
@@ -3288,7 +3345,7 @@ mod tests {
         assert_eq!(
             sig_cache.verify_count(),
             1,
-            "first verify must run the real RSA check"
+            "first verify must run the real signature check"
         );
 
         // Build a NEW token string with the same header+payload but one flipped bit in the
@@ -3317,7 +3374,7 @@ mod tests {
         assert_eq!(
             sig_cache.verify_count(),
             2,
-            "a different (tampered) signature must be a cache miss and trigger a real RSA \
+            "a different (tampered) signature must be a cache miss and trigger a real signature \
              verify — a hit here would mean a tampered token could ride the valid token's \
              cached result and skip signature verification entirely"
         );
@@ -3329,7 +3386,7 @@ mod tests {
 
     /// A cache keyed on only the signature segment let an attacker copy a legitimately
     /// verified signature onto a forged header+payload for a DIFFERENT ServiceAccount and
-    /// ride the original token's cached "verified" result straight past RSA verification —
+    /// ride the original token's cached "verified" result straight past signature verification —
     /// a full authentication bypass allowing any holder of one valid SA JWT to forge tokens
     /// for any other ServiceAccount whose UID they can discover. This is the exact
     /// vulnerability the whole-token cache key closes.
@@ -3349,7 +3406,7 @@ mod tests {
         assert_eq!(
             sig_cache.verify_count(),
             1,
-            "first verify must run the real RSA check"
+            "first verify must run the real signature check"
         );
 
         // Keep the legitimate signature segment verbatim, but forge a brand-new
@@ -3367,7 +3424,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let forged_header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        let forged_header =
+            serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": dec.signing_kid()});
         let forged_payload = serde_json::json!({
             "iss": "https://kubernetes.default.svc",
             "sub": "system:serviceaccount:kube-system:cluster-admin-sa",
@@ -3402,7 +3460,7 @@ mod tests {
         );
         assert!(
             forged.is_none(),
-            "the real RSA verify must reject the forged header+payload against the replayed \
+            "the real signature verify must reject the forged header+payload against the replayed \
              signature — if this ever returned Some(_), an attacker holding one valid SA JWT \
              could authenticate as any ServiceAccount whose UID they can discover, with zero \
              knowledge of the signing key"
@@ -3531,8 +3589,7 @@ mod tests {
                 "node": {"name": "node-a", "uid": "node-uid-1"},
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+        let token = enc.sign(&claims).expect("mint JWT");
 
         let user = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache())
             .await
@@ -3603,7 +3660,7 @@ mod tests {
     /// Mint a pod-bound SA JWT with explicit ServiceAccount/pod identity, for exercising the
     /// bound-object liveness check with deliberately mismatched or absent store objects.
     fn mint_pod_bound_sa_jwt(
-        enc: &jsonwebtoken::EncodingKey,
+        enc: &SaKeyring,
         ns: &str,
         sa_name: &str,
         sa_uid: &str,
@@ -3628,8 +3685,7 @@ mod tests {
                 "pod": {"name": pod_name, "uid": pod_uid},
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        jsonwebtoken::encode(&header, &claims, enc).expect("mint pod-bound JWT")
+        enc.sign(&claims).expect("mint pod-bound JWT")
     }
 
     /// A token whose embedded ServiceAccount UID does not match the live SA's UID must be
@@ -3783,8 +3839,7 @@ mod tests {
                 "warnafter": now - 10, // already past warnafter
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+        let token = enc.sign(&claims).expect("mint JWT");
 
         let before = crate::metrics::STALE_SA_TOKENS_TOTAL.get();
         let result = try_verify_sa_jwt(&token, &dec, &[], &store, &make_test_sig_cache()).await;
@@ -3897,12 +3952,7 @@ mod tests {
 
     /// Mint a JWT that includes a `jti` claim, plus the same `kubernetes.io`
     /// namespace/serviceaccount claim `mint_sa_jwt` embeds (see `TEST_SA_UID`).
-    fn mint_sa_jwt_with_jti(
-        enc: &jsonwebtoken::EncodingKey,
-        sub: &str,
-        jti: &str,
-        exp_offset_secs: i64,
-    ) -> String {
+    fn mint_sa_jwt_with_jti(enc: &SaKeyring, sub: &str, jti: &str, exp_offset_secs: i64) -> String {
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -3927,8 +3977,7 @@ mod tests {
                 "serviceaccount": {"name": name, "uid": TEST_SA_UID},
             },
         });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT with jti")
+        enc.sign(&claims).expect("mint JWT with jti")
     }
 
     #[tokio::test]

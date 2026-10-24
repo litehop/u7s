@@ -1,6 +1,6 @@
 use crate::pki::{
-    cert_validity, CertInventory, CertRole, CertSpec, Pki, Swap, CLIENT_CERT_LIFETIME,
-    RENEW_FRACTION, ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
+    cert_validity, ensure_ca_cert, CertInventory, CertRole, CertSpec, Pki, Swap,
+    CLIENT_CERT_LIFETIME, RENEW_FRACTION, ROOT_CA_LIFETIME, SERVING_CERT_LIFETIME,
 };
 use crate::rotation::{CaKind, CaSigner, LeafPlan, Rotator, SERVING_LEAF};
 use rcgen::{CertificateParams, Issuer, KeyPair, SanType};
@@ -59,81 +59,6 @@ fn sync_parent_dir(path: &str) -> std::io::Result<()> {
 }
 
 const CA_REMEDY: &str = "restore from backup, or delete both files to deliberately start a new CA";
-
-// ---------------------------------------------------------------------------
-// SA signing key — RSA 2048, persisted across restarts
-// ---------------------------------------------------------------------------
-
-/// RSA key pair used for signing service-account JWTs.
-pub struct SaKeys {
-    /// PEM-encoded PKCS#1 RSA private key (`-----BEGIN RSA PRIVATE KEY-----`).
-    /// KCM requires this format; PKCS#8 (`-----BEGIN PRIVATE KEY-----`) causes
-    /// "invalid serviceaccount key" and prevents token issuance.
-    pub private_key_pem: Vec<u8>,
-    /// PEM-encoded RSA public key — used to construct a DecodingKey.
-    pub public_key_pem: Vec<u8>,
-}
-
-/// Load `sa.key` from disk, or generate a fresh RSA-2048 key and write it.
-///
-/// The public key (`sa.pub`) is derived from the private key; we write it
-/// for operator convenience but never read it back (we re-derive it from
-/// the private key at startup).
-///
-/// Design: load-or-generate ensures tokens minted before a restart remain
-/// valid after restart, because the signing key stays constant.
-pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow::Result<SaKeys> {
-    use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
-    use rsa::RsaPrivateKey;
-
-    // If the private key already exists, load it and re-derive the public key.
-    if std::path::Path::new(sa_key_path).exists() {
-        use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
-        let pem = std::fs::read(validate_cli_path(std::path::Path::new(sa_key_path))?)?;
-        let pem_str = std::str::from_utf8(&pem)
-            .map_err(|e| anyhow::anyhow!("SA key file is not valid UTF-8: {e}"))?;
-        let private_key = RsaPrivateKey::from_pkcs1_pem(pem_str)
-            .map_err(|e| anyhow::anyhow!("failed to parse SA private key: {e}"))?;
-        let public_pem = private_key
-            .to_public_key()
-            .to_pkcs1_pem(LineEnding::LF)
-            .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
-        tracing::info!("loaded SA signing key from {sa_key_path}");
-        return Ok(SaKeys {
-            private_key_pem: pem,
-            public_key_pem: public_pem.into_bytes(),
-        });
-    }
-
-    // Generate a new 2048-bit RSA key.
-    tracing::info!("generating new SA signing key → {sa_key_path}");
-    let mut rng = rsa::rand_core::OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
-
-    let private_pem = private_key
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("PKCS#1 encode error: {e}"))?;
-
-    let public_pem = private_key
-        .to_public_key()
-        .to_pkcs1_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
-
-    write_private_key(
-        validate_cli_path(std::path::Path::new(sa_key_path))?,
-        private_pem.as_bytes(),
-    )?;
-    std::fs::write(
-        validate_cli_path(std::path::Path::new(sa_pub_path))?,
-        public_pem.as_bytes(),
-    )?;
-    tracing::info!("SA signing key written to {sa_key_path}");
-
-    Ok(SaKeys {
-        private_key_pem: private_pem.as_bytes().to_vec(),
-        public_key_pem: public_pem.into_bytes(),
-    })
-}
 
 // ---------------------------------------------------------------------------
 // CA key+cert — persisted across restarts
@@ -581,17 +506,6 @@ pub struct TlsMaterial {
     /// Re-issues every apiserver-owned leaf before it expires. The fields above are the
     /// leaves as of startup; consumers learn of later ones through the rotator.
     pub rotator: Arc<Rotator>,
-}
-
-impl TlsMaterial {
-    /// Cert + key PEM that outbound webhook callouts present. It is the front-proxy-client
-    /// identity: signed by a CA the apiserver does not accept for its own client auth, so a
-    /// webhook pointed at the apiserver itself is never authenticated as `system:masters`.
-    pub fn webhook_client_identity_pem(&self) -> Vec<u8> {
-        let mut pem = self.proxy_client_cert_pem.clone();
-        pem.extend_from_slice(&self.proxy_client_key_pem);
-        pem
-    }
 }
 
 /// Split an advertise address ("https://host:6443", "[fd00::1]:6443", "myhost") into its
@@ -1043,7 +957,7 @@ pub(crate) fn leaf_files(args: &Args, stem: &str) -> LeafFiles {
 
 /// Atomically replace `path` with `bytes` (mode 0o600 when `private`), so a reader never
 /// sees a half-written file.
-fn replace_file(path: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
+pub(crate) fn replace_file(path: &str, bytes: &[u8], private: bool) -> anyhow::Result<()> {
     let tmp = format!("{path}.tmp");
     let tmp_path = validate_cli_path(std::path::Path::new(&tmp))?;
     if private {
@@ -1072,6 +986,7 @@ pub(crate) fn parse_ca_bundle_pem(pem: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
     anyhow::ensure!(!ders.is_empty(), "CA bundle contains no certificates");
     for der in &ders {
         cert_validity(der).map_err(|e| anyhow::anyhow!("CA bundle holds an invalid cert: {e}"))?;
+        ensure_ca_cert(der).map_err(|e| anyhow::anyhow!("CA bundle holds a non-CA cert: {e}"))?;
     }
     Ok(ders)
 }
@@ -1084,6 +999,23 @@ pub(crate) fn load_trust_bundle(
 ) -> anyhow::Result<Vec<Vec<u8>>> {
     let mut bundle = vec![signing_ca_der.to_vec()];
     let path = ca_extra_path(ca_cert_path);
+    // Whoever can write this file adds trust anchors: refuse a symlink (its target's
+    // writers count), a group/world-writable file, and a file owned by another user.
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        use std::os::unix::fs::MetadataExt as _;
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "{} is a symlink; refusing to load trust anchors from it",
+            path.display()
+        );
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            meta.mode() & 0o022 == 0 && (meta.uid() == euid || meta.uid() == 0),
+            "{} must be owned by root or the apiserver user and not group/world-writable",
+            path.display()
+        );
+    }
     match std::fs::read(&path) {
         Ok(pem) => {
             for der in
@@ -1108,6 +1040,25 @@ pub(crate) fn changed_trust_bundle(
 ) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
     let next = load_trust_bundle(ca_cert_path, &current[0])?;
     Ok((next != current).then_some(next))
+}
+
+/// Hold a changed bundle until two consecutive polls agree on it. A non-atomic write cut
+/// short on a certificate boundary parses cleanly as a smaller bundle; the next poll sees
+/// the finished file, so a transient truncation never reaches the trust stores.
+pub(crate) fn settle_bundle(
+    pending: &mut Option<Vec<Vec<u8>>>,
+    observed: Option<Vec<Vec<u8>>>,
+) -> Option<Vec<Vec<u8>>> {
+    match observed {
+        Some(next) if pending.as_ref() == Some(&next) => {
+            *pending = None;
+            Some(next)
+        }
+        other => {
+            *pending = other;
+            None
+        }
+    }
 }
 
 pub(crate) fn pem_encode_bundle(ders: &[Vec<u8>]) -> Vec<u8> {
@@ -1834,57 +1785,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// Security test: the identity presented on webhook callouts must not carry
-    /// `system:masters`. A webhook (or CRD conversion) clientConfig can name the apiserver's
-    /// own Service, and an admin-cert callout would be authenticated as cluster-admin.
-    #[test]
-    fn webhook_client_identity_is_not_cluster_admin() {
-        let dir = test_temp_dir("webhook-identity-not-admin");
-        let args = Args {
-            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
-            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
-            proxy_client_ca_key: dir
-                .join("proxy-client-ca.key")
-                .to_string_lossy()
-                .into_owned(),
-            proxy_client_ca_cert: dir
-                .join("proxy-client-ca.crt")
-                .to_string_lossy()
-                .into_owned(),
-            ..args_with(None)
-        };
-        let tls = generate_tls(&args).expect("generate_tls failed");
-        let pem = tls.webhook_client_identity_pem();
-        let text = std::str::from_utf8(&pem).expect("utf8 pem");
-        let cert_end = text
-            .find("-----END CERTIFICATE-----")
-            .expect("identity must start with a certificate")
-            + "-----END CERTIFICATE-----".len();
-        let id =
-            crate::auth::extract_client_cert_identity(&der_from_pem(&text.as_bytes()[..cert_end]))
-                .expect("webhook identity cert must parse");
-        assert_ne!(
-            id.username, "admin",
-            "webhook callouts must not present the admin cert"
-        );
-        assert!(
-            !id.groups.iter().any(|g| g == "system:masters"),
-            "webhook callouts must not carry system:masters; got {:?}",
-            id.groups
-        );
-        assert_eq!(
-            pem,
-            {
-                let mut p = tls.proxy_client_cert_pem.clone();
-                p.extend_from_slice(&tls.proxy_client_key_pem);
-                p
-            },
-            "webhook identity must be the front-proxy-client cert+key"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
     /// Helper: call load_or_generate_ca with paths inside `dir`.
     fn run_load_or_generate_ca(
         dir: &std::path::Path,
@@ -2249,78 +2149,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
-    /// load_or_generate_sa_keys must reload the same key material on a second call
-    /// rather than generating a new key pair. This is the core correctness property:
-    /// tokens minted before a restart must remain valid after restart because the
-    /// signing key is loaded from disk, not regenerated.
-    #[test]
-    fn sa_keys_load_from_disk_returns_same_private_key() {
-        let dir = test_temp_dir("sa-keys-load");
-        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
-        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
-
-        // First call: generates and writes sa.key / sa.pub.
-        let first = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("first load_or_generate_sa_keys must succeed");
-        assert!(
-            std::path::Path::new(&key_path).exists(),
-            "sa.key must exist after first call"
-        );
-
-        // Second call: must load from disk, not generate a new key.
-        let second = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("second load_or_generate_sa_keys must succeed");
-
-        assert_eq!(
-            first.private_key_pem, second.private_key_pem,
-            "private key PEM must be identical on load — \
-             generating a new key would invalidate tokens minted before restart"
-        );
-        assert_eq!(
-            first.public_key_pem, second.public_key_pem,
-            "public key PEM must be identical on load"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
-    /// sa.key must be written in PKCS#1 PEM format so KCM can parse it.
-    ///
-    /// KCM's token controller calls crypto.ParseRSAPrivateKeyFromPEM which expects
-    /// the `-----BEGIN RSA PRIVATE KEY-----` header (PKCS#1). Writing PKCS#8
-    /// (`-----BEGIN PRIVATE KEY-----`) causes "invalid serviceaccount key" in KCM logs
-    /// and prevents any SA token from being issued, so pods never get a mounted token.
-    #[test]
-    fn sa_key_is_written_in_pkcs1_pem_format_for_kcm_compatibility() {
-        let dir = test_temp_dir("sa-key-pkcs1");
-        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
-        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
-
-        let keys = load_or_generate_sa_keys(&key_path, &pub_path)
-            .expect("load_or_generate_sa_keys must succeed");
-
-        let priv_pem = std::str::from_utf8(&keys.private_key_pem)
-            .expect("private_key_pem must be valid UTF-8");
-        assert!(
-            priv_pem.contains("-----BEGIN RSA PRIVATE KEY-----"),
-            "sa.key must use PKCS#1 PEM header '-----BEGIN RSA PRIVATE KEY-----' \
-             so KCM can parse it; reverting to PKCS#8 breaks SA token issuance and \
-             prevents pods from getting a mounted token file. Got: {}",
-            priv_pem.lines().next().unwrap_or("<empty>")
-        );
-
-        let pub_pem =
-            std::str::from_utf8(&keys.public_key_pem).expect("public_key_pem must be valid UTF-8");
-        assert!(
-            pub_pem.contains("-----BEGIN RSA PUBLIC KEY-----"),
-            "sa.pub must use PKCS#1 PEM header '-----BEGIN RSA PUBLIC KEY-----'; \
-             got: {}",
-            pub_pem.lines().next().unwrap_or("<empty>")
-        );
-
-        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
-    }
-
     /// generate_tls must succeed when the PQC provider is active.
     ///
     /// This test exists to catch provider-installation failures early: if
@@ -2651,6 +2479,147 @@ mod tests {
             vec![b"signing".to_vec()],
             "no extra file means the signing CA alone"
         );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// webpki does not check constraints on a trust anchor, so a leaf (or a CA that may not
+    /// sign certificates) listed in ca-extra.pem would let its key holder mint client certs the
+    /// apiserver accepts.
+    #[test]
+    fn bundle_rejects_certs_that_are_not_signing_cas() {
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["leaf".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let err = parse_ca_bundle_pem(pem_encode("CERTIFICATE", leaf.der()).as_slice())
+            .expect_err("a CA:FALSE leaf must not become a trust anchor");
+        assert!(format!("{err:#}").contains("not a CA"), "{err:#}");
+
+        let mut no_sign = CertificateParams::new(vec![]).unwrap();
+        no_sign.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        no_sign.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let no_sign = no_sign.self_signed(&key).unwrap();
+        assert!(
+            parse_ca_bundle_pem(pem_encode("CERTIFICATE", no_sign.der()).as_slice()).is_err(),
+            "a CA whose KeyUsage lacks keyCertSign must be rejected"
+        );
+
+        let (_, ca) = extra_ca("ok");
+        let mixed = [
+            pem_encode("CERTIFICATE", &ca),
+            pem_encode("CERTIFICATE", leaf.der()),
+        ]
+        .concat();
+        assert!(
+            parse_ca_bundle_pem(&mixed).is_err(),
+            "one non-CA cert must poison the whole bundle"
+        );
+        assert_eq!(
+            parse_ca_bundle_pem(&pem_encode("CERTIFICATE", &ca)).unwrap(),
+            vec![ca]
+        );
+    }
+
+    #[test]
+    fn extra_ca_symlink_is_refused() {
+        let dir = test_temp_dir("extra-ca-symlink");
+        let ca_cert = dir.join("ca.crt").to_string_lossy().into_owned();
+        let (_, ca) = extra_ca("target");
+        let target = dir.join("elsewhere.pem");
+        std::fs::write(&target, pem_encode("CERTIFICATE", &ca)).unwrap(); // lgtm[rust/path-injection]
+        std::os::unix::fs::symlink(&target, ca_extra_path(&ca_cert)).unwrap(); // lgtm[rust/path-injection]
+        let err = load_trust_bundle(&ca_cert, b"signing")
+            .expect_err("a symlinked ca-extra.pem hands trust to its target's writers");
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn extra_ca_writable_by_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = test_temp_dir("extra-ca-perm");
+        let ca_cert = dir.join("ca.crt").to_string_lossy().into_owned();
+        let (_, ca) = extra_ca("target");
+        let path = ca_extra_path(&ca_cert);
+        std::fs::write(&path, pem_encode("CERTIFICATE", &ca)).unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap(); // lgtm[rust/path-injection]
+        assert!(load_trust_bundle(&ca_cert, b"signing").is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap(); // lgtm[rust/path-injection]
+        assert!(load_trust_bundle(&ca_cert, b"signing").is_ok());
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// A write cut short on a certificate boundary parses as a valid, smaller bundle. It must
+    /// not be applied (and published to every consumer) until a second poll sees the same.
+    #[test]
+    fn settle_bundle_applies_only_a_stable_observation() {
+        let full = vec![b"a".to_vec(), b"b".to_vec()];
+        let truncated = vec![b"a".to_vec()];
+        let mut pending = None;
+        assert_eq!(settle_bundle(&mut pending, Some(truncated)), None);
+        assert_eq!(
+            settle_bundle(&mut pending, Some(full.clone())),
+            None,
+            "a different observation restarts the debounce"
+        );
+        assert_eq!(settle_bundle(&mut pending, Some(full.clone())), Some(full));
+        assert_eq!(settle_bundle(&mut pending, None), None);
+        assert_eq!(pending, None);
+    }
+
+    /// A failed bundle apply must leave inbound client-CA trust and the outbound bundle as they
+    /// were, not half-applied (new inbound CA, old outbound clients).
+    #[tokio::test]
+    async fn failed_trust_apply_changes_nothing() {
+        let dir = test_temp_dir("apply-atomic");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let store = u7s_store::SqliteStore::new(":memory:").expect("in-memory store");
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store: Arc::new(u7s_store::SqliteStore::new(":memory:").unwrap()),
+            sa_keys: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_ders: Some(tls.ca_bundle_ders.clone()),
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
+        let (issuer, extra) = extra_ca("successor");
+        let client = client_config_with_identity_from(&tls.ca_cert_der, &issuer);
+        let mut next = tls.ca_bundle_ders.clone();
+        next.push(extra);
+        let bad = vec![tls.ca_cert_der.clone(), b"not der".to_vec()];
+
+        crate::apply_trust_bundle(&args.ca_cert, &bad, &tls.rotator, &state, &store)
+            .await
+            .expect_err("garbage DER cannot be applied");
+        assert!(
+            !crate::test_tls::handshake_completes(client.clone(), tls.server_config.get()),
+            "client CAs must not change when the apply fails"
+        );
+        assert_eq!(
+            state.cluster_ca_ders.get().as_deref(),
+            Some(&tls.ca_bundle_ders),
+            "outbound bundle must not change when the apply fails"
+        );
+
+        crate::apply_trust_bundle(&args.ca_cert, &next, &tls.rotator, &state, &store)
+            .await
+            .expect("valid bundle applies");
+        assert!(crate::test_tls::handshake_completes(
+            client,
+            tls.server_config.get()
+        ));
+        assert_eq!(state.cluster_ca_ders.get().as_deref(), Some(&next));
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 

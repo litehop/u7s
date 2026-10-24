@@ -153,6 +153,7 @@ jobs:
       - name: Start apiserver with 120s test lifetimes
         env:
           U7S_PKI_TEST_LIFETIME_SECS: "120"
+          U7S_PKI_TEST_SA_ROTATION_SECS: "120"
         run: |
           W="$PWD/temp/pki-e2e"
           mkdir -p "$W/manifests"
@@ -187,6 +188,11 @@ jobs:
         run: |
           scripts/e2e-pki-rotation/ca-bundle.sh \
             --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+
+      - name: SA signing-key rotation e2e (2 rotations)
+        run: |
+          scripts/e2e-pki-rotation/sa-key-rotation.sh \
+            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --rotation 120 --iterations 2
 
       - name: Upload apiserver log
         if: failure()

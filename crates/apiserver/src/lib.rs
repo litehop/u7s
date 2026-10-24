@@ -15,6 +15,7 @@ mod bootstrap_rbac;
 #[cfg(test)]
 mod bootstrap_rbac_upstream;
 mod bootstrap_token;
+mod cel_runtime;
 mod cert_expiry;
 mod certificates_gen_adapter;
 mod content_type;
@@ -45,6 +46,7 @@ mod rbac;
 mod rbac_gen_adapter;
 mod resource_gen_adapter;
 mod rotation;
+pub(crate) mod sa_keys;
 mod sa_sig_cache;
 mod serve;
 mod service_alloc;
@@ -80,7 +82,7 @@ use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
 use state::AppState;
-use tls::{generate_tls, load_or_generate_sa_keys, write_component_kubeconfig, write_kubeconfig};
+use tls::{generate_tls, write_component_kubeconfig, write_kubeconfig};
 pub use util::resolve_dhat_backtrace_depth;
 
 /// Maximum request body size in bytes. Applied as the outermost layer so
@@ -320,29 +322,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         None => std::collections::HashMap::new(),
     };
 
-    // 7. Load or generate the SA signing key.
-    let (sa_encoding_key, sa_decoding_key, sa_public_key_pem) =
-        match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
-            Ok(sa_keys) => {
-                let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
-                    .map_err(|e| {
-                        tracing::error!("failed to load SA signing key: {e}");
-                        e
-                    })
-                    .ok();
-                let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&sa_keys.public_key_pem)
-                    .map_err(|e| {
-                        tracing::error!("failed to load SA public key: {e}");
-                        e
-                    })
-                    .ok();
-                (enc, dec, Some(sa_keys.public_key_pem))
-            }
-            Err(e) => {
-                tracing::error!("SA key gen/load failed: {e}");
-                (None, None, None)
-            }
-        };
+    // 7. Load or generate the SA keyring (ES256, rotated automatically).
+    let sa_knob = sa_keys::RotationPolicy::test_knob();
+    let sa_tick = std::time::Duration::from_secs(if sa_knob.is_some() { 1 } else { 60 });
+    let sa_keys = sa_keys::SaKeyring::load_or_generate(
+        &args.sa_key,
+        &args.sa_pub,
+        sa_knob.unwrap_or_default(),
+        pki::Clock::default(),
+    )?;
+    tokio::spawn(sa_keys.clone().run(sa_tick));
 
     // 8. Compute advertised server address.
     let server_address = match args.advertise_address {
@@ -384,7 +373,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
 
     // 10. Build app state (shared with the auth layer).
-    let webhook_identity_pem = tls_material.webhook_client_identity_pem();
     // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
     // The apiserver presents this certificate when proxying log/exec/attach requests to
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
@@ -396,19 +384,16 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     proxy_client_identity_pem.extend_from_slice(&tls_material.proxy_client_key_pem);
     let mut state = state::AppState::new_with_config(state::AppStateConfig {
         store: Arc::clone(&store),
-        sa_key: sa_encoding_key,
-        sa_decoding_key,
+        sa_keys: Some(sa_keys),
         token_map,
         server_address,
         cluster_ca_ders: Some(tls_material.ca_bundle_ders.clone()),
-        webhook_identity_pem: Some(webhook_identity_pem),
         service_ip_allocator,
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
         kubelet_preferred_address: args.kubelet_preferred_address,
         kubelet_port: args.kubelet_port,
         continue_token_key: None, // fresh random key generated at startup
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
-        sa_public_key_pem,
     });
     state.deny_service_external_ips = args.deny_service_external_ips;
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
@@ -445,12 +430,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                 "proxy-client" => {
                     rotation_state
                         .proxy_client_identity_pem
-                        .set(Some(Arc::new(identity_pem.clone())));
-                    if let Err(e) = rotation_state.set_webhook_identity(identity_pem) {
-                        rotation_inventory
-                            .record_failure(name, format_args!("webhook client: {e}"));
-                        tracing::error!("webhook client after rotating {name}: {e}");
-                    }
+                        .set(Some(Arc::new(identity_pem)));
                 }
                 _ => {}
             }
@@ -464,11 +444,20 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             Arc::clone(&store),
         );
         let mut current = tls_material.ca_bundle_ders.clone();
+        let mut pending = None;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(CA_TRUST_POLL).await;
-                match tls::changed_trust_bundle(&ca_cert_path, &current) {
-                    Ok(Some(next)) => match apply_trust_bundle(
+                let observed = match tls::changed_trust_bundle(&ca_cert_path, &current) {
+                    Ok(observed) => observed,
+                    Err(e) => {
+                        pending = None;
+                        tracing::error!("cluster CA trust bundle unchanged: {e:#}");
+                        continue;
+                    }
+                };
+                if let Some(next) = tls::settle_bundle(&mut pending, observed) {
+                    match apply_trust_bundle(
                         &ca_cert_path,
                         &next,
                         &rotator,
@@ -482,9 +471,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                             current = next;
                         }
                         Err(e) => tracing::error!("reload cluster CA trust bundle: {e:#}"),
-                    },
-                    Ok(None) => {}
-                    Err(e) => tracing::error!("cluster CA trust bundle unchanged: {e:#}"),
+                    }
                 }
             }
         });
@@ -768,7 +755,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             Arc::clone(&state.store),
             Arc::clone(&state.sa_sig_cache),
             Arc::clone(&state.flowcontrol_cache),
@@ -1835,8 +1822,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     put!(key, body, "system:public-info-viewer", "ClusterRoleBinding");
 
     // -----------------------------------------------------------------------
-    // ClusterRole: system:kube-controller-manager — KCM needs these to run its
-    // reconciliation loops for deployments, replicasets, endpoints, etc.
+    // ClusterRole: system:kube-controller-manager — upstream's narrow root identity; each
+    // controller runs as its own system:controller:* service account.
     // -----------------------------------------------------------------------
     let key = keys::group_object_key(
         GROUP,
@@ -1850,72 +1837,16 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "metadata": { "name": "system:kube-controller-manager", "uid": "00000000-0000-0000-0000-000000000020", "creationTimestamp": TS },
         "rules": [
             { "apiGroups": ["","events.k8s.io"], "resources": ["events"], "verbs": ["create","patch","update"] },
-            // create is limited to what upstream's per-controller roles grant; the rest of the
-            // verbs come from the generic rule at the end. pods/binding (daemonset controller),
-            // endpoints/restricted (endpointslicemirroring) and serviceaccounts/token
-            // (service-account controller) are subresources the wildcard doesn't reach.
-            { "apiGroups": [""], "resources": ["endpoints","pods","serviceaccounts","configmaps","secrets","persistentvolumes","persistentvolumeclaims"], "verbs": ["create"] },
-            { "apiGroups": [""], "resources": ["endpoints/restricted","pods/binding","serviceaccounts/token"], "verbs": ["create"] },
-            { "apiGroups": ["resource.k8s.io"], "resources": ["resourceclaims"], "verbs": ["create"] },
-            { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","update","patch","delete"] },
-            { "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["apps"], "resources": ["replicasets","controllerrevisions"], "verbs": ["create"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","update","patch","delete"] },
-            { "apiGroups": ["apps"], "resources": ["daemonsets/status","deployments/status","replicasets/status","statefulsets/status"], "verbs": ["get","update","patch"] },
-            { "apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create"] },
-            { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","update","patch","delete"] },
-            { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            // The endpointslice controller mirrors each Service's endpoints into
-            // EndpointSlice objects; the generic read-only discovery rule below doesn't
-            // cover this because it needs write verbs too.
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch","create","update","patch","delete"] },
-            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["create"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["kube-controller-manager"], "verbs": ["get","update"] },
+            { "apiGroups": [""], "resources": ["secrets","serviceaccounts"], "verbs": ["create"] },
+            { "apiGroups": [""], "resources": ["secrets"], "verbs": ["delete"] },
+            { "apiGroups": [""], "resources": ["configmaps","namespaces","secrets","serviceaccounts"], "verbs": ["get"] },
+            { "apiGroups": [""], "resources": ["secrets","serviceaccounts"], "verbs": ["update"] },
             { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["storageclasses","csinodes","csidrivers","csistoragecapacities"], "verbs": ["get","list","watch"] },
-            // attachdetach-controller creates/deletes VolumeAttachments to drive CSI
-            // ControllerPublish/Unpublish (matches upstream's per-controller
-            // system:controller:attachdetach-controller role — see the seeded-but-unused
-            // copy elsewhere in this function). With --use-service-account-credentials=false
-            // this identity runs that controller too, so the grant has to live here instead:
-            // without `create`, kubelet's volume manager waits forever for an attach that
-            // never happens and every CSI pod using an attachable driver (e.g. csi-hostpath)
-            // hangs in ContainerCreating, live-confirmed via kcm.log's "system:kube-controller-manager
-            // is not allowed to create volumeattachments" before this fix.
-            { "apiGroups": ["storage.k8s.io"], "resources": ["volumeattachments"], "verbs": ["get","list","watch","create","delete"] },
-            // kube-apiserver-serving ClusterTrustBundle publisher: with
-            // --use-service-account-credentials=false this identity runs it, so upstream's
-            // per-controller system:controller:kube-apiserver-serving-clustertrustbundle-publisher
-            // rules live here. `create` is not covered by the generic wildcard rule below.
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-serving"], "verbs": ["attest"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["clustertrustbundles"], "verbs": ["create","update","delete","list","watch"] },
-            // csrapproving/csrsigning controllers: upstream's
-            // system:controller:certificate-controller grants. The CSR /approval and /status
-            // writes themselves are covered by the wildcard update/patch rule below, but
-            // the apiserver additionally requires approve/sign on the signer.
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kube-apiserver-client-kubelet"], "verbs": ["approve"] },
-            { "apiGroups": ["certificates.k8s.io"], "resources": ["signers"], "resourceNames": ["kubernetes.io/kubelet-serving","kubernetes.io/kube-apiserver-client-kubelet","kubernetes.io/kube-apiserver-client","kubernetes.io/legacy-unknown"], "verbs": ["sign"] },
-            // namespace-controller needs these two subresources specifically (the base
-            // "namespaces" rule above doesn't cover them) to record deletion-progress
-            // conditions and clear the "kubernetes" finalizer once a namespace's contents
-            // are gone — without it, a deleted namespace hangs in Terminating forever.
-            { "apiGroups": [""], "resources": ["namespaces/status","namespaces/finalize"], "verbs": ["get","update","patch"] },
-            // The garbage-collector, resourcequota, and namespace controllers all do
-            // generic, type-agnostic discovery/cleanup across the entire API surface —
-            // they must handle arbitrary/future resource types, including CRDs, without a
-            // hardcoded list (e.g. namespace deletion has to delete every object of every
-            // type living in that namespace, whatever type that turns out to be). This is
-            // the exact union of verbs upstream's own bootstrap policy grants their
-            // per-controller ClusterRoles (system:controller:generic-garbage-collector:
-            // get/list/watch/patch/update/delete; system:controller:resourcequota-controller:
-            // get/list/watch; system:controller:namespace-controller:
-            // get/list/watch/delete/deletecollection — see the seeded-but-currently-unused
-            // copies of those three roles below). With
-            // --use-service-account-credentials=false all three controllers run as this
-            // single identity, so the grant has to live here instead. Stops short of
-            // create/escalate/bind on arbitrary types, so this is still not
-            // cluster-admin-equivalent.
-            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["get","list","watch","patch","update","delete","deletecollection"] }
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["list","watch"] },
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] }
         ]
     });
     put!(key, body, "system:kube-controller-manager", "ClusterRole");
@@ -3356,10 +3287,11 @@ async fn apply_trust_bundle(
     state: &state::AppState<SqliteStore>,
     store: &SqliteStore,
 ) -> anyhow::Result<()> {
-    rotator.set_client_cas(ca_ders.to_vec())?;
-    state
-        .set_cluster_ca_bundle(ca_ders.to_vec())
+    let clients = state
+        .build_ca_bundle_clients(ca_ders)
         .map_err(|e| anyhow::anyhow!(e))?;
+    rotator.set_client_cas(ca_ders.to_vec())?;
+    state.install_ca_bundle(ca_ders.to_vec(), clients);
     tls::write_ca_bundle(ca_cert_path, ca_ders)?;
     seed_kube_root_ca(store, ca_ders).await?;
     seed_cluster_info(store, &state.server_address, ca_ders).await
@@ -5257,91 +5189,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_on_a_store_with_an_old_kcm_role_grants_kcm_the_new_signers_rule() {
-        // Bootstrap-role fixes (e.g. new certificates.k8s.io/signers grants for KCM) only
-        // reach existing clusters if startup reconciles stale roles, not just creates.
-        const GROUP: &str = "rbac.authorization.k8s.io";
-        let store = std::sync::Arc::new(make_store());
-        seed_rbac(&store).await.expect("first seed must not fail");
-
-        let key = keys::group_object_key(
-            GROUP,
-            "clusterroles",
-            None,
-            "system:kube-controller-manager",
-        );
-        let existing = store.get(&key).await.unwrap().expect("kcm role seeded");
-        let mut old: serde_json::Value = serde_json::from_slice(&existing.value).unwrap();
-        let rules = old["rules"].as_array_mut().unwrap();
-        let before = rules.len();
-        rules.retain(|r| r["resources"] != serde_json::json!(["signers"]));
-        let stripped = before - rules.len();
-        assert_eq!(
-            stripped, 3,
-            "the bootstrap KCM role defines attest, approve and sign rules on signers; the old-shaped role must lack all of them"
-        );
-        store
-            .put(
-                &key,
-                bytes::Bytes::from(old.to_string()),
-                Some(existing.revision),
-            )
-            .await
-            .unwrap();
-
-        let grant = |verb: &'static str, signer: &'static str| rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &[],
-            verb,
-            api_group: "certificates.k8s.io",
-            resource: "signers",
-            subresource: "",
-            namespace: None,
-            name: Some(signer),
-            non_resource_url: None,
-        };
-        let needed = [
-            grant("attest", "kubernetes.io/kube-apiserver-serving"),
-            grant("approve", "kubernetes.io/kube-apiserver-client-kubelet"),
-            grant("sign", "kubernetes.io/kube-apiserver-client"),
-            grant("sign", "kubernetes.io/kubelet-serving"),
-        ];
-        let new_state = || {
-            state::AppState::new(
-                std::sync::Arc::clone(&store),
-                None,
-                None,
-                std::collections::HashMap::new(),
-                "https://localhost:6443".into(),
-            )
-        };
-        let state = new_state();
-        state.init().await;
-        for req in &needed {
-            assert!(
-                !state.rbac_index.is_allowed(req),
-                "setup: stale role must lack {} on {:?}",
-                req.verb,
-                req.name
-            );
-        }
-
-        seed_rbac(&store).await.expect("restart seed must not fail");
-
-        let state = new_state();
-        state.init().await;
-        for req in &needed {
-            assert!(
-                state.rbac_index.is_allowed(req),
-                "after restart KCM must be allowed {} on signer {:?}; otherwise on an existing \
-                 cluster CSRs are approved but never signed and kubelet certs stop rotating",
-                req.verb,
-                req.name
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn seed_rbac_reseed_does_not_clobber_an_operators_edit_to_a_bootstrap_clusterrole() {
         // Upstream kube-apiserver stamps bootstrap RBAC once per cluster lifetime; if an
         // operator edits a seeded ClusterRole after boot and the apiserver restarts, that
@@ -5858,7 +5705,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6069,7 +5915,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6222,7 +6067,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6288,7 +6132,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6367,7 +6210,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6444,7 +6286,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6546,7 +6387,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6716,7 +6556,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -6939,7 +6778,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -6993,303 +6831,147 @@ mod tests {
         }
     }
 
-    /// Regression test: the KCM resourcequota controller must be able
-    /// to PATCH resourcequotas/status after pod creation. With --use-service-account-credentials=false
-    /// the KCM uses the system:kube-controller-manager identity for all controllers. If
-    /// resourcequotas/status is absent from that ClusterRole, the quota controller gets 403
-    /// and quota.status.used is never updated — conformance polls for 300s and times out.
+    /// With --use-service-account-credentials=true every controller authenticates as its own
+    /// kube-system service account, so the writes below must come from its system:controller:*
+    /// role. The KCM root identity must hold none of them: that is the point of splitting the
+    /// identities (a stolen KCM credential must not be able to delete namespaces' contents,
+    /// attach volumes or rewrite quotas).
     #[tokio::test]
-    async fn kcm_identity_can_patch_resourcequotas_status() {
+    async fn controller_service_accounts_hold_their_writes_and_the_kcm_root_identity_does_not() {
         let store = std::sync::Arc::new(make_store());
         seed_rbac(&store).await.expect("seed must not fail");
-
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
         state.init().await;
 
-        let groups: Vec<String> = vec![];
-
-        // KCM's resourcequota controller patches quota status to update used counts.
-        let patch_status = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "patch",
-            api_group: "",
-            resource: "resourcequotas",
-            subresource: "status",
-            namespace: Some("default"),
-            name: None,
-            non_resource_url: None,
+        let allowed = |user: &str, verb: &str, group: &str, resource: &str, sub: &str| {
+            state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                username: user,
+                groups: &[],
+                verb,
+                api_group: group,
+                resource,
+                subresource: sub,
+                namespace: Some("default"),
+                name: None,
+                non_resource_url: None,
+            })
         };
+        let sa = |name: &str| format!("system:serviceaccount:kube-system:{name}");
+        let kcm = "system:kube-controller-manager";
+
+        for (controller, verb, group, resource, sub, why) in [
+            (
+                "resourcequota-controller",
+                "update",
+                "",
+                "resourcequotas",
+                "status",
+                "quota.status.used is never updated",
+            ),
+            (
+                "replicaset-controller",
+                "update",
+                "apps",
+                "replicasets",
+                "status",
+                "ReplicaSet .status.replicas is never updated",
+            ),
+            (
+                "endpointslice-controller",
+                "create",
+                "discovery.k8s.io",
+                "endpointslices",
+                "",
+                "Service endpoints are never mirrored",
+            ),
+            (
+                "generic-garbage-collector",
+                "delete",
+                "policy",
+                "poddisruptionbudgets",
+                "",
+                "garbage collection of arbitrary types stalls",
+            ),
+            (
+                "generic-garbage-collector",
+                "patch",
+                "policy",
+                "poddisruptionbudgets",
+                "",
+                "owner-reference fixups on arbitrary types fail",
+            ),
+            (
+                "namespace-controller",
+                "deletecollection",
+                "policy",
+                "poddisruptionbudgets",
+                "",
+                "namespace deletion hangs in Terminating",
+            ),
+            (
+                "namespace-controller",
+                "update",
+                "",
+                "namespaces",
+                "finalize",
+                "namespace deletion hangs in Terminating",
+            ),
+            (
+                "attachdetach-controller",
+                "create",
+                "storage.k8s.io",
+                "volumeattachments",
+                "",
+                "CSI volumes never attach",
+            ),
+            (
+                "attachdetach-controller",
+                "delete",
+                "storage.k8s.io",
+                "volumeattachments",
+                "",
+                "VolumeAttachments leak after detach",
+            ),
+        ] {
+            assert!(
+                allowed(&sa(controller), verb, group, resource, sub),
+                "{controller} must be allowed {verb} {group}/{resource}/{sub}: {why}"
+            );
+            assert!(
+                !allowed(kcm, verb, group, resource, sub),
+                "the KCM root identity must not {verb} {group}/{resource}/{sub}; only {controller} may"
+            );
+        }
+
         assert!(
-            state.rbac_index.is_allowed(&patch_status),
-            "system:kube-controller-manager must be allowed to PATCH resourcequotas/status — \
-             without this the KCM quota controller gets 403 and quota.status.used is never updated"
+            !allowed(
+                &sa("generic-garbage-collector"),
+                "create",
+                "policy",
+                "poddisruptionbudgets",
+                ""
+            ),
+            "the GC/quota/namespace roles stop short of create on arbitrary types"
         );
-
-        // Also verify GET on resourcequotas/status (quota controller reads current status).
-        let get_status = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "get",
-            api_group: "",
-            resource: "resourcequotas",
-            subresource: "status",
-            namespace: Some("default"),
-            name: None,
-            non_resource_url: None,
-        };
         assert!(
-            state.rbac_index.is_allowed(&get_status),
-            "system:kube-controller-manager must be allowed to GET resourcequotas/status — \
-             quota controller reads current status before updating it"
-        );
-    }
-
-    /// Regression test: with --use-service-account-credentials=false, the garbage-collector,
-    /// resourcequota, and namespace controllers all run as system:kube-controller-manager and
-    /// must be able to discover AND clean up arbitrary/future resource types (including CRDs)
-    /// they have no hardcoded knowledge of. Confirmed live, in two stages:
-    /// 1. A real KCM process against a read-only version of this rule spammed "is not allowed
-    ///    to list poddisruptionbudgets/ingresses/customresourcedefinitions/..." on every one of
-    ///    its generic-discovery informers.
-    /// 2. After adding read-only get/list/watch, a real namespace deletion (sonobuoy's own
-    ///    teardown) hung in Terminating forever: the namespace controller's content-cleanup
-    ///    step needs deletecollection across every resource type in the namespace, which
-    ///    read-only access does not grant — every teardown failed with a wall of "is not
-    ///    allowed to deletecollection <type>" for dozens of types, live-observed in kcm.log.
-    /// The verb set here is the union of what upstream's own bootstrap policy grants the three
-    /// per-controller ClusterRoles this identity is standing in for (see the seeded-but-unused
-    /// system:controller:generic-garbage-collector / resourcequota-controller /
-    /// namespace-controller roles elsewhere in this function). Also checks the boundary of
-    /// that grant: it still must not include `create` on an arbitrary type, or this would be
-    /// silently cluster-admin-equivalent and defeat the whole point of a dedicated identity.
-    #[tokio::test]
-    async fn kcm_identity_can_discover_and_cleanup_but_not_create_arbitrary_resource_types() {
-        let store = std::sync::Arc::new(make_store());
-        seed_rbac(&store).await.expect("seed must not fail");
-
-        let state = state::AppState::new(
-            std::sync::Arc::clone(&store),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-        state.init().await;
-
-        let groups: Vec<String> = vec![];
-
-        let patch_replicaset_status = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "patch",
-            api_group: "apps",
-            resource: "replicasets",
-            subresource: "status",
-            namespace: Some("kube-system"),
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&patch_replicaset_status),
-            "system:kube-controller-manager must be allowed to PATCH replicasets/status — \
-             without it every ReplicaSet sync ends in a 403 and .status.replicas is never \
-             updated, live-confirmed via kubectl auth can-i before this fix"
-        );
-
-        let create_endpointslice = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "create",
-            api_group: "discovery.k8s.io",
-            resource: "endpointslices",
-            subresource: "",
-            namespace: Some("default"),
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&create_endpointslice),
-            "system:kube-controller-manager must be allowed to CREATE endpointslices — the \
-             read-only generic-discovery rule doesn't cover this, the endpointslice controller \
-             needs its own write grant or every Service's endpoints mirroring silently 403s, \
-             live-confirmed via kubectl auth can-i before this fix"
-        );
-
-        let list_arbitrary_type = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "list",
-            api_group: "policy",
-            resource: "poddisruptionbudgets",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&list_arbitrary_type),
-            "system:kube-controller-manager must be able to LIST resource types outside its \
-             explicit rule list (e.g. poddisruptionbudgets) — the GC/quota-monitor controllers \
-             discover the full API surface generically, they don't have a hardcoded type list"
-        );
-
-        let deletecollection_arbitrary_type = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "deletecollection",
-            api_group: "policy",
-            resource: "poddisruptionbudgets",
-            subresource: "",
-            namespace: Some("sonobuoy"),
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state
-                .rbac_index
-                .is_allowed(&deletecollection_arbitrary_type),
-            "system:kube-controller-manager must be allowed to DELETECOLLECTION arbitrary \
-             resource types — without it, deleting a namespace hangs in Terminating forever \
-             because the namespace controller can never finish clearing its contents, \
-             live-confirmed: a real sonobuoy namespace got stuck exactly this way before this fix"
-        );
-
-        let namespace_finalize = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "update",
-            api_group: "",
-            resource: "namespaces",
-            subresource: "finalize",
-            namespace: None,
-            name: Some("sonobuoy"),
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&namespace_finalize),
-            "system:kube-controller-manager must be allowed to UPDATE namespaces/finalize — \
-             without it a namespace whose contents are already gone still never clears its \
-             'kubernetes' finalizer and stays Terminating forever"
-        );
-
-        let create_arbitrary_type = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "create",
-            api_group: "policy",
-            resource: "poddisruptionbudgets",
-            subresource: "",
-            namespace: Some("default"),
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            !state.rbac_index.is_allowed(&create_arbitrary_type),
-            "the generic wildcard rule must stop short of `create` on arbitrary types — if \
-             create is also allowed, this identity is silently cluster-admin-equivalent and \
-             the dedicated least-privilege identity provides no real boundary"
-        );
-    }
-
-    /// Regression test: with --use-service-account-credentials=false, the
-    /// attach-detach controller also runs as system:kube-controller-manager and must be able
-    /// to CREATE and DELETE VolumeAttachments to drive CSI attach/detach. Without `create`
-    /// here, a real kube-controller-manager process live-logged "system:kube-controller-manager
-    /// is not allowed to create volumeattachments" on every retry, kubelet's volume manager
-    /// never saw the volume as attached, and every pod using an attachable CSI driver
-    /// (e.g. csi-hostpath) hung in ContainerCreating for the full 300s test timeout —
-    /// confirmed via a live sonobuoy `csi-hostpath` run before this fix. Also checks the
-    /// boundary: csidrivers gets no dedicated `create` grant from this fix, matching
-    /// upstream's real bootstrap policy split between VolumeAttachments (create/delete) and
-    /// CSIDriver/CSINode (read-only) for this controller — kubelet and the CSI driver's own
-    /// sidecars own those write paths, not KCM.
-    #[tokio::test]
-    async fn kcm_identity_can_create_and_delete_volumeattachments() {
-        let store = std::sync::Arc::new(make_store());
-        seed_rbac(&store).await.expect("seed must not fail");
-
-        let state = state::AppState::new(
-            std::sync::Arc::clone(&store),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-        state.init().await;
-
-        let groups: Vec<String> = vec![];
-
-        let create_va = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "create",
-            api_group: "storage.k8s.io",
-            resource: "volumeattachments",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&create_va),
-            "system:kube-controller-manager must be allowed to CREATE volumeattachments — \
-             without it the attach-detach controller can never attach a CSI volume and every \
-             pod using an attachable driver hangs in ContainerCreating forever, live-confirmed \
-             via kcm.log before this fix"
-        );
-
-        let delete_va = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "delete",
-            api_group: "storage.k8s.io",
-            resource: "volumeattachments",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            state.rbac_index.is_allowed(&delete_va),
-            "system:kube-controller-manager must be allowed to DELETE volumeattachments — \
-             without it the attach-detach controller can never detach a CSI volume and the \
-             VolumeAttachment object leaks forever after the pod using it is gone"
-        );
-
-        // csidrivers gets no dedicated create grant (unlike volumeattachments above) — the
-        // attach-detach controller only reads CSIDriver to decide attachability, it never
-        // creates one. (update/delete/patch on csidrivers fall through the pre-existing
-        // generic-cleanup wildcard shared with the GC/quota/namespace controllers — see
-        // kcm_identity_can_discover_and_cleanup_but_not_create_arbitrary_resource_types —
-        // but that wildcard deliberately stops short of `create`, same boundary asserted there.)
-        let create_csidriver = rbac::AuthzRequest {
-            username: "system:kube-controller-manager",
-            groups: &groups,
-            verb: "create",
-            api_group: "storage.k8s.io",
-            resource: "csidrivers",
-            subresource: "",
-            namespace: None,
-            name: None,
-            non_resource_url: None,
-        };
-        assert!(
-            !state.rbac_index.is_allowed(&create_csidriver),
-            "csidrivers must not get a dedicated create grant for this identity — the \
-             attach-detach controller never creates a CSIDriver, only volumeattachments needed \
-             a new grant for this fix"
+            !allowed(
+                &sa("attachdetach-controller"),
+                "create",
+                "storage.k8s.io",
+                "csidrivers",
+                ""
+            ),
+            "attach-detach only reads CSIDrivers; kubelet and CSI sidecars own those writes"
         );
     }
 
     /// Regression test: KCM's kube-apiserver-serving ClusterTrustBundle publisher runs as
-    /// system:kube-controller-manager and must create/update/delete ClusterTrustBundles and
+    /// its own service account and must create/update/delete ClusterTrustBundles and
     /// hold `attest` on exactly its own signer. Without it KCM logs "is not allowed to create
     /// clustertrustbundles", the root CA bundle is never published, and workloads relying on
     /// clusterTrustBundle projection break. Grants must match upstream release-1.37's
@@ -7300,7 +6982,6 @@ mod tests {
         seed_rbac(&store).await.expect("seed must not fail");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -7322,18 +7003,20 @@ mod tests {
                     non_resource_url: None,
                 })
             };
-        let kcm = "system:kube-controller-manager";
+        let ctb =
+            "system:serviceaccount:kube-system:kube-apiserver-serving-clustertrustbundle-publisher";
+        let csr = "system:serviceaccount:kube-system:certificate-controller";
 
         for verb in ["create", "update", "delete", "list", "watch"] {
             assert!(
-                allowed(kcm, &groups, verb, "clustertrustbundles", None),
+                allowed(ctb, &groups, verb, "clustertrustbundles", None),
                 "KCM must be allowed to {verb} clustertrustbundles — otherwise the root CA \
                  bundle is never published and CTB-projecting workloads break"
             );
         }
         assert!(
             allowed(
-                kcm,
+                ctb,
                 &groups,
                 "attest",
                 "signers",
@@ -7344,7 +7027,7 @@ mod tests {
 
         assert!(
             !allowed(
-                kcm,
+                ctb,
                 &groups,
                 "attest",
                 "signers",
@@ -7353,19 +7036,19 @@ mod tests {
             "attest must be limited to the kube-apiserver-serving signer, not any signer"
         );
         assert!(
-            !allowed(kcm, &groups, "attest", "signers", Some("example.com/other")),
+            !allowed(ctb, &groups, "attest", "signers", Some("example.com/other")),
             "attest must not extend to arbitrary signers"
         );
         assert!(
-            !allowed(kcm, &groups, "attest", "signers", None),
+            !allowed(ctb, &groups, "attest", "signers", None),
             "attest without a signer name must be denied (resourceNames-restricted)"
         );
         assert!(
-            !allowed(kcm, &groups, "create", "podcertificaterequests", None),
+            !allowed(ctb, &groups, "create", "podcertificaterequests", None),
             "the CTB publisher grant must not leak create on other certificates.k8s.io resources"
         );
         assert!(
-            !allowed(kcm, &groups, "create", "certificatesigningrequests", None),
+            !allowed(ctb, &groups, "create", "certificatesigningrequests", None),
             "KCM must not gain CSR create from the CTB publisher grant"
         );
 
@@ -7376,14 +7059,14 @@ mod tests {
             ("sign", "kubernetes.io/kubelet-serving"),
         ] {
             assert!(
-                allowed(kcm, &groups, verb, "signers", Some(signer)),
+                allowed(csr, &groups, verb, "signers", Some(signer)),
                 "KCM csrapproving/csrsigning must hold {verb} on {signer}, or node join and \
                  CSR rotation stall once the apiserver enforces signer authorization"
             );
         }
         assert!(
             !allowed(
-                kcm,
+                csr,
                 &groups,
                 "approve",
                 "signers",
@@ -7445,7 +7128,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -7526,7 +7208,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7565,7 +7246,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7603,7 +7283,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -7640,7 +7319,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -7680,7 +7358,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -8545,7 +8222,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -8607,7 +8283,6 @@ mod tests {
         seed_rbac(&store).await.expect("seed must not fail");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -8816,8 +8491,9 @@ mod tests {
     async fn reconcile_extension_apiserver_authentication_publishes_the_extra_cas() {
         let store = make_store();
         let dir = write_temp_ca_certs("bundle", b"fake-ca-der-bytes-v1", b"fake-proxy-ca-v1");
-        let extra = rcgen::CertificateParams::new(vec![])
-            .unwrap()
+        let mut extra_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        extra_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let extra = extra_params
             .self_signed(&rcgen::KeyPair::generate().unwrap())
             .unwrap()
             .der()
@@ -8954,7 +8630,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -8962,7 +8637,7 @@ mod tests {
         build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -9037,7 +8712,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -9071,7 +8745,7 @@ mod tests {
         let app = build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -9433,7 +9107,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             tokens,
             "https://localhost:6443".into(),
         );
@@ -9463,7 +9136,7 @@ mod tests {
         let app = build_router(state.clone()).layer(AuthLayer::new(
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
-            state.sa_decoding_key.clone(),
+            state.sa_keys.clone(),
             std::sync::Arc::clone(&state.store),
             std::sync::Arc::clone(&state.sa_sig_cache),
             std::sync::Arc::clone(&state.flowcontrol_cache),
@@ -9639,7 +9312,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -9679,7 +9351,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9737,7 +9408,6 @@ mod tests {
 
         let state = state::AppState::new(
             std::sync::Arc::new(make_store()),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -9936,7 +9606,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10064,7 +9733,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10153,7 +9821,6 @@ mod tests {
         let state = state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10206,7 +9873,6 @@ mod tests {
         let store = Arc::new(make_store());
         let state = state::AppState::new(
             Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10296,29 +9962,9 @@ mod tests {
     #[tokio::test]
     async fn sa_token_request_to_auth_round_trip() {
         use axum::response::IntoResponse as _;
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-        use std::sync::Arc;
-
-        // 1. Generate a fresh RSA key pair for this test — the same key must be used
-        //    for minting (handler) and verification (auth middleware).
-        let mut rng = rsa::rand_core::OsRng;
-        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
-        let priv_pem = rsa_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("priv pem")
-            .as_bytes()
-            .to_vec();
-        let pub_pem = rsa_key
-            .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
-            .expect("pub pem")
-            .into_bytes();
-        let enc_key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key from pem");
-        let dec_key =
-            jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key from pem");
 
         // 2. Build AppState with the SA key pair and seed the store.
+        let sa_keys = sa_keys::SaKeyring::for_test();
         let store = Arc::new(make_store());
         seed_namespaces(&store)
             .await
@@ -10329,8 +9975,7 @@ mod tests {
 
         let state = state::AppState::new(
             Arc::clone(&store),
-            Some(enc_key),
-            Some(dec_key.clone()),
+            Some(sa_keys.clone()),
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10388,7 +10033,7 @@ mod tests {
         let user = auth::authenticate_token_with_audiences(
             token,
             &std::collections::HashMap::new(),
-            Some(&dec_key),
+            Some(&sa_keys),
             &[],
             store.as_ref(),
             &sig_cache,
@@ -10444,7 +10089,6 @@ mod tests {
         let store = Arc::new(make_store());
         let state = state::AppState::new(
             Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10715,7 +10359,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -10780,7 +10423,6 @@ mod tests {
         seed_namespaces(&store).await.expect("seed namespaces");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10871,7 +10513,6 @@ mod tests {
         seed_namespaces(&store).await.expect("seed namespaces");
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -10978,7 +10619,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11059,7 +10699,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11133,7 +10772,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11241,7 +10879,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11341,19 +10978,16 @@ mod tests {
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
         state::AppState::new_with_config(state::AppStateConfig {
             store,
-            sa_key: None,
-            sa_decoding_key: None,
+            sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
             cluster_ca_ders: None,
-            webhook_identity_pem: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
-            sa_public_key_pem: None,
         })
     }
 
@@ -11513,7 +11147,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11635,7 +11268,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11728,7 +11360,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11810,7 +11441,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -11870,7 +11500,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -11940,7 +11569,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12039,7 +11667,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12158,7 +11785,6 @@ mod tests {
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -12219,7 +11845,6 @@ mod tests {
             let state = state::AppState::new(
                 std::sync::Arc::clone(&store),
                 None,
-                None,
                 std::collections::HashMap::new(),
                 "https://localhost:6443".into(),
             );
@@ -12276,7 +11901,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             store,
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12754,7 +12378,6 @@ mod tests {
         let state = state::AppState::new(
             store,
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -12815,7 +12438,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
@@ -12883,7 +12505,6 @@ mod tests {
         let store = std::sync::Arc::new(make_store());
         let state = state::AppState::new(
             std::sync::Arc::clone(&store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),

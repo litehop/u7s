@@ -11,7 +11,7 @@
 #       --kubelet-port <KP> --stack-only
 # then
 #   scripts/e2e-pki-rotation/leaf-rotation.sh --kubeconfig temp/u7s/kubeconfig \
-#       --workdir temp/u7s --port <PORT> --vm <VM> --iterations 10
+#       --workdir temp/u7s --port <PORT> --vm <VM> --kubelet-port <KP> --iterations 10
 # Without --vm only the apiserver is exercised (no kubelet, KCM or scheduler), which is the
 # shape a plain CI runner can host. --scheduler additionally watches a standalone u7s-scheduler
 # running on this host against <workdir>/kubeconfig-scheduler (cert re-issue, no restart, TLS
@@ -37,7 +37,11 @@
 #      client cert is re-issued, KCM is unchanged, and a new Deployment is still made into a
 #      scheduled pod;
 #   6. the apiserver log shows serving, kubelet-client, proxy-client and, with --scheduler or
-#      --vm, scheduler-client (plus kcm-client with --vm) rotated.
+#      --vm, scheduler-client (plus kcm-client with --vm) rotated;
+#   7. with --vm (needs --kubelet-port): the kubelet's serving cert, requested by the kubelet
+#      through a kubelet-serving CSR and signed by KCM for --lifetime seconds, is re-issued
+#      by the kubelet without a restart, chains to the cluster CA, and `kubectl exec/logs`
+#      keep working after the original kubelet serving cert expired.
 #
 # Pending (need other beads, not asserted here): kubelet client-cert reload, intermediate
 # rotation, root succession. proxy-client rotation is checked by log only:
@@ -82,6 +86,7 @@ KC=""
 WORKDIR=""
 PORT=""
 VM=""
+KUBELET_PORT=""
 WITH_SCHED=0
 LIFETIME=60
 ITERATIONS=1
@@ -91,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --workdir) WORKDIR="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --vm) VM="$2"; shift 2 ;;
+    --kubelet-port) KUBELET_PORT="$2"; shift 2 ;;
     --scheduler) WITH_SCHED=1; shift ;;
     --lifetime) LIFETIME="$2"; shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
@@ -98,7 +104,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [ -n "$KC" ] && [ -n "$WORKDIR" ] && [ -n "$PORT" ] || {
-  echo "usage: $0 --kubeconfig <path> --workdir <path> --port <N> [--vm <name>] [--scheduler] [--lifetime <s>] [--iterations <n>]" >&2
+  echo "usage: $0 --kubeconfig <path> --workdir <path> --port <N> [--vm <name> --kubelet-port <N>] [--scheduler] [--lifetime <s>] [--iterations <n>]" >&2
+  exit 1
+}
+
+[ -z "$VM" ] || [ -n "$KUBELET_PORT" ] || {
+  echo "error: --vm needs --kubelet-port (the kubelet serving cert is read through it)" >&2
   exit 1
 }
 
@@ -114,6 +125,12 @@ k() { kubectl --kubeconfig "$KC" --request-timeout=15s "$@"; }
 served_pem() {
   local out
   out="$(openssl s_client -connect "127.0.0.1:$PORT" -servername localhost </dev/null 2>/dev/null || true)"
+  openssl x509 <<<"$out"
+}
+
+kubelet_pem() {
+  local out
+  out="$(openssl s_client -connect "127.0.0.1:$KUBELET_PORT" </dev/null 2>/dev/null || true)"
   openssl x509 <<<"$out"
 }
 
@@ -134,6 +151,9 @@ dump_diagnostics() {
     limactl shell "$VM" tail -30 /tmp/kcm.log >&2 || true
     echo "--- kubelet journal ---" >&2
     limactl shell "$VM" sudo journalctl -u kubelet --no-pager --utc -n 30 >&2 || true
+    echo "--- kubelet serving cert and CSRs ---" >&2
+    kubelet_pem 2>&1 | openssl x509 -noout -serial -issuer -startdate -enddate >&2 2>&1 || true
+    k get csr >&2 || true
   fi
 }
 
@@ -189,6 +209,13 @@ sched_start() {
   if [ -r "/proc/$1/stat" ]; then stat_start_ticks "$(cat "/proc/$1/stat")"; else ps -o lstart= -p "$1" 2>/dev/null | sed "s/^ *//"; fi
 }
 sched_reloads() { grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true; }
+kubelet_cert_from_ca() {
+  kubelet_pem >"$TMP/kubelet.cur.pem" && openssl verify -CAfile "$ABS_WORKDIR/ca.pem" "$TMP/kubelet.cur.pem" >/dev/null 2>&1
+}
+kubelet_serial_differs() {
+  kubelet_cert_from_ca && [ "$(pem_file_serial "$TMP/kubelet.cur.pem")" != "$1" ]
+}
+kubelet_start() { limactl shell "$VM" systemctl show kubelet -p ActiveEnterTimestampMonotonic --value; }
 file_serial_differs() { [ "$(pem_file_serial "$1")" != "$2" ]; }
 
 if [ "$WITH_SCHED" = 1 ]; then
@@ -203,6 +230,11 @@ if [ -n "$VM" ]; then
   [ -n "$KCM_PID" ] || fail "no kube-controller-manager process in $VM"
   KCM_START="$(kcm_start "$KCM_PID")"
   echo "kcm pid $KCM_PID started $KCM_START"
+  # Until its CSR is approved and signed the kubelet serves a self-signed cert.
+  poll 180 kubelet_cert_from_ca ||
+    fail "the kubelet's serving cert never chained to the cluster CA (still self-signed, or a static file?)"
+  echo "kubelet serving cert $(pem_file_serial "$TMP/kubelet.cur.pem") chains to the cluster CA"
+  KUBELET_START="$(kubelet_start)"
 fi
 
 WHO=""
@@ -216,6 +248,11 @@ for i in $(seq 1 "$ITERATIONS"); do
   for who in $WHO; do
     cp "$ABS_WORKDIR/$who.pem" "$TMP/$who.old.pem"
   done
+  if [ -n "$VM" ]; then
+    kubelet_cert_from_ca || fail "iteration $i: the kubelet's serving cert does not chain to the cluster CA"
+    cp "$TMP/kubelet.cur.pem" "$TMP/kubelet.old.pem"
+    kubelet_old_serial="$(pem_file_serial "$TMP/kubelet.old.pem")"
+  fi
   t0=$SECONDS
 
   poll $((LIFETIME + 20)) serial_differs "$old_serial" ||
@@ -246,6 +283,15 @@ for i in $(seq 1 "$ITERATIONS"); do
     k -n "$NS" logs "$NAME" >/dev/null || fail "iteration $i: kubectl logs failed"
     echo "PASS[$i]: kubectl exec/logs through the rotated kubelet-client identity"
 
+    poll $((LIFETIME + 60)) kubelet_serial_differs "$kubelet_old_serial" ||
+      fail "iteration $i: the kubelet never replaced its serving cert $kubelet_old_serial (CSR not approved or signed, or no reload)"
+    poll $((LIFETIME + 10)) cert_expired "$TMP/kubelet.old.pem" ||
+      fail "iteration $i: the old kubelet serving cert never expired"
+    k -n "$NS" exec "$NAME" -- /agnhost help >/dev/null ||
+      fail "iteration $i: kubectl exec failed after the kubelet re-issued its serving cert"
+    k -n "$NS" logs "$NAME" >/dev/null || fail "iteration $i: kubectl logs failed after the kubelet re-issued its serving cert"
+    [ "$(kubelet_start)" = "$KUBELET_START" ] || fail "iteration $i: the kubelet was restarted"
+    echo "PASS[$i]: kubelet serving cert $kubelet_old_serial -> $(pem_file_serial "$TMP/kubelet.cur.pem") by CSR, no restart; exec/logs work after the old one expired"
   fi
 
   if [ "$WITH_SCHED" = 1 ]; then
@@ -282,4 +328,10 @@ for leaf in $leaves; do
   grep -q "rotated $leaf" "$WORKDIR/apiserver.log" || fail "apiserver log never reports rotating $leaf"
 done
 ! grep -q "rotation failed" "$WORKDIR/apiserver.log" || fail "apiserver log reports a failed rotation"
+if [ -n "$VM" ]; then
+  issued="$(k get csr -o json | jq '[.items[] | select(.spec.signerName == "kubernetes.io/kubelet-serving" and (.status.certificate // "") != "" and any(.status.conditions[]?; .type == "Approved"))] | length')"
+  [ "$issued" -gt "$ITERATIONS" ] ||
+    fail "only $issued approved+issued kubelet-serving CSRs for $ITERATIONS rotation(s); the initial cert plus one per rotation are expected"
+  echo "PASS: $issued kubelet-serving CSRs approved and issued"
+fi
 echo "PASS: $leaves all rotated; $ITERATIONS iteration(s) in $((SECONDS - START))s"

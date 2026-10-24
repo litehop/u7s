@@ -1136,6 +1136,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group == "admissionregistration.k8s.io" && plural == "validatingadmissionpolicies" {
         crate::admission::validate_vap_cel(obj)?;
     }
+    if group == "admissionregistration.k8s.io" && plural == "mutatingadmissionpolicies" {
+        crate::admission::validate_map_cel(obj)?;
+    }
     if group.is_empty() && (plural == "configmaps" || plural == "secrets") {
         validate_data_keys(obj, plural)?;
     }

@@ -75,7 +75,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
@@ -93,6 +93,9 @@ Usage:
                          well-known auto-applied folder). An alternate path
                          leaves the well-known folder empty, for GitOps to
                          manage instead.
+  --allow-service-external-ips
+                         Omit the apiserver's --deny-service-external-ips, which
+                         by default rejects new/changed Service externalIPs.
   --mint-join-token     Run on an existing control-plane node: create a 24h
                          single-use join token and print the join command.
   --join <url>          Join an existing cluster at <url> (e.g. https://1.2.3.4:6443).
@@ -128,6 +131,7 @@ TARBALL_URL_EXPLICIT=0
 # Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
 DOWNLOAD_DIR=""
 MINT_JOIN_TOKEN=0
+ALLOW_SERVICE_EXTERNAL_IPS=0
 JOIN_SERVER=""
 JOIN_TOKEN=""
 CA_CERT_HASH=""
@@ -146,6 +150,7 @@ while [ $# -gt 0 ]; do
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
+    --allow-service-external-ips) ALLOW_SERVICE_EXTERNAL_IPS=1; shift ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
     --join) JOIN_SERVER="$2"; shift 2 ;;
     --token) JOIN_TOKEN="$2"; shift 2 ;;
@@ -425,12 +430,11 @@ stage_binaries() {
 # otherwise /etc/resolv.conf. "" is wrong: dnsPolicy Default pods (CoreDNS)
 # then get nameserver 127.0.0.1 and CoreDNS forwards to itself.
 #
-# tlsCertFile/tlsPrivateKeyFile (control plane) -- a serving cert signed by the
-# cluster CA, minted by kubelet.service's ExecStartPre. Without it kubelet
-# self-signs and the apiserver's kubelet-client rejects it, breaking kubectl
-# logs/exec. A worker (argument 1) sets serverTLSBootstrap instead: the kubelet
-# files its own kubelet-serving CSR once its Node exists, and the apiserver's
-# approver checks the SANs against that Node.
+# serverTLSBootstrap -- the kubelet files its own kubelet-serving CSR once its
+# Node exists, and the apiserver's approver checks the SANs against that Node.
+# Without a CA-signed serving cert kubelet self-signs and the apiserver's
+# kubelet-client rejects it, breaking kubectl logs/exec. kubelet rotates the
+# cert itself before expiry. No tlsCertFile: a static file is never renewed.
 #
 # clientCAFile -- lets kubelet authenticate the apiserver's own client cert
 # rather than treating proxied requests as anonymous, which its container-log
@@ -448,15 +452,10 @@ write_kubelet_config_yaml() {
   if systemctl is-active --quiet systemd-resolved; then
     resolv_conf=/run/systemd/resolve/resolv.conf
   fi
-  # A worker's kubelet files its own kubelet-serving CSR once its Node exists
-  # (serverTLSBootstrap); the control-plane kubelet keeps the minted cert file.
   # ca-bundle.pem (every CA the apiserver trusts) on the control plane; the joined
   # bundle on a worker. The kubelet re-reads clientCAFile on change.
   local client_ca="$STATE_DIR/ca-bundle.pem"
-  local serving="tlsCertFile: $STATE_DIR/kubelet-serving.crt
-tlsPrivateKeyFile: $STATE_DIR/kubelet-serving.key"
   if [ "$worker" -eq 1 ]; then
-    serving="serverTLSBootstrap: true"
     client_ca="$STATE_DIR/ca.pem"
   fi
   cat > "$STATE_DIR/kubelet-config.yaml" <<EOF
@@ -470,7 +469,7 @@ staticPodPath: /etc/u7s/static-pods
 clusterDNS:
   - 10.96.0.10
 clusterDomain: cluster.local
-$serving
+serverTLSBootstrap: true
 authentication:
   x509:
     clientCAFile: $client_ca
@@ -978,12 +977,12 @@ wait_for_upgraded_worker() {
 }
 
 # Control-plane upgrades keep the cluster identity: the apiserver only generates
-# ca.*/sa.* when absent, and join tokens are Secrets in the store. The restart
-# below must leave all four files byte-identical, or every node's identity and
-# every issued service-account token is invalid.
+# ca.* when absent. The restart below must leave both files byte-identical, or
+# every node's identity is invalid. sa.key is excluded: the apiserver rotates it
+# on its own schedule and keeps the previous key verifying until its tokens expire.
 cp_identity_fingerprint() {
   local f
-  for f in ca.key ca.crt sa.key sa.pub; do
+  for f in ca.key ca.crt; do
     if [ -f "$STATE_DIR/$f" ]; then
       printf '%s ' "$f"
       openssl dgst -sha256 -r "$STATE_DIR/$f" | cut -d' ' -f1
@@ -995,10 +994,10 @@ verify_cp_identity_preserved() {
   local before="$1" after
   after="$(cp_identity_fingerprint)"
   if [ "$before" != "$after" ]; then
-    echo "error: the control-plane CA / service-account keys under $STATE_DIR changed during the upgrade -- every node's client identity and every issued token is now invalid. Restore ca.key, ca.crt, sa.key and sa.pub from backup." >&2
+    echo "error: the control-plane CA under $STATE_DIR changed during the upgrade -- every node's client identity is now invalid. Restore ca.key and ca.crt from backup." >&2
     return 1
   fi
-  echo "Control-plane identity preserved (ca.key, ca.crt, sa.key, sa.pub unchanged); no CA or tokens re-minted."
+  echo "Control-plane identity preserved (ca.key, ca.crt unchanged); no CA re-minted."
 }
 
 if [ "$MINT_JOIN_TOKEN" -eq 1 ]; then
@@ -1318,6 +1317,8 @@ IFACE="$IFACE"
 EOF
 
 write_kubelet_config_yaml "$WORKER_MODE"
+# Serving cert minted by an earlier install (10-year, never renewed).
+rm -f "$STATE_DIR"/kubelet-serving.crt "$STATE_DIR"/kubelet-serving.key "$STATE_DIR"/kubelet-serving.csr
 
 # Round-2 kubelet tuning, shared by both kubelet.service blocks
 # below. --max-pods and ConfigMapAndSecretChangeDetectionStrategy are
@@ -1366,12 +1367,6 @@ write_kubelet_config_yaml "$WORKER_MODE"
 kubelet_round2_flags() {
   local minor="${1#*.}"
   local flags="--feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false"
-  # A worker's kubelet requests its own serving cert (serverTLSBootstrap), which
-  # needs RotateKubeletServerCertificate on; the control-plane kubelet still
-  # uses the CA-signed cert minted at start.
-  if [ "${2:-}" != worker ]; then
-    flags="$flags,RotateKubeletServerCertificate=false"
-  fi
   # The two gates below only exist from 1.37; an older kubelet rejects them as
   # unrecognized, so they are appended only when the staged kubelet is >= 1.37.
   if [ "$minor" -ge 37 ]; then
@@ -1379,11 +1374,7 @@ kubelet_round2_flags() {
   fi
   printf '%s' "$flags"
 }
-if [ "$WORKER_MODE" -eq 1 ]; then
-  KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR" worker)"
-else
-  KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"
-fi
+KUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"
 
 if [ "$WORKER_MODE" -eq 1 ]; then
   # --- Join an existing cluster via the CSR API, or upgrade an
@@ -1562,7 +1553,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
@@ -1626,7 +1617,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=false --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
@@ -1673,19 +1664,15 @@ WorkingDirectory=$STATE_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 Environment=GOMAXPROCS=2
-# Without a CA-signed serving cert (wired via kubelet-config.yaml's
-# tlsCertFile), kubelet self-signs for :10250, and the apiserver's
-# kubelet-client -- pinned to the cluster CA by build_kubelet_tls_config in
+# The kubelet requests its own CA-signed serving cert (serverTLSBootstrap in
+# kubelet-config.yaml); the apiserver's kubelet-serving approver admits it and
+# KCM signs it. A self-signed one is rejected by the apiserver's kubelet-client
+# -- pinned to the cluster CA by build_kubelet_tls_config in
 # crates/apiserver/src/handlers/proxy.rs, not the system trust store --
-# rejects it, surfacing as BadGateway on kubectl logs/exec. KCM has no
-# auto-approve path for kubelet-serving CSRs, since approving one blindly
-# would let any node claim a cert for any IP or hostname, so the cert is
-# minted here from the CA this script already controls.
-# ExecStartPre is idempotent: it skips regeneration when the cert exists, so
-# Restart=always does not churn it, and the DER->PEM conversion is safe to
-# repeat across services.
+# surfacing as BadGateway on kubectl logs/exec.
+# ExecStartPre keeps ca.pem (clientCAFile) current; the DER->PEM conversion is
+# safe to repeat across services.
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
-ExecStartPre=/bin/bash -c 'test -s $STATE_DIR/kubelet-serving.crt || { openssl ecparam -name prime256v1 -genkey -noout -out $STATE_DIR/kubelet-serving.key && chmod 600 $STATE_DIR/kubelet-serving.key && openssl req -new -key $STATE_DIR/kubelet-serving.key -subj "/CN=$NODE_NAME" -out $STATE_DIR/kubelet-serving.csr && openssl x509 -req -in $STATE_DIR/kubelet-serving.csr -CA $STATE_DIR/ca.pem -CAkey $STATE_DIR/ca.key -CAcreateserial -days 3650 -extfile <(printf "subjectAltName=IP:$IFACE_IP\nextendedKeyUsage=serverAuth\n") -out $STATE_DIR/kubelet-serving.crt; }'
 # --cert-dir -- see the worker-mode kubelet.service block above for why this
 # must be a CLI flag under $STATE_DIR rather than a kubelet-config.yaml key.
 ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS

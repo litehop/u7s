@@ -21,7 +21,6 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
-use jsonwebtoken::{Algorithm, Header};
 use serde::{Deserialize, Serialize};
 use u7s_store::Store;
 
@@ -48,10 +47,20 @@ struct TokenRequest {
 struct TokenRequestSpec {
     #[serde(default = "default_expiration")]
     expiration_seconds: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     audiences: Vec<String>,
     #[serde(default)]
     bound_object_ref: Option<serde_json::Value>,
+}
+
+/// Go clients marshal a nil slice as `null` (client-go's TokenRequest carries
+/// `"audiences":null` when none are requested).
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 fn default_expiration() -> u64 {
@@ -143,8 +152,8 @@ pub async fn create_token<S: Store>(
         .ok_or_else(|| Status::not_found("", "serviceaccounts", &sa_name))?;
 
     // 3. Require a signing key.
-    let encoding_key = state
-        .sa_key
+    let sa_keys = state
+        .sa_keys
         .as_ref()
         .ok_or_else(|| Status::internal("SA signing key not available".into()))?;
 
@@ -177,8 +186,13 @@ pub async fn create_token<S: Store>(
         spec.audiences = vec!["https://kubernetes.default.svc".to_owned()];
     }
 
-    // Clamp expiration to Kubernetes-specified range: [600, 172800] (10 min to 48 h).
-    spec.expiration_seconds = spec.expiration_seconds.clamp(600, 172_800);
+    // Clamp expiration to Kubernetes-specified range: [600, 172800] (10 min to 48 h), then to
+    // the keyring's max token lifetime (the same 48 h in production) so the lifetime reported
+    // to the caller is the one the token really has.
+    spec.expiration_seconds = spec
+        .expiration_seconds
+        .clamp(600, 172_800)
+        .min(sa_keys.max_token_lifetime().as_secs());
 
     // 5. Extract UID from the stored ServiceAccount object.
     let uid = serde_json::from_slice::<serde_json::Value>(&sa.value)
@@ -265,6 +279,8 @@ pub async fn create_token<S: Store>(
     } else {
         (spec.expiration_seconds, None)
     };
+    // A key is retired a bounded time after it stops signing; no token may outlive that.
+    let jwt_lifetime = jwt_lifetime.min(sa_keys.max_token_lifetime().as_secs());
     let jwt_exp = now + jwt_lifetime;
     tracing::debug!(
         ns = ns.as_str(),
@@ -293,8 +309,8 @@ pub async fn create_token<S: Store>(
         },
     };
 
-    let header = Header::new(Algorithm::RS256);
-    let token = jsonwebtoken::encode(&header, &claims, encoding_key)
+    let token = sa_keys
+        .sign(&claims)
         .map_err(|e| Status::internal(format!("JWT encode error: {e}")))?;
 
     // 8. Build response.
@@ -515,38 +531,18 @@ mod handler_tests {
         let state = AppState::new(
             store.clone(),
             None,
-            None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
         (state, store)
     }
 
-    /// Build AppState with a freshly generated RSA signing key.
+    /// Build AppState with a freshly generated ES256 signing key.
     fn make_state_with_key() -> (AppState, Arc<SqliteStore>) {
-        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-        let mut rng = rsa::rand_core::OsRng;
-        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
-        let priv_pem = rsa_key
-            .to_pkcs8_pem(LineEnding::LF)
-            .expect("priv pem")
-            .as_bytes()
-            .to_vec();
-        let pub_pem = rsa_key
-            .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
-            .expect("pub pem")
-            .into_bytes();
-        let enc_key =
-            jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key from pem");
-        let dec_key =
-            jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key from pem");
-
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
-            Some(enc_key),
-            Some(dec_key),
+            Some(crate::sa_keys::SaKeyring::for_test()),
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
@@ -900,6 +896,34 @@ mod handler_tests {
         assert_eq!(
             claims["aud"][0], "https://kubernetes.default.svc",
             "empty audiences must default to https://kubernetes.default.svc"
+        );
+    }
+
+    /// kube-controller-manager with --use-service-account-credentials=true requests each
+    /// controller's token with `"audiences":null` (Go nil slice). Rejecting that body leaves
+    /// every controller without credentials, so none of them can list or write anything.
+    #[tokio::test]
+    async fn create_token_accepts_go_client_null_audiences() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "kube-system").await;
+        seed_serviceaccount(&store, "kube-system", "node-controller", "uid-6").await;
+
+        let req_body = br#"{"kind":"TokenRequest","apiVersion":"authentication.k8s.io/v1","metadata":{"creationTimestamp":null},"spec":{"audiences":null,"expirationSeconds":3600,"boundObjectRef":null},"status":{"token":"","expirationTimestamp":null}}"#;
+
+        let result = create_token(
+            State(state),
+            Path(("kube-system".to_owned(), "node-controller".to_owned())),
+            Bytes::from_static(req_body),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!("null-audiences token request must succeed: status={}", e.0),
+        };
+        let claims = decode_jwt_claims(resp_body["status"]["token"].as_str().unwrap());
+        assert_eq!(
+            claims["aud"][0], "https://kubernetes.default.svc",
+            "null audiences mean the default audience"
         );
     }
 
@@ -1530,6 +1554,54 @@ mod handler_tests {
             iat + 600,
             "warnafter must equal iat + the originally requested expirationSeconds"
         );
+    }
+
+    /// No JWT may outlive the keyring's max token lifetime, including the pod-bound 8h
+    /// extension: a signing key is retired that long after it stops signing, so a longer
+    /// token would be orphaned (rejected as unknown kid) before its own expiry.
+    #[tokio::test]
+    async fn create_token_lifetime_is_capped_by_keyring_max_token_lifetime() {
+        let policy = crate::sa_keys::RotationPolicy {
+            max_token_lifetime: std::time::Duration::from_secs(700),
+            ..Default::default()
+        };
+        let ring = crate::sa_keys::SaKeyring::for_test_with(policy, Default::default());
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            Some(ring),
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-cap-1").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-cap-1", "node-a").await;
+
+        for bound in [false, true] {
+            let mut spec = serde_json::json!({"expirationSeconds": 3600});
+            if bound {
+                spec["boundObjectRef"] =
+                    serde_json::json!({"kind": "Pod", "name": "my-pod", "uid": "pod-uid-cap-1"});
+            }
+            let result = create_token(
+                State(state.clone()),
+                Path(("default".to_owned(), "my-sa".to_owned())),
+                Bytes::from(serde_json::to_vec(&serde_json::json!({ "spec": spec })).unwrap()),
+            )
+            .await;
+            let body = match result {
+                Ok(r) => collect_body(r).await,
+                Err(e) => panic!("token request must succeed: {}", e.0),
+            };
+            let claims = decode_jwt_claims(body["status"]["token"].as_str().unwrap());
+            let lifetime = claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap();
+            assert_eq!(lifetime, 700, "bound={bound}: lifetime must be capped");
+            assert_eq!(
+                body["spec"]["expirationSeconds"], 700,
+                "bound={bound}: kubelet schedules refresh from the reported lifetime, so it \
+                 must be the real one or the projected token expires before it is refreshed"
+            );
+        }
     }
 
     /// An unbound token (no boundObjectRef) requested with the default kube-native audience

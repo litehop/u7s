@@ -378,7 +378,7 @@ struct KubeconfigCreds {
     server: String,
     ca_pem: Vec<u8>,
     /// Concatenated client-certificate PEM + client-key PEM, the shape `reqwest::Identity`
-    /// expects (same convention as `state.rs`'s `webhook_identity_pem`).
+    /// expects (same shape as `kubelet_client_identity_pem`).
     identity_pem: Vec<u8>,
 }
 
@@ -904,7 +904,6 @@ mod tests {
         let state = crate::state::AppState::new(
             Arc::clone(&store),
             None,
-            None,
             std::collections::HashMap::new(),
             format!("https://127.0.0.1:{port}"),
         );
@@ -915,7 +914,7 @@ mod tests {
             .layer(crate::auth::AuthLayer::new(
                 Arc::clone(&state.rbac_index),
                 (*state.token_map).clone(),
-                state.sa_decoding_key.clone(),
+                state.sa_keys.clone(),
                 Arc::clone(&state.store),
                 Arc::clone(&state.sa_sig_cache),
                 Arc::clone(&state.flowcontrol_cache),
@@ -1606,7 +1605,6 @@ mod tests {
 
         let state = crate::state::AppState::new(
             std::sync::Arc::clone(&server.store),
-            None,
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
