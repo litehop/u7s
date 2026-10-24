@@ -747,6 +747,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn join_token_requestor_gets_no_apiserver_ip_serving_cert_even_under_the_local_node_name()
+    {
+        // Residual of the node-name exemption: a bootstrap-token identity (the only thing a
+        // joiner holds once it cannot enroll as the control-plane node) must never be
+        // approved for the apiserver's IP, whatever name it puts in the CSR.
+        let state = make_state();
+        let apiserver: IpAddr = "192.168.5.15".parse().unwrap();
+        seed(
+            &state,
+            &cluster_object_key("nodes", "cp"),
+            &node_named("cp", &["192.168.5.15"]),
+        )
+        .await;
+        let mut csr = serving_csr_for("cp", &["192.168.5.15"]);
+        csr["spec"]["username"] = "system:bootstrap:abcdef".into();
+        csr["spec"]["groups"] = serde_json::json!(["system:bootstrappers"]);
+        let key = crate::keys::group_object_key(GROUP, PLURAL, None, "csr-cp");
+        seed(&state, &key, &csr).await;
+        approve_kubelet_serving_csrs(&state, &[apiserver], Some("cp")).await;
+        assert!(conditions(&state, "csr-cp").await.is_null());
+    }
+
     #[test]
     fn forbidden_apiserver_ips_is_lifted_only_for_the_exact_local_node_name() {
         let ips: Vec<IpAddr> = vec!["192.168.5.15".parse().unwrap()];

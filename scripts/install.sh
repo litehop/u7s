@@ -1138,6 +1138,10 @@ if [ -z "$NODE_NAME" ]; then
   # lowercases and trims the hostname the same way.
   NODE_NAME="$(normalize_node_name "$(hostname)")"
 fi
+if [ -z "$NODE_NAME" ]; then
+  echo "error: refusing to continue: empty node name (hostname is empty; pass --node-name)" >&2
+  exit 1
+fi
 
 if [ -z "$IFACE" ]; then
   # Whitelist physical-NIC name patterns rather than blacklisting virtual

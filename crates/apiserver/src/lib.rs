@@ -397,6 +397,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
     });
     state.deny_service_external_ips = args.deny_service_external_ips;
+    state.local_node_name = args.local_node_name.clone();
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state
         .proxy_client_identity_pem

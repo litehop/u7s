@@ -520,6 +520,19 @@ assert_true "u7s-apiserver.service's ExecStart passes --embedded-scheduler true 
 assert_true "u7s-apiserver.service's ExecStart passes --local-node-name \$NODE_NAME -- without it the single-node kubelet's serving CSR (IP SAN == apiserver address) stays Pending and kubectl logs/exec fail" \
   grep -qF -- '--local-node-name $NODE_NAME' "$INSTALL"
 
+line_of() { grep -nF -- "$1" "$INSTALL" | head -1 | cut -d: -f1; }
+node_name_defaulted_before_unit_written() {
+  local dflt unit
+  dflt="$(line_of 'NODE_NAME="$(normalize_node_name "$(hostname)")"')"
+  unit="$(line_of '--local-node-name $NODE_NAME')"
+  [ -n "$dflt" ] && [ -n "$unit" ] && [ "$dflt" -lt "$unit" ]
+}
+assert_true "NODE_NAME is defaulted from the hostname before the apiserver unit is written -- an empty --local-node-name would silently disable the single-node serving-CSR exemption" \
+  node_name_defaulted_before_unit_written
+
+assert_true "install.sh refuses an empty NODE_NAME after defaulting -- the apiserver must never be started with a blank --local-node-name" \
+  grep -qF -- 'refusing to continue: empty node name' "$INSTALL"
+
 assert_false "(regression guard) install.sh no longer writes a u7s-scheduler.service unit file -- running the embedded scheduler AND a standalone u7s-scheduler against the same cluster risks double-preemption, so a fresh install must not provision the standalone unit at all" \
   grep -qF 'cat > /etc/systemd/system/u7s-scheduler.service' "$INSTALL"
 
