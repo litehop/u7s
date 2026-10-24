@@ -29,7 +29,7 @@ assert() {
 }
 CALLS=""
 has() { printf '%s' "$CALLS" | grep -qF -- "$1" && echo 1 || echo 0; }
-line_of() { printf '%s\n' "$CALLS" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
+line_of() { printf '%s\n' "$CALLS" | grep -nF -- "$1" | sed -n 1p | cut -d: -f1; }
 run() { : > "$TMP/calls"; rc=0; PATH="$TMP/bin:$PATH" "$@" >/dev/null 2>"$TMP/err" || rc=$?; CALLS="$(cat "$TMP/calls")"; }
 
 run "$DIR/lima-unrig.sh" --vm vm-x

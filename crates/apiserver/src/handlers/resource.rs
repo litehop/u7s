@@ -573,7 +573,7 @@ pub(crate) async fn create_resource<S: Store>(
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     if is_csr {
-        super::csr::finalize_csr_create(&mut obj.body, &user)?;
+        super::csr::finalize_csr_create(&state, &mut obj.body, &user).await?;
     }
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
     // forged/scalar status into the body the earlier clear_create_status already
@@ -1667,7 +1667,7 @@ pub(crate) async fn do_patch<S: Store>(
         };
         obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
         if is_csr {
-            super::csr::finalize_csr_create(&mut obj.body, user)?;
+            super::csr::finalize_csr_create(state, &mut obj.body, user).await?;
         }
         // Re-clear status after mutating webhooks — see create_resource's identical call
         // for why: a webhook can reinject a forged/scalar status the earlier
