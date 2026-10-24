@@ -10,6 +10,9 @@ use cel::common::ast::{
     operators, CallExpr, ComprehensionExpr, EntryExpr, Expr, IdedExpr, LiteralValue, SelectExpr,
 };
 
+use super::authzlib::{
+    root as authorizer_root, Attributes, AuthorizeFn, Decision, Principal, RequestResource,
+};
 use super::parse::{parse_cached, qualified_segments};
 use super::stdlib;
 use super::value::{CelError, MapKey, Value, R};
@@ -39,6 +42,8 @@ pub(crate) struct Env<'a> {
     /// first use and may only see the variables declared before it.
     pub(crate) variables: Vec<(String, String)>,
     memo: RefCell<Vec<Option<R<Value<'a>>>>>,
+    /// Backs the `authorizer` root; absent when the environment does not declare one.
+    authorize: Option<AuthorizeFn<'a>>,
 }
 
 impl<'a> Env<'a> {
@@ -47,7 +52,14 @@ impl<'a> Env<'a> {
             roots,
             variables: Vec::new(),
             memo: RefCell::new(Vec::new()),
+            authorize: None,
         }
+    }
+
+    pub(crate) fn with_authorizer(mut self, request: RequestResource, f: AuthorizeFn<'a>) -> Self {
+        self.roots.push(("authorizer", authorizer_root(request)));
+        self.authorize = Some(f);
+        self
     }
 
     pub(crate) fn with_variables(mut self, variables: Vec<(String, String)>) -> Self {
@@ -117,6 +129,17 @@ impl<'a, 'p> Evaluator<'a, 'p> {
             stack_base: stack_position(),
             locals: RefCell::new(Vec::new()),
             var_limit: Cell::new(env.variables.len()),
+        }
+    }
+
+    pub(crate) fn authorize(&self, principal: &Principal, attrs: &Attributes) -> Decision {
+        match &self.env.authorize {
+            Some(f) => f(principal, attrs),
+            None => Decision {
+                allowed: false,
+                reason: String::new(),
+                error: Some("no authorizer is available".into()),
+            },
         }
     }
 
@@ -331,6 +354,9 @@ impl<'a, 'p> Evaluator<'a, 'p> {
                 let inner = (**inner).clone();
                 Ok(self.select_optional(inner, field))
             }
+            Value::Authz(a) => a
+                .select(field)
+                .ok_or_else(|| CelError::new(format!("no such key: {field}"))),
             v if v.is_map() => v
                 .map_get(&MapKey::Str(Arc::from(field)))
                 .ok_or_else(|| CelError::new(format!("no such key: {field}"))),

@@ -1668,6 +1668,32 @@ mod tests {
         assert_eq!(obj, serde_json::json!({"data": {"j": "v"}}));
     }
 
+    /// The move proper-prefix check must compare unescaped keys: `/a~1b` is the single key
+    /// `a/b`, so moving it under itself is a cycle (silent subtree loss), while
+    /// `/a/b/c` is a different key path and a legitimate move. Same for `~0`.
+    #[test]
+    fn apply_json_patch_move_prefix_check_compares_unescaped_keys() {
+        for (key, esc) in [("a/b", "a~1b"), ("a~b", "a~0b")] {
+            let mut obj = serde_json::json!({ key: {"v": 1} });
+            let before = obj.clone();
+            let into_self = serde_json::json!([{"op": "move", "from": format!("/{esc}"), "path": format!("/{esc}/c")}]);
+            apply_json_patch(&mut obj, &into_self).unwrap_err();
+            assert_eq!(obj, before, "move of '{key}' into itself must not mutate");
+        }
+
+        // `/a~1b` (key "a/b") is not a prefix of `/a/b/c` (a -> b -> c).
+        let mut obj = serde_json::json!({"a/b": 1, "a": {"b": {}}});
+        let patch = serde_json::json!([{"op": "move", "from": "/a~1b", "path": "/a/b/c"}]);
+        apply_json_patch(&mut obj, &patch).unwrap();
+        assert_eq!(obj, serde_json::json!({"a": {"b": {"c": 1}}}));
+
+        // `/a~0b` (key "a~b") vs `/a~b/c`: raw-string prefix would wrongly differ from segments.
+        let mut obj = serde_json::json!({"a~b": 1, "a": {"b": {}}});
+        let patch = serde_json::json!([{"op": "move", "from": "/a~0b", "path": "/a/b/c"}]);
+        apply_json_patch(&mut obj, &patch).unwrap();
+        assert_eq!(obj, serde_json::json!({"a": {"b": {"c": 1}}}));
+    }
+
     /// `test` on a key absent from an existing object is a *failed test* (typed, so MAP
     /// can skip), whereas a missing parent is a plain error; user PATCH errors on both.
     #[test]
