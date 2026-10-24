@@ -111,6 +111,10 @@ then the workers.
   (`systemctl stop kubelet; rm -rf /var/lib/u7s`); re-join it with a fresh
   `install.sh --mint-join-token` token. A worker whose identity files are
   missing needs a join too.
+- **Node name on join**: a joiner cannot claim the control-plane node's name
+  (the apiserver answers 403 "it is the control-plane node"); pick a
+  different `--node-name`. Other names, including an existing worker's, are
+  accepted so a worker can re-join.
 
 ## Running on a 1 GiB host
 

@@ -253,7 +253,7 @@ apiserver_port_from_psline() {
     apiserver)
       printf '%s' "$line" | grep -oE -e '--listen[ =][^ ]*:[0-9]+' | head -1 | grep -oE '[0-9]+$' || true ;;
     scheduler)
-      kc=$(printf '%s' "$line" | grep -oE -e '--kubeconfig[ =][^ ]+' | head -1 | sed -E 's/^--kubeconfig[ =]//')
+      kc=$(printf '%s' "$line" | grep -oE -e '--kubeconfig[ =][^ ]+' | sed -n 1p | sed -E 's/^--kubeconfig[ =]//')
       [ -f "$kc" ] || return 0
       grep -m1 -E 'server: *https?://' "$kc" | grep -oE ':[0-9]+/?$' | grep -oE '[0-9]+' || true ;;
   esac
@@ -268,7 +268,7 @@ exe_basename_from_psline() {
 
 # Host konnectivity server port (--server-port=N) of a konnectivity line.
 konnectivity_port_from_psline() {
-  printf '%s' "$1" | grep -oE -e '--server-port=[0-9]+' | head -1 | cut -d= -f2
+  printf '%s' "$1" | grep -oE -e '--server-port=[0-9]+' | sed -n 1p | cut -d= -f2
 }
 
 # Worker slots 1-5 konnectivity server ports (dispatch template slot table).
@@ -290,7 +290,7 @@ is_worker_slot_konnectivity_port() {
 # worktree root immediately before it, so one extraction covers both
 # argument styles and all four process types.
 extract_worktree_path_from_psline() {
-  printf '%s' "$1" | grep -oE '[^ =]*/temp/u7s' | head -1 | sed -E 's#/temp/u7s$##'
+  printf '%s' "$1" | grep -oE '[^ =]*/temp/u7s' | sed -n 1p | sed -E 's#/temp/u7s$##'
 }
 
 pid_from_psline() {
@@ -660,7 +660,7 @@ step_d_gone_upstream_branches() {
 bead_id_from_finding() {
   local f="$1" bead_line
   bead_line=$(head -n 5 "$f" | grep -m1 -E '^Bead: ' || true)
-  printf '%s' "$bead_line" | grep -oE 'mayor-[a-z0-9.]+' | head -1
+  printf '%s' "$bead_line" | grep -oE 'mayor-[a-z0-9.]+' | sed -n 1p
 }
 
 # True (exit 0) iff a bead in the given live-bd status is stale enough to

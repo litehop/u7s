@@ -4,8 +4,11 @@
 # (crates/apiserver/src/lib.rs seed_rbac) -- only the ServiceAccount binding, config and
 # DaemonSet below are new.
 #
-# Two install-time placeholders scripts/install.sh substitutes before writing this file into
+# Three install-time placeholders scripts/install.sh substitutes before writing this file into
 # --manifest-output-dir:
+#   __POD_CLUSTER_CIDR__ install.sh's $POD_CLUSTER_CIDR (--cluster-cidr), the same value flannel
+#                        and KCM use: kube-proxy masquerades traffic to Services that does not
+#                        originate inside it.
 #   __KUBE_VERSION__    kubelet's own --version output (install.sh's $KUBE_VERSION) -- kube-proxy
 #                        must track whichever kubelet a given release actually bundles, not a
 #                        fixed tag Renovate/Dependabot would otherwise bump independently and out
@@ -52,6 +55,7 @@ data:
     apiVersion: kubeproxy.config.k8s.io/v1alpha1
     kind: KubeProxyConfiguration
     mode: "iptables"
+    clusterCIDR: __POD_CLUSTER_CIDR__
     clientConnection:
       kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
   kubeconfig.conf: |

@@ -202,7 +202,8 @@ served_chain >"$TMP/chain0.pem"
 chain_verifies "$TMP/root.pem" "$TMP/chain0.pem" || fail "the served chain does not verify to the root"
 ! leaf_alone_verifies "$TMP/root.pem" "$TMP/chain0.pem" ||
   fail "the served leaf verifies to the root without its intermediate: the root must not be signing leaves"
-nth_cert 2 "$TMP/chain0.pem" | openssl x509 -noout -text | grep -q "pathlen:0" ||
+INTERMEDIATE_TEXT="$(nth_cert 2 "$TMP/chain0.pem" | openssl x509 -noout -text)"
+[[ "$INTERMEDIATE_TEXT" == *"pathlen:0"* ]] ||
   fail "the intermediate is not constrained to pathlen:0"
 I0="$(cert_field 2 "$TMP/chain0.pem" -serial)"
 echo "PASS: served chain is leaf + intermediate $I0, verifies to the root, and the leaf alone does not; admin.pem carries the chain"
@@ -249,10 +250,10 @@ SHA_CA="$(sha "$ABS_WORKDIR/ca.crt")"
 SHA_KEY="$(sha "$ABS_WORKDIR/ca.key")"
 SHA_BUNDLE="$(sha "$ABS_WORKDIR/ca-bundle.pem")"
 ROOT_CM="$(k -n "$NS" get configmap kube-root-ca.crt -o 'jsonpath={.data.ca\.crt}' 2>/dev/null || true)"
-APISERVER_PID="$(pgrep -f "$(workdir_kill_pattern apiserver "$ABS_WORKDIR")" | head -1 || true)"
+APISERVER_PID="$(pgrep -f "$(workdir_kill_pattern apiserver "$ABS_WORKDIR")" | sed -n 1p || true)"
 
 if [ "$WITH_SCHED" = 1 ] || [ -n "$VM" ]; then
-  SCHED_PID="$(pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | head -1 || true)"
+  SCHED_PID="$(pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | sed -n 1p || true)"
   [ -n "$SCHED_PID" ] || fail "no standalone u7s-scheduler process for $ABS_WORKDIR"
   RELOADS_PREV="$(grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true)"
 fi
@@ -278,7 +279,7 @@ chain_verifies "$TMP/root.pem" "$TMP/chain1.pem" || fail "the chain served after
 grep -q "rotated intermediate CA" "$WORKDIR/apiserver.log" || fail "apiserver log never reports rotating the intermediate"
 echo "PASS: intermediate $I0 -> $I1, serving chain re-issued and verifies to the root"
 
-[ "$(pgrep -f "$(workdir_kill_pattern apiserver "$ABS_WORKDIR")" | head -1 || true)" = "$APISERVER_PID" ] ||
+[ "$(pgrep -f "$(workdir_kill_pattern apiserver "$ABS_WORKDIR")" | sed -n 1p || true)" = "$APISERVER_PID" ] ||
   fail "the apiserver was restarted"
 kf get namespaces >/dev/null ||
   fail "the root-only kubeconfig with the pre-rotation admin cert (chain: old intermediate) stopped authenticating"
@@ -305,7 +306,7 @@ k get namespaces >/dev/null || fail "the current admin kubeconfig fails after th
 echo "PASS: $files re-issued under the new intermediate, each file carrying its chain"
 
 if [ "$WITH_SCHED" = 1 ] || [ -n "$VM" ]; then
-  [ "$(pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | head -1)" = "$SCHED_PID" ] ||
+  [ "$(pgrep -f "$(workdir_kill_pattern scheduler "$ABS_WORKDIR")" | sed -n 1p)" = "$SCHED_PID" ] ||
     fail "the scheduler was restarted"
   reloaded() { [ "$(grep -c "TLS material changed on disk" "$WORKDIR/scheduler.log" || true)" -gt "$RELOADS_PREV" ]; }
   poll 60 reloaded || fail "the scheduler never reloaded its re-issued client cert chain"

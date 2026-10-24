@@ -70,6 +70,14 @@ pub struct Args {
     #[arg(long, default_value = "10.96.0.0/12")]
     pub(crate) service_cluster_ip_range: String,
 
+    /// ClusterIP reserved for the kube-system/kube-dns Service. Must lie inside
+    /// `--service-cluster-ip-range` and must not be the network address, the broadcast
+    /// address or the `kubernetes` Service's first host. Defaults to the tenth host of the range
+    /// (kubeadm's `.10`). It must match the clusterIP in the applied CoreDNS manifest and
+    /// the kubelet's `clusterDNS`.
+    #[arg(long)]
+    pub(crate) kube_dns_cluster_ip: Option<String>,
+
     /// Hostname or IP to use for all kubelet proxy requests (log, exec, attach, port-forward).
     /// When set, overrides the node's InternalIP from status.addresses. Useful when the
     /// apiserver runs on a different host than the kubelet (e.g. Mac host + Lima VM) and
@@ -105,6 +113,13 @@ pub struct Args {
     /// default, matching upstream kube-apiserver. Removing or keeping existing entries stays allowed.
     #[arg(long, default_value_t = false)]
     pub(crate) deny_service_external_ips: bool,
+
+    /// Name of the Node that runs on the same host as this apiserver. Only that Node's
+    /// kubelet-serving CSR may carry the apiserver's own address as an IP SAN: its kubelet
+    /// already shares the host (and the CA key) with the apiserver, so the cert grants it
+    /// nothing. Any other Node asking for that address stays Pending.
+    #[arg(long)]
+    pub(crate) local_node_name: Option<String>,
 
     /// Max number of distinct SA-JWT signatures cached to skip the RSA verify (modular
     /// exponentiation) on repeat presentation of the same token. Falls back to the
