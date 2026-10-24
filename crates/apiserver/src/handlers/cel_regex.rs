@@ -7,18 +7,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use regex::{Regex, RegexBuilder};
+use regex_automata::meta::{self, BuildError};
 
-/// Estimated compiled bytes the cache holds before it evicts. Patterns can come from request
+type Regex = meta::Regex;
+
+/// Real compiled bytes the cache holds before it evicts. Patterns can come from request
 /// data, so the cache must not grow with traffic.
 const MAX_CACHED_BYTES: usize = 32 * 1024 * 1024;
 
-/// The most one pattern may occupy. Compilation is refused past this size, so it also bounds
-/// what a single entry can really use and how much of the cache one pattern can displace.
+/// NFA size limit per pattern; compilation is refused past it, which bounds how much of the
+/// cache one pattern can displace.
 const MAX_ENTRY_BYTES: usize = MAX_CACHED_BYTES / 8;
-
-/// Compiled-size estimate per pattern byte; the `regex` crate does not report the real size.
-const COMPILED_BYTES_PER_PATTERN_BYTE: usize = 64;
 
 struct Entry {
     regex: Regex,
@@ -45,7 +44,7 @@ impl RegexCache {
         if self.entries.contains_key(pattern) {
             return;
         }
-        let bytes = (pattern.len() * COMPILED_BYTES_PER_PATTERN_BYTE).clamp(1024, MAX_ENTRY_BYTES);
+        let bytes = pattern.len() + regex.memory_usage();
         while self.bytes + bytes > MAX_CACHED_BYTES {
             let Some(coldest) = self
                 .entries
@@ -77,7 +76,7 @@ static CACHE: Mutex<Option<RegexCache>> = Mutex::new(None);
 #[cfg(test)]
 pub(crate) static COMPILES: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 
-fn compile(pattern: &str) -> Result<Regex, regex::Error> {
+fn compile(pattern: &str) -> Result<Regex, Box<BuildError>> {
     #[cfg(test)]
     {
         *COMPILES
@@ -87,9 +86,10 @@ fn compile(pattern: &str) -> Result<Regex, regex::Error> {
             .entry(pattern.to_string())
             .or_default() += 1;
     }
-    RegexBuilder::new(pattern)
-        .size_limit(MAX_ENTRY_BYTES)
-        .build()
+    Regex::builder()
+        .configure(Regex::config().nfa_size_limit(Some(MAX_ENTRY_BYTES)))
+        .build(pattern)
+        .map_err(Box::new)
 }
 
 /// Compiles outside the lock: a slow compile of one pattern must not hold up cache hits for
@@ -97,8 +97,8 @@ fn compile(pattern: &str) -> Result<Regex, regex::Error> {
 fn lookup_or_compile(
     cache: &Mutex<Option<RegexCache>>,
     pattern: &str,
-    compile: impl FnOnce(&str) -> Result<Regex, regex::Error>,
-) -> Result<Regex, regex::Error> {
+    compile: impl FnOnce(&str) -> Result<Regex, Box<BuildError>>,
+) -> Result<Regex, Box<BuildError>> {
     let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(re) = lock().get_or_insert_with(RegexCache::default).get(pattern) {
         return Ok(re);
@@ -116,7 +116,7 @@ pub(crate) fn cel_matches(
     pattern: Arc<String>,
 ) -> Result<bool, cel::ExecutionError> {
     match lookup_or_compile(&CACHE, &pattern, compile) {
-        Ok(re) => Ok(re.is_match(&this)),
+        Ok(re) => Ok(re.is_match(this.as_str())),
         Err(err) => Err(cel::ExecutionError::function_error(
             "matches",
             format!("'{pattern}' not a valid regex:\n{err}"),
@@ -128,8 +128,12 @@ pub(crate) fn cel_matches(
 mod tests {
     use super::*;
 
-    fn plain(pattern: &str) -> Result<Regex, regex::Error> {
-        Regex::new(pattern)
+    fn plain(pattern: &str) -> Result<Regex, Box<BuildError>> {
+        Regex::new(pattern).map_err(Box::new)
+    }
+
+    fn cost(pattern: &str) -> usize {
+        pattern.len() + Regex::new(pattern).unwrap().memory_usage()
     }
 
     /// One slow compile used to hold the process-wide lock, stalling every `matches()` on every
@@ -146,7 +150,7 @@ mod tests {
                 lookup_or_compile(cache, "slow", |p| {
                     started_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
-                    Regex::new(p)
+                    Regex::new(p).map_err(Box::new)
                 })
                 .unwrap();
             });
@@ -166,21 +170,48 @@ mod tests {
         });
     }
 
+    /// A 7-byte `\pL{50}` compiles to megabytes; a per-pattern-byte estimate would admit tens of
+    /// GiB of them, so the cache must charge the real compiled size.
+    #[test]
+    fn many_small_class_heavy_patterns_stay_within_the_real_memory_budget() {
+        let cache = Mutex::new(None);
+        for n in 20..80 {
+            lookup_or_compile(&cache, &format!(r"\pL{{{n}}}"), plain).unwrap();
+        }
+        let guard = cache.lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        let real: usize = state.entries.values().map(|e| e.regex.memory_usage()).sum();
+        assert!(
+            real <= MAX_CACHED_BYTES,
+            "cached regexes really use {real} bytes, over the {MAX_CACHED_BYTES} budget"
+        );
+        assert!(
+            state.entries.len() < 60,
+            "nothing was evicted, so the test never exercised the bound"
+        );
+    }
+
     /// Patterns come from request data; one huge pattern must displace only what it needs,
     /// least recently used first, never the whole cache.
     #[test]
     fn a_huge_pattern_evicts_cold_entries_not_the_hot_ones() {
         let cache = Mutex::new(None);
-        let filler = "x".repeat(MAX_ENTRY_BYTES / COMPILED_BYTES_PER_PATTERN_BYTE);
-        let filler_count = MAX_CACHED_BYTES / MAX_ENTRY_BYTES - 1;
-        for i in 0..filler_count {
-            lookup_or_compile(&cache, &format!("{filler}{i}"), plain).unwrap();
+        let huge = r"\pL{200}";
+        let mut used = cost("hot");
+        let mut i = 0;
+        loop {
+            let filler = format!(r"\pL{{{}}}", 30 + i);
+            if used + cost(&filler) + cost(huge) > MAX_CACHED_BYTES {
+                break;
+            }
+            used += cost(&filler);
+            lookup_or_compile(&cache, &filler, plain).unwrap();
+            i += 1;
         }
         lookup_or_compile(&cache, "hot", plain).unwrap();
-        let huge = "y".repeat(MAX_ENTRY_BYTES / COMPILED_BYTES_PER_PATTERN_BYTE);
-        lookup_or_compile(&cache, &huge, plain).unwrap();
+        lookup_or_compile(&cache, huge, plain).unwrap();
         lookup_or_compile(&cache, "hot", |_| panic!("hot pattern was evicted")).unwrap();
-        lookup_or_compile(&cache, &huge, |_| panic!("new pattern was not cached")).unwrap();
+        lookup_or_compile(&cache, huge, |_| panic!("new pattern was not cached")).unwrap();
         let guard = cache.lock().unwrap();
         let state = guard.as_ref().unwrap();
         assert!(

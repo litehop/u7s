@@ -3453,6 +3453,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "regex",
+ "regex-automata",
  "reqwest",
  "rlimit",
  "rustls",
