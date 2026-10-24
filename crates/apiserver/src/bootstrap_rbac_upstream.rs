@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use u7s_store::{ListOptions, Store};
 
 use crate::bootstrap_rbac::{rules_cover, yaml_items};
+use crate::state::KCM_CONTROLLER_SERVICE_ACCOUNTS;
 use crate::SqliteStore;
 
 const GROUP: &str = "rbac.authorization.k8s.io";
@@ -229,49 +230,6 @@ async fn every_service_account_kcm_runs_a_controller_as_is_bound_to_its_controll
         );
     }
 }
-
-/// Service accounts KCM 1.37 authenticates controllers as under the u7s `--controllers` set.
-/// `selinux-warning-controller` is absent on purpose: it is disabled by default and needs the
-/// SELinuxChangePolicy gate, so `--controllers=*` never starts it.
-const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
-    "attachdetach-controller",
-    "certificate-controller",
-    "cronjob-controller",
-    "daemon-set-controller",
-    "deployment-controller",
-    "device-taint-eviction-controller",
-    "disruption-controller",
-    "endpoint-controller",
-    "endpointslice-controller",
-    "endpointslicemirroring-controller",
-    "ephemeral-volume-controller",
-    "expand-controller",
-    "generic-garbage-collector",
-    "horizontal-pod-autoscaler",
-    "job-controller",
-    "kube-apiserver-serving-clustertrustbundle-publisher",
-    "legacy-service-account-token-cleaner",
-    "namespace-controller",
-    "node-controller",
-    "persistent-volume-binder",
-    "pod-garbage-collector",
-    "podcertificaterequestcleaner",
-    "pv-protection-controller",
-    "pvc-protection-controller",
-    "replicaset-controller",
-    "replication-controller",
-    "resource-claim-controller",
-    "resourcequota-controller",
-    "root-ca-cert-publisher",
-    "service-account-controller",
-    "statefulset-controller",
-    "storage-version-migrator-controller",
-    "ttl-after-finished-controller",
-    "ttl-controller",
-    "validatingadmissionpolicy-status-controller",
-    "volumeattributesclass-protection-controller",
-];
-
 fn upstream_cluster_objects(yamls: &[&str]) -> BTreeMap<String, Value> {
     yamls
         .iter()
