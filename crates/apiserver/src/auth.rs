@@ -1207,6 +1207,9 @@ fn log_denial(
     if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
+    if !crate::log_limit::admit(kind, peer.map(|p| p.0.ip())) {
+        return resp;
+    }
     tracing::info!(
         kind,
         status = resp.status().as_u16(),

@@ -261,7 +261,9 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    tracing::warn!(peer = %peer_addr, "TLS accept error: {e}");
+                    if crate::log_limit::admit("tls_accept_error", Some(peer_addr.ip())) {
+                        tracing::warn!(peer = %peer_addr, "TLS accept error: {e}");
+                    }
                     return;
                 }
                 Err(_) => {
