@@ -50,8 +50,11 @@ enum Migrate {
     /// `migrate.u7s.dev/source-uid` (its UID on the source). Do not remove
     /// it: a re-run adopts only same-named objects carrying it and reports
     /// any other as a failure, leaving it untouched. Admission
-    /// configurations are created last, once their Services have a ready
-    /// endpoint; the backend port may still be starting at that moment.
+    /// configurations are created last, each only after its webhook's
+    /// Service answers over TLS (probed through the target apiserver's
+    /// service proxy, up to 90s); on timeout the configurations are not
+    /// created and the run fails naming the webhook. Re-run once the
+    /// workload is up.
     Import {
         /// Target u7s kubeconfig (client-certificate auth).
         #[arg(long)]
