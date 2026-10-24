@@ -808,9 +808,9 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
 /// Then schema + CEL validation of the mutated object, as upstream's `rest.BeforeCreate`
 /// runs `Validate` after mutating admission: validating a pre-webhook object would let a
 /// webhook persist a schema-invalid CR.
-fn prepare_cr_for_create(
+async fn prepare_cr_for_create(
     ctx: &CrContext,
-    cache: &crate::state::CrSchemaCache,
+    cache: &std::sync::Arc<crate::state::CrSchemaCache>,
     obj: &mut serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
     if ctx.has_status_subresource {
@@ -819,7 +819,7 @@ fn prepare_cr_for_create(
         }
     }
     obj["metadata"]["generation"] = serde_json::json!(1i64);
-    validate_cr_schema(obj, ctx, cache, None)
+    validate_cr_schema(obj, ctx, cache, None).await
 }
 
 /// Anything outside `metadata` (`apiVersion`/`kind` are envelope, not content) differing
@@ -979,13 +979,42 @@ fn store_err_cr(
 /// `old_object` is the previously-stored object on UPDATE (for binding `oldSelf` in CEL
 /// rules), or `None` on CREATE — upstream only makes `oldSelf` available on UPDATE.
 /// Returns `Err(StatusError)` with HTTP 422 if validation fails.
-fn validate_cr_schema(
+///
+/// A schema with CEL rules waits on evaluation threads for up to the wall-clock budgets, so
+/// that work runs on the blocking pool rather than pinning an async worker.
+async fn validate_cr_schema(
     obj: &serde_json::Value,
     ctx: &CrContext,
-    cache: &crate::state::CrSchemaCache,
+    cache: &std::sync::Arc<crate::state::CrSchemaCache>,
     old_object: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
-    validate_cr_schema_with_budgets(obj, ctx, cache, old_object, &CelBudgets::PRODUCTION)
+    validate_cr_schema_off_worker(obj, ctx, cache, old_object, CelBudgets::PRODUCTION).await
+}
+
+async fn validate_cr_schema_off_worker(
+    obj: &serde_json::Value,
+    ctx: &CrContext,
+    cache: &std::sync::Arc<crate::state::CrSchemaCache>,
+    old_object: Option<&serde_json::Value>,
+    budgets: CelBudgets,
+) -> Result<(), crate::status::StatusError> {
+    let no_cel = cache
+        .get(&ctx.schema_cache_key)
+        .is_some_and(|compiled| compiled.cel_programs.is_empty());
+    if no_cel {
+        return validate_cr_schema_with_budgets(obj, ctx, cache, old_object, &budgets);
+    }
+    let (obj, ctx, cache, old_object) = (
+        obj.clone(),
+        ctx.clone(),
+        std::sync::Arc::clone(cache),
+        old_object.cloned(),
+    );
+    tokio::task::spawn_blocking(move || {
+        validate_cr_schema_with_budgets(&obj, &ctx, &cache, old_object.as_ref(), &budgets)
+    })
+    .await
+    .map_err(|e| Status::internal(format!("CR validation task failed: {e}")))?
 }
 
 fn validate_cr_schema_with_budgets(
@@ -1628,6 +1657,7 @@ const CEL_COST_REPLAY_BUDGET: std::time::Duration =
 
 /// The wall-clock budgets a CEL evaluation runs under. Production code uses `PRODUCTION`;
 /// tests inject their own so a timeout verdict is either unreachable or forced.
+#[derive(Clone, Copy)]
 struct CelBudgets {
     rule_eval: std::time::Duration,
     replay: std::time::Duration,
@@ -3028,7 +3058,7 @@ pub async fn create_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
+    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     record_cr_write(
@@ -3218,7 +3248,7 @@ pub async fn replace_cr<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
                 .await?;
@@ -3245,7 +3275,7 @@ pub async fn replace_cr<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -4041,7 +4071,7 @@ pub async fn create_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
+    prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     record_cr_write(
@@ -4269,7 +4299,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
                 .await?;
@@ -4296,7 +4326,7 @@ pub async fn replace_cr_namespaced<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing))?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
     debug_assert_eq!(
         existing["metadata"]["uid"], obj["metadata"]["uid"],
         "old_object passed to run_validating_webhooks must be the same resource's pre-update \
@@ -4781,7 +4811,7 @@ pub async fn patch_cr<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
+        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
         ssa_plan.record(&mut obj);
@@ -4924,7 +4954,7 @@ pub async fn patch_cr<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
                 .await?;
@@ -4963,7 +4993,7 @@ pub async fn patch_cr<S: Store>(
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
@@ -5090,7 +5120,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
-        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj)?;
+        prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
         run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
         prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
         ssa_plan.record(&mut obj);
@@ -5268,7 +5298,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
-        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
+        validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
             complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
                 .await?;
@@ -5307,7 +5337,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
     crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
-    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old))?;
+    validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
     prune_cr_for_storage(ctx.schema.as_deref(), &mut obj);
     apply_cr_generation_on_update(&old, &mut obj);
@@ -11565,13 +11595,8 @@ mod tests {
         check_schema_inner(obj, schema, None, budgets)
     }
 
-    fn check_schema_inner(
-        obj: &serde_json::Value,
-        schema: serde_json::Value,
-        old_object: Option<&serde_json::Value>,
-        budgets: &CelBudgets,
-    ) -> Result<(), crate::status::StatusError> {
-        let ctx = CrContext {
+    fn test_ctx(schema: serde_json::Value) -> CrContext {
+        CrContext {
             kind: "Test".into(),
             namespaced: false,
             has_status_subresource: false,
@@ -11583,7 +11608,25 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
-        };
+        }
+    }
+
+    fn validate_cr_schema_sync(
+        obj: &serde_json::Value,
+        ctx: &CrContext,
+        cache: &crate::state::CrSchemaCache,
+        old_object: Option<&serde_json::Value>,
+    ) -> Result<(), crate::status::StatusError> {
+        validate_cr_schema_with_budgets(obj, ctx, cache, old_object, &CelBudgets::PRODUCTION)
+    }
+
+    fn check_schema_inner(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+        old_object: Option<&serde_json::Value>,
+        budgets: &CelBudgets,
+    ) -> Result<(), crate::status::StatusError> {
+        let ctx = test_ctx(schema);
         // Fresh cache per call: these tests exercise schema-correctness, not caching, and
         // every call here uses the same fixed schema_cache_key — sharing one cache across
         // calls with different schemas would return the wrong compiled schema.
@@ -11728,11 +11771,11 @@ mod tests {
         let value = serde_json::json!({ "spec": {} });
 
         assert!(
-            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            validate_cr_schema_sync(&value, &ctx, &cache, None).is_ok(),
             "first write must validate"
         );
         assert!(
-            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            validate_cr_schema_sync(&value, &ctx, &cache, None).is_ok(),
             "second write must validate"
         );
 
@@ -11778,11 +11821,11 @@ mod tests {
         let value = serde_json::json!({ "spec": {} });
 
         assert!(
-            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            validate_cr_schema_sync(&value, &ctx, &cache, None).is_ok(),
             "first write must validate"
         );
         assert!(
-            validate_cr_schema(&value, &ctx, &cache, None).is_ok(),
+            validate_cr_schema_sync(&value, &ctx, &cache, None).is_ok(),
             "second write must validate"
         );
 
@@ -11846,8 +11889,8 @@ mod tests {
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });
 
-        assert!(validate_cr_schema(&value, &make_ctx("1"), &cache, None).is_ok());
-        assert!(validate_cr_schema(&value, &make_ctx("2"), &cache, None).is_ok());
+        assert!(validate_cr_schema_sync(&value, &make_ctx("1"), &cache, None).is_ok());
+        assert!(validate_cr_schema_sync(&value, &make_ctx("2"), &cache, None).is_ok());
 
         assert_eq!(
             cache.compile_count(),
@@ -11914,7 +11957,7 @@ mod tests {
         let key = ctx.schema_cache_key.clone();
 
         // Populate the cache via the real validation path (same code every CR write uses).
-        validate_cr_schema(
+        validate_cr_schema_sync(
             &serde_json::json!({ "spec": {} }),
             &ctx,
             &state.cr_schema_cache,
@@ -12076,7 +12119,7 @@ mod tests {
             .await
             .expect("CRD must be found right after installing it");
         assert!(
-            validate_cr_schema(
+            validate_cr_schema_sync(
                 &serde_json::json!({ "spec": {} }),
                 &ctx,
                 &state.cr_schema_cache,
@@ -12100,7 +12143,7 @@ mod tests {
             .await
             .expect("CRD must still be found after replace");
         assert!(
-            validate_cr_schema(
+            validate_cr_schema_sync(
                 &serde_json::json!({ "spec": {} }),
                 &ctx,
                 &state.cr_schema_cache,
@@ -12182,7 +12225,7 @@ mod tests {
             .await
             .expect("CRD must be found right after installing it");
         assert!(
-            validate_cr_schema(
+            validate_cr_schema_sync(
                 &serde_json::json!({ "spec": {} }),
                 &ctx,
                 &state.cr_schema_cache,
@@ -12215,7 +12258,7 @@ mod tests {
             .await
             .expect("CRD must still be found after patch");
         assert!(
-            validate_cr_schema(
+            validate_cr_schema_sync(
                 &serde_json::json!({ "spec": {} }),
                 &ctx,
                 &state.cr_schema_cache,
@@ -13224,6 +13267,40 @@ mod tests {
         });
         let obj = serde_json::json!({ "spec": { "a": vec![1; items] } });
         (schema, obj)
+    }
+
+    /// Waiting out a CEL evaluation must not hold an async worker: on a one-worker runtime a
+    /// ticker task only advances during the wait if validation yields the worker. Blocked
+    /// workers stall every other request the runtime serves for as long as the rule runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cel_validation_wait_leaves_the_async_worker_free() {
+        let (schema, obj) = slow_quadratic_schema_and_obj(725);
+        let ctx = test_ctx(schema);
+        let cache = std::sync::Arc::new(crate::state::CrSchemaCache::new());
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = std::sync::Arc::clone(&ticks);
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        let verdict = validate_cr_schema_off_worker(&obj, &ctx, &cache, None, UNBOUNDED_BUDGETS)
+            .await
+            .unwrap_err();
+        ticker.abort();
+        assert!(
+            verdict.1.message.contains("call cost exceeds limit"),
+            "the rule must have run through the counted-cost path: {}",
+            verdict.1.message
+        );
+        let ticks = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            ticks >= 10,
+            "the async worker made no progress during the CEL wait ({ticks} ticks)"
+        );
     }
 
     /// The static bound bills the quadratic arm of this rule, so the replay runs; the replay
