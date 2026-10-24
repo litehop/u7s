@@ -125,7 +125,7 @@ cm_has() { [ "$(cm_cert_count "$1" "$2" "$3")" = "$4" ]; }
 cluster_info_has() {
   local data
   data="$(k -n kube-public get configmap cluster-info -o jsonpath='{.data.kubeconfig}')"
-  [ "$(sed -n 's/^ *certificate-authority-data: *//p' <<<"$data" | head -n1 | base64 -d | cert_count)" = "$1" ]
+  [ "$(sed -n 's/^ *certificate-authority-data: *//p' <<<"$data" | sed -n 1p | base64 -d | cert_count)" = "$1" ]
 }
 node_ready() { [ "$(k get nodes -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}')" = "True" ]; }
 pod_running() { [ "$(k -n "$NS" get pod "$NAME" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; }

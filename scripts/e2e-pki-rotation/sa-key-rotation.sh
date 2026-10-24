@@ -44,6 +44,20 @@ jwt_kid() {
   printf '%s' "$h" | openssl base64 -d -A | jq -r '.kid // empty'
 }
 
+# Capture before matching: `jwks_kids | grep -q` makes grep exit on the first hit, the
+# upstream `sort` then dies of SIGPIPE and pipefail turns a present kid into a failure.
+kid_listed() {
+  local kids
+  kids="$(jwks_kids)"
+  grep -qx -- "$1" <<<"$kids"
+}
+# first_other_kid <kid>: a listed kid other than <kid>.
+first_other_kid() {
+  local kids
+  kids="$(jwks_kids)"
+  grep -vx -m1 -- "$1" <<<"$kids"
+}
+
 [[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
 
 KC=""
@@ -111,7 +125,7 @@ switched() {
   LAST_A="$t"
   return 1
 }
-a_gone() { ! jwks_kids | grep -qx "$KID_A"; }
+a_gone() { ! kid_listed "$KID_A"; }
 
 for i in $(seq 1 "$ITERATIONS"); do
   echo "== rotation $i/$ITERATIONS =="
@@ -122,13 +136,13 @@ for i in $(seq 1 "$ITERATIONS"); do
   KID_A="$(jwt_kid "$LAST_A")"
   [ -n "$KID_A" ] || fail "token has no kid header"
   echo "signing kid A=$KID_A"
-  jwks_kids | grep -qx "$KID_A" || fail "JWKS does not list the signing kid $KID_A"
+  kid_listed "$KID_A" || fail "JWKS does not list the signing kid $KID_A"
   authenticates "$LAST_A" || fail "fresh token not authenticated"
   [ -z "$POD" ] || poll 30 pod_token_ok || fail "pod projected token does not authenticate before rotation"
 
   echo "waiting for the successor to be published (JWKS lists two kids)"
   poll "$DEADLINE" successor_published || fail "successor key never appeared in the JWKS"
-  KID_B="$(jwks_kids | grep -vx "$KID_A" | head -1)"
+  KID_B="$(first_other_kid "$KID_A")"
   [ "$(jwt_kid "$(mint)")" = "$KID_A" ] || fail "successor already signs: it was not pre-published"
   echo "successor B=$KID_B published while A still signs"
 

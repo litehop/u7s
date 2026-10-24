@@ -4794,17 +4794,19 @@ fn record_cr_write(
 
 fn record_cr_scale_write(
     headers: &HeaderMap,
+    plan: Option<&crate::field_manager::ApplyPlan>,
     before: &serde_json::Value,
     obj: &mut serde_json::Value,
     group: &str,
     version: &str,
     ctx: &CrContext,
 ) {
-    crate::field_manager::WriteIdentity::new(None, headers).record(
+    crate::field_manager::WriteIdentity::new(None, headers).record_subresource_write(
+        plan,
         before,
         obj,
         &format!("{group}/{version}"),
-        Some("scale"),
+        "scale",
         ctx.schema.as_deref(),
     );
 }
@@ -5590,7 +5592,11 @@ pub async fn put_cr_status<S: Store>(
         }
     }
 
-    crate::handlers::status::merge_incoming_metadata(&mut current, &incoming, &kind);
+    crate::handlers::status::merge_incoming_metadata(
+        &mut current,
+        &incoming,
+        cr_ctx.is_none().then_some(kind.as_str()),
+    );
 
     if let Some(old) = &csr_before {
         crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
@@ -5792,7 +5798,13 @@ pub async fn patch_cr_status<S: Store>(
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
     let ssa_plan = crate::handlers::status::plan_status_apply(
-        &headers, is_ssa, &current, &patch, &group, &version,
+        &headers,
+        is_ssa,
+        &current,
+        &patch,
+        &group,
+        &version,
+        cr_ctx.is_none().then_some(kind.as_str()),
     )?;
 
     match patch_type {
@@ -5818,7 +5830,11 @@ pub async fn patch_cr_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
+            crate::handlers::status::merge_incoming_metadata(
+                &mut current,
+                &patch,
+                cr_ctx.is_none().then_some(kind.as_str()),
+            );
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -5961,7 +5977,7 @@ fn scale_path_get_str<'a>(obj: &'a serde_json::Value, path: &str) -> &'a str {
 /// matching upstream's `unstructured.SetNestedField`). Only ever called with
 /// `specReplicasPath` — `statusReplicasPath`/`labelSelectorPath` are read-only from the scale
 /// subresource's perspective; the CR's own controller owns writing those.
-fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
+pub(super) fn scale_path_set_i64(obj: &mut serde_json::Value, path: &str, new_value: i64) {
     let segs: Vec<&str> = path.split('.').collect();
     let Some((last, parents)) = segs.split_last() else {
         return;
@@ -6114,6 +6130,7 @@ async fn cr_scale_put_impl<S: Store>(
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
+        None,
         &before,
         &mut obj,
         target.group,
@@ -6193,6 +6210,19 @@ async fn cr_scale_patch_impl<S: Store>(
     // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
     // is a no-op write, not an error).
     let before = obj.clone();
+    let ssa_plan = content_type(headers)
+        .contains("apply-patch+yaml")
+        .then(|| {
+            super::scale::plan_scale_apply(
+                headers,
+                &before,
+                scale_body.spec.replicas.map(i64::from),
+                &scale_cfg.spec_replicas_path,
+                &format!("{}/{}", target.group, target.version),
+                ctx.schema.as_deref(),
+            )
+        })
+        .transpose()?;
     let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
     let new_replicas = admit_cr_scale(
         state,
@@ -6213,9 +6243,13 @@ async fn cr_scale_patch_impl<S: Store>(
     if scale_body.spec.replicas.is_some() || new_replicas != old_replicas {
         scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
     }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut obj);
+    }
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(
         headers,
+        ssa_plan.as_ref(),
         &before,
         &mut obj,
         target.group,
@@ -16480,6 +16514,106 @@ mod tests {
     // patch_cr_status tests
     // ---------------------------------------------------------------------------
 
+    async fn cr_status_apply(
+        state: &AppState,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_cr_status(
+            State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "ssa-widget".to_string(),
+            )),
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    async fn seed_ssa_widget(state: &AppState) {
+        install_cluster_crd_with_status_subresource(state).await;
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body("ssa-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+    }
+
+    /// A controller applying a custom resource's /status must own what it named under a
+    /// status-scoped Apply entry and be able to delete it again; spec stays untouched.
+    #[tokio::test]
+    async fn cr_status_apply_is_scoped_and_prunes() {
+        let state = make_state();
+        seed_ssa_widget(&state).await;
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            |m, f, y| cr_status_apply(&state, m, f, y),
+            "status:\n  readyToUse: true\n",
+            "status:\n  phase: Done\n",
+        )
+        .await;
+        assert!(
+            second["status"].get("readyToUse").is_none(),
+            "a field the applier stopped applying must be removed: {second}"
+        );
+        assert_eq!(second["status"]["phase"], "Done");
+        assert_eq!(
+            second["spec"]["color"], "blue",
+            "/status must not touch spec"
+        );
+    }
+
+    /// Upstream's custom-resource status strategy resets all of `metadata` and `spec`: a
+    /// status apply carrying an annotation and a spec change must land only the status, and
+    /// own nothing but it. Before, the annotation landed under no manager.
+    #[tokio::test]
+    async fn cr_status_apply_drops_metadata_and_spec() {
+        let state = make_state();
+        seed_ssa_widget(&state).await;
+        let out = cr_status_apply(
+            &state,
+            "ctrl",
+            false,
+            "metadata:\n  annotations:\n    sneaked: \"1\"\nspec:\n  color: red\nstatus:\n  readyToUse: true\n".into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status apply must succeed: {e:?}"));
+        assert_eq!(out["status"]["readyToUse"], true);
+        assert_eq!(
+            out["spec"]["color"], "blue",
+            "status apply must not change spec"
+        );
+        assert!(
+            out["metadata"].get("annotations").is_none(),
+            "a CR status apply must not land metadata: {}",
+            out["metadata"]
+        );
+        let owned =
+            &crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("status"))
+                .unwrap()["fieldsV1"];
+        assert!(
+            owned.get("f:metadata").is_none() && owned.get("f:spec").is_none(),
+            "reset fields must never be owned: {owned}"
+        );
+    }
+
     // patch_cr_status must update .status and leave .spec untouched for a cluster-scoped
     // CRD declaring subresources.status. Before patch_cr_status existed, the route wired
     // PATCH directly to the non-CR-aware patch_resource_status, which 404s on any group
@@ -26730,6 +26864,71 @@ mod tests {
             scale["status"]["selector"], "app=gizmo",
             "status.selector must come from the CRD-declared labelSelectorPath — the HPA \
              controller treats an empty selector as a hard, unrecoverable error"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_cr_scale_apply_owns_the_crd_declared_replicas_path_under_scale() {
+        let state = make_state();
+        install_namespaced_crd_with_scale_subresource(&state).await;
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Gizmo",
+                "metadata": { "name": "g", "namespace": "default" },
+                "spec": { "desiredReplicas": 2, "color": "blue" }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed: {e:?}"));
+
+        patch_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+                "g".to_string(),
+            )),
+            None,
+            crate::handlers::test_support::apply_headers("ctrl", true),
+            Bytes::from("spec:\n  replicas: 7\n"),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("scale apply must succeed: {e:?}"));
+
+        let stored = state
+            .store
+            .get("/registry/cr/example.io/gizmos/default/g")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(obj["spec"]["desiredReplicas"], 7);
+        let entry =
+            crate::handlers::test_support::managed_entry(&obj, "ctrl", "Apply", Some("scale"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "scale apply must record an Apply scoped to scale: {}",
+                        obj["metadata"]["managedFields"]
+                    )
+                });
+        assert!(
+            entry["fieldsV1"]["f:spec"]["f:desiredReplicas"].is_object(),
+            "the applier must own the CRD-declared replicas path, not spec.replicas: {entry}"
         );
     }
 

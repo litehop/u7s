@@ -53,11 +53,23 @@ use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 /// Restore semantics: if the field was absent (null) in the stored object, the field is
 /// removed after merge even if the incoming body added it. If it was present, it is
 /// restored to its stored value unconditionally.
+///
+/// `kind` is the built-in kind; `None` is a custom resource, whose `/status` strategy
+/// resets all of `metadata`. Metadata the kind's status strategy resets (see
+/// `field_manager::reset_fields`) is dropped from `incoming` too.
 pub(crate) fn merge_incoming_metadata(
     current: &mut serde_json::Value,
     incoming: &serde_json::Value,
-    kind: &str,
+    kind: Option<&str>,
 ) {
+    let Some(kind) = kind else {
+        return;
+    };
+    let mut incoming = incoming.clone();
+    crate::field_manager::strip_paths(
+        &mut incoming,
+        crate::field_manager::reset_fields(Some(kind), Some("status")),
+    );
     let incoming_meta = &incoming["metadata"];
     if !incoming_meta.is_object() {
         return;
@@ -65,6 +77,39 @@ pub(crate) fn merge_incoming_metadata(
     let saved = protected_metadata(&current["metadata"], kind);
     crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
     restore_metadata(&mut current["metadata"], saved);
+}
+
+/// What a status-subresource write takes from `patch`, and so what an apply to it owns:
+/// `status` and the `metadata` the write may change, minus what the subresource's strategy
+/// resets. `kind` is `None` for a custom resource.
+pub(crate) fn status_write_fields(
+    patch: &serde_json::Value,
+    kind: Option<&str>,
+    subresource: &str,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for member in ["status", "metadata"] {
+        if let Some(v) = patch.get(member) {
+            out.insert(member.into(), v.clone());
+        }
+    }
+    let mut out = serde_json::Value::Object(out);
+    crate::field_manager::strip_paths(
+        &mut out,
+        crate::field_manager::reset_fields(kind, Some(subresource)),
+    );
+    if let (Some(kind), Some(meta)) = (
+        kind,
+        out.get_mut("metadata").and_then(|m| m.as_object_mut()),
+    ) {
+        for (k, _) in protected_metadata(&serde_json::Value::Null, kind) {
+            meta.remove(k);
+        }
+        if meta.is_empty() {
+            out.as_object_mut().map(|o| o.remove("metadata"));
+        }
+    }
+    out
 }
 
 fn protected_metadata(
@@ -191,8 +236,8 @@ fn status_api_version(group: &str, version: &str) -> String {
     }
 }
 
-/// Plan an apply to the status subresource: it owns the `status` it names under an Apply
-/// entry scoped to `status`, never the main resource's fields.
+/// Plan an apply to the status subresource: it owns what the write takes (`status_write_fields`)
+/// under an Apply entry scoped to `status`, never the main resource's fields.
 pub(super) fn plan_status_apply(
     headers: &HeaderMap,
     is_ssa: bool,
@@ -200,6 +245,7 @@ pub(super) fn plan_status_apply(
     patch: &serde_json::Value,
     group: &str,
     version: &str,
+    kind: Option<&str>,
 ) -> Result<Option<crate::field_manager::ApplyPlan>, crate::status::StatusError> {
     if !is_ssa {
         return Ok(None);
@@ -207,8 +253,8 @@ pub(super) fn plan_status_apply(
     crate::field_manager::WriteIdentity::new(None, headers)
         .plan_subresource_apply(
             live,
-            patch,
-            &["status"],
+            &status_write_fields(patch, kind, "status"),
+            &["status", "metadata"],
             &status_api_version(group, version),
             "status",
             None,
@@ -313,7 +359,7 @@ pub async fn put_resource_status<S: Store>(
             None => replace_status_field(&mut current.body, incoming_status)?,
         }
     }
-    merge_incoming_metadata(&mut current.body, &incoming.body, &meta.kind);
+    merge_incoming_metadata(&mut current.body, &incoming.body, Some(meta.kind.as_str()));
 
     if let Some(ref old_node) = node_before {
         crate::node_authz::restrict_node_self_write(
@@ -419,7 +465,15 @@ pub async fn patch_resource_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     reject_patch_identity_mismatch(&patch, &name, None)?;
-    let ssa_plan = plan_status_apply(&headers, is_ssa, &current.body, &patch, &group, &version)?;
+    let ssa_plan = plan_status_apply(
+        &headers,
+        is_ssa,
+        &current.body,
+        &patch,
+        &group,
+        &version,
+        Some(meta.kind.as_str()),
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -444,7 +498,7 @@ pub async fn patch_resource_status<S: Store>(
                     }
                 }
             }
-            merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
+            merge_incoming_metadata(&mut current.body, &patch, Some(meta.kind.as_str()));
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -686,7 +740,11 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
             None => replace_status_field(&mut current.body, incoming_status)?,
         }
     }
-    merge_incoming_metadata(&mut current.body, &incoming.body, &kind);
+    merge_incoming_metadata(
+        &mut current.body,
+        &incoming.body,
+        cr_ctx.is_none().then_some(kind.as_str()),
+    );
 
     if let (Some(guard), Some(stored_body)) = (guard, &stored_body) {
         guard(stored_body, &current.body)?;
@@ -819,7 +877,15 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     reject_patch_identity_mismatch(&patch, &name, Some(&ns))?;
-    let ssa_plan = plan_status_apply(&headers, is_ssa, &current.body, &patch, &group, &version)?;
+    let ssa_plan = plan_status_apply(
+        &headers,
+        is_ssa,
+        &current.body,
+        &patch,
+        &group,
+        &version,
+        cr_ctx.is_none().then_some(kind.as_str()),
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -844,7 +910,11 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
                     }
                 }
             }
-            merge_incoming_metadata(&mut current.body, &patch, &kind);
+            merge_incoming_metadata(
+                &mut current.body,
+                &patch,
+                cr_ctx.is_none().then_some(kind.as_str()),
+            );
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -2496,6 +2566,276 @@ mod tests {
         assert_eq!(
             after_second["spec"]["replicas"], 3,
             "a status apply must not touch main-resource fields"
+        );
+    }
+
+    async fn deployment_status_apply(
+        state: &crate::state::AppState<SqliteStore>,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_namespaced_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            bytes::Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// kubectl/controllers that apply status over a field the kubelet-style Update writers
+    /// own must be told (409) rather than silently stealing it, unless they force.
+    #[tokio::test]
+    async fn namespaced_status_apply_over_update_owner_conflicts_without_force() {
+        use crate::handlers::test_support::{
+            assert_status_apply_conflicts_without_force, update_entry,
+        };
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {
+                "name": "web", "namespace": "default",
+                "managedFields": [update_entry(
+                    "deployment-controller", "apps/v1", Some("status"),
+                    serde_json::json!({"f:status": {"f:readyReplicas": {}}}),
+                )]
+            },
+            "spec": { "replicas": 3 },
+            "status": { "readyReplicas": 1 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        assert_status_apply_conflicts_without_force(
+            |m, f, y| deployment_status_apply(&state, m, f, y),
+            "status:\n  readyReplicas: 2\n",
+            "readyReplicas",
+        )
+        .await;
+    }
+
+    async fn seeded_deployment_state() -> crate::state::AppState<SqliteStore> {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {
+                "name": "web", "namespace": "default",
+                "labels": {"app": "web"}
+            },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// Upstream's deployment status strategy resets `spec` and `metadata.labels` only, so a
+    /// status apply lands the annotation it carries and owns it (a later apply can delete
+    /// it), while the spec and label changes in the same body are dropped. Before, the
+    /// annotation landed under no manager at all.
+    #[tokio::test]
+    async fn deployment_status_apply_lands_and_owns_annotations_but_drops_spec_and_labels() {
+        let state = seeded_deployment_state().await;
+        let out = deployment_status_apply(
+            &state,
+            "ctrl",
+            false,
+            "metadata:\n  annotations:\n    deployment.kubernetes.io/revision: \"2\"\n  labels:\n    app: hijacked\nspec:\n  replicas: 9\nstatus:\n  readyReplicas: 1\n".into(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status apply must succeed: {e:?}"));
+        assert_eq!(
+            out["spec"]["replicas"], 3,
+            "status apply must not change spec"
+        );
+        assert_eq!(
+            out["metadata"]["labels"]["app"], "web",
+            "status apply must not change labels"
+        );
+        assert_eq!(
+            out["metadata"]["annotations"]["deployment.kubernetes.io/revision"],
+            "2"
+        );
+        let entry =
+            crate::handlers::test_support::managed_entry(&out, "ctrl", "Apply", Some("status"))
+                .expect("status-scoped entry");
+        let owned = &entry["fieldsV1"];
+        assert!(
+            owned["f:metadata"]["f:annotations"]["f:deployment.kubernetes.io/revision"].is_object(),
+            "the annotation a status apply writes must be owned: {owned}"
+        );
+        assert!(
+            owned["f:metadata"].get("f:labels").is_none() && owned.get("f:spec").is_none(),
+            "reset fields must never be owned: {owned}"
+        );
+
+        let out = deployment_status_apply(
+            &state,
+            "ctrl",
+            false,
+            "status:\n  readyReplicas: 1\n".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out["metadata"].get("annotations").is_none(),
+            "an owned annotation the applier stops sending must be removed: {out}"
+        );
+    }
+
+    /// The per-kind reset table mirrors upstream release-1.37 `GetResetFields`: a status apply
+    /// owns exactly status + non-reset metadata, so this is what every `*/status` site builds.
+    #[test]
+    fn status_write_fields_drop_exactly_what_upstream_resets() {
+        let patch = serde_json::json!({
+            "spec": {"x": 1},
+            "metadata": {
+                "name": "n", "labels": {"l": "1"}, "annotations": {"a": "1"},
+                "ownerReferences": [{"name": "o"}], "deletionTimestamp": "t"
+            },
+            "status": {"conditions": [{"type": "T"}], "certificate": "c", "phase": "p"}
+        });
+        let fields = |kind: Option<&str>, sub: &str| status_write_fields(&patch, kind, sub);
+
+        let pod = fields(Some("Pod"), "status");
+        assert_eq!(
+            pod["metadata"],
+            serde_json::json!({"annotations": {"a": "1"}}),
+            "pods/status resets ownerReferences and deletionTimestamp; labels are write-protected: {pod}"
+        );
+        assert_eq!(
+            fields(Some("Node"), "status")["metadata"],
+            serde_json::json!({"annotations": {"a": "1"}, "labels": {"l": "1"}, "ownerReferences": [{"name": "o"}]}),
+            "kubelet publishes Node labels through nodes/status, so they stay in"
+        );
+        assert!(
+            fields(None, "status").get("metadata").is_none()
+                && fields(None, "status").get("spec").is_none(),
+            "a custom resource's /status resets all of metadata and spec"
+        );
+        let csr = fields(Some("CertificateSigningRequest"), "status");
+        assert!(
+            csr["status"].get("conditions").is_none() && csr["status"]["certificate"] == "c",
+            "csr /status resets status.conditions only: {csr}"
+        );
+        let approval = fields(Some("CertificateSigningRequest"), "approval");
+        assert!(
+            approval["status"].get("certificate").is_none()
+                && approval["status"]["conditions"].is_array(),
+            "csr /approval resets status.certificate only: {approval}"
+        );
+        for kind in [
+            "StatefulSet",
+            "DaemonSet",
+            "ReplicaSet",
+            "Job",
+            "Namespace",
+            "CustomResourceDefinition",
+        ] {
+            let f = fields(Some(kind), "status");
+            assert!(f.get("spec").is_none(), "{kind} /status resets spec");
+            assert_eq!(
+                f["metadata"],
+                serde_json::json!({"annotations": {"a": "1"}, "ownerReferences": [{"name": "o"}]})
+            );
+            assert_eq!(f["status"], patch["status"], "{kind} status is taken whole");
+        }
+    }
+
+    /// Cluster-scoped `*/status` (PersistentVolume here) has its own handler: it must scope
+    /// the applier to `status` and prune fields it stops applying, like the namespaced one.
+    #[tokio::test]
+    async fn cluster_scoped_status_apply_is_scoped_and_prunes() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pv = serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": { "name": "pv1" },
+            "spec": { "capacity": { "storage": "1Gi" } },
+            "status": { "phase": "Available" }
+        });
+        store
+            .put(
+                &group_object_key("", "persistentvolumes", None, "pv1"),
+                bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let apply = |m: &'static str, f: bool, y: String| {
+            let state = state.clone();
+            async move {
+                let resp = patch_resource_status(
+                    axum::extract::State(state),
+                    axum::extract::Path((
+                        "".into(),
+                        "v1".into(),
+                        "persistentvolumes".into(),
+                        "pv1".into(),
+                    )),
+                    axum::Extension(UserInfo::default()),
+                    crate::handlers::test_support::apply_headers(m, f),
+                    bytes::Bytes::from(y),
+                )
+                .await?
+                .into_response();
+                Ok::<_, crate::status::StatusError>(
+                    crate::handlers::test_support::response_json(resp).await,
+                )
+            }
+        };
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            apply,
+            "status:\n  message: first\n",
+            "status:\n  reason: second\n",
+        )
+        .await;
+        assert!(
+            second["status"].get("message").is_none(),
+            "a field the applier stopped applying must be removed: {second}"
+        );
+        assert_eq!(second["status"]["reason"], "second");
+        assert_eq!(
+            second["status"]["phase"], "Available",
+            "status the applier never owned must survive"
         );
     }
 
