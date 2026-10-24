@@ -6545,9 +6545,10 @@ mod tests {
         let closed_total_after = u7s_store::metrics::WATCH_CLOSED_TOTAL
             .with_label_values(&["client_limit_exceeded"])
             .get();
-        assert_eq!(
-            closed_total_after,
-            closed_total_before + 1,
+        // The closed-reason counter has no per-test label, so a concurrent test's own
+        // per-client rejection may also bump it; only a missing increment is a regression.
+        assert!(
+            closed_total_after > closed_total_before,
             "a 429 watch rejection must be counted in \
              u7s_watch_closed_total{{reason=\"client_limit_exceeded\"}}"
         );

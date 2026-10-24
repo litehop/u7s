@@ -985,6 +985,16 @@ fn validate_cr_schema(
     cache: &crate::state::CrSchemaCache,
     old_object: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
+    validate_cr_schema_with_budgets(obj, ctx, cache, old_object, &CelBudgets::PRODUCTION)
+}
+
+fn validate_cr_schema_with_budgets(
+    obj: &serde_json::Value,
+    ctx: &CrContext,
+    cache: &crate::state::CrSchemaCache,
+    old_object: Option<&serde_json::Value>,
+    budgets: &CelBudgets,
+) -> Result<(), crate::status::StatusError> {
     let Some(schema) = ctx.schema.as_deref() else {
         return Ok(());
     };
@@ -1036,7 +1046,7 @@ fn validate_cr_schema(
     // rule like `self.foo > 0` against a body that doesn't even have `foo` typed as a
     // number yet produces confusing CEL runtime errors instead of the clearer boon
     // "wrong type" error above.
-    validate_cel_rules(schema, obj, old_object, "", &compiled.cel_programs)
+    validate_cel_rules(schema, obj, old_object, "", &compiled.cel_programs, budgets)
 }
 
 /// Walks `schema` collecting a pre-compiled `cel::Program` for every unique
@@ -1128,9 +1138,18 @@ fn validate_cel_rules(
     old_node: Option<&serde_json::Value>,
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    budgets: &CelBudgets,
 ) -> Result<(), crate::status::StatusError> {
     let mut errors = Vec::new();
-    collect_cel_rule_errors(schema, obj, old_node, field_path, programs, &mut errors);
+    collect_cel_rule_errors(
+        schema,
+        obj,
+        old_node,
+        field_path,
+        programs,
+        budgets,
+        &mut errors,
+    );
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1173,6 +1192,7 @@ fn collect_cel_rule_errors(
     old_node: Option<&serde_json::Value>,
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    budgets: &CelBudgets,
     errors: &mut Vec<String>,
 ) -> bool {
     if let Some(rules) = schema
@@ -1180,7 +1200,9 @@ fn collect_cel_rule_errors(
         .and_then(|v| v.as_array())
     {
         for rule in rules {
-            if let Err(e) = evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs) {
+            if let Err(e) =
+                evaluate_cel_rule(rule, schema, obj, old_node, field_path, programs, budgets)
+            {
                 errors.push(e.error.1.message);
                 if e.halts_rules {
                     return false;
@@ -1200,6 +1222,7 @@ fn collect_cel_rule_errors(
                         child_old,
                         &join_cr_field_path(field_path, key),
                         programs,
+                        budgets,
                         errors,
                     ) {
                         return false;
@@ -1217,6 +1240,7 @@ fn collect_cel_rule_errors(
                     item_old,
                     &format!("{field_path}[{i}]"),
                     programs,
+                    budgets,
                     errors,
                 ) {
                     return false;
@@ -1234,7 +1258,9 @@ fn collect_cel_rule_errors(
     // "no such key" CEL error), not produce a meaningful pass/fail.
     if let Some(branches) = schema.get("allOf").and_then(|v| v.as_array()) {
         for branch in branches {
-            if !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors) {
+            if !collect_cel_rule_errors(
+                branch, obj, old_node, field_path, programs, budgets, errors,
+            ) {
                 return false;
             }
         }
@@ -1243,7 +1269,9 @@ fn collect_cel_rule_errors(
         if let Some(branches) = schema.get(combinator).and_then(|v| v.as_array()) {
             for branch in branches {
                 if schema_branch_structurally_matches(branch, obj)
-                    && !collect_cel_rule_errors(branch, obj, old_node, field_path, programs, errors)
+                    && !collect_cel_rule_errors(
+                        branch, obj, old_node, field_path, programs, budgets, errors,
+                    )
                 {
                     return false;
                 }
@@ -1472,6 +1500,8 @@ pub(crate) fn json_to_cel_value(
 /// CR-author-controlled list) — at the point it actually runs, on every CR write, rather
 /// than trying to predict its cost statically. Mirrors `walk_schema_dos_bounds` (crd.rs),
 /// which bounds the equivalent risk for boon schema compilation.
+///
+/// Callers receive it through `CelBudgets` so tests can inject their own.
 const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Caps how many `execute_cel_with_budget` threads may be alive at once. Each thread
@@ -1596,11 +1626,18 @@ fn run_within_budget<T: Send + 'static>(
 const CEL_COST_REPLAY_BUDGET: std::time::Duration =
     std::time::Duration::from_millis(20 * CEL_RULE_EVAL_BUDGET.as_millis() as u64);
 
-fn replay_within_budget(
-    gate: &'static ConcurrencyGate,
-    work: impl FnOnce() -> bool + Send + 'static,
-) -> Result<bool, CelEvalOverBudget> {
-    run_within_budget(CEL_COST_REPLAY_BUDGET, gate, work)
+/// The wall-clock budgets a CEL evaluation runs under. Production code uses `PRODUCTION`;
+/// tests inject their own so a timeout verdict is either unreachable or forced.
+struct CelBudgets {
+    rule_eval: std::time::Duration,
+    replay: std::time::Duration,
+}
+
+impl CelBudgets {
+    const PRODUCTION: Self = Self {
+        rule_eval: CEL_RULE_EVAL_BUDGET,
+        replay: CEL_COST_REPLAY_BUDGET,
+    };
 }
 
 enum RuntimeCost {
@@ -1624,6 +1661,7 @@ fn check_runtime_cost(
     schema: &serde_json::Value,
     self_value: &serde_json::Value,
     old_self_value: Option<&serde_json::Value>,
+    replay_budget: std::time::Duration,
     build_ctx: impl FnOnce() -> cel::Context<'static, 'static>,
 ) -> RuntimeCost {
     let data_node = |value| crate::handlers::cel_cost::Node::Data {
@@ -1635,6 +1673,7 @@ fn check_runtime_cost(
         data_node(self_value),
         old_self_value.map(data_node),
         None,
+        None,
     );
     if upper_bound_cost <= crate::handlers::cel_cost::CALL_COST_LIMIT {
         return RuntimeCost::Within;
@@ -1642,7 +1681,9 @@ fn check_runtime_cost(
     let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
     let replay_ctx = build_ctx();
     let rule_program = std::sync::Arc::clone(program);
-    let within_limit = replay_within_budget(&CEL_EVAL_THREAD_GATE, move || {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let replay_cancelled = std::sync::Arc::clone(&cancelled);
+    let within_limit = run_within_budget(replay_budget, &CEL_EVAL_THREAD_GATE, move || {
         let (self_json, old_json, schema) = &replay;
         let node = |value| crate::handlers::cel_cost::Node::Data {
             value,
@@ -1653,8 +1694,10 @@ fn check_runtime_cost(
             node(self_json),
             old_json.as_ref().map(node),
             Some(&replay_ctx),
+            Some(&replay_cancelled),
         ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
     });
+    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     classify_replay(within_limit)
 }
 
@@ -1682,6 +1725,7 @@ fn evaluate_cel_rule(
     old_self_value: Option<&serde_json::Value>,
     field_path: &str,
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    budgets: &CelBudgets,
 ) -> Result<(), RuleFailure> {
     let Some(rule_text) = rule.get("rule").and_then(|v| v.as_str()) else {
         return Ok(());
@@ -1722,7 +1766,14 @@ fn evaluate_cel_rule(
         ))
     };
 
-    match check_runtime_cost(&program, schema, self_value, old_self_value, build_ctx) {
+    match check_runtime_cost(
+        &program,
+        schema,
+        self_value,
+        old_self_value,
+        budgets.replay,
+        build_ctx,
+    ) {
         RuntimeCost::Within => {}
         RuntimeCost::OverLimit => {
             return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
@@ -1734,8 +1785,9 @@ fn evaluate_cel_rule(
         RuntimeCost::ReplayAbandoned => {
             return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule cost replay exceeded its \
-                 evaluation time budget of {CEL_COST_REPLAY_BUDGET:?} — rejecting to bound \
-                 CEL evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
+                 evaluation time budget of {:?} — rejecting to bound \
+                 CEL evaluation cost, {CEL_NO_FURTHER_RULES} (rule: {rule_text})",
+                budgets.replay
             ))));
         }
         RuntimeCost::TooManyInFlight => return Err(RuleFailure::halting(too_many_in_flight())),
@@ -1744,14 +1796,15 @@ fn evaluate_cel_rule(
     let result = match execute_cel_with_budget(
         &program,
         build_ctx(),
-        CEL_RULE_EVAL_BUDGET,
+        budgets.rule_eval,
         &CEL_EVAL_THREAD_GATE,
     ) {
         Err(CelEvalOverBudget::TimedOut) => {
             return Err(RuleFailure::halting(Status::unprocessable_entity(format!(
                 "{field_path}: x-kubernetes-validations rule exceeded its evaluation time \
-                 budget of {CEL_RULE_EVAL_BUDGET:?} — rejecting to bound CEL evaluation cost, \
-                 {CEL_NO_FURTHER_RULES} (rule: {rule_text})"
+                 budget of {:?} — rejecting to bound CEL evaluation cost, \
+                 {CEL_NO_FURTHER_RULES} (rule: {rule_text})",
+                budgets.rule_eval
             ))));
         }
         Err(CelEvalOverBudget::TooManyInFlight) => {
@@ -1797,6 +1850,7 @@ fn evaluate_cel_rule(
         (&escaped_self, escaped_old_self.as_ref()),
         (schema, self_value, old_self_value),
         programs,
+        budgets,
     );
     let value_prefix = match self_value {
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => String::new(),
@@ -1822,6 +1876,7 @@ fn cel_rule_failure_detail(
         Option<&serde_json::Value>,
     ),
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    budgets: &CelBudgets,
 ) -> String {
     if let Some(msg) = rule
         .get("message")
@@ -1832,7 +1887,8 @@ fn cel_rule_failure_detail(
         return msg.to_string();
     }
     if let Some(expr) = rule.get("messageExpression").and_then(|v| v.as_str()) {
-        if let Some(rendered) = evaluate_message_expression(expr, cel_values, json_values, programs)
+        if let Some(rendered) =
+            evaluate_message_expression(expr, cel_values, json_values, programs, budgets)
         {
             return rendered;
         }
@@ -1855,6 +1911,7 @@ fn evaluate_message_expression(
         Option<&serde_json::Value>,
     ),
     programs: &std::collections::HashMap<String, std::sync::Arc<cel::Program>>,
+    budgets: &CelBudgets,
 ) -> Option<String> {
     let program = resolve_cel_program(programs, expr).ok()?;
     let build_ctx = || {
@@ -1867,7 +1924,14 @@ fn evaluate_message_expression(
         cel_ctx
     };
     if !matches!(
-        check_runtime_cost(&program, schema, self_json, old_self_json, build_ctx),
+        check_runtime_cost(
+            &program,
+            schema,
+            self_json,
+            old_self_json,
+            budgets.replay,
+            build_ctx,
+        ),
         RuntimeCost::Within
     ) {
         return None;
@@ -1875,7 +1939,7 @@ fn evaluate_message_expression(
     match execute_cel_with_budget(
         &program,
         build_ctx(),
-        CEL_RULE_EVAL_BUDGET,
+        budgets.rule_eval,
         &CEL_EVAL_THREAD_GATE,
     )
     .ok()?
@@ -11454,6 +11518,13 @@ mod tests {
     // openAPIV3Schema validation tests (boon-based)
     // ---------------------------------------------------------------------------
 
+    /// Wall-clock budgets no test host can reach, so a counted-cost verdict is never
+    /// turned into a timeout by a loaded machine.
+    const UNBOUNDED_BUDGETS: CelBudgets = CelBudgets {
+        rule_eval: std::time::Duration::from_secs(600),
+        replay: std::time::Duration::from_secs(600),
+    };
+
     /// Helper: call validate_cr_schema with an inline schema value, as a CREATE (no
     /// previous object — `oldSelf` is unavailable, same as every real CREATE request).
     fn check_schema(
@@ -11469,6 +11540,23 @@ mod tests {
         obj: &serde_json::Value,
         schema: serde_json::Value,
         old_object: Option<&serde_json::Value>,
+    ) -> Result<(), crate::status::StatusError> {
+        check_schema_inner(obj, schema, old_object, &UNBOUNDED_BUDGETS)
+    }
+
+    fn check_schema_budgeted(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+        budgets: &CelBudgets,
+    ) -> Result<(), crate::status::StatusError> {
+        check_schema_inner(obj, schema, None, budgets)
+    }
+
+    fn check_schema_inner(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+        old_object: Option<&serde_json::Value>,
+        budgets: &CelBudgets,
     ) -> Result<(), crate::status::StatusError> {
         let ctx = CrContext {
             kind: "Test".into(),
@@ -11487,7 +11575,7 @@ mod tests {
         // every call here uses the same fixed schema_cache_key — sharing one cache across
         // calls with different schemas would return the wrong compiled schema.
         let cache = crate::state::CrSchemaCache::new();
-        validate_cr_schema(obj, &ctx, &cache, old_object)
+        validate_cr_schema_with_budgets(obj, &ctx, &cache, old_object, budgets)
     }
 
     // type:object with valid object passes.
@@ -13059,15 +13147,76 @@ mod tests {
         );
     }
 
-    /// A replay slower than the plain evaluation budget but under its own must not be
-    /// reported as over the cost limit, or a slow host rejects CRs whose counted cost is fine.
-    #[test]
-    fn replay_slower_than_plain_budget_is_not_misreported_as_over_cost_limit() {
-        let verdict = replay_within_budget(&CEL_EVAL_THREAD_GATE, || {
-            std::thread::sleep(CEL_RULE_EVAL_BUDGET + std::time::Duration::from_millis(100));
-            true
+    const SLOW: std::time::Duration = std::time::Duration::from_nanos(1);
+
+    fn slow_quadratic_schema_and_obj(items: usize) -> (serde_json::Value, serde_json::Value) {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [
+                    { "rule": "self.a.all(x, self.a.all(y, y >= 0))" }
+                ],
+                "properties": {
+                    "a": { "type": "array", "maxItems": 725, "items": { "type": "integer" } }
+                }
+            } }
         });
-        assert!(matches!(verdict, Ok(true)));
+        let obj = serde_json::json!({ "spec": { "a": vec![1; items] } });
+        (schema, obj)
+    }
+
+    /// The static bound bills the quadratic arm of this rule, so the replay runs; the replay
+    /// follows the short-circuit and counts a cheap rule. That verdict must be accepted, not
+    /// misreported as over the cost limit.
+    #[test]
+    fn replay_that_counts_within_the_limit_is_accepted_despite_a_static_bound_over_it() {
+        let (mut schema, obj) = slow_quadratic_schema_and_obj(725);
+        schema["properties"]["spec"]["x-kubernetes-validations"][0]["rule"] =
+            serde_json::json!("self.a.exists(x, x == 1) || self.a.all(x, self.a.all(y, y >= 0))");
+        assert!(
+            check_schema_budgeted(&obj, schema, &UNBOUNDED_BUDGETS).is_ok(),
+            "a rule whose counted cost is within the limit must pass however long the replay takes"
+        );
+    }
+
+    /// The replay backstop must surface as a rejection naming the replay, and must be
+    /// driven by `CelBudgets::replay`: a swapped or ignored field would let a stuck replay
+    /// hold a gate slot or report the wrong verdict.
+    #[test]
+    fn replay_exceeding_its_injected_budget_is_rejected_as_a_replay_timeout() {
+        let (schema, obj) = slow_quadratic_schema_and_obj(725);
+        let budgets = CelBudgets {
+            rule_eval: std::time::Duration::from_secs(600),
+            replay: SLOW,
+        };
+        let err = check_schema_budgeted(&obj, schema, &budgets).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("cost replay exceeded its evaluation time budget"),
+            "got: {}",
+            err.1.message
+        );
+    }
+
+    /// A rule that stays under the counted limit but outlives the plain evaluation budget
+    /// must be rejected as a timeout, driven by `CelBudgets::rule_eval`.
+    #[test]
+    fn rule_exceeding_its_injected_eval_budget_is_rejected_as_a_timeout() {
+        let (schema, obj) = slow_quadratic_schema_and_obj(300);
+        let budgets = CelBudgets {
+            rule_eval: SLOW,
+            replay: std::time::Duration::from_secs(600),
+        };
+        let err = check_schema_budgeted(&obj, schema, &budgets).unwrap_err();
+        assert!(
+            err.1
+                .message
+                .contains("rule exceeded its evaluation time budget"),
+            "got: {}",
+            err.1.message
+        );
     }
 
     #[test]
@@ -13140,34 +13289,99 @@ mod tests {
             std::sync::Arc::new(cel::Program::compile(expr).unwrap()),
         );
 
-        let before = CEL_EVAL_THREAD_GATE
-            .in_flight
-            .load(std::sync::atomic::Ordering::SeqCst);
         let rendered = evaluate_message_expression(
             expr,
             (&self_cel, None),
             (&schema, &self_json, None),
             &programs,
+            &UNBOUNDED_BUDGETS,
         );
         assert_eq!(
             rendered, None,
             "an over-cost messageExpression falls back to the default message"
         );
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let in_flight = || {
-            CEL_EVAL_THREAD_GATE
-                .in_flight
-                .load(std::sync::atomic::Ordering::SeqCst)
-        };
-        while in_flight() > before && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(
-            in_flight() <= before,
-            "a thread still holds a gate slot: the quadratic messageExpression was started \
-             instead of refused, and it keeps running after the request returns"
+        let verdict = check_runtime_cost(
+            &programs[expr],
+            &schema,
+            &self_json,
+            None,
+            UNBOUNDED_BUDGETS.replay,
+            || {
+                let mut ctx = cel::Context::default();
+                register_cel_extensions(&mut ctx);
+                ctx.add_variable_from_value("self", self_cel.clone());
+                ctx
+            },
         );
+        assert!(
+            matches!(verdict, RuntimeCost::OverLimit),
+            "the quadratic messageExpression must be refused by its counted cost; any other \
+             verdict means it was started and keeps running after the request returns"
+        );
+    }
+
+    fn csv_scan_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "x-kubernetes-validations": [{
+                    "rule": "self.csv.split(',').all(a, self.csv.contains(a))"
+                }],
+                "properties": { "csv": { "type": "string" } }
+            } }
+        })
+    }
+
+    /// Each step of this rule scans the whole payload, so the per-step count (a handful of
+    /// units) says nothing about the real work: 20k items over a 110KB string is two billion
+    /// byte-reads. It must be rejected by the cost the scans are billed, and the replay that
+    /// decides so must give its gate slot back instead of grinding on.
+    #[test]
+    fn rule_scanning_the_payload_per_split_item_is_rejected_by_cost_and_frees_its_gate_slot() {
+        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
+        let csv = (0..20_000)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let obj = serde_json::json!({ "spec": { "csv": csv } });
+        let err = check_schema(&obj, csv_scan_schema()).unwrap_err();
+        assert!(
+            err.1.message.contains("call cost exceeds limit"),
+            "got: {}",
+            err.1.message
+        );
+
+        let spec_schema = csv_scan_schema()["properties"]["spec"].clone();
+        let spec_value = obj["spec"].clone();
+        let program = std::sync::Arc::new(
+            cel::Program::compile("self.csv.split(',').all(a, self.csv.contains(a))").unwrap(),
+        );
+        let mut ctx = cel::Context::default();
+        register_cel_extensions(&mut ctx);
+        ctx.add_variable_from_value(
+            "self",
+            json_to_cel_value(&spec_schema, &spec_value).unwrap(),
+        );
+        let verdict = run_within_budget(UNBOUNDED_BUDGETS.replay, &GATE, move || {
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &spec_value,
+                schema: Some(&spec_schema),
+            };
+            crate::handlers::cel_cost::estimate_for_write(&program, node, None, Some(&ctx), None)
+                <= crate::handlers::cel_cost::CALL_COST_LIMIT
+        });
+        assert!(matches!(verdict, Ok(false)), "counted verdict expected");
+        let mut spins = 0u64;
+        while !GATE.try_acquire() {
+            spins += 1;
+            assert!(
+                spins < 50_000_000,
+                "the replay thread never released its slot"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -14037,14 +14251,10 @@ mod tests {
     // CR-author-controlled list, so any tenant that can write a CR against this CRD could
     // grow that list until the rule takes arbitrarily long to evaluate — without a budget
     // this would hang the request-handling thread indefinitely instead of ever responding.
-    // This proves the write is REJECTED once evaluation exceeds CEL_RULE_EVAL_BUDGET,
-    // mirroring `validate_cr_schema_defense_in_depth_rejects_oversized_pattern...` above
-    // for the equivalent boon-schema risk. The hard wall-clock cap on the assertion below
-    // is what makes this a safe regression test: the list is sized so the full O(n^2)
-    // comparison would take single-digit seconds if ever finished (calibrated separately),
-    // but the budget must abandon it and return within CEL_RULE_EVAL_BUDGET, so the test
-    // itself finishes in a small fraction of a second — a test that took as long as the
-    // full computation would defeat the point of having a budget at all.
+    // This proves the write is REJECTED by counted cost before the rule runs, mirroring
+    // `validate_cr_schema_defense_in_depth_rejects_oversized_pattern...` above for the
+    // equivalent boon-schema risk. The verdict is a count, not a wall-clock measurement, so
+    // it holds on a loaded host.
     #[test]
     fn cel_rule_exceeding_evaluation_budget_is_rejected_not_left_to_hang() {
         let schema = serde_json::json!({
@@ -14066,21 +14276,11 @@ mod tests {
         let items: Vec<i64> = (0..2000).collect();
         let value = serde_json::json!({ "items": items });
 
-        let start = std::time::Instant::now();
         let err = check_schema(&value, schema).expect_err(
             "a CEL rule whose cost scales with a CR-author-controlled list must be rejected \
-             once it exceeds the evaluation time budget, not accepted after silently running \
-             unbounded work",
+             by its counted cost, not accepted after silently running unbounded work",
         );
-        let elapsed = start.elapsed();
 
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "the whole point of the budget is to bound how long a single request waits for a \
-             runaway CEL rule — this took {elapsed:?}, which means the timeout mechanism \
-             itself did not fire (it should reject in ~CEL_RULE_EVAL_BUDGET, not run the full \
-             O(n^2) comprehension to completion)"
-        );
         assert!(
             err.1.message.contains("call cost exceeds limit"),
             "the rejection must identify itself as the CEL cost-limit defense, not a \
@@ -14094,14 +14294,16 @@ mod tests {
     #[test]
     fn abandoned_cost_replay_is_not_reported_as_a_counted_cost_rejection() {
         static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
-        let stuck = run_within_budget(std::time::Duration::from_millis(20), &GATE, || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let stuck = run_within_budget(std::time::Duration::from_millis(20), &GATE, move || {
+            let _ = held.recv();
             true
         });
         assert!(matches!(
             classify_replay(stuck),
             RuntimeCost::ReplayAbandoned
         ));
+        let _ = release.send(());
         assert!(matches!(classify_replay(Ok(false)), RuntimeCost::OverLimit));
         assert!(matches!(classify_replay(Ok(true)), RuntimeCost::Within));
         assert!(matches!(
@@ -14177,7 +14379,7 @@ mod tests {
         let over_budget = execute_cel_with_budget(
             &program,
             cel::Context::default(),
-            CEL_RULE_EVAL_BUDGET,
+            CelBudgets::PRODUCTION.rule_eval,
             &GATE,
         );
         assert!(
@@ -14191,7 +14393,7 @@ mod tests {
         let result = execute_cel_with_budget(
             &program,
             cel::Context::default(),
-            CEL_RULE_EVAL_BUDGET,
+            std::time::Duration::from_secs(60),
             &GATE,
         );
         assert!(
