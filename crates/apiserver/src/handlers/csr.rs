@@ -23,7 +23,7 @@ use axum::{
 use base64::Engine as _;
 use bytes::Bytes;
 use serde::Deserialize;
-use x509_cert::der::DecodePem as _;
+use x509_cert::der::Decode as _;
 use x509_cert::request::CertReq;
 
 use u7s_store::{ListOptions, Store, StoreError};
@@ -53,6 +53,30 @@ const VERSION: &str = "v1";
 const PLURAL: &str = "certificatesigningrequests";
 const KIND: &str = "CertificateSigningRequest";
 
+/// The single parser for `spec.request`. Go's `ParseCSR` (create-time validation, signer) takes
+/// the FIRST PEM block, skips junk before it, ignores everything after it and accepts PEM
+/// headers; any consumer here that read a different block or tolerated different bytes than
+/// the signer would see another subject than the one that gets signed. So accept only exactly
+/// one `CERTIFICATE REQUEST` block with nothing but whitespace around it, no headers, and
+/// strict DER with no trailing bytes: input that passes here parses identically in Go.
+pub(crate) fn parse_csr_pem(pem: &[u8]) -> Result<CertReq, String> {
+    const BEGIN: &[u8] = b"-----BEGIN ";
+    let pem = pem.trim_ascii();
+    if pem.windows(BEGIN.len()).filter(|w| *w == BEGIN).count() != 1 {
+        return Err("request must contain exactly one PEM block".into());
+    }
+    if !pem.starts_with(b"-----BEGIN CERTIFICATE REQUEST-----")
+        || !pem.ends_with(b"-----END CERTIFICATE REQUEST-----")
+    {
+        return Err(
+            "request must be a single CERTIFICATE REQUEST PEM block with no surrounding data"
+                .into(),
+        );
+    }
+    let (_, der) = x509_cert::der::pem::decode_vec(pem).map_err(|e| format!("invalid PEM: {e}"))?;
+    CertReq::from_der(&der).map_err(|e| format!("invalid DER PKCS#10: {e}"))
+}
+
 /// Validate spec.request and spec.signerName, returning 422 on any violation.
 ///
 /// Extracted as a pure function so it can be unit-tested without an HTTP stack.
@@ -80,7 +104,7 @@ pub(crate) fn validate_csr_spec(
             Status::unprocessable_entity(format!("spec.request is not valid base64: {e}"))
         })?;
 
-    CertReq::from_pem(&pem_bytes).map_err(|e| {
+    parse_csr_pem(&pem_bytes).map_err(|e| {
         Status::unprocessable_entity(format!(
             "spec.request does not contain a valid PEM-encoded PKCS#10 CertificationRequest: {e}"
         ))
@@ -479,7 +503,7 @@ fn claimed_kubelet_node_name(body: &serde_json::Value) -> Result<Option<String>,
     let pem = base64::engine::general_purpose::STANDARD
         .decode(spec["request"].as_str().unwrap_or(""))
         .map_err(|e| format!("failed to parse CSR: {e}"))?;
-    let req = CertReq::from_pem(&pem).map_err(|e| format!("failed to parse CSR: {e}"))?;
+    let req = parse_csr_pem(&pem).map_err(|e| format!("failed to parse CSR: {e}"))?;
     let mut cns = req
         .info
         .subject
@@ -534,8 +558,8 @@ pub(crate) fn reject_system_masters_client_csr(
     let pem = base64::engine::general_purpose::STANDARD
         .decode(spec["request"].as_str().unwrap_or(""))
         .map_err(|e| Status::forbidden(format!("failed to parse CSR: {e}")))?;
-    let req = CertReq::from_pem(&pem)
-        .map_err(|e| Status::forbidden(format!("failed to parse CSR: {e}")))?;
+    let req =
+        parse_csr_pem(&pem).map_err(|e| Status::forbidden(format!("failed to parse CSR: {e}")))?;
     for atv in req.info.subject.iter() {
         if atv.oid.to_string() != OID_ORGANIZATION {
             continue;
@@ -1792,6 +1816,134 @@ mod tests {
         joiner_create_raw("bm90IGEgY3Ny".into())
             .await
             .expect_err("a request the guard cannot read must fail closed, not skip the check");
+    }
+
+    fn csr_pem_for(cn_value: &str) -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn_value.to_string());
+        params
+            .serialize_request(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+            .unwrap()
+    }
+
+    fn b64(bytes: impl AsRef<[u8]>) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn pem_of_der(der: &[u8]) -> String {
+        x509_cert::der::pem::encode_string(
+            "CERTIFICATE REQUEST",
+            x509_cert::der::pem::LineEnding::LF,
+            der,
+        )
+        .unwrap()
+    }
+
+    fn der_of(pem: &str) -> Vec<u8> {
+        x509_cert::der::pem::decode_vec(pem.as_bytes()).unwrap().1
+    }
+
+    #[test]
+    fn single_well_formed_block_is_accepted_with_surrounding_whitespace() {
+        let pem = format!("\n  {}\n\n", csr_pem_for("system:node:w1"));
+        let req = parse_csr_pem(pem.as_bytes()).expect("a normal kubectl/kubelet CSR must parse");
+        let atv = req
+            .info
+            .subject
+            .iter()
+            .find(|a| a.oid.to_string() == OID_COMMON_NAME)
+            .unwrap();
+        assert_eq!(
+            crate::auth::atv_string(&atv.value).unwrap(),
+            "system:node:w1"
+        );
+    }
+
+    /// Go signs the first block and ignores the rest; a parser that picked another block would
+    /// let the guard approve a decoy while KCM signs the claimed control-plane name.
+    #[test]
+    fn two_blocks_are_rejected_in_either_order_so_guard_and_signer_cannot_pick_different_ones() {
+        let (decoy, real) = (
+            csr_pem_for("system:node:fresh"),
+            csr_pem_for("system:node:cp"),
+        );
+        for pem in [format!("{decoy}{real}"), format!("{real}{decoy}")] {
+            parse_csr_pem(pem.as_bytes()).expect_err("two PEM blocks are ambiguous");
+        }
+    }
+
+    #[test]
+    fn data_around_the_block_is_rejected_because_go_skips_it_silently() {
+        let pem = csr_pem_for("system:node:w1");
+        for bad in [
+            format!("junk\n{pem}"),
+            format!("{pem}junk"),
+            format!("{pem}\n-----BEGIN CERTIFICATE-----\n"),
+        ] {
+            parse_csr_pem(bad.as_bytes()).expect_err("only whitespace may surround the block");
+        }
+    }
+
+    #[test]
+    fn wrong_block_type_is_rejected_because_go_requires_certificate_request() {
+        let pem =
+            csr_pem_for("system:node:w1").replace("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST");
+        parse_csr_pem(pem.as_bytes()).expect_err("block type must be CERTIFICATE REQUEST");
+    }
+
+    #[test]
+    fn pem_headers_are_rejected_because_go_accepts_them_and_parsers_disagree_on_them() {
+        let pem = csr_pem_for("system:node:w1").replacen(
+            "-----BEGIN CERTIFICATE REQUEST-----\n",
+            "-----BEGIN CERTIFICATE REQUEST-----\nProc-Type: 4,ENCRYPTED\n\n",
+            1,
+        );
+        parse_csr_pem(pem.as_bytes()).expect_err("encapsulated headers must be rejected");
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_der_are_rejected_because_go_errors_on_them() {
+        let mut der = der_of(&csr_pem_for("system:node:w1"));
+        der.extend_from_slice(&[0x30, 0x00]);
+        parse_csr_pem(pem_of_der(&der).as_bytes()).expect_err("trailing DER data");
+    }
+
+    #[test]
+    fn ber_indefinite_length_is_rejected_because_go_requires_strict_der() {
+        let der = der_of(&csr_pem_for("system:node:w1"));
+        let hdr = if der[1] & 0x80 != 0 {
+            2 + (der[1] & 0x7f) as usize
+        } else {
+            2
+        };
+        let mut ber = vec![0x30, 0x80];
+        ber.extend_from_slice(&der[hdr..]);
+        ber.extend_from_slice(&[0, 0]);
+        parse_csr_pem(pem_of_der(&ber).as_bytes()).expect_err("BER must not parse");
+    }
+
+    #[tokio::test]
+    async fn guard_rejects_decoy_plus_real_two_block_request_naming_the_local_node() {
+        let (decoy, real) = (
+            csr_pem_for("system:node:fresh"),
+            csr_pem_for("system:node:cp"),
+        );
+        for pem in [format!("{decoy}{real}"), format!("{real}{decoy}")] {
+            joiner_create_raw(b64(pem))
+                .await
+                .expect_err("a joiner must not smuggle the control-plane name in a second block");
+        }
+    }
+
+    #[test]
+    fn create_time_validation_rejects_what_the_guard_rejects() {
+        let two = format!("{}{}", csr_pem_for("a"), csr_pem_for("b"));
+        let body = serde_json::json!({"spec": {"request": b64(two), "signerName": "x"}});
+        validate_csr_spec(&body).expect_err("create must reject ambiguous requests");
     }
 
     /// list_csr with label selector must filter results.
