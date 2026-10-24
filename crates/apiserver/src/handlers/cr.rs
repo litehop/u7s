@@ -1681,8 +1681,8 @@ fn check_runtime_cost(
     let replay = (self_value.clone(), old_self_value.cloned(), schema.clone());
     let replay_ctx = build_ctx();
     let rule_program = std::sync::Arc::clone(program);
-    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let replay_cancelled = std::sync::Arc::clone(&cancelled);
+    let cancel = CancelOnDrop::default();
+    let replay_cancelled = std::sync::Arc::clone(&cancel.0);
     let within_limit = run_within_budget(replay_budget, &CEL_EVAL_THREAD_GATE, move || {
         let (self_json, old_json, schema) = &replay;
         let node = |value| crate::handlers::cel_cost::Node::Data {
@@ -1697,8 +1697,19 @@ fn check_runtime_cost(
             Some(&replay_cancelled),
         ) <= crate::handlers::cel_cost::CALL_COST_LIMIT
     });
-    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     classify_replay(within_limit)
+}
+
+/// Raises its flag when the caller leaves the scope holding it — timeout, panic, or the
+/// awaiting future being dropped — so the thread it was lent to stops working for a caller
+/// that is no longer there.
+#[derive(Default)]
+struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn classify_replay(within_limit: Result<bool, CelEvalOverBudget>) -> RuntimeCost {
@@ -14408,6 +14419,25 @@ mod tests {
             GATE.try_acquire(),
             "releasing a held slot must make the gate accept a new acquisition again"
         );
+    }
+
+    /// A caller that leaves for any reason (timeout return, panic, dropped future) must stop
+    /// the replay it started, or the thread keeps its gate slot until it finishes by itself.
+    #[test]
+    fn replay_cancel_flag_rises_when_the_caller_leaves_even_by_panic() {
+        let cancel = CancelOnDrop::default();
+        let flag = std::sync::Arc::clone(&cancel.0);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        drop(cancel);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        let cancel = CancelOnDrop::default();
+        let flag = std::sync::Arc::clone(&cancel.0);
+        let _ = std::panic::catch_unwind(move || {
+            let _held = cancel;
+            panic!("caller unwinds");
+        });
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // `execute_cel_with_budget` is the function the reviewed finding was raised against

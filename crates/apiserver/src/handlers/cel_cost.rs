@@ -511,7 +511,7 @@ impl<'a> Coster<'a> {
         let mut operands = Vec::with_capacity(call.args.len() + 1);
         if let Some(ctx) = ctx {
             for expr in call.target.iter().map(|t| &**t).chain(&call.args) {
-                if self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                if self.is_cancelled() {
                     return Some(self.limit.saturating_add(1));
                 }
                 operands.push(operand_of_value(&ctx.resolve(expr).ok()?, deep));
@@ -527,7 +527,16 @@ impl<'a> Coster<'a> {
         call_cost_from_table(&call.func_name, &operands, is_member)
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
     fn cost(&mut self, e: &IdedExpr, ctx: Ctx<'_, '_>) -> (u64, Node<'a>) {
+        // Every loop in the walk recurses through here, so a cancelled walk unwinds without
+        // visiting or evaluating anything further.
+        if self.is_cancelled() {
+            return (self.limit.saturating_add(1), Node::Unknown);
+        }
         match &e.expr {
             Expr::Ident(name) => {
                 let node = self
@@ -652,7 +661,7 @@ impl<'a> Coster<'a> {
                         let mut ran = 0u64;
                         let mut child = ctx.map(|ctx| ctx.new_inner_scope());
                         for pass in passes {
-                            if self.cancelled.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                            if self.is_cancelled() {
                                 total = self.limit.saturating_add(1);
                                 break;
                             }
@@ -1315,6 +1324,23 @@ mod tests {
         assert_eq!(operand_of_value(&some, false).size, 1000);
         let none = cel::Value::Opaque(std::sync::Arc::new(cel::objects::OptionalValue::none()));
         assert_eq!(operand_of_value(&none, false).size, 1);
+    }
+
+    /// Cancellation must reach every kind of work in the walk, not only comprehension passes:
+    /// a flat expression of many calls (no loop at all) used to be walked to the end, so an
+    /// abandoned replay held its gate slot for as long as the walk takes.
+    #[test]
+    fn cancelled_walk_stops_in_expressions_without_a_comprehension() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "abc", "items": [] });
+        let rule = format!("[{}][0]", vec!["self.csv"; 40].join(", "));
+        let cost = live_cost(&rule, &schema, &data, Some(&AtomicBool::new(false)));
+        assert!(cost < CALL_COST_LIMIT, "uncancelled walk is cheap: {cost}");
+        let cost = live_cost(&rule, &schema, &data, Some(&AtomicBool::new(true)));
+        assert!(
+            cost > CALL_COST_LIMIT,
+            "a cancelled walk must stop at the next node, not finish the expression: {cost}"
+        );
     }
 
     /// A deep method chain is re-evaluated by the call that bills its receiver; once the
