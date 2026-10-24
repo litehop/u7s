@@ -24,7 +24,17 @@
 # bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
 # RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
 #
-# Usage: burst-gate.sh [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
+# --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real 1-vCPU shared-core
+# Spot e2-micro (x86_64, 1 GiB, no swap) on GCP (docs/dev-setup.md, "GCP test VPSes"), installing
+# <tag> from the mirror https://u7s.dekiru.tech/<tag>/install.sh; nothing is built locally. The
+# phases, collectors and verdict are the same as on Lima (lib.sh); the Lima arm64 run is an
+# advisory pre-check. Contention mapping: on GCP the guest is the host, so the Lima host-side
+# checks (host idle CPU, other VMs) are replaced by in-guest steal time over the idle window
+# (> RG_STEAL_MAX_PCT, 10%) plus the same in-guest calibration; a non-pass with either is
+# INVALID. A non-pass on an instance Google reclaimed (Spot preemption) is PREEMPTED, counted
+# apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
+#
+# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 50); the verdict names it
@@ -48,7 +58,11 @@
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
-# Requires: limactl (vz), cargo-zigbuild + zig (unless --tarball-dir), network access.
+#   --backend B       lima (default; local arm64 VM) or gcp (needs --release; rejects --memory and
+#                     --tarball-dir)
+#   --release TAG     gcp only: mirror release to install, e.g. v0.4.1-snapshot.1
+# Requires: lima: limactl (vz), cargo-zigbuild + zig (unless --tarball-dir); gcp: the u7s-gcp
+# gcloud configuration and scripts/gcp/setup.sh run once. Both: network access.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,6 +71,7 @@ COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
 BURST_CAP_SECS=300
+BACKEND=lima; RELEASE=""
 RUN_WALL_SECS=3300
 MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
 RG_RETRY_WAIT_SECS="${RG_RETRY_WAIT_SECS:-300}"
@@ -77,6 +92,8 @@ while [ $# -gt 0 ]; do
     --mem-hog-mib) HOG_MIB="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
+    --backend) BACKEND="$2"; shift 2 ;;
+    --release) RELEASE="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -96,6 +113,22 @@ esac
 
 # shellcheck source=lib.sh
 . "$HERE/lib.sh"
+# shellcheck source=backend.sh
+. "$HERE/backend.sh"
+
+case "$BACKEND" in
+  lima)
+    [ -z "$RELEASE" ] || { echo "--release is only for --backend gcp (lima builds the tarball from this checkout)" >&2; exit 2; } ;;
+  gcp)
+    [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "--backend gcp needs --release <tag> (e.g. v0.4.1-snapshot.1), got '$RELEASE'" >&2; exit 2; }
+    [ -z "$MEMORY" ] || { echo "--memory is not supported with --backend gcp (the e2-micro is fixed at 1 GiB)" >&2; exit 2; }
+    [ -z "$TARBALL_DIR" ] || { echo "--tarball-dir is not supported with --backend gcp (the release is installed from the mirror)" >&2; exit 2; }
+    # shellcheck source=../gcp/lib.sh
+    . "$ROOT/scripts/gcp/lib.sh"
+    gcp_require_config
+    GCP_PROJECT="$(gcloud config get-value project 2>/dev/null)" ;;
+  *) echo "--backend must be lima or gcp, got '$BACKEND'" >&2; exit 2 ;;
+esac
 
 case "$PROBE_KILL_SECS" in
   ''|*[!0-9]*|0) echo "--probe-kill must be a positive integer (seconds), got '$PROBE_KILL_SECS'" >&2; exit 2 ;;
@@ -117,11 +150,13 @@ VMS=""
 cleanup() {
   [ "$KEEP" = 1 ] && return
   local vm
-  for vm in $VMS; do limactl delete -f "$vm" >/dev/null 2>&1; done
+  for vm in $VMS; do vm_delete "$vm"; done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-if [ -z "$TARBALL_DIR" ]; then
+if [ "$BACKEND" = lima ] && [ -z "$TARBALL_DIR" ]; then
   TARBALL_DIR="$OUT/dist"
   "$HERE/build-arm64-tarball.sh" "$TARBALL_DIR" || { echo "tarball build failed" >&2; exit 2; }
 fi
@@ -131,7 +166,9 @@ fi
 if [ "$CONFIRM" = 1 ]; then
   tried=()
   for size in $CONFIRM_SIZES; do
-    "$0" --runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --tarball-dir "$TARBALL_DIR" --out "$OUT/burst-$size" >&2 || true
+    sub_args=(--runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --out "$OUT/burst-$size")
+    if [ "$BACKEND" = gcp ]; then sub_args+=(--backend gcp --release "$RELEASE"); else sub_args+=(--tarball-dir "$TARBALL_DIR"); fi
+    "$0" "${sub_args[@]}" >&2 || true
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")
@@ -143,7 +180,9 @@ fi
 
 STAGE="$OUT/stage"
 mkdir -p "$STAGE/wordpress"
-cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
+if [ "$BACKEND" = lima ]; then
+  cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
+fi
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
 printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\n' \
   "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" > "$STAGE/gate.env"
@@ -167,52 +206,78 @@ quiet_sample() {
 VM_ALLOW_PCT=0
 VM_VCPUS="$(awk '/^cpus:/ {print $2}' "$HERE/u7s-vps-1g.yaml")"
 HOST_CORES="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 0)"
-host_state() { echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(limactl list 2>/dev/null | rg_other_vms "$VM" | tr '\n' ' ')"; }
+# On gcp the guest is the host: its contention shows up as in-guest steal and calibration
+# (lib.sh), so the Lima host-side idle / other-VM checks do not apply.
+host_state() {
+  if [ "$BACKEND" = gcp ]; then echo "$(date -u +%H:%M:%SZ) $1 vm-status=$(vm_running "$VM")"; return; fi
+  echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(vm_running "$VM")"
+}
 
-overall=0; passed=0; valid=0; invalid=0; attempt=0
-while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
+overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
+while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ]; do
   attempt=$((attempt + 1))
-  VM="u7s-rg-$STAMP-$attempt"
+  # The guest's hostname is the VPS name plus GCE's ".c.<project>.internal"; the node's
+  # certificate CN is "system:node:<hostname>" and openssl rejects a CN over 64 characters, so
+  # the gcp name stays short.
+  if [ "$BACKEND" = gcp ]; then VM="u7s-rg-${STAMP:4:2}${STAMP:6:2}${STAMP:9:6}-$attempt"; else VM="u7s-rg-$STAMP-$attempt"; fi
   RUN_OUT="$OUT/run-$attempt"; mkdir -p "$RUN_OUT"
-  echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid/$MAX_INVALID_RUNS): VM $VM ===="
+  echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid, preempted $preempted, cap $MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
   status=""
   VM_ALLOW_PCT=0
-  quiet_sample "$RUN_OUT/quiet.log"
-  if [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
-    status=INVALID
-    echo "pre-flight: host not quiet, no VM created:"; rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null
+  : > "$RUN_OUT/quiet.log"
+  if [ "$BACKEND" = lima ]; then
+    quiet_sample "$RUN_OUT/quiet.log"
+    if [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
+      status=INVALID
+      echo "pre-flight: host not quiet, no VM created:"; rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null
+    fi
   fi
-  create_args=(--name "$VM" --tty=false)
-  [ -n "$MEMORY" ] && create_args+=(--memory "$MEMORY")
   if [ -n "$status" ]; then
     :
-  elif VMS="$VMS $VM"; limactl create "${create_args[@]}" "$HERE/u7s-vps-1g.yaml" >"$RUN_OUT/lima-create.log" 2>&1 \
-     && limactl start "$VM" >"$RUN_OUT/lima-start.log" 2>&1; then
-    VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
-    rm -f "$RUN_OUT/quiet.stop"
-    rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
-    quiet_pid=$!
-    limactl shell "$VM" sudo install -d -m 0777 /var/tmp/rg
-    limactl shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
+  elif VMS="$VMS $VM"; vm_create "$VM" "$RUN_OUT"; then
+    quiet_pid=""
+    if [ "$BACKEND" = lima ]; then
+      VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
+      rm -f "$RUN_OUT/quiet.stop"
+      rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
+      quiet_pid=$!
+    fi
+    vm_shell "$VM" sudo install -d -m 0777 /var/tmp/rg
+    vm_shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
+    stage_files=()
     for f in "$STAGE"/*.tar.gz "$STAGE"/*.sha256 "$STAGE"/*.sh "$STAGE"/*.env "$STAGE/wordpress"; do
-      limactl copy -r "$f" "$VM:/var/tmp/rg/" >/dev/null
+      [ -e "$f" ] && stage_files+=("$f")
     done
-    limactl shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
+    vm_copy_to "$VM" /var/tmp/rg "${stage_files[@]}" || echo "warning: could not copy the gate scripts to $VM" >&2
+    if [ "$BACKEND" = gcp ]; then
+      vm_shell "$VM" curl -fsSL "https://u7s.dekiru.tech/$RELEASE/install.sh" -o /var/tmp/rg/install.sh \
+        || echo "warning: could not fetch install.sh for $RELEASE from the mirror" >&2
+    fi
+    if [ "$BACKEND" = gcp ]; then
+      # The guest hostname embeds the project id.
+      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh 2>&1 | gcp_redact -u >"$RUN_OUT/vm-gate.log" &
+    else
+      vm_shell "$VM" sudo bash /var/tmp/rg/vm-gate.sh >"$RUN_OUT/vm-gate.log" 2>&1 &
+    fi
     gate_pid=$!
     tail -n +1 -f "$RUN_OUT/vm-gate.log" & tail_pid=$!
     # The host-side client dying leaves the workload running in the VM, so kill it there first.
     ( sleep "$RUN_WALL_SECS"; echo "run wall-clock cap ${RUN_WALL_SECS}s hit; killing" >&2
-      limactl shell "$VM" sudo pkill -KILL -f "$RG_VM_KILL_PATTERN" 2>/dev/null
+      vm_shell "$VM" sudo pkill -KILL -f "$RG_VM_KILL_PATTERN" 2>/dev/null
       kill "$gate_pid" 2>/dev/null ) &
     wd_pid=$!
     wait "$gate_pid" 2>/dev/null
     kill "$wd_pid" "$tail_pid" 2>/dev/null
-    touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null
-    limactl copy -r "$VM:/var/tmp/rg/out" "$RUN_OUT/out" >/dev/null 2>&1 \
+    if [ -n "$quiet_pid" ]; then touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null; fi
+    vm_copy_from "$VM" /var/tmp/rg/out "$RUN_OUT/out" 2>/dev/null \
       || echo "warning: could not copy results out of $VM" >&2
   else
-    echo "VM $VM failed to create/start (see $RUN_OUT/lima-*.log)" >&2
+    echo "VM $VM failed to create/start (see $RUN_OUT/*-create.log)" >&2
+    if [ "$BACKEND" = gcp ]; then
+      status=INVALID
+      echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+    fi
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
@@ -230,6 +295,18 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
       [ "$rc" -eq 0 ] && status=PASS || status=FAIL
     fi
   fi
+  if [ "$BACKEND" = gcp ] && [ "$status" != PASS ]; then
+    pre_rc=0; gcp_vps_was_preempted "$VM" || pre_rc=$?
+    case "$pre_rc" in
+      0) status="$(rg_apply_preemption "$status" 1)" ;;
+      1) ;;
+      *) if [ "$status" = FAIL ]; then
+           status=INVALID
+           echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): could not tell whether Google reclaimed $VM" | tee -a "$RUN_OUT/verdict.txt"
+         fi ;;
+    esac
+    [ "$status" != PREEMPTED ] || echo "PREEMPTED: Google reclaimed $VM mid-run; the run is not a verdict" | tee -a "$RUN_OUT/verdict.txt"
+  fi
   rg_contention_reasons "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env" > "$RUN_OUT/contention.txt"
   harness_error="$(rg_get "$RUN_OUT/out/results.env" harness_error)"
   [ -z "$harness_error" ] || echo "HARNESS ERROR (run is INVALID, not a u7s FAIL): $harness_error"
@@ -239,16 +316,23 @@ while [ "$valid" -lt "$RUNS" ] && [ "$invalid" -lt "$MAX_INVALID_RUNS" ]; do
   case "$status" in
     PASS) passed=$((passed + 1)); valid=$((valid + 1)) ;;
     FAIL) overall=1; valid=$((valid + 1)) ;;
-    INVALID) invalid=$((invalid + 1)); [ "$invalid" -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
+    INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
+    PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
   [ -s "$RUN_OUT/out/samples.tsv" ] && "$HERE/summarize.sh" "$RUN_OUT/out" | tee "$RUN_OUT/summary.md"
-  [ "$KEEP" = 1 ] || { limactl delete -f "$VM" >/dev/null 2>&1; VMS="${VMS/ $VM/}"; }
+  [ "$KEEP" = 1 ] || { vm_delete "$VM" && VMS="${VMS/ $VM/}"; }
 done
 
 echo "$passed" > "$OUT/passed"
 echo "$valid" > "$OUT/valid"
 if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
+elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED (only $valid/$RUNS valid runs; $preempted preempted, $invalid invalid)"; rc=3
 elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
 else verdict=PASS; rc=0; fi
+if [ "$BACKEND" = gcp ]; then
+  echo "backend=gcp release=$RELEASE machine=e2-micro arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
+  verdict="$verdict [release-authoritative: x86_64 GCP e2-micro Spot, mirror release $RELEASE]"
+fi
+[ ! -s "$OUT/leaked-vps.txt" ] || { echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"; }
 echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="
 exit "$rc"

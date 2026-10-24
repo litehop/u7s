@@ -475,5 +475,92 @@ rc=0; out="$(RG_IDLE_PROBE="$TMP/bin/idle30" "$HERE/burst-gate.sh" --confirm --r
 assert "--confirm on a noisy host: INVALID exit 3, and it never falls through to 40 pods" \
   "$([ "$rc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && [ ! -e "$TMP/out-conf2/burst-40" ] && echo 1 || echo 0)"
 
+# --- gcp backend: steal-based INVALID, PREEMPTED, backend selection ---
+CPU_A='cpu  1000 0 500 8000 100 0 0 0 0 0'
+assert "steal % = steal delta over total delta (100 of 1000 ticks -> 10.0)" \
+  "$([ "$(rg_steal_pct "$CPU_A" 'cpu  1400 0 500 8500 100 0 0 100 0 0')" = 10.0 ] && echo 1 || echo 0)"
+assert "steal % is empty when no time passed or the line is unusable (never a fake 0)" \
+  "$([ -z "$(rg_steal_pct "$CPU_A" "$CPU_A")" ] && [ -z "$(rg_steal_pct "$CPU_A" garbage)" ] && echo 1 || echo 0)"
+steal_env() { { good; echo "steal_idle_pct=$1"; } > "$TMP/steal.env"; echo "$TMP/steal.env"; }
+printf '1 100 0 0\n' > "$TMP/q-ok.log"
+BACKEND=lima
+assert "steal is not judged on Lima (its host-side checks own contention; a Lima FAIL must not change meaning)" \
+  "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$(steal_env 25.0)")" = FAIL ] && echo 1 || echo 0)"
+BACKEND=gcp
+assert "steal above 10% on a non-pass -> INVALID (a stolen shared core must not be blamed on u7s)" \
+  "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$(steal_env 25.0)")" = INVALID ] && echo 1 || echo 0)"
+assert "steal above 10% on a PASS stays PASS (noise never turns a pass into anything else)" \
+  "$([ "$(rg_run_status 0 "$TMP/q-ok.log" "$(steal_env 25.0)")" = PASS ] && echo 1 || echo 0)"
+assert "steal at 2% on a non-pass stays FAIL (ordinary shared-core jitter must not launder a u7s failure)" \
+  "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$(steal_env 2.0)")" = FAIL ] && echo 1 || echo 0)"
+assert "unmeasured steal judges nothing: a non-pass without steal_idle_pct stays FAIL" \
+  "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$TMP/good.env")" = FAIL ] && echo 1 || echo 0)"
+assert "a reclaimed instance's non-pass is PREEMPTED, not FAIL/INVALID" \
+  "$([ "$(rg_apply_preemption FAIL 1)" = PREEMPTED ] && [ "$(rg_apply_preemption INVALID 1)" = PREEMPTED ] && echo 1 || echo 0)"
+assert "a PASS stays PASS even if the instance was reclaimed afterwards; no preemption changes nothing" \
+  "$([ "$(rg_apply_preemption PASS 1)" = PASS ] && [ "$(rg_apply_preemption FAIL 0)" = FAIL ] && echo 1 || echo 0)"
+
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
+  '  "config configurations describe"*) exit 0 ;;' \
+  '  "config get-value project") echo p-secret ;;' \
+  '  "config get-value compute/zone") echo z-1 ;;' \
+  '  "compute instances create"*) echo "created p-secret" ;;' \
+  '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && exit 1; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
+  '  "compute instances describe"*) [ "${GCLOUD_DESCRIBE_ERR:-0}" = 1 ] && exit 1; echo 1 ;;' \
+  '  "compute ssh"*) echo "ERROR: ssh to x.c.p-secret.internal failed" >&2; [ "${GCLOUD_SSH_OK:-0}" = 1 ] && exit 0; exit 1 ;;' \
+  '  "compute scp"*) for a; do d="$a"; done; case "$*" in *:/var/tmp/rg/out*) mkdir -p "$d"; echo "host x.c.p-secret.internal" > "$d/install.log" ;; esac; exit 0 ;;' \
+  'esac' 'exit 0' > "$TMP/bin/gcloud"
+chmod +x "$TMP/bin/gcloud"
+export GCLOUD_CALLS="$TMP/gcloud-calls" GCP_SSH_TRIES=1 GCP_SSH_SLEEP=0 GCP_OPS_SLEEP=0 GCP_DELETE_SLEEP=0
+gcp_gate() { # out-dir, extra args...; sets rc
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/$1"
+  rc=0; "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/$1" "${@:2}" >"$TMP/$1.out" 2>&1 || rc=$?
+}
+for bad in "--backend gcp" "--backend lima --release v1.0.0" "--backend gcp --release v1.0.0 --memory 2" "--backend gcp --release v1.0.0 --tarball-dir $TMP/tb" "--backend gcp --release not-a-tag" "--backend vmware"; do
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rc=0
+  # shellcheck disable=SC2086
+  "$HERE/burst-gate.sh" $bad --out "$TMP/out-gbad" >/dev/null 2>&1 || rc=$?
+  assert "'$bad' rejected with exit 2 before any VM exists (a mis-targeted gate run must not create billable or local VMs)" \
+    "$([ "$rc" = 2 ] && ! grep -q 'instances create' "$GCLOUD_CALLS" && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+done
+gcp_gate out-gfail --runs 1
+assert "gcp backend uses gcloud and never limactl or a local tarball build" \
+  "$(grep -q 'instances create' "$GCLOUD_CALLS" && [ ! -s "$LIMA_CALLS" ] && [ ! -e "$TMP/out-gfail/dist" ] && echo 1 || echo 0)"
+assert "gcp VPS never reachable (stockout/quota/IAP flake) -> INVALID exit 3, retried to the cap, never FAIL (infrastructure is not a u7s verdict)" \
+  "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gfail/valid")" = 0 ] && [ "$(grep -c 'instances create' "$GCLOUD_CALLS")" = 3 ] && grep -q 'GATE: 0/1 runs passed.*INVALID' "$TMP/out-gfail.out" && ! grep -q 'GATE:.*FAIL' "$TMP/out-gfail.out" && echo 1 || echo 0)"
+assert "gcp VPS is deleted at the end of the run (an e2-micro left up keeps billing)" \
+  "$(grep -q 'instances delete u7s-rg-' "$GCLOUD_CALLS" && echo 1 || echo 0)"
+assert "gcp VM names are valid GCE names (lowercase) and run-unique" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
+assert "gcp verdict line says release-authoritative and names the mirror release" \
+  "$(grep -q 'release-authoritative: x86_64 GCP e2-micro Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
+assert "the gcloud project id never reaches the run logs (redacted)" \
+  "$(grep -rq 'p-secret' "$TMP/out-gfail" "$TMP/out-gfail.out" && echo 0 || echo 1)"
+export GCLOUD_PREEMPTED=1
+gcp_gate out-gpre --runs 1
+assert "preempted gcp VPS -> PREEMPTED exit 3, counted as no valid run, retried up to the cap (a reclaimed Spot VM is not a u7s FAIL)" \
+  "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gpre/valid")" = 0 ] && [ "$(grep -c 'instances create' "$GCLOUD_CALLS")" = 3 ] && grep -q 'GATE: 0/1 runs passed.*PREEMPTED' "$TMP/out-gpre.out" && echo 1 || echo 0)"
+unset GCLOUD_PREEMPTED
+export GCLOUD_SSH_OK=1
+RG_IDLE_PROBE="$TMP/bin/idle30" gcp_gate out-gquiet --runs 1
+assert "gcp ignores the local host's idle probe (the guest is the host): a busy laptop must not make a VPS run INVALID; a reachable VPS with no results is a valid FAIL" \
+  "$([ "$rc" = 1 ] && [ "$(cat "$TMP/out-gquiet/valid")" = 1 ] && echo 1 || echo 0)"
+assert "the project id is scrubbed from console gcloud stderr and the copied-out install.log, not only the run logs" \
+  "$(! grep -rq 'p-secret' "$TMP/out-gquiet" "$TMP/out-gquiet.out" && grep -q 'x.c.<project>.internal' "$TMP/out-gquiet/run-1/out/install.log" && echo 1 || echo 0)"
+export GCLOUD_OPS_ERR=1
+gcp_gate out-gops --runs 1
+assert "a failed run whose preemption lookup keeps erroring -> INVALID exit 3, never FAIL (a preempted run must not be scored as u7s broken)" \
+  "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gops/valid")" = 0 ] && ! grep -q 'GATE:.*FAIL' "$TMP/out-gops.out" && echo 1 || echo 0)"
+assert "the preemption lookup is retried before giving up (one IAP/API blip must not decide the verdict)" \
+  "$([ "$(grep -c 'operations list' "$GCLOUD_CALLS")" -ge 3 ] && echo 1 || echo 0)"
+unset GCLOUD_OPS_ERR
+export GCLOUD_DESCRIBE_ERR=1
+gcp_gate out-gdel --runs 2
+assert "a VPS delete that keeps failing never aborts the gate: every attempt still runs, and the leaked VPS is named loudly" \
+  "$([ "$rc" = 1 ] && [ "$(grep -c 'instances create' "$GCLOUD_CALLS")" = 2 ] && grep -q 'LEAKED GCP VPS u7s-rg-' "$TMP/out-gdel.out" && grep -q 'GATE: 0/2' "$TMP/out-gdel.out" && [ -s "$TMP/out-gdel/leaked-vps.txt" ] && echo 1 || echo 0)"
+assert "a failed delete is retried (a transient describe error must not leak a billing VPS)" \
+  "$([ "$(grep -c 'instances describe' "$GCLOUD_CALLS")" -ge 8 ] && echo 1 || echo 0)"
+unset GCLOUD_DESCRIBE_ERR GCLOUD_SSH_OK
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
