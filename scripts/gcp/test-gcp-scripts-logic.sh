@@ -18,6 +18,7 @@ hasnt() { grep -qF -- "$1" <<<"$2" && echo 0 || echo 1; }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir "$TMP/bin"
+export GCP_DELETE_SLEEP=0 GCP_OPS_SLEEP=0
 
 cat >"$TMP/bin/gcloud" <<'EOF'
 #!/usr/bin/env bash
@@ -32,7 +33,7 @@ case "$*" in
   "services list "*) echo "${STUB_SERVICES:-}"; exit 0 ;;
   "compute instances list "*) echo "${STUB_INSTANCES:-}"; exit 0 ;;
   "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
-  "compute operations list "*) echo "${STUB_OPS:-}"; exit 0 ;;
+  "compute operations list "*) [ "${STUB_OPS_FAIL:-0}" = 1 ] && exit 1; echo "${STUB_OPS:-}"; exit 0 ;;
   "compute "*" list "*)
     [ "${STUB_LIST_FAIL:-0}" = 1 ] && exit 1
     for w in ${STUB_EXISTING:-}; do case "$* " in *"name=$w "*) echo "$w" ;; esac; done
@@ -206,6 +207,19 @@ STUB_OPS=op-1 gcp_vps_was_preempted t1 && p=1 || p=0
 assert "a compute.instances.preempted operation reads as preempted (so gates report PREEMPTED, not FAIL)" "$p"
 STUB_OPS= gcp_vps_was_preempted t1 && p=1 || p=0
 assert "no preempted operation reads as not preempted" "$([ "$p" = 0 ] && echo 1 || echo 0)"
+: >"$STUB_LOG"
+STUB_OPS_FAIL=1 gcp_vps_was_preempted t1 && p=0 || p=$?
+assert "a lookup that keeps failing is 'unknown' (2), not 'not preempted' (1): gates must not score a reclaimed VPS as a u7s FAIL" "$([ "$p" = 2 ] && echo 1 || echo 0)"
+assert "the preemption lookup is retried before giving up" \
+  "$([ "$(grep -c 'compute operations list' "$STUB_LOG")" -ge 3 ] && echo 1 || echo 0)"
+
+# --- delete never exits its caller
+: >"$STUB_LOG"
+r=0; STUB_DESCRIBE_FAIL=t1 gcp_vps_delete t1 us-west1-b 2>/dev/null || r=$?
+assert "a describe that keeps failing makes delete return non-zero, not exit the caller (an aborted gate skips later cleanup and leaks VPSes)" \
+  "$([ "$r" = 1 ] && echo 1 || echo 0)"
+assert "delete retries a failing describe (a transient API error must not leak a billing VPS)" \
+  "$([ "$(grep -c 'instances describe' "$STUB_LOG")" = 4 ] && echo 1 || echo 0)"
 
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

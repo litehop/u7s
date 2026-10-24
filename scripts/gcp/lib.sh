@@ -47,13 +47,26 @@ gcp_vps_ssh() {
 # gcp_vps_scp scp-args... (remote side written NAME:path)
 gcp_vps_scp() { gcloud compute scp --tunnel-through-iap "$@"; }
 
-# gcp_vps_delete NAME ZONE: refuses instances not labelled u7s-test=1.
+# gcp_vps_delete NAME ZONE: refuses instances not labelled u7s-test=1. Never exits the caller:
+# a transient API error is retried (GCP_DELETE_TRIES, GCP_DELETE_SLEEP) and then returned as
+# non-zero so later cleanup still runs. An instance that does not exist counts as deleted.
 gcp_vps_delete() {
-  local label
-  label="$(gcloud compute instances describe "$1" --zone="$2" --format='value(labels.u7s-test)')" \
-    || gcp_die "cannot describe $1"
-  [ "$label" = 1 ] || gcp_die "$1 is not labelled u7s-test=1; refusing to delete"
-  gcloud compute instances delete "$1" --zone="$2" --quiet
+  local label err i tries="${GCP_DELETE_TRIES:-4}" ok=0
+  err="$(mktemp)"
+  for i in $(seq 1 "$tries"); do
+    if label="$(gcloud compute instances describe "$1" --zone="$2" --format='value(labels.u7s-test)' 2>"$err")"; then ok=1; break; fi
+    if grep -q 'was not found' "$err"; then rm -f "$err"; return 0; fi
+    sleep "${GCP_DELETE_SLEEP:-5}"
+  done
+  if [ "$ok" = 0 ]; then cat "$err" >&2; rm -f "$err"; echo "error: cannot describe $1 after $tries tries" >&2; return 1; fi
+  rm -f "$err"
+  [ "$label" = 1 ] || { echo "error: $1 is not labelled u7s-test=1; refusing to delete" >&2; return 1; }
+  for i in $(seq 1 "$tries"); do
+    gcloud compute instances delete "$1" --zone="$2" --quiet && return 0
+    sleep "${GCP_DELETE_SLEEP:-5}"
+  done
+  echo "error: cannot delete $1 after $tries tries" >&2
+  return 1
 }
 
 # Prints "NAME<TAB>ZONE" per u7s-test=1 instance.
@@ -73,11 +86,17 @@ gcp_print_target() {
   echo "target: project=$(gcloud config get-value project 2>/dev/null) account=$(gcloud config get-value account 2>/dev/null) config=$CLOUDSDK_ACTIVE_CONFIG_NAME"
 }
 
-# True iff Google reclaimed NAME (Spot preemption).
+# Did Google reclaim NAME (Spot preemption)? Returns 0 yes, 1 no, 2 the lookup kept failing
+# (GCP_OPS_TRIES, GCP_OPS_SLEEP): unknown, which callers must not read as "no".
 gcp_vps_was_preempted() {
-  local ops
-  ops="$(gcloud compute operations list \
-    --filter="operationType=compute.instances.preempted AND targetLink~/$1\$" \
-    --format='value(name)')" || return 1
-  [ -n "$ops" ]
+  local ops i
+  for i in $(seq 1 "${GCP_OPS_TRIES:-3}"); do
+    if ops="$(gcloud compute operations list \
+      --filter="operationType=compute.instances.preempted AND targetLink~/$1\$" \
+      --format='value(name)')"; then
+      [ -n "$ops" ]; return $?
+    fi
+    sleep "${GCP_OPS_SLEEP:-5}"
+  done
+  return 2
 }

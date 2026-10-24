@@ -251,9 +251,11 @@ rg_steal_pct() {
 # Prints a reason when the idle-window steal time (results key steal_idle_pct, recorded in the
 # guest) exceeds RG_STEAL_MAX_PCT. Only idle windows are judged: throttling under the burst is
 # the shared-core host's behaviour under u7s's own load, which is what the gate measures. A
-# missing value judges nothing, like an unmeasured calibration.
+# missing value judges nothing, like an unmeasured calibration. Only the gcp backend (BACKEND)
+# judges steal: on Lima the host-side checks own contention.
 rg_steal_reason() {
   local v
+  [ "${BACKEND:-}" = gcp ] || return 0
   v="$(rg_get "$1" steal_idle_pct)"
   [ -n "$v" ] || return 0
   awk -v v="$v" -v max="$RG_STEAL_MAX_PCT" 'BEGIN {exit !(v ~ /^[0-9]+(\.[0-9]+)?$/ && v + 0 > max + 0)}' \

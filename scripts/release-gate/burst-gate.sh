@@ -274,6 +274,10 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       || echo "warning: could not copy results out of $VM" >&2
   else
     echo "VM $VM failed to create/start (see $RUN_OUT/*-create.log)" >&2
+    if [ "$BACKEND" = gcp ]; then
+      status=INVALID
+      echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+    fi
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
@@ -292,8 +296,15 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     fi
   fi
   if [ "$BACKEND" = gcp ] && [ "$status" != PASS ]; then
-    was_preempted=0; gcp_vps_was_preempted "$VM" && was_preempted=1
-    status="$(rg_apply_preemption "$status" "$was_preempted")"
+    pre_rc=0; gcp_vps_was_preempted "$VM" || pre_rc=$?
+    case "$pre_rc" in
+      0) status="$(rg_apply_preemption "$status" 1)" ;;
+      1) ;;
+      *) if [ "$status" = FAIL ]; then
+           status=INVALID
+           echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): could not tell whether Google reclaimed $VM" | tee -a "$RUN_OUT/verdict.txt"
+         fi ;;
+    esac
     [ "$status" != PREEMPTED ] || echo "PREEMPTED: Google reclaimed $VM mid-run; the run is not a verdict" | tee -a "$RUN_OUT/verdict.txt"
   fi
   rg_contention_reasons "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env" > "$RUN_OUT/contention.txt"
@@ -309,7 +320,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
   [ -s "$RUN_OUT/out/samples.tsv" ] && "$HERE/summarize.sh" "$RUN_OUT/out" | tee "$RUN_OUT/summary.md"
-  [ "$KEEP" = 1 ] || { vm_delete "$VM"; VMS="${VMS/ $VM/}"; }
+  [ "$KEEP" = 1 ] || { vm_delete "$VM" && VMS="${VMS/ $VM/}"; }
 done
 
 echo "$passed" > "$OUT/passed"
@@ -322,5 +333,6 @@ if [ "$BACKEND" = gcp ]; then
   echo "backend=gcp release=$RELEASE machine=e2-micro arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
   verdict="$verdict [release-authoritative: x86_64 GCP e2-micro Spot, mirror release $RELEASE]"
 fi
+[ ! -s "$OUT/leaked-vps.txt" ] || { echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"; }
 echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="
 exit "$rc"
