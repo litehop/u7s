@@ -184,6 +184,11 @@ jobs:
             --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 --iterations 3 \
             --scheduler --lifetime 120
 
+      - name: CA bundle tolerance e2e
+        run: |
+          scripts/e2e-pki-rotation/ca-bundle.sh \
+            --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+
       - name: SA signing-key rotation e2e (2 rotations)
         run: |
           scripts/e2e-pki-rotation/sa-key-rotation.sh \

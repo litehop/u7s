@@ -151,6 +151,17 @@ pub(crate) mod test_support {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// Base64 caBundle holding an unrelated cert first and then `ca_bundle_b64`'s certs, so a
+    /// consumer that reads only the first PEM block cannot verify the backend.
+    pub(crate) fn multi_cert_bundle_b64(ca_bundle_b64: &str) -> String {
+        use base64::Engine as _;
+        let std = base64::engine::general_purpose::STANDARD;
+        let decoy = rcgen::generate_simple_self_signed(vec!["decoy".to_owned()]).unwrap();
+        let mut pem = decoy.cert.pem().into_bytes();
+        pem.extend(std.decode(ca_bundle_b64).unwrap());
+        std.encode(pem)
+    }
+
     pub(crate) struct TlsBackend {
         pub port: u16,
         pub ca_bundle_b64: String,

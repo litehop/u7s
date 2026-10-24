@@ -216,6 +216,7 @@ if [ -f "$WORKDIR/ca.crt" ]; then
   if [ -f "$WORKDIR/proxy-client-ca.crt" ]; then
     openssl x509 -inform DER -in "$WORKDIR/proxy-client-ca.crt" >> "$WORKDIR/ca.pem"
   fi
+  if [ -f "$WORKDIR/ca-extra.pem" ]; then cat "$WORKDIR/ca-extra.pem" >> "$WORKDIR/ca.pem"; fi
 
   if [ "$RESET" -eq 1 ] || [ ! -f "$WORKDIR/konnectivity-server.crt" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-server.key"
@@ -421,6 +422,7 @@ if [ -f "$WORKDIR/ca.crt" ] && ! nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/de
   if [ -f "$WORKDIR/proxy-client-ca.crt" ]; then
     openssl x509 -inform DER -in "$WORKDIR/proxy-client-ca.crt" >> "$WORKDIR/ca.pem"
   fi
+  if [ -f "$WORKDIR/ca-extra.pem" ]; then cat "$WORKDIR/ca-extra.pem" >> "$WORKDIR/ca.pem"; fi
   if [ ! -f "$WORKDIR/konnectivity-server.crt" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-server.key"
     openssl req -new -key "$WORKDIR/konnectivity-server.key" \
