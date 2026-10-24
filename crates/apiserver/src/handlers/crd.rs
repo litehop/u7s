@@ -4209,14 +4209,10 @@ mod tests {
     }
 
     /// A MERGE patch to .../customresourcedefinitions/{name}/status setting
-    /// `metadata.labels` must not change the stored labels — same PSA-bypass class as
-    /// #733's JSON-Patch fix, but merge-patch reaches /status through
-    /// `merge_incoming_metadata` rather than `validate_status_json_patch_paths`, so
-    /// closing only the JSON-Patch vector left this one open. CRD labels can gate policy
-    /// elsewhere (e.g. namespace/webhook selectors), so a `customresourcedefinitions/status`
-    /// grant must not be able to rewrite them via a plain merge-patch.
+    /// `metadata.labels` applies them: upstream's CRD status strategy resets only `spec`
+    /// (its `ResetObjectMetaForStatus` is called on the new object twice, a no-op).
     #[tokio::test]
-    async fn patch_crd_status_merge_patch_rejects_metadata_labels() {
+    async fn patch_crd_status_merge_patch_applies_metadata_labels() {
         let state = make_state();
         let name = "widgets.example.io";
         let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
@@ -4253,10 +4249,9 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            v["metadata"]["labels"]["attacker"].is_null(),
-            "a merge-patch on /status must NOT be able to set arbitrary labels — \
-             otherwise a status-only grant can rewrite labels used for policy elsewhere"
+        assert_eq!(
+            v["metadata"]["labels"]["attacker"], "true",
+            "only Deployment's status strategy resets labels"
         );
         assert_eq!(
             v["status"]["conditions"][0]["type"], "NamesAccepted",
@@ -4270,9 +4265,9 @@ mod tests {
             .await
             .unwrap();
         let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
-        assert!(
-            v2["metadata"]["labels"]["attacker"].is_null(),
-            "the dropped label must not have been persisted to the store either"
+        assert_eq!(
+            v2["metadata"]["labels"]["attacker"], "true",
+            "the label must be persisted to the store"
         );
     }
 

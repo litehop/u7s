@@ -1542,7 +1542,7 @@ pub(crate) async fn do_patch<S: Store>(
         let now = crate::util::utc_now_rfc3339();
         let ssa_plan = crate::field_manager::plan_apply(
             &serde_json::Value::Null,
-            &applied_fields(&obj.body, meta.has_status_subresource),
+            &applied_fields(&obj.body, Some(&meta.kind), meta.has_status_subresource),
             force,
             &field_request(&manager, &api_version, &now),
         )
@@ -1759,7 +1759,7 @@ pub(crate) async fn do_patch<S: Store>(
                 strip_managed_fields(&mut patch);
                 let race_plan = crate::field_manager::plan_apply(
                     &current.body,
-                    &applied_fields(&patch, meta.has_status_subresource),
+                    &applied_fields(&patch, Some(&meta.kind), meta.has_status_subresource),
                     force,
                     &field_request(&manager, &api_version, &now),
                 )
@@ -2123,7 +2123,7 @@ pub(crate) async fn do_patch<S: Store>(
             Some(
                 crate::field_manager::plan_apply(
                     &current.body,
-                    &applied_fields(&patch, meta.has_status_subresource),
+                    &applied_fields(&patch, Some(&meta.kind), meta.has_status_subresource),
                     force,
                     &field_request(&manager, &api_version, &now),
                 )

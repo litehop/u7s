@@ -5589,15 +5589,11 @@ mod tests {
         );
     }
 
-    /// A MERGE patch to .../namespaces/{ns}/status setting `metadata.labels` must not
-    /// change the stored labels — same PSA-bypass class as #733's JSON-Patch fix, but a
-    /// different content-type: merge-patch (and strategic-merge-patch) reach /status
-    /// through `merge_incoming_metadata`, not `validate_status_json_patch_paths`, so
-    /// closing only the JSON-Patch vector left this one open. A caller with only
-    /// `namespaces/status` rights could otherwise rewrite
-    /// `pod-security.kubernetes.io/enforce` via a plain merge-patch and bypass PSA.
+    /// A MERGE patch to .../namespaces/{ns}/status setting `metadata.labels` applies them:
+    /// upstream's `namespaceStatusStrategy` resets only `spec`, so gating labels is left to
+    /// RBAC on `namespaces/status`.
     #[tokio::test]
-    async fn patch_namespace_status_merge_patch_rejects_metadata_labels() {
+    async fn patch_namespace_status_merge_patch_applies_metadata_labels() {
         let state = make_state();
 
         assert!(
@@ -5635,11 +5631,7 @@ mod tests {
             patch_body,
         )
         .await;
-        assert!(
-            result.is_ok(),
-            "a merge-patch to /status must still succeed — the label change is dropped, \
-             not rejected, mirroring how finalizers/deletionTimestamp are already restored"
-        );
+        assert!(result.is_ok(), "a merge-patch to /status must succeed");
 
         let stored = state
             .store
@@ -5651,10 +5643,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        assert!(
-            body["metadata"]["labels"]["pod-security.kubernetes.io/enforce"].is_null(),
-            "a merge-patch on /status must NOT be able to set the PSA enforce label — \
-             otherwise a status-only grant can silently weaken Pod Security Admission"
+        assert_eq!(
+            body["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "privileged",
+            "namespaceStatusStrategy does not reset labels"
         );
         assert_eq!(
             body["status"]["phase"], "Active",
