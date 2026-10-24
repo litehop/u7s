@@ -2307,6 +2307,45 @@ mod tests {
             assert_eq!(seen.as_deref(), Some("real"));
         }
 
+        /// A client that forges `x-u7s-force` must not be able to take fields from other
+        /// managers without `?force=true`; only the query string may set it.
+        #[tokio::test]
+        async fn client_supplied_force_header_is_discarded() {
+            async fn force_seen(uri: &str, forged: bool) -> Option<String> {
+                let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let seen2 = seen.clone();
+                let app = axum::Router::new()
+                    .route(
+                        "/x",
+                        axum::routing::patch(move |h: axum::http::HeaderMap| async move {
+                            *seen2.lock().unwrap() = h
+                                .get(FORCE_HEADER)
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+                            "ok"
+                        }),
+                    )
+                    .layer(axum::middleware::from_fn(resolve_field_manager));
+                let mut b = Request::builder()
+                    .method("PATCH")
+                    .uri(uri)
+                    .header("content-type", APPLY);
+                if forged {
+                    b = b.header(FORCE_HEADER, "true");
+                }
+                app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+                let v = seen.lock().unwrap().clone();
+                v
+            }
+            assert_eq!(force_seen("/x?fieldManager=m", true).await, None);
+            assert_eq!(
+                force_seen("/x?fieldManager=m&force=true", false)
+                    .await
+                    .as_deref(),
+                Some("true")
+            );
+        }
+
         /// The layer is installed on the real router, so every kind's apply route is covered.
         #[tokio::test]
         async fn real_router_rejects_apply_without_field_manager() {
