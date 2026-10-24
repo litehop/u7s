@@ -7,7 +7,7 @@
 # U7S_PKI_TEST_SA_ROTATION_SECS=<R> (run-all.sh --pki-test-sa-rotation <R> --stack-only does
 # both). With R, the signing key rotates every R seconds, a successor is published R/4 before it
 # signs, tokens live at most R/6 and the replaced key is dropped R/4 after the switch. Use
-# R >= 120 so the one-second poll interval is small against those windows. One rotation takes
+# R >= 60 so the one-second poll interval is small against those windows. One rotation takes
 # about R seconds; --iterations n repeats it.
 #
 #   scripts/e2e-pki-rotation/sa-key-rotation.sh --kubeconfig temp/u7s/kubeconfig \

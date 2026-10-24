@@ -1,0 +1,133 @@
+name: PKI rotation e2e
+
+# Real-binary rotation suites: an apiserver built with the test-only pki-test-knobs feature
+# issues certs and SA keys with compressed lifetimes, and each script asserts the rotation
+# happens live without breaking watches, fresh requests or the standalone scheduler. Each suite
+# gets its own apiserver so they run in parallel; the node-side checks run through
+# scripts/conformance/run-all.sh --pki-test-lifetime on the Lima fleet.
+
+on:
+  push:
+    branches-ignore:
+      - 'gh-readonly-queue/**'
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      # save-if: only main writes the shared cache; branches restore it read-only.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build apiserver with pki-test-knobs and the scheduler
+        run: cargo build --locked --release -p u7s-apiserver --features pki-test-knobs && cargo build --locked --release -p u7s-scheduler
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pki-rotation-binaries
+          path: |
+            target/release/u7s-apiserver
+            target/release/u7s-scheduler
+          retention-days: 1
+          if-no-files-found: error
+
+  suite:
+    name: ${{ matrix.suite }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The standalone scheduler re-reads its cert every 30s; leaves renew at 2/3 of their
+          # life, so a leaf run with the scheduler needs 120s to keep ~10s of slack. The
+          # intermediate suite leaves leaf lifetimes at their defaults (clamped to the intermediate).
+          - suite: intermediate
+            scheduler: "--scheduler"
+            lifetime: ""
+            sa_rotation: ""
+            intermediate: "135"
+            run: >-
+              scripts/e2e-pki-rotation/intermediate-rotation.sh
+              --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+              --scheduler --intermediate-lifetime 135
+          - suite: leaf
+            scheduler: ""
+            lifetime: "30"
+            sa_rotation: ""
+            intermediate: ""
+            run: >-
+              scripts/e2e-pki-rotation/leaf-rotation.sh
+              --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+              --iterations 3 --lifetime 30
+          - suite: leaf-scheduler
+            scheduler: "--scheduler"
+            lifetime: "120"
+            sa_rotation: ""
+            intermediate: ""
+            run: >-
+              scripts/e2e-pki-rotation/leaf-rotation.sh
+              --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+              --iterations 1 --scheduler --lifetime 120
+          - suite: sa-key-and-ca-bundle
+            scheduler: ""
+            lifetime: ""
+            sa_rotation: "60"
+            intermediate: ""
+            run: >-
+              scripts/e2e-pki-rotation/sa-key-rotation.sh
+              --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --rotation 60 --iterations 2
+              && scripts/e2e-pki-rotation/ca-bundle.sh
+              --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pki-rotation-binaries
+          path: target/release
+      - name: Make binaries executable
+        run: chmod +x target/release/u7s-apiserver target/release/u7s-scheduler
+      - name: Start the stack
+        env:
+          U7S_PKI_TEST_LIFETIME_SECS: ${{ matrix.lifetime }}
+          U7S_PKI_TEST_SA_ROTATION_SECS: ${{ matrix.sa_rotation }}
+          U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS: ${{ matrix.intermediate }}
+        run: |
+          # An empty knob variable must be absent, not an unparseable empty string.
+          for v in U7S_PKI_TEST_LIFETIME_SECS U7S_PKI_TEST_SA_ROTATION_SECS U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS; do
+            [ -n "${!v}" ] || unset "$v"
+          done
+          scripts/e2e-pki-rotation/start-stack.sh --workdir temp/pki-e2e ${{ matrix.scheduler }}
+      - name: Helper logic tests
+        if: matrix.suite == 'leaf' || matrix.suite == 'intermediate'
+        run: |
+          scripts/e2e-pki-rotation/test-leaf-rotation-logic.sh
+          scripts/e2e-pki-rotation/test-intermediate-rotation-logic.sh
+      - name: ${{ matrix.suite }} e2e
+        run: ${{ matrix.run }}
+      - name: Upload apiserver log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pki-rotation-e2e-logs-${{ matrix.suite }}
+          path: |
+            temp/pki-e2e/apiserver.log
+            temp/pki-e2e/scheduler.log
+          retention-days: 7
