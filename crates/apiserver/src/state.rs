@@ -99,6 +99,7 @@ pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 /// SELinuxChangePolicy gate, so `--controllers=*` never starts it.
 pub(crate) const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
     "attachdetach-controller",
+    "bootstrap-signer",
     "certificate-controller",
     "cronjob-controller",
     "daemon-set-controller",
@@ -130,6 +131,7 @@ pub(crate) const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
     "service-account-controller",
     "statefulset-controller",
     "storage-version-migrator-controller",
+    "token-cleaner",
     "ttl-after-finished-controller",
     "ttl-controller",
     "validatingadmissionpolicy-status-controller",

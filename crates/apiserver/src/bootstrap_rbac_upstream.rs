@@ -217,6 +217,10 @@ async fn every_service_account_kcm_runs_a_controller_as_is_bound_to_its_controll
     let roles = seeded_cluster_scoped("clusterroles").await;
     let bindings = seeded_cluster_scoped("clusterrolebindings").await;
     for sa in KCM_CONTROLLER_SERVICE_ACCOUNTS {
+        // Bound by namespace RoleBindings, not ClusterRoleBindings.
+        if matches!(*sa, "bootstrap-signer" | "token-cleaner") {
+            continue;
+        }
         let name = format!("system:controller:{sa}");
         assert!(roles.contains_key(&name), "ClusterRole {name} missing");
         let b = bindings
@@ -230,6 +234,51 @@ async fn every_service_account_kcm_runs_a_controller_as_is_bound_to_its_controll
         );
     }
 }
+#[tokio::test]
+async fn kcm_controller_service_account_list_equals_kube_system_controller_sas_bound_in_rbac() {
+    // A controller SA missing from the list loses its priority level and can starve under
+    // load; an extra entry grants priority to an identity KCM never runs as.
+    let cluster = seeded_cluster_scoped("clusterrolebindings").await;
+    let namespaced = seeded_namespaced("rolebindings").await;
+    let in_kube_system = namespaced
+        .iter()
+        .filter(|(id, _)| id.starts_with("kube-system/"))
+        .map(|(_, v)| v);
+    // Bound upstream but not started by u7s's KCM: disabled via --controllers, cloud-only
+    // (no cloud provider), or gated off.
+    const NOT_RUN: [&str; 5] = [
+        "clusterrole-aggregation-controller",
+        "route-controller",
+        "selinux-warning-controller",
+        "service-cidrs-controller",
+        "service-controller",
+    ];
+    let mut bound: BTreeSet<String> = BTreeSet::new();
+    for b in cluster.values().chain(in_kube_system) {
+        if !b["roleRef"]["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("system:controller:"))
+        {
+            continue;
+        }
+        for s in subject_set(b) {
+            if let Some(sa) = s.strip_prefix("ServiceAccount:kube-system/") {
+                if !NOT_RUN.contains(&sa) {
+                    bound.insert(sa.to_string());
+                }
+            }
+        }
+    }
+    let listed: BTreeSet<String> = KCM_CONTROLLER_SERVICE_ACCOUNTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        listed, bound,
+        "KCM_CONTROLLER_SERVICE_ACCOUNTS must equal the kube-system SAs bound to system:controller:* roles"
+    );
+}
+
 fn upstream_cluster_objects(yamls: &[&str]) -> BTreeMap<String, Value> {
     yamls
         .iter()
