@@ -100,7 +100,7 @@ snap() {
       [ -f "$c/memory.current" ] && echo "cgroup $c $(( $(cat "$c/memory.current") / 1024 )) kB"
     done
     echo "system.slice memory.low=$(cat /sys/fs/cgroup/system.slice/memory.low) memory.min=$(cat /sys/fs/cgroup/system.slice/memory.min)"
-    echo "cgroup-of-kubelet $(cut -d: -f3 /proc/$(pgrep -x kubelet | head -1)/cgroup) crio $(cut -d: -f3 /proc/$(pgrep -x crio | head -1)/cgroup)"
+    echo "cgroup-of-kubelet $(cut -d: -f3 /proc/$(pgrep -x kubelet | sed -n 1p)/cgroup) crio $(cut -d: -f3 /proc/$(pgrep -x crio | sed -n 1p)/cgroup)"
     awk '$1 == "kmalloc-256" || /^(cred_jar|task_struct|veth|kmalloc-cg-)/ {printf "slab %s objs=%s\n", $1, $2}' /proc/slabinfo 2>/dev/null
   } >> "$OUT/snap.txt"
 }
