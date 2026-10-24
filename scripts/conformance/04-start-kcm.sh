@@ -113,7 +113,7 @@ esac
 
 KCM_BINARY="\$CACHE_DIR/kube-controller-manager-\${K8S_VERSION}-linux-\${ARCH}"
 
-for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/ca.key" "\$WORKDIR/ca-bundle.pem"; do
+for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/intermediate-cert.pem" "\$WORKDIR/intermediate.key" "\$WORKDIR/ca-bundle.pem"; do
   if [ ! -f "\$f" ]; then
     echo "error: missing required file: \$f" >&2
     exit 1
@@ -129,10 +129,7 @@ if [ ! -f "\$KCM_BINARY" ]; then
   echo "Cached at \$KCM_BINARY"
 fi
 
-# ca.crt is written by u7s in DER format; KCM requires PEM.
 TMPDIR_KCM="\$(mktemp -d)"
-openssl x509 -inform DER -in "\$WORKDIR/ca.crt" -out "\$TMPDIR_KCM/ca.pem"
-CA_CERT="\$TMPDIR_KCM/ca.pem"
 
 # The kubeconfig names its cert/key/CA files by absolute path under \$WORKDIR, so the
 # address-rewritten copy below still reads the files the apiserver re-issues in place.
@@ -165,8 +162,8 @@ chmod +x /tmp/kcm-supervisor.sh
 # token; /healthz,/readyz,/livez stay open by default.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
-  --cluster-signing-cert-file="\$CA_CERT" \\
-  --cluster-signing-key-file="\$WORKDIR/ca.key" \\
+  --cluster-signing-cert-file="\$WORKDIR/intermediate-cert.pem" \\
+  --cluster-signing-key-file="\$WORKDIR/intermediate.key" \\
   --cluster-signing-duration="${SIGNING_DURATION}" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\

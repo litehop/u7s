@@ -181,6 +181,39 @@ fn a_leaf_is_flagged_only_once_its_automatic_renewal_is_overdue() {
     assert!(late[0].message.contains("admin"), "{}", late[0].message);
 }
 
+/// The intermediate re-issues itself at 2/3 of its life, so it is a healthy certificate for
+/// most of a year; only an overdue rotation may raise the CA warning that every operator's
+/// kubectl would otherwise print on each request.
+#[test]
+fn an_intermediate_is_flagged_only_once_its_automatic_rotation_is_overdue() {
+    let pki = Pki {
+        clock: Clock::new(t0),
+        ..Pki::default()
+    };
+    pki.issue(
+        &spec(
+            "intermediate",
+            "u7s-intermediate-a",
+            CertRole::Intermediate,
+            365,
+        ),
+        None,
+    )
+    .unwrap();
+    assert!(
+        findings(&pki.inventory, after_days(250)).is_empty(),
+        "a healthy intermediate must not warn from the day it is issued"
+    );
+    let late = findings(&pki.inventory, after_days(320));
+    assert_eq!(late.len(), 1);
+    assert_eq!(late[0].reason, REASON_CA_WARNING);
+    assert!(
+        late[0].message.contains("u7s-intermediate-a"),
+        "{}",
+        late[0].message
+    );
+}
+
 #[test]
 fn findings_use_k3s_reasons_per_cert_class_and_report_rotation_failures() {
     let inv = ca_only("kubernetes-ca");
