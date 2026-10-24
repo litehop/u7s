@@ -102,7 +102,7 @@ assert "schema_version itself never appears as an index entry" \
 #    dead variable.
 # ---------------------------------------------------------------------------
 OUT_SHORT=$(DESC_LEN=10 render_slim_prime "$EXPORT_1" "$MEM_1")
-SNIPPET=$(printf '%s' "$OUT_SHORT" | grep -E '^- memory-one: ' | head -1)
+SNIPPET=$(printf '%s' "$OUT_SHORT" | grep -E '^- memory-one: ' | sed -n 1p)
 assert "DESC_LEN=10 actually shortens the snippet (proves the cap isn't dead code)" \
   "$([ "${#SNIPPET}" -lt 40 ] && echo 1 || echo 0)"
 

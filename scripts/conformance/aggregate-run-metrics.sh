@@ -169,7 +169,7 @@ CATEGORIES
     $4 ~ skip_re { next }
     { if ($5 + 0 > max[$4]) max[$4] = $5 + 0 }
     END { for (c in max) print max[c] "\t" c }
-  ' "$RSS_CSV" | sort -rn | head -5)"
+  ' "$RSS_CSV" | sort -rn | sed -n 1,5p)"
   if [ -z "$other_rows" ]; then
     echo "| _(none)_ | -- |"
   else

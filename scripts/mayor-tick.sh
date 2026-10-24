@@ -240,7 +240,7 @@ is_live_agent_branch() {
 # else (needs-changes, needs-discussion, or no match at all -> empty) does
 # not, even though the `## critical-reviewer findings` header is present.
 parse_verdict() {
-  printf '%s\n' "$1" | grep -oE '\*\*Verdict\*\*:[[:space:]]*[A-Za-z-]+' | head -1 \
+  printf '%s\n' "$1" | grep -oE '\*\*Verdict\*\*:[[:space:]]*[A-Za-z-]+' | sed -n 1p \
     | sed -E 's/^\*\*Verdict\*\*:[[:space:]]*//'
 }
 

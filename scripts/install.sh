@@ -1148,14 +1148,14 @@ if [ -z "$IFACE" ]; then
   # 26.04 Lima fleet, one template, splits 2/5 enp0s1 vs 3/5 eth0.
   IFACE="$(ip -o link show | awk -F': ' '{print $2}' \
     | grep -E '^(en|wl|ww)[a-zA-Z0-9]+$|^eth[0-9]+$' \
-    | head -n1)"
+    | sed -n 1p)"
   if [ -z "$IFACE" ]; then
     echo "error: no recognized physical network interface found -- pass --iface explicitly" >&2
     exit 1
   fi
 fi
 
-IFACE_IP="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
+IFACE_IP="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | sed -n 1p)"
 if [ -z "$IFACE_IP" ]; then
   echo "error: interface $IFACE has no IPv4 address assigned" >&2
   exit 1
@@ -1284,7 +1284,7 @@ fi
 # that CRI-O's 10-crio-bridge.conflist references. CRI-O only Recommends a
 # CNI-plugins package and cloud-image apt disables recommends, so without this
 # every node sits NotReady forever with "failed to find plugin \"bridge\"".
-KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p)"
 if [ -z "$KUBE_VERSION" ]; then
   echo "error: could not determine kubelet version from '$BIN_DIR/kubelet --version'" >&2
   exit 1
