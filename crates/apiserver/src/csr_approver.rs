@@ -282,10 +282,28 @@ fn is_undecided(csr: &serde_json::Value) -> bool {
         })
 }
 
+/// The apiserver addresses a serving-cert IP SAN must avoid for `node_name`. The node
+/// co-located with the apiserver legitimately owns that address (single-node installs run
+/// the kubelet on the apiserver's own IP) and already shares the CA key's host, so the
+/// guard does not apply to it; every other node, which could be a worker claiming the
+/// apiserver's address to impersonate it, keeps the full list.
+fn forbidden_apiserver_ips<'a>(
+    apiserver_ips: &'a [IpAddr],
+    node_name: &str,
+    local_node_name: Option<&str>,
+) -> &'a [IpAddr] {
+    if !node_name.is_empty() && local_node_name == Some(node_name) {
+        &[]
+    } else {
+        apiserver_ips
+    }
+}
+
 /// One sweep: approve every undecided kubelet-serving CSR that passes [`evaluate`].
 pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(
     state: &AppState<S>,
     apiserver_ips: &[IpAddr],
+    local_node_name: Option<&str>,
 ) {
     let prefix = group_list_prefix(GROUP, PLURAL, None);
     let Ok(resp) = state.store.list(&prefix, ListOptions::default()).await else {
@@ -316,7 +334,8 @@ pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(
                 .service_ip_allocator
                 .as_ref()
                 .map(|a| (a.base, a.size)),
-            apiserver_ips: apiserver_ips.to_vec(),
+            apiserver_ips: forbidden_apiserver_ips(apiserver_ips, node_name, local_node_name)
+                .to_vec(),
             ..Default::default()
         };
         for n in &nodes.items {
@@ -598,13 +617,13 @@ mod tests {
             )
             .await;
         }
-        approve_kubelet_serving_csrs(&state, &[]).await;
+        approve_kubelet_serving_csrs(&state, &[], None).await;
         assert_eq!(conditions(&state, "ok").await[0]["type"], "Approved");
         assert!(
             conditions(&state, "bad").await.is_null(),
             "a CSR with a foreign IP SAN must never be approved or denied"
         );
-        approve_kubelet_serving_csrs(&state, &[]).await;
+        approve_kubelet_serving_csrs(&state, &[], None).await;
         assert_eq!(
             conditions(&state, "ok").await.as_array().unwrap().len(),
             1,
@@ -658,7 +677,7 @@ mod tests {
             &attack,
         )
         .await;
-        approve_kubelet_serving_csrs(&state, &[]).await;
+        approve_kubelet_serving_csrs(&state, &[], None).await;
         assert!(
             conditions(&state, "csr-n2").await.is_null(),
             "an IP reported by two Nodes must not be approved for either"
@@ -687,8 +706,58 @@ mod tests {
             &csr,
         )
         .await;
-        approve_kubelet_serving_csrs(&state, &[]).await;
+        approve_kubelet_serving_csrs(&state, &[], None).await;
         assert_eq!(conditions(&state, "csr-n2").await[0]["type"], "Approved");
+    }
+
+    async fn sweep_for_apiserver_address(csr_node: &str, local_node_name: Option<&str>) -> bool {
+        let state = make_state();
+        let apiserver: IpAddr = "192.168.5.15".parse().unwrap();
+        seed(
+            &state,
+            &cluster_object_key("nodes", csr_node),
+            &node_named(csr_node, &["192.168.5.15"]),
+        )
+        .await;
+        let key = crate::keys::group_object_key(GROUP, PLURAL, None, &format!("csr-{csr_node}"));
+        seed(&state, &key, &serving_csr_for(csr_node, &["192.168.5.15"])).await;
+        approve_kubelet_serving_csrs(&state, &[apiserver], local_node_name).await;
+        !conditions(&state, &format!("csr-{csr_node}"))
+            .await
+            .is_null()
+    }
+
+    #[tokio::test]
+    async fn single_node_kubelet_gets_a_serving_cert_for_the_apiserver_address_it_runs_on() {
+        // Otherwise the only node of an install.sh cluster has no serving cert and
+        // logs/exec fail until an operator approves by hand.
+        assert!(sweep_for_apiserver_address("cp", Some("cp")).await);
+    }
+
+    #[tokio::test]
+    async fn any_other_node_claiming_the_apiserver_address_stays_pending_so_it_cannot_impersonate_the_apiserver(
+    ) {
+        assert!(
+            !sweep_for_apiserver_address("worker", Some("cp")).await,
+            "a non-local node must not get the apiserver's IP in a CA-signed serving cert"
+        );
+        assert!(
+            !sweep_for_apiserver_address("cp", None).await,
+            "without a configured local node name the guard stays on for every node"
+        );
+    }
+
+    #[test]
+    fn forbidden_apiserver_ips_is_lifted_only_for_the_exact_local_node_name() {
+        let ips: Vec<IpAddr> = vec!["192.168.5.15".parse().unwrap()];
+        assert!(forbidden_apiserver_ips(&ips, "cp", Some("cp")).is_empty());
+        assert_eq!(forbidden_apiserver_ips(&ips, "worker", Some("cp")), ips);
+        assert_eq!(forbidden_apiserver_ips(&ips, "cp", None), ips);
+        assert_eq!(
+            forbidden_apiserver_ips(&ips, "", Some("")),
+            ips,
+            "a CSR whose requestor is not a node has an empty node name and must not match an empty flag"
+        );
     }
 
     fn with_pod_cidrs(mut node: serde_json::Value, cidrs: &[&str]) -> serde_json::Value {
@@ -705,7 +774,7 @@ mod tests {
         let csr = serving_csr_for(csr_node, &[ip]);
         let key = crate::keys::group_object_key(GROUP, PLURAL, None, &format!("csr-{csr_node}"));
         seed(&state, &key, &csr).await;
-        approve_kubelet_serving_csrs(&state, &[]).await;
+        approve_kubelet_serving_csrs(&state, &[], None).await;
         !conditions(&state, &format!("csr-{csr_node}"))
             .await
             .is_null()

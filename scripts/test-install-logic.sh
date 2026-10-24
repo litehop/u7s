@@ -517,6 +517,9 @@ assert_true "the apiserver restart step fails loud with a systemctl status/journ
 assert_true "u7s-apiserver.service's ExecStart passes --embedded-scheduler true -- production now schedules inside this process instead of relying on a separate u7s-scheduler binary" \
   grep -qF -- '--embedded-scheduler true' "$INSTALL"
 
+assert_true "u7s-apiserver.service's ExecStart passes --local-node-name \$NODE_NAME -- without it the single-node kubelet's serving CSR (IP SAN == apiserver address) stays Pending and kubectl logs/exec fail" \
+  grep -qF -- '--local-node-name $NODE_NAME' "$INSTALL"
+
 assert_false "(regression guard) install.sh no longer writes a u7s-scheduler.service unit file -- running the embedded scheduler AND a standalone u7s-scheduler against the same cluster risks double-preemption, so a fresh install must not provision the standalone unit at all" \
   grep -qF 'cat > /etc/systemd/system/u7s-scheduler.service' "$INSTALL"
 
