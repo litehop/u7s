@@ -898,7 +898,7 @@ pub(crate) async fn put_namespace_status<S: Store>(
         current.body,
     )
     .await?;
-    super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
+    super::status::record_status_write(&headers, None, &before_write, &mut current.body, "", "v1");
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
@@ -953,6 +953,8 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, Some(&name))?;
+    let ssa_plan =
+        super::status::plan_status_apply(&headers, is_ssa, &current.body, &patch, "", "v1")?;
 
     match patch_type {
         PatchType::Json => {
@@ -987,6 +989,9 @@ pub(crate) async fn patch_namespace_status<S: Store>(
             );
         }
     }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current.body);
+    }
     // Convergence point for every patch content-type above (JSON Patch, merge, strategic
     // merge): guard once here, right before the store write, instead of per-branch — this
     // handler previously guarded neither branch, so a merge-patch or JSON Patch `/status`
@@ -1018,7 +1023,14 @@ pub(crate) async fn patch_namespace_status<S: Store>(
         current.body,
     )
     .await?;
-    super::status::record_status_write(&headers, &before_write, &mut current.body, "", "v1");
+    super::status::record_status_write(
+        &headers,
+        ssa_plan.as_ref(),
+        &before_write,
+        &mut current.body,
+        "",
+        "v1",
+    );
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.

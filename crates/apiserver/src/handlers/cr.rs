@@ -4643,22 +4643,6 @@ fn record_cr_write(
     );
 }
 
-fn record_cr_status_write(
-    headers: &HeaderMap,
-    before: &serde_json::Value,
-    obj: &mut serde_json::Value,
-    group: &str,
-    version: &str,
-) {
-    crate::field_manager::WriteIdentity::new(None, headers).record(
-        before,
-        obj,
-        &format!("{group}/{version}"),
-        Some("status"),
-        None,
-    );
-}
-
 fn record_cr_scale_write(
     headers: &HeaderMap,
     before: &serde_json::Value,
@@ -5482,7 +5466,14 @@ pub async fn put_cr_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
-    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
+    crate::handlers::status::record_status_write(
+        &headers,
+        None,
+        &before_write,
+        &mut current,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
@@ -5651,6 +5642,9 @@ pub async fn patch_cr_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
+    let ssa_plan = crate::handlers::status::plan_status_apply(
+        &headers, is_ssa, &current, &patch, &group, &version,
+    )?;
 
     match patch_type {
         PatchType::Json => {
@@ -5677,6 +5671,9 @@ pub async fn patch_cr_status<S: Store>(
             }
             crate::handlers::status::merge_incoming_metadata(&mut current, &patch, &kind);
         }
+    }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current);
     }
     // Convergence point for every patch content-type above (JSON Patch, merge, strategic
     // merge): guard once here, right before the store write, instead of per-branch. A
@@ -5727,7 +5724,14 @@ pub async fn patch_cr_status<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
-    record_cr_status_write(&headers, &before_write, &mut current, &group, &version);
+    crate::handlers::status::record_status_write(
+        &headers,
+        ssa_plan.as_ref(),
+        &before_write,
+        &mut current,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         return Ok(Json(current));
     }
