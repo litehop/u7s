@@ -1962,6 +1962,8 @@ fn evaluate_message_expression(
 /// Crossplane's `self.plural == self.plural.lowerAscii()` would fail every CR write with an
 /// "undeclared reference" CEL error instead of evaluating as the CRD author intended.
 fn register_cel_extensions(ctx: &mut cel::Context) {
+    ctx.add_function("matches", crate::handlers::cel_regex::cel_matches)
+        .expect("regex extension name must not collide with a cel builtin");
     ctx.add_function("split", cel_split)
         .expect("string extension name must not collide with a cel builtin");
     ctx.add_function("lowerAscii", cel_lower_ascii)
@@ -12696,6 +12698,53 @@ mod tests {
                 .message
                 .contains("slug must be lowercase letters only"),
             "an uppercase/digit slug must fail the matches() rule (got: {})",
+            err.1.message
+        );
+    }
+
+    /// A rule matching a large pattern against every list element must not recompile it per
+    /// element (cost O(n x compile) outside what the cost model bills), nor on every write.
+    #[test]
+    fn matches_compiles_each_pattern_once_across_elements_and_writes() {
+        let pattern = "^cachedpattern-[a-z]{1,40}$";
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "items": {
+                "type": "array",
+                "items": { "type": "string" },
+                "x-kubernetes-validations": [{
+                    "rule": format!("self.all(x, x.matches('{pattern}') && matches(x, '{pattern}'))")
+                }]
+            } }
+        });
+        let obj = serde_json::json!({ "items": vec!["cachedpattern-abc"; 200] });
+        assert!(check_schema(&obj, schema.clone()).is_ok());
+        assert!(check_schema(&obj, schema).is_ok());
+        let compiles = crate::handlers::cel_regex::COMPILES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(pattern).copied());
+        assert_eq!(
+            compiles,
+            Some(1),
+            "400 matches() calls over two writes must share one compile"
+        );
+    }
+
+    #[test]
+    fn matches_with_an_invalid_regex_reports_it_instead_of_passing() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "s": {
+                "type": "string",
+                "x-kubernetes-validations": [{ "rule": "self.matches('(unclosed')" }]
+            } }
+        });
+        let err = check_schema(&serde_json::json!({ "s": "a" }), schema).unwrap_err();
+        assert!(
+            err.1.message.contains("not a valid regex"),
+            "{}",
             err.1.message
         );
     }

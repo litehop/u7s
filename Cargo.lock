@@ -483,7 +483,6 @@ dependencies = [
  "lazy_static",
  "nom",
  "pastey",
- "regex",
  "serde",
  "serde_json",
  "thiserror",
