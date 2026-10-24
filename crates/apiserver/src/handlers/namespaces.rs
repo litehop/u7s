@@ -257,10 +257,9 @@ pub(crate) async fn create_namespace<S: Store>(
 /// pod forever. KCM's publisher still POSTs its own copy later — that becomes
 /// a 409 which the generic create-conflict path already handles.
 pub(crate) async fn seed_root_ca_configmap<S: Store>(state: &AppState<S>, name: &str) {
-    if let Some(ca_der) = state.cluster_ca_der.as_deref() {
+    if let Some(ca_ders) = state.cluster_ca_ders.get() {
         let cm_key = crate::keys::object_key("configmaps", name, "kube-root-ca.crt");
-        let ca_pem =
-            String::from_utf8_lossy(&crate::tls::pem_encode("CERTIFICATE", ca_der)).into_owned();
+        let ca_pem = String::from_utf8_lossy(&crate::tls::pem_encode_bundle(&ca_ders)).into_owned();
         let cm_body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -1613,7 +1612,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(ca_der.clone()),
+            cluster_ca_ders: Some(vec![ca_der.clone()]),
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,

@@ -303,6 +303,42 @@ async fn client_ca_store_swap_admits_new_ca_and_rejects_removed_one() {
     );
 }
 
+#[tokio::test]
+async fn client_ca_bundle_admits_clients_of_every_ca_in_it() {
+    let h = Harness::new("client-ca-bundle");
+    let r = h.start(CLIENT_CERT_LIFETIME).unwrap();
+    let trust_server = h.cluster_ca().cert_der;
+    let successor = h.other_ca();
+    let stranger = h.other_ca();
+    let identity = |ca: &CaSigner| {
+        connector(
+            &trust_server,
+            Some(&issue_leaf(&h.pki, ca, &h.admin_plan(CLIENT_CERT_LIFETIME)).unwrap()),
+        )
+    };
+    let (from_old, from_new, from_stranger) = (
+        connector(&trust_server, Some(&r.leaf("admin"))),
+        identity(&successor),
+        identity(&stranger),
+    );
+
+    r.set_client_cas(vec![trust_server.clone(), successor.cert_der.clone()])
+        .unwrap();
+    let cfg = r.server_config();
+    assert!(
+        server_accepts(cfg.get(), &from_old).await,
+        "kubeconfigs issued before the new CA appeared must keep working"
+    );
+    assert!(
+        server_accepts(cfg.get(), &from_new).await,
+        "kubeconfigs issued by the new CA must work before the old CA is dropped"
+    );
+    assert!(
+        !server_accepts(cfg.get(), &from_stranger).await,
+        "a CA outside the bundle must still be rejected"
+    );
+}
+
 #[test]
 fn crash_mid_rotation_restarts_into_the_new_pair_and_never_regenerates() {
     let h = Harness::new("crash");

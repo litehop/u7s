@@ -193,7 +193,9 @@ if [ "$COREDNS_REQ" = 1 ]; then
 fi
 
 phase idle
+cpu_before="$(head -1 /proc/stat)"
 sleep "$SETTLE_IDLE"
+res steal_idle_pct "$(rg_steal_pct "$cpu_before" "$(head -1 /proc/stat)")"
 calibrate_boundary
 
 phase wordpress
