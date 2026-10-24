@@ -1413,7 +1413,7 @@ pub(crate) const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
-    cluster_ca_der: Option<&[u8]>,
+    cluster_ca_ders: Option<&[Vec<u8>]>,
     proxy_identity_pem: Option<&[u8]>,
     dial: Option<(&str, std::net::SocketAddr)>,
     fallback: &reqwest::Client,
@@ -1427,7 +1427,7 @@ fn build_webhook_call_client(
     // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
     // we fall back to the cluster CA (or no pinned CA) rather than refusing the
     // call, but we always apply the proxy and timeout regardless.
-    let webhook_cert: Option<reqwest::Certificate> = ca_bundle_b64.and_then(|b64| {
+    let webhook_certs: Option<Vec<reqwest::Certificate>> = ca_bundle_b64.and_then(|b64| {
         let pem_bytes = match base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
             b64,
@@ -1440,9 +1440,9 @@ fn build_webhook_call_client(
                 return None;
             }
         };
-        match reqwest::Certificate::from_pem(&pem_bytes) {
-            Ok(c) => Some(c),
-            Err(_) => {
+        match reqwest::Certificate::from_pem_bundle(&pem_bytes) {
+            Ok(c) if !c.is_empty() => Some(c),
+            _ => {
                 tracing::warn!(
                     "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
                 );
@@ -1455,9 +1455,8 @@ fn build_webhook_call_client(
     // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
     // The proxy and timeout are applied regardless of whether a CA bundle is present:
     // without the proxy, service-based webhook calls never reach the in-cluster pod.
-    let mut builder = if let Some(cert) = webhook_cert {
-        let mut certs = vec![cert];
-        if let Some(der) = cluster_ca_der {
+    let mut builder = if let Some(mut certs) = webhook_certs {
+        for der in cluster_ca_ders.unwrap_or_default() {
             if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
                 certs.push(cluster_cert);
             }
@@ -1512,7 +1511,7 @@ pub(crate) async fn prepare_webhook_call<S: Store>(
     let client = build_webhook_call_client(
         config.ca_bundle.as_deref(),
         effective_proxy,
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
@@ -1744,7 +1743,7 @@ async fn invoke_mutating_webhook<S: Store>(
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
         effective_proxy,
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
         effective_identity.as_deref().map(|v| v.as_slice()),
         dial,
         &state.webhook_client.get(),
@@ -3166,7 +3165,7 @@ pub async fn run_validating_webhooks<S: Store>(
             let wh_client = build_webhook_call_client(
                 webhook.client_config.ca_bundle.as_deref(),
                 effective_proxy,
-                state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+                state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
                 effective_identity.as_deref().map(|v| v.as_slice()),
                 dial,
                 &state.webhook_client.get(),
@@ -7908,6 +7907,31 @@ mod tests {
         );
     }
 
+    /// A multi-cert `clientConfig.caBundle` (old and new webhook CA during rotation) must
+    /// verify a server signed by any entry, not only the first.
+    #[tokio::test]
+    async fn multi_cert_ca_bundle_verifies_server_matching_a_later_entry() {
+        use crate::service_resolver::test_support::{multi_cert_bundle_b64, tls_json_backend};
+
+        let backend = tls_json_backend("hook.ns.svc", serde_json::json!({})).await;
+        let bundle = multi_cert_bundle_b64(&backend.ca_bundle_b64);
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], backend.port).into();
+        let client = build_webhook_call_client(
+            Some(&bundle),
+            None,
+            None,
+            None,
+            Some(("hook.ns.svc", addr)),
+            &reqwest::Client::new(),
+            Some(5),
+        );
+        client
+            .get(format!("https://hook.ns.svc:{}/x", backend.port))
+            .send()
+            .await
+            .expect("a CA listed second in caBundle must still be trusted");
+    }
+
     /// Upstream presents no client certificate to a webhook unless the admission
     /// configuration's kubeconfig names one. A Service-resolved callout built exactly as
     /// production builds it (state from `AppStateConfig`, `routing`, then
@@ -7972,7 +7996,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: Some(server_cert_der),
+            cluster_ca_ders: Some(vec![server_cert_der]),
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -7996,7 +8020,7 @@ mod tests {
         let client = build_webhook_call_client(
             Some(&ca_bundle_b64),
             proxy,
-            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
             identity.as_deref().map(|v| v.as_slice()),
             dial,
             &state.webhook_client.get(),

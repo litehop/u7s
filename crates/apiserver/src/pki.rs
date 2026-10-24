@@ -289,6 +289,29 @@ impl Pki {
     }
 }
 
+/// Err unless `der` is a CA certificate: BasicConstraints CA:TRUE, and keyCertSign when a
+/// KeyUsage extension is present. webpki does not check constraints on a trust anchor
+/// itself, so a leaf accepted here would let its key holder mint accepted client certs.
+pub(crate) fn ensure_ca_cert(der: &[u8]) -> anyhow::Result<()> {
+    use x509_cert::der::Decode as _;
+    use x509_cert::ext::pkix::{BasicConstraints as Bc, KeyUsage};
+    let cert = x509_cert::Certificate::from_der(der)
+        .map_err(|e| anyhow::anyhow!("cert is not valid DER X.509: {e}"))?;
+    let tbs = cert.tbs_certificate();
+    let is_ca = tbs
+        .get_extension::<Bc>()
+        .map_err(|e| anyhow::anyhow!("bad BasicConstraints: {e}"))?
+        .is_some_and(|(_, bc)| bc.ca);
+    anyhow::ensure!(is_ca, "cert is not a CA (BasicConstraints CA:TRUE missing)");
+    if let Some((_, usage)) = tbs
+        .get_extension::<KeyUsage>()
+        .map_err(|e| anyhow::anyhow!("bad KeyUsage: {e}"))?
+    {
+        anyhow::ensure!(usage.key_cert_sign(), "CA cert KeyUsage lacks keyCertSign");
+    }
+    Ok(())
+}
+
 pub(crate) fn cert_validity(der: &[u8]) -> anyhow::Result<(OffsetDateTime, OffsetDateTime)> {
     use x509_cert::der::Decode as _;
     let cert = x509_cert::Certificate::from_der(der)

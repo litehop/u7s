@@ -15404,7 +15404,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -15516,7 +15516,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -17741,7 +17741,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -17822,7 +17822,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -17907,7 +17907,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -18016,7 +18016,7 @@ mod tests {
             sa_keys: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_ders: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
@@ -31389,7 +31389,8 @@ mod tests {
     #[tokio::test]
     async fn ssa_create_of_a_namespace_gets_name_label_and_root_ca_configmap_like_post() {
         let mut state = make_state();
-        state.cluster_ca_der = Some(std::sync::Arc::new(vec![1, 2, 3]));
+        state.cluster_ca_ders =
+            crate::pki::Swap::new(Some(std::sync::Arc::new(vec![vec![1, 2, 3]])));
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,

@@ -287,12 +287,12 @@ async fn build_backend_client<S: Store>(
             if let Ok(pem) =
                 base64::Engine::decode(&base64::engine::general_purpose::STANDARD, ca_b64)
             {
-                if let Ok(cert) = reqwest::Certificate::from_pem(&pem) {
-                    certs.push(cert);
+                if let Ok(bundle) = reqwest::Certificate::from_pem_bundle(&pem) {
+                    certs.extend(bundle);
                 }
             }
         }
-        if let Some(der) = state.cluster_ca_der.as_deref() {
+        for der in state.cluster_ca_ders.get().iter().flat_map(|b| b.iter()) {
             if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
                 certs.push(cluster_cert);
             }
@@ -2411,6 +2411,29 @@ mod tests {
             "discovery fetch must reach the backend via ClusterIP"
         );
         assert_eq!(backend.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A multi-cert `spec.caBundle` (old and new backend CA during rotation) must verify a
+    /// backend signed by any entry, not only the first.
+    #[tokio::test]
+    async fn multi_cert_ca_bundle_verifies_backend_matching_a_later_entry() {
+        use crate::service_resolver::test_support::{
+            multi_cert_bundle_b64, put_loopback_service, tls_json_backend,
+        };
+
+        let backend = tls_json_backend(
+            "api.wardle-ns.svc",
+            serde_json::json!({"kind": "APIResourceList", "resources": []}),
+        )
+        .await;
+        let state = make_state();
+        put_loopback_service(&*state.store, "wardle-ns", "api", backend.port).await;
+        let apiservice =
+            wardle_apiservice(&multi_cert_bundle_b64(&backend.ca_bundle_b64), backend.port);
+
+        health_check_backend(&state, &apiservice)
+            .await
+            .expect("a backend CA listed second in caBundle must still be trusted");
     }
 
     /// Upstream's availability controller reports `ServiceNotFound` / `ServicePortError`
