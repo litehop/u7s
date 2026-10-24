@@ -1778,6 +1778,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     })
                     .unwrap_or("admission webhook denied the request")
                     .to_string();
+                crate::metrics::record_admission_rejected("MutatingAdmissionWebhook");
                 return Err(Status::forbidden(format!(
                     "admission webhook \"{}\" denied the request: {message}",
                     webhook.name
@@ -2385,6 +2386,7 @@ pub async fn run_cel_mutating_policies<S: Store>(
                     continue;
                 }
                 Err(e) => {
+                    crate::metrics::record_admission_rejected("MutatingAdmissionPolicy");
                     return Err(Status::forbidden(policy_params::config_error_message(
                         policy_name,
                         binding_name,
@@ -2408,6 +2410,7 @@ pub async fn run_cel_mutating_policies<S: Store>(
                     "admission: MutatingAdmissionPolicy \"{policy_name}\" failed, denying \
                      (failurePolicy=Fail): {first}"
                 );
+                crate::metrics::record_admission_rejected("MutatingAdmissionPolicy");
                 return Err(Status::unprocessable_entity(format!(
                     "policy '{policy_name}' with binding '{binding_name}' denied request: {first}"
                 )));
@@ -2939,6 +2942,7 @@ async fn run_validating_admission_policies<S: Store>(
                 }
                 Err(e) => {
                     let binding_name = binding["metadata"]["name"].as_str().unwrap_or("");
+                    crate::metrics::record_admission_rejected("ValidatingAdmissionPolicy");
                     return Err(Status::forbidden(policy_params::config_error_message(
                         policy_name,
                         binding_name,
@@ -3125,6 +3129,7 @@ fn eval_vap_invocation(
                     // Real Kubernetes: default reason is Invalid (422 Unprocessable Entity).
                     // Only reason="Forbidden" maps to 403. The conformance test polls for
                     // apierrors.IsInvalid (HTTP 422) — any other code fails the test.
+                    crate::metrics::record_admission_rejected("ValidatingAdmissionPolicy");
                     let err = if reason == "Forbidden" {
                         Status::forbidden(message)
                     } else {
@@ -3340,6 +3345,7 @@ pub async fn run_validating_webhooks<S: Store>(
                             })
                             .unwrap_or("admission webhook denied the request")
                             .to_string();
+                        crate::metrics::record_admission_rejected("ValidatingAdmissionWebhook");
                         return Err(Status::forbidden(format!(
                             "admission webhook \"{}\" denied the request: {message}",
                             webhook.name

@@ -923,20 +923,15 @@ fn record_manifest_apply_outcome(
 ///
 /// A path holding a `%` that does not start a valid escape is left untouched: decoding the
 /// escapes around it could splice a new one together (`%%32F` -> `%2F`) that axum would then
-/// decode to `/` while auth reads the literal text `%2F`.
+/// decode to `/` while auth reads the literal text `%2F`. `AuthLayer` answers such a path with
+/// 400 before it gets here ([`auth::invalid_path_escape`]); this guard keeps the function safe
+/// on its own.
 fn normalize_path_escapes(uri: &axum::http::Uri) -> Option<axum::http::Uri> {
     let path = uri.path();
-    if !path.contains('%') {
+    if !path.contains('%') || auth::invalid_path_escape(path).is_some() {
         return None;
     }
     let bytes = path.as_bytes();
-    let invalid_escape = bytes.iter().enumerate().any(|(i, b)| {
-        *b == b'%'
-            && !matches!(bytes.get(i + 1..i + 3), Some([h, l]) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit())
-    });
-    if invalid_escape {
-        return None;
-    }
     let mut out = String::with_capacity(path.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -8678,9 +8673,15 @@ mod tests {
             "an encoded slash is a separator for routing exactly as it is for authorization"
         );
         assert_eq!(
-            norm("/x/%zz/%3A/a%252Fb"),
+            norm("/x/%3A/a%252Fb"),
             None,
-            "invalid escapes, other reserved escapes and double-encoding stay as sent"
+            "other reserved escapes and double-encoding stay as sent"
+        );
+        assert_eq!(
+            norm("/x/%63%%32F"),
+            None,
+            "a stray % next to a decodable escape must leave the path alone: decoding could \
+             splice a new escape (%2F) that routing decodes to / while auth reads literal text"
         );
     }
 
@@ -9018,6 +9019,11 @@ mod tests {
                         build(segs, i, &format!("{seg}Q"), "/"),
                     ),
                     (
+                        "spliced %%32f",
+                        build(segs, i, &format!("{seg}%%32f"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
                         "spliced %2%46",
                         build(segs, i, &format!("{seg}%2%46"), "/"),
                         build(segs, i, &format!("{seg}Q"), "/"),
@@ -9032,16 +9038,42 @@ mod tests {
                         build(segs, i, &format!("{seg}%2"), "/"),
                         build(segs, i, &format!("{seg}Q"), "/"),
                     ),
+                    (
+                        "backslash %5C",
+                        build(segs, i, &format!("{seg}%5C"), "/"),
+                        build(segs, i, &format!("{seg}Q"), "/"),
+                    ),
+                    (
+                        "mixed unreserved + %2F",
+                        build(segs, i, &first, "%2F"),
+                        plain.clone(),
+                    ),
                 ];
                 for (enc, encoded, reference) in cells {
                     sites += 1;
+                    if matches!(
+                        enc,
+                        "spliced %%32F"
+                            | "spliced %%32f"
+                            | "spliced %2%46"
+                            | "invalid %zz"
+                            | "truncated %2"
+                    ) {
+                        // Go's net/http rejects an invalid escape with 400 before any filter
+                        // runs; a path that reaches routing or authorization with one could
+                        // be decoded differently by each.
+                        let got = send_as(&app, "admin-token", "GET", &encoded, "").await;
+                        if got.0 != 400 || !got.1.contains("invalid URL escape") {
+                            failures.push(format!("400 {label} {enc}: {encoded} -> {got:?}"));
+                        }
+                        continue;
+                    }
                     // Cells whose decoded segment is the original text plus literal `%…`
                     // characters: normalised to `Q` so they compare against one reference.
                     let literal = match enc {
-                        "double-encoded %252F" | "spliced %%32F" | "spliced %2%46" => Some("%2F"),
+                        "double-encoded %252F" => Some("%2F"),
                         "triple-encoded %25252F" => Some("%252F"),
-                        "invalid %zz" => Some("%zz"),
-                        "truncated %2" => Some("%2"),
+                        "backslash %5C" => Some("\\"),
                         _ => None,
                     };
                     let double = literal.is_some();
@@ -9066,7 +9098,7 @@ mod tests {
                         // One segment holding the literal text `%2F`: either the same
                         // not-found as any unknown segment, or the name validator rejecting
                         // the `%`; never a split into two segments.
-                        got.0 == want.0 || (got.0 == 400 && got.1.contains("may not contain '%'"))
+                        got.0 == want.0 || (got.0 == 400 && got.1.contains("may not contain '"))
                     } else {
                         outcome(got.clone()) == outcome(want.clone())
                     };
@@ -9076,13 +9108,30 @@ mod tests {
                 }
             }
         }
-        assert_eq!(sites, 70, "7 segment positions x 10 encodings");
+        assert_eq!(sites, 91, "7 segment positions x 13 encodings");
         assert!(
             failures.is_empty(),
             "auth and router disagree at {}/{sites} sites:\n{}",
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    /// One invalid escape used to make the router skip normalization of the whole path, so an
+    /// encoded literal segment elsewhere (`%61pproval`) missed its bespoke route while RBAC,
+    /// which decodes it, still authorized the approval verb. The request must now die with 400
+    /// before authorization, and must not reach any handler.
+    #[tokio::test]
+    async fn invalid_escape_anywhere_in_path_is_rejected_before_routing_or_authorization() {
+        let (app, _state) = certificates_app().await;
+        for path in [
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/x%zz/%61pproval",
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/x/%61pproval%",
+        ] {
+            let (status, body) = send_as(&app, "updater-token", "PUT", path, "{}").await;
+            assert_eq!(status, 400, "{path}: {body}");
+            assert!(body.contains("invalid URL escape"), "{path}: {body}");
+        }
     }
 
     /// A caller holding only `nonResourceURLs: [/api/*]` or a single `resourceNames` grant

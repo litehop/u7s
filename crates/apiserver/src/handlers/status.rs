@@ -183,24 +183,55 @@ pub(crate) fn reject_patch_identity_mismatch(
     super::json_patch::enforce_patch_identity(&mut probe, name, ns)
 }
 
-/// Record the writer of a status-subresource PUT/PATCH as owner of the fields it changed.
+fn status_api_version(group: &str, version: &str) -> String {
+    if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    }
+}
+
+/// Plan an apply to the status subresource: it owns the `status` it names under an Apply
+/// entry scoped to `status`, never the main resource's fields.
+pub(super) fn plan_status_apply(
+    headers: &HeaderMap,
+    is_ssa: bool,
+    live: &serde_json::Value,
+    patch: &serde_json::Value,
+    group: &str,
+    version: &str,
+) -> Result<Option<crate::field_manager::ApplyPlan>, crate::status::StatusError> {
+    if !is_ssa {
+        return Ok(None);
+    }
+    crate::field_manager::WriteIdentity::new(None, headers)
+        .plan_subresource_apply(
+            live,
+            patch,
+            &["status"],
+            &status_api_version(group, version),
+            "status",
+            None,
+        )
+        .map(Some)
+}
+
+/// Record the writer of a status-subresource PUT/PATCH: an apply owns exactly the fields it
+/// named, any other write owns the fields it changed.
 pub(super) fn record_status_write(
     headers: &HeaderMap,
+    plan: Option<&crate::field_manager::ApplyPlan>,
     before: &serde_json::Value,
     after: &mut serde_json::Value,
     group: &str,
     version: &str,
 ) {
-    let api_version = if group.is_empty() {
-        version.to_string()
-    } else {
-        format!("{group}/{version}")
-    };
-    crate::field_manager::WriteIdentity::new(None, headers).record(
+    crate::field_manager::WriteIdentity::new(None, headers).record_subresource_write(
+        plan,
         before,
         after,
-        &api_version,
-        Some("status"),
+        &status_api_version(group, version),
+        "status",
         None,
     );
 }
@@ -322,7 +353,14 @@ pub async fn put_resource_status<S: Store>(
     // Dry-run: validation and node-restriction checks passed; return the would-be
     // status object without persisting — mirrors replace_pod/replace_namespace's
     // dry-run early-return.
-    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
+    record_status_write(
+        &headers,
+        None,
+        &before_write,
+        &mut current.body,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &meta.kind);
         return Ok(Json(current.body));
@@ -381,6 +419,7 @@ pub async fn patch_resource_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     reject_patch_identity_mismatch(&patch, &name, None)?;
+    let ssa_plan = plan_status_apply(&headers, is_ssa, &current.body, &patch, &group, &version)?;
 
     match patch_type {
         PatchType::Json => {
@@ -407,6 +446,9 @@ pub async fn patch_resource_status<S: Store>(
             }
             merge_incoming_metadata(&mut current.body, &patch, &meta.kind);
         }
+    }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current.body);
     }
     // Convergence point for every patch content-type above (JSON Patch, merge, strategic
     // merge): guard once here, right before the store write, instead of per-branch. A
@@ -475,7 +517,14 @@ pub async fn patch_resource_status<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
-    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
+    record_status_write(
+        &headers,
+        ssa_plan.as_ref(),
+        &before_write,
+        &mut current.body,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &meta.kind);
         return Ok(Json(current.body));
@@ -662,7 +711,14 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return above.
-    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
+    record_status_write(
+        &headers,
+        None,
+        &before_write,
+        &mut current.body,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
         return Ok(Json(current.body).into_response());
@@ -763,6 +819,7 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     reject_patch_identity_mismatch(&patch, &name, Some(&ns))?;
+    let ssa_plan = plan_status_apply(&headers, is_ssa, &current.body, &patch, &group, &version)?;
 
     match patch_type {
         PatchType::Json => {
@@ -789,6 +846,9 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
             }
             merge_incoming_metadata(&mut current.body, &patch, &kind);
         }
+    }
+    if let Some(plan) = &ssa_plan {
+        plan.remove_dropped_fields(&mut current.body);
     }
     // Convergence point for every patch content-type above (JSON Patch, merge, strategic
     // merge): guard once here, right before the store write, instead of per-branch. A
@@ -843,7 +903,14 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
 
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
-    record_status_write(&headers, &before_write, &mut current.body, &group, &version);
+    record_status_write(
+        &headers,
+        ssa_plan.as_ref(),
+        &before_write,
+        &mut current.body,
+        &group,
+        &version,
+    );
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
         return Ok(Json(current.body).into_response());
@@ -2304,6 +2371,131 @@ mod tests {
             "apply-patch+yaml with a genuine YAML body on namespaced /status must succeed, \
              not 400 'invalid patch JSON': {:?}",
             result.err()
+        );
+    }
+
+    async fn apply_deployment_status(
+        state: &crate::state::AppState<SqliteStore>,
+        manager: &str,
+        yaml: &str,
+    ) -> serde_json::Value {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        headers.insert(
+            "x-u7s-field-manager",
+            axum::http::HeaderValue::from_str(manager).unwrap(),
+        );
+        let resp = patch_namespaced_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            None,
+            headers,
+            bytes::Bytes::from(yaml.to_owned()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("status apply must succeed: {e:?}"))
+        .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn managed_entry<'a>(
+        obj: &'a serde_json::Value,
+        manager: &str,
+        subresource: Option<&str>,
+    ) -> Option<&'a serde_json::Value> {
+        obj["metadata"]["managedFields"]
+            .as_array()?
+            .iter()
+            .find(|e| {
+                e["manager"] == manager
+                    && e["operation"] == "Apply"
+                    && e["subresource"].as_str() == subresource
+            })
+    }
+
+    /// An apply to /status must be recorded as `{operation: Apply, subresource: status}` and
+    /// dropping a status field from the next status apply must delete only that field.
+    /// Before, the write was recorded as an Update, so `kubectl apply --server-side
+    /// --subresource=status` never owned what it applied and later applies could not
+    /// remove fields it had dropped.
+    #[tokio::test]
+    async fn status_apply_records_subresource_scoped_apply_manager_and_removes_only_its_own_dropped_fields(
+    ) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "web", "namespace": "default",
+                "managedFields": [{
+                    "manager": "applier", "operation": "Apply", "apiVersion": "apps/v1",
+                    "time": "2026-01-01T00:00:00Z", "fieldsType": "FieldsV1",
+                    "fieldsV1": {"f:spec": {"f:replicas": {}}}
+                }]
+            },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let after_first = apply_deployment_status(
+            &state,
+            "applier",
+            "status:\n  readyReplicas: 1\n  availableReplicas: 1\n",
+        )
+        .await;
+        let status_entry = managed_entry(&after_first, "applier", Some("status"))
+            .expect("a status apply must record an Apply manager scoped to the status subresource");
+        assert_eq!(
+            status_entry["fieldsV1"]["f:status"]["f:readyReplicas"],
+            serde_json::json!({}),
+            "the applied status field must be owned by the status-scoped manager"
+        );
+        assert_eq!(
+            managed_entry(&after_first, "applier", None).unwrap()["fieldsV1"],
+            serde_json::json!({"f:spec": {"f:replicas": {}}}),
+            "the main-resource Apply entry must be untouched by a status apply"
+        );
+
+        let after_second =
+            apply_deployment_status(&state, "applier", "status:\n  availableReplicas: 2\n").await;
+        assert!(
+            after_second["status"].get("readyReplicas").is_none(),
+            "a field the status-scoped applier stopped applying must be removed: {after_second}"
+        );
+        assert_eq!(after_second["status"]["availableReplicas"], 2);
+        assert_eq!(
+            after_second["status"]["replicas"], 3,
+            "status fields the applier never owned must survive its apply"
+        );
+        assert_eq!(
+            after_second["spec"]["replicas"], 3,
+            "a status apply must not touch main-resource fields"
         );
     }
 

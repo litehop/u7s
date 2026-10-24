@@ -435,6 +435,7 @@ pub(crate) fn forwarded_query(headers: &axum::http::HeaderMap) -> (String, bool)
 pub(crate) struct WriteIdentity {
     manager: String,
     now: String,
+    force: bool,
 }
 
 impl WriteIdentity {
@@ -448,6 +449,58 @@ impl WriteIdentity {
         Self {
             manager: request_manager(query_manager.or(forwarded), user_agent),
             now: crate::util::utc_now_rfc3339(),
+            force: headers.get(FORCE_HEADER).and_then(|v| v.to_str().ok()) == Some("true"),
+        }
+    }
+
+    /// Plan an apply of `patch` to a subresource of `live`. Only the top-level members in
+    /// `fields` are applied: the others belong to the main resource (or are reset by the
+    /// subresource's strategy), so this manager must not come to own them.
+    pub(crate) fn plan_subresource_apply(
+        &self,
+        live: &Value,
+        patch: &Value,
+        fields: &[&str],
+        api_version: &str,
+        subresource: &str,
+        schema: Option<&Value>,
+    ) -> Result<ApplyPlan, crate::status::StatusError> {
+        let mut applied = Value::Object(
+            fields
+                .iter()
+                .filter_map(|f| patch.get(*f).map(|v| (f.to_string(), v.clone())))
+                .collect(),
+        );
+        crate::handlers::json_patch::strip_managed_fields(&mut applied);
+        plan_apply(
+            live,
+            &applied,
+            self.force,
+            &Request {
+                manager: &self.manager,
+                api_version,
+                subresource: Some(subresource),
+                schema,
+                now: &self.now,
+            },
+        )
+        .map_err(Conflict::into_status)
+    }
+
+    /// Record a subresource write: an apply owns exactly what its plan names, anything
+    /// else is an Update of the fields that changed.
+    pub(crate) fn record_subresource_write(
+        &self,
+        plan: Option<&ApplyPlan>,
+        before: &Value,
+        after: &mut Value,
+        api_version: &str,
+        subresource: &str,
+        schema: Option<&Value>,
+    ) {
+        match plan {
+            Some(plan) => plan.record(after),
+            None => self.record(before, after, api_version, Some(subresource), schema),
         }
     }
 
@@ -1054,6 +1107,11 @@ pub(crate) async fn resolve_field_manager(
     if let Some(Ok(v)) = manager.map(axum::http::HeaderValue::from_str) {
         req.headers_mut().insert(FIELD_MANAGER_HEADER, v);
     }
+    req.headers_mut().remove(FORCE_HEADER);
+    if query.iter().any(|(n, v)| n == "force" && v == "true") {
+        req.headers_mut()
+            .insert(FORCE_HEADER, axum::http::HeaderValue::from_static("true"));
+    }
     next.run(req).await
 }
 
@@ -1353,6 +1411,65 @@ mod tests {
 
         apply(&mut live, &deployment(None, false), "applier", false).unwrap();
         assert_eq!(live["spec"]["replicas"], 5);
+    }
+
+    /// One manager applying to the main resource and to /status holds two independent
+    /// entries, so re-applying one without the other's fields must not delete them. If the
+    /// entries shared a key, `kubectl apply` of the spec would wipe the status a controller
+    /// applied under the same manager name (and the reverse).
+    #[test]
+    fn main_and_status_applies_by_one_manager_never_remove_each_others_fields() {
+        let status_req = Request {
+            subresource: Some("status"),
+            ..req("ctrl")
+        };
+        let mut live = json!({});
+        apply(&mut live, &deployment(Some(3), false), "ctrl", false).unwrap();
+        live["status"] = json!({"readyReplicas": 1});
+        plan_apply(
+            &live,
+            &json!({"status": {"readyReplicas": 1}}),
+            false,
+            &status_req,
+        )
+        .unwrap()
+        .record(&mut live);
+
+        let managers = read_managers(&live);
+        assert!(
+            managers
+                .iter()
+                .any(|m| m.is("ctrl", OPERATION_APPLY, Some("status"))),
+            "status apply must be recorded with subresource=status: {managers:?}"
+        );
+
+        let main_only = deployment(Some(4), false);
+        let plan = plan_apply(
+            &live,
+            &applied_fields(&main_only, true),
+            false,
+            &req("ctrl"),
+        )
+        .unwrap();
+        assert!(
+            plan.removals.is_empty(),
+            "a main-resource apply must not remove status fields: {:?}",
+            plan.removals
+        );
+        plan.record(&mut live);
+
+        let plan = plan_apply(
+            &live,
+            &json!({"status": {"availableReplicas": 2}}),
+            false,
+            &status_req,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.removals,
+            vec![vec!["f:status".to_string(), "f:readyReplicas".to_string()]],
+            "a status apply drops only status fields, never spec.replicas"
+        );
     }
 
     /// A PUT body carries no managedFields; recording it must keep existing ownership rather
