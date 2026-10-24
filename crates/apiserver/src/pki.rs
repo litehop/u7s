@@ -9,6 +9,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 pub(crate) const ROOT_CA_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+pub(crate) const INTERMEDIATE_CA_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 pub(crate) const CLIENT_CERT_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 pub(crate) const SERVING_CERT_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
@@ -35,6 +36,23 @@ pub(crate) fn test_lifetime() -> Option<Duration> {
 
 #[cfg(not(feature = "pki-test-knobs"))]
 pub(crate) fn test_lifetime() -> Option<Duration> {
+    None
+}
+
+/// Lifetime, in seconds, of the signing intermediate CA. Same feature gate as
+/// [`test_lifetime`].
+#[cfg(feature = "pki-test-knobs")]
+pub(crate) fn test_intermediate_lifetime() -> Option<Duration> {
+    let secs: u64 = std::env::var("U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS")
+        .ok()?
+        .parse()
+        .expect("U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS must be an integer number of seconds");
+    tracing::warn!("pki-test-knobs: intermediate CA lifetime is {secs}s");
+    Some(Duration::from_secs(secs))
+}
+
+#[cfg(not(feature = "pki-test-knobs"))]
+pub(crate) fn test_intermediate_lifetime() -> Option<Duration> {
     None
 }
 
@@ -126,7 +144,6 @@ impl KeyAlgorithm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CertRole {
     Leaf,
-    #[allow(dead_code)]
     Intermediate,
     Root,
 }
@@ -232,9 +249,12 @@ impl Pki {
         let mut params = CertificateParams::default();
         params.not_before = not_before;
         params.not_after = not_after;
-        if spec.role != CertRole::Leaf {
-            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        }
+        params.is_ca = match spec.role {
+            CertRole::Leaf => IsCa::NoCa,
+            // pathlen 0: an intermediate signs end-entity certs only, never another CA.
+            CertRole::Intermediate => IsCa::Ca(BasicConstraints::Constrained(0)),
+            CertRole::Root => IsCa::Ca(BasicConstraints::Unconstrained),
+        };
         params.subject_alt_names = spec.sans.clone();
         params
             .distinguished_name
@@ -323,4 +343,38 @@ pub(crate) fn cert_validity(der: &[u8]) -> anyhow::Result<(OffsetDateTime, Offse
         )?)
     };
     Ok((to_time(validity.not_before)?, to_time(validity.not_after)?))
+}
+
+/// Err unless `cert_der` names `issuer_der`'s subject as its issuer and carries a valid
+/// ECDSA P-256/SHA-256 signature by `issuer_der`'s key. Webpki refuses to validate a CA
+/// certificate as an end entity, so a persisted intermediate cannot be checked through the
+/// handshake verifier.
+pub(crate) fn ensure_signed_by(cert_der: &[u8], issuer_der: &[u8]) -> anyhow::Result<()> {
+    use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+    use x509_cert::der::{Decode as _, Encode as _};
+    const ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| anyhow::anyhow!("cert is not valid DER X.509: {e}"))?;
+    let issuer = x509_cert::Certificate::from_der(issuer_der)
+        .map_err(|e| anyhow::anyhow!("issuer is not valid DER X.509: {e}"))?;
+    anyhow::ensure!(
+        cert.tbs_certificate().issuer() == issuer.tbs_certificate().subject(),
+        "issuer name does not match the issuing CA's subject"
+    );
+    anyhow::ensure!(
+        cert.signature_algorithm().oid.to_string() == ECDSA_SHA256,
+        "unsupported signature algorithm {}",
+        cert.signature_algorithm().oid
+    );
+    let tbs = cert.tbs_certificate().to_der()?;
+    UnparsedPublicKey::new(
+        &ECDSA_P256_SHA256_ASN1,
+        issuer
+            .tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .raw_bytes(),
+    )
+    .verify(&tbs, cert.signature().raw_bytes())
+    .map_err(|_| anyhow::anyhow!("signature does not verify under the issuing CA's key"))
 }

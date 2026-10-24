@@ -919,6 +919,10 @@ pub struct AppState<S = SqliteStore> {
     /// needs a non-default value at construction time, so `run()` sets this field directly
     /// after construction, same pattern as `node_kubelet_ports`/`sa_sig_cache`.
     pub proxy_client_identity_pem: Swap<Option<Arc<Vec<u8>>>>,
+    /// DER of the intermediate CA(s) that sign certificates through the CSR API, newest first.
+    /// Appended to an issued `status.certificate` so the client presents a chain that verifies
+    /// against the root it pins. Not part of `AppStateConfig`: `run()` sets it after construction.
+    pub signing_intermediates: Swap<Arc<Vec<Vec<u8>>>>,
     /// In-memory cache for the 5 admission configuration object sets.
     /// See `AdmissionConfigCache` for the invalidation strategy.
     pub admission_cache: Arc<AdmissionConfigCache>,
@@ -1028,6 +1032,7 @@ impl<S> Clone for AppState<S> {
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             proxy_client_identity_pem: self.proxy_client_identity_pem.clone(),
+            signing_intermediates: self.signing_intermediates.clone(),
             admission_cache: self.admission_cache.clone(),
             apiservice_cache: self.apiservice_cache.clone(),
             discovery_cache: self.discovery_cache.clone(),
@@ -1295,6 +1300,7 @@ impl<S: Store> AppState<S> {
             // Not part of AppStateConfig: see the field's own doc — run() sets this
             // directly after construction, same pattern as node_kubelet_ports above.
             proxy_client_identity_pem: Swap::new(None),
+            signing_intermediates: Swap::new(Arc::new(Vec::new())),
             admission_cache: Arc::new(AdmissionConfigCache::new()),
             apiservice_cache: Arc::new(ApiServiceCache::new()),
             discovery_cache: Arc::new(DiscoveryCache::new()),

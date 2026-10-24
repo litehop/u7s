@@ -400,6 +400,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     state
         .proxy_client_identity_pem
         .set(Some(Arc::new(proxy_client_identity_pem)));
+    state
+        .signing_intermediates
+        .set(Arc::new(vec![tls_material.rotator.intermediate_der()]));
 
     // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
     // the old one. KCM and the scheduler re-read the rewritten file without a restart.
@@ -412,7 +415,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
         move |name: &'static str, leaf: &rotation::Leaf| {
             if let Some((_, files)) = rotating_leaf_files.iter().find(|(n, _)| *n == name) {
-                if let Err(e) = tls::write_leaf_pem(files, &leaf.cert_der, &leaf.key_pem) {
+                if let Err(e) = tls::write_leaf_pem(files, leaf) {
                     rotation_inventory.record_failure(
                         name,
                         format_args!("rewrite {}: {e:#}", files.pem().display()),
@@ -423,14 +426,27 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     );
                 }
             }
-            let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
-            identity_pem.extend_from_slice(&leaf.key_pem);
+            let identity_pem = leaf.identity_pem();
             match name {
                 "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
                 "proxy-client" => {
                     rotation_state
                         .proxy_client_identity_pem
                         .set(Some(Arc::new(identity_pem)));
+                }
+                rotation::INTERMEDIATE => {
+                    // Keep the previous intermediate: KCM may sign with it until it
+                    // reloads the new files.
+                    let mut known = vec![leaf.cert_der.clone()];
+                    known.extend(
+                        rotation_state
+                            .signing_intermediates
+                            .get()
+                            .iter()
+                            .take(1)
+                            .cloned(),
+                    );
+                    rotation_state.signing_intermediates.set(Arc::new(known));
                 }
                 _ => {}
             }
