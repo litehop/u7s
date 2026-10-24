@@ -4748,7 +4748,7 @@ pub async fn patch_cr<S: Store>(
         let now = crate::util::utc_now_rfc3339();
         let ssa_plan = crate::field_manager::plan_apply(
             &serde_json::Value::Null,
-            &crate::field_manager::applied_fields(&obj, ctx.has_status_subresource),
+            &crate::field_manager::applied_fields(&obj, None, ctx.has_status_subresource),
             force,
             &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
         )
@@ -4870,7 +4870,7 @@ pub async fn patch_cr<S: Store>(
         Some(
             crate::field_manager::plan_apply(
                 &old,
-                &crate::field_manager::applied_fields(&patch, ctx.has_status_subresource),
+                &crate::field_manager::applied_fields(&patch, None, ctx.has_status_subresource),
                 force,
                 &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
             )
@@ -5051,7 +5051,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         let now = crate::util::utc_now_rfc3339();
         let ssa_plan = crate::field_manager::plan_apply(
             &serde_json::Value::Null,
-            &crate::field_manager::applied_fields(&obj, ctx.has_status_subresource),
+            &crate::field_manager::applied_fields(&obj, None, ctx.has_status_subresource),
             force,
             &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
         )
@@ -5214,7 +5214,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         Some(
             crate::field_manager::plan_apply(
                 &old,
-                &crate::field_manager::applied_fields(&patch, ctx.has_status_subresource),
+                &crate::field_manager::applied_fields(&patch, None, ctx.has_status_subresource),
                 force,
                 &cr_field_request(&manager, &api_version, ctx.schema.as_deref(), &now),
             )
@@ -6084,6 +6084,11 @@ async fn cr_scale_patch_impl<S: Store>(
         })
         .transpose()?;
     let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
+    let sent_replicas = super::scale::scale_apply_replicas(
+        ssa_plan.as_ref(),
+        scale_body.spec.replicas.map(i64::from),
+        &scale_cfg.spec_replicas_path,
+    );
     let new_replicas = admit_cr_scale(
         state,
         &target,
@@ -6091,7 +6096,7 @@ async fn cr_scale_patch_impl<S: Store>(
         is_dry_run_header(headers),
         (
             old_replicas,
-            scale_body.spec.replicas.map_or(old_replicas, |r| r as i64),
+            sent_replicas.unwrap_or(old_replicas),
             status_replicas,
         ),
         (
@@ -6100,11 +6105,11 @@ async fn cr_scale_patch_impl<S: Store>(
         ),
     )
     .await?;
-    if scale_body.spec.replicas.is_some() || new_replicas != old_replicas {
-        scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
-    }
     if let Some(plan) = &ssa_plan {
         plan.remove_dropped_fields(&mut obj);
+    }
+    if sent_replicas.is_some() || new_replicas != old_replicas {
+        scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
     }
     apply_cr_generation_on_update(&before, &mut obj);
     record_cr_scale_write(

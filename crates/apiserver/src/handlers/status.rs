@@ -33,22 +33,10 @@ use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 /// a peer controller just removed, causing livelock where the object stays Terminating
 /// forever.
 ///
-/// `labels` is also protected: labels drive policy decisions elsewhere (Namespace's
-/// `pod-security.kubernetes.io/enforce`, selector-based webhook/NetworkPolicy matching),
-/// so a caller with only `<resource>/status` rights must not be able to rewrite them via
-/// a merge/strategic-merge-patch or PUT to /status — the same RBAC-isolation rule that
-/// `validate_status_json_patch_paths` already enforces for JSON Patch. `annotations` stays
-/// unprotected: CronJob and other controllers rely on setting annotations via /status, and
-/// annotations do not gate policy the way labels do.
-///
-/// `Node` is the one built-in exception to the `labels` rule: upstream's
-/// `nodeStatusStrategy.PrepareForUpdate` (pkg/registry/core/node/strategy.go) only resets
-/// `.spec` on a status update and deliberately leaves labels alone, because kubelet holds
-/// only `nodes/status` RBAC and relies on exactly this path (`nodeinfomanager.go`'s
-/// `updateNode`/`PatchNodeStatus`) to publish arch/os labels and CSI topology labels.
-/// Protecting labels here for Node silently drops those labels and breaks CSI
-/// topology-aware provisioning: the external-provisioner sidecar can never find a node
-/// carrying the driver's topology key, so PVCs never leave Pending.
+/// `labels` is protected for Deployment only: upstream's `deploymentStatusStrategy` is the one
+/// status strategy that resets `metadata.labels`; every other kind leaves labels and
+/// annotations writable. kubelet holds only `nodes/status` RBAC and relies on that to publish arch/os and CSI
+/// topology labels; protecting labels silently drops them and PVCs never leave Pending.
 ///
 /// Restore semantics: if the field was absent (null) in the stored object, the field is
 /// removed after merge even if the incoming body added it. If it was present, it is
@@ -130,7 +118,7 @@ fn protected_metadata(
     ];
     PROTECTED
         .iter()
-        .filter(|&&k| !(kind == "Node" && k == "labels"))
+        .filter(|&&k| k != "labels" || kind == "Deployment")
         .map(|&k| (k, metadata[k].clone()))
         .collect()
 }
@@ -2733,8 +2721,8 @@ mod tests {
         let pod = fields(Some("Pod"), "status");
         assert_eq!(
             pod["metadata"],
-            serde_json::json!({"annotations": {"a": "1"}}),
-            "pods/status resets ownerReferences and deletionTimestamp; labels are write-protected: {pod}"
+            serde_json::json!({"annotations": {"a": "1"}, "labels": {"l": "1"}}),
+            "pods/status resets ownerReferences and deletionTimestamp only: {pod}"
         );
         assert_eq!(
             fields(Some("Node"), "status")["metadata"],
@@ -2762,17 +2750,74 @@ mod tests {
             "DaemonSet",
             "ReplicaSet",
             "Job",
+            "CronJob",
+            "ReplicationController",
             "Namespace",
             "CustomResourceDefinition",
+            "PersistentVolume",
+            "PersistentVolumeClaim",
+            "Service",
+            "Ingress",
+            "HorizontalPodAutoscaler",
+            "PodDisruptionBudget",
+            "ResourceQuota",
         ] {
             let f = fields(Some(kind), "status");
             assert!(f.get("spec").is_none(), "{kind} /status resets spec");
             assert_eq!(
                 f["metadata"],
-                serde_json::json!({"annotations": {"a": "1"}, "ownerReferences": [{"name": "o"}]})
+                serde_json::json!({"annotations": {"a": "1"}, "labels": {"l": "1"}, "ownerReferences": [{"name": "o"}]}),
+                "{kind} /status leaves metadata alone, labels included"
             );
             assert_eq!(f["status"], patch["status"], "{kind} status is taken whole");
         }
+        for kind in [
+            "APIService",
+            "FlowSchema",
+            "PriorityLevelConfiguration",
+            "PodCertificateRequest",
+            "ResourceClaim",
+            "DeviceTaintRule",
+            "ServiceCIDR",
+            "StorageVersionMigration",
+            "ValidatingAdmissionPolicy",
+            "VolumeAttachment",
+        ] {
+            let f = fields(Some(kind), "status");
+            assert!(
+                f.get("spec").is_none() && f.get("metadata").is_none(),
+                "{kind} /status resets spec and all of metadata, as upstream: {f}"
+            );
+            assert_eq!(f["status"], patch["status"], "{kind} status is taken whole");
+        }
+        assert!(
+            fields(Some("Deployment"), "status")["metadata"]
+                .get("labels")
+                .is_none(),
+            "only Deployment's status strategy resets labels"
+        );
+    }
+
+    /// Upstream's `csrStrategy.GetResetFields` resets `spec` and `status` on the main
+    /// resource, so an apply of the main resource owns neither.
+    #[test]
+    fn csr_main_resource_apply_owns_neither_spec_nor_status() {
+        let body = serde_json::json!({
+            "metadata": {"name": "c"},
+            "spec": {"request": "x", "signerName": "s"},
+            "status": {"certificate": "c"}
+        });
+        let owned =
+            crate::field_manager::applied_fields(&body, Some("CertificateSigningRequest"), true);
+        assert!(
+            owned.get("spec").is_none() && owned.get("status").is_none(),
+            "CSR main strategy resets spec and status: {owned}"
+        );
+        let other = crate::field_manager::applied_fields(&body, Some("Service"), true);
+        assert!(
+            other.get("spec").is_some() && other.get("status").is_none(),
+            "other kinds reset status only: {other}"
+        );
     }
 
     /// Cluster-scoped `*/status` (PersistentVolume here) has its own handler: it must scope
@@ -4932,15 +4977,11 @@ mod tests {
         );
     }
 
-    /// A merge-patch to a generic resource's /status must NOT change `metadata.labels`,
-    /// even though (per the test above) it IS allowed to change `metadata.annotations`.
-    /// Labels drive policy decisions elsewhere (Namespace's PSA enforce label, selector-based
-    /// webhook/NetworkPolicy matching) while annotations do not, so the merge/strategic-merge
-    /// path — used generically by every resource's /status endpoint, not just Namespace/CRD —
-    /// must block label writes the same way `validate_status_json_patch_paths` already blocks
-    /// them for JSON Patch.
+    /// Upstream resets `metadata.labels` on a status write for Deployment only, so a
+    /// merge-patch to any other kind's /status (CronJob here) must apply labels. Blocking
+    /// them silently drops labels a controller with only `<resource>/status` rights sets.
     #[tokio::test]
-    async fn patch_namespaced_status_merge_patch_rejects_metadata_labels() {
+    async fn patch_namespaced_status_merge_patch_applies_labels_for_non_deployment_kinds() {
         let store = Arc::new(SqliteStore::new(":memory:").unwrap());
         let cronjob = serde_json::json!({
             "apiVersion": "batch/v1",
@@ -4970,7 +5011,7 @@ mod tests {
         );
 
         let patch = serde_json::json!({
-            "metadata": { "labels": { "attacker": "true" } },
+            "metadata": { "labels": { "team": "a" } },
             "status": { "lastScheduleTime": "2024-01-01T00:00:00Z" }
         });
         let result = patch_namespaced_resource_status(
@@ -4995,9 +5036,9 @@ mod tests {
 
         let stored = store.get(key).await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        assert!(
-            v["metadata"]["labels"]["attacker"].is_null(),
-            "a merge-patch on /status must NOT be able to set arbitrary labels"
+        assert_eq!(
+            v["metadata"]["labels"]["team"], "a",
+            "only Deployment's status strategy resets labels"
         );
         assert_eq!(
             v["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",

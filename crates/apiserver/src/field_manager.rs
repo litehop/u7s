@@ -74,6 +74,7 @@ pub(crate) struct ApplyPlan {
     /// Fields the manager applied before, no longer applies, and nobody else owns.
     removals: Vec<Path>,
     managers: Vec<Manager>,
+    mine: Option<usize>,
 }
 
 #[derive(Default)]
@@ -392,15 +393,14 @@ fn display_path(path: &[String]) -> String {
 /// The fields a write through `subresource` (`None` is the main resource) neither takes nor
 /// owns, as upstream's per-strategy `GetResetFields` (release-1.37). `kind` is the built-in
 /// kind; `None` is a custom resource. The main resource of every kind with a status
-/// subresource resets `status`; custom resources' `/status` resets all of `metadata`.
-///
-/// Not mirrored: the main strategies of `CertificateSigningRequest` also reset `spec`, which
-/// would leave a CSR created by apply with an unowned spec.
+/// subresource resets `status` (a `CertificateSigningRequest` also `spec`); custom
+/// resources' `/status` resets all of `metadata`.
 pub(crate) fn reset_fields(
     kind: Option<&str>,
     subresource: Option<&str>,
 ) -> &'static [&'static [&'static str]] {
     match (kind, subresource) {
+        (Some("CertificateSigningRequest"), None) => &[&["spec"], &["status"]],
         (_, None) => &[&["status"]],
         (None, Some(_)) => &[&["metadata"], &["spec"]],
         (Some("Deployment"), Some("status")) => &[&["spec"], &["metadata", "labels"]],
@@ -415,9 +415,27 @@ pub(crate) fn reset_fields(
         (Some("CertificateSigningRequest"), Some("approval")) => {
             &[&["spec"], &["status", "certificate"]]
         }
+        (Some(kind), Some(_)) if STATUS_RESETS_METADATA.contains(&kind) => {
+            &[&["metadata"], &["spec"]]
+        }
         (Some(_), Some(_)) => &[&["spec"]],
     }
 }
+
+/// Built-in kinds whose status strategy resets all of `metadata` as well as `spec`; every
+/// other kind's resets `spec` only.
+const STATUS_RESETS_METADATA: &[&str] = &[
+    "APIService",
+    "FlowSchema",
+    "PriorityLevelConfiguration",
+    "PodCertificateRequest",
+    "ResourceClaim",
+    "DeviceTaintRule",
+    "ServiceCIDR",
+    "StorageVersionMigration",
+    "ValidatingAdmissionPolicy",
+    "VolumeAttachment",
+];
 
 /// Remove each of `paths` (object members, outermost first) from `body`.
 pub(crate) fn strip_paths(body: &mut Value, paths: &[&[&str]]) {
@@ -437,10 +455,14 @@ pub(crate) fn strip_paths(body: &mut Value, paths: &[&[&str]]) {
 
 /// The part of an apply body the apply actually manages: a kind with a status subresource
 /// never takes `status` from a main-resource write, so it owns nothing there.
-pub(crate) fn applied_fields(body: &Value, has_status_subresource: bool) -> Value {
+pub(crate) fn applied_fields(
+    body: &Value,
+    kind: Option<&str>,
+    has_status_subresource: bool,
+) -> Value {
     let mut applied = body.clone();
     if has_status_subresource {
-        strip_paths(&mut applied, reset_fields(None, None));
+        strip_paths(&mut applied, reset_fields(kind, None));
     }
     applied
 }
@@ -679,10 +701,32 @@ pub(crate) fn plan_apply(
         None => managers.push(mine),
     }
     managers.retain(|m| !m.set.is_empty() || m.is(req.manager, OPERATION_APPLY, req.subresource));
-    Ok(ApplyPlan { removals, managers })
+    let mine = managers
+        .iter()
+        .position(|m| m.is(req.manager, OPERATION_APPLY, req.subresource));
+    Ok(ApplyPlan {
+        removals,
+        managers,
+        mine,
+    })
 }
 
 impl ApplyPlan {
+    /// Whether this apply deletes `fields` (object members, outermost first) because the
+    /// applier owned it before and no longer sends it.
+    pub(crate) fn removes(&self, fields: &[&str]) -> bool {
+        let want: Path = fields.iter().map(|f| format!("f:{f}")).collect();
+        self.removals.contains(&want)
+    }
+
+    /// Keep only the applier's owned paths for which `keep` holds. The body still carries
+    /// the dropped fields (a list item's key is read from it); only ownership excludes them.
+    pub(crate) fn retain_owned(&mut self, keep: impl Fn(&Path) -> bool) {
+        if let Some(m) = self.mine.and_then(|i| self.managers.get_mut(i)) {
+            m.set.retain(keep);
+        }
+    }
+
     /// Delete the fields this apply dropped, then record the new ownership on `obj`.
     pub(crate) fn remove_dropped_fields(&self, obj: &mut Value) {
         for path in &self.removals {
