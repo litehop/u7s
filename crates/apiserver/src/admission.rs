@@ -2408,25 +2408,78 @@ fn apply_map_mutations(
 
     for mutation in policy["spec"]["mutations"].as_array().into_iter().flatten() {
         let patch_type = mutation["patchType"].as_str().unwrap_or("");
-        if patch_type != "ApplyConfiguration" {
-            errors.push(format!("unsupported patchType '{patch_type}'"));
-            continue;
-        }
-        let expr = mutation["applyConfiguration"]["expression"]
-            .as_str()
-            .unwrap_or("")
-            .trim();
+        let (expr, is_json_patch) = match patch_type {
+            "ApplyConfiguration" => (mutation["applyConfiguration"]["expression"].as_str(), false),
+            "JSONPatch" => (mutation["jsonPatch"]["expression"].as_str(), true),
+            _ => {
+                errors.push(format!("unsupported patchType '{patch_type}'"));
+                continue;
+            }
+        };
+        let expr = expr.unwrap_or("").trim();
         if expr.is_empty() {
             continue;
         }
         // Each mutation sees the object as the previous ones left it.
-        let patch = eval_apply_configuration(&map_env(object, inputs, variable_defs.clone()), expr);
+        let env = map_env(object, inputs, variable_defs.clone());
+        if is_json_patch {
+            let ops = eval_json_patch(&env, expr);
+            drop(env);
+            match ops {
+                Ok(ops) => match crate::handlers::json_patch::apply_json_patch(object, &ops) {
+                    Ok(()) => {}
+                    // Upstream leaves the object untouched, without error, when a
+                    // `test` operation fails.
+                    Err(e)
+                        if e.1
+                            .message
+                            .starts_with(crate::handlers::json_patch::TEST_FAILED_PREFIX) => {}
+                    Err(e) => errors.push(format!("JSON Patch: {}", e.1.message)),
+                },
+                Err(e) => errors.push(format!("expression '{expr}' resulted in error: {e}")),
+            }
+            continue;
+        }
+        let patch = eval_apply_configuration(&env, expr);
+        drop(env);
         match patch {
             Ok(patch) => apply_cel_patch(object, &patch),
             Err(e) => errors.push(format!("expression '{expr}' resulted in error: {e}")),
         }
     }
     errors
+}
+
+/// Evaluate a `jsonPatch` expression, which must produce a list of `JSONPatch` objects, and
+/// return them as an RFC 6902 operation array.
+fn eval_json_patch(env: &cel_runtime::Env<'_>, expr: &str) -> Result<serde_json::Value, String> {
+    let serde_json::Value::Array(items) = cel_runtime::eval_json(env, expr)? else {
+        return Err("type mismatch: JSONPatchType.expression should evaluate to array".into());
+    };
+    let mut ops = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(fields) = item else {
+            return Err(
+                "type mismatch: JSONPatchType.expression should evaluate to array of JSONPatch"
+                    .into(),
+            );
+        };
+        let mut op = serde_json::Map::new();
+        for (k, v) in fields {
+            match k.as_str() {
+                "op" | "path" | "from" if v.is_string() => {}
+                "value" => {}
+                _ => return Err(format!("invalid JSONPatch field '{k}'")),
+            }
+            // An empty `from` is "unset" upstream.
+            if k == "from" && v.as_str() == Some("") {
+                continue;
+            }
+            op.insert(k, v);
+        }
+        ops.push(serde_json::Value::Object(op));
+    }
+    Ok(serde_json::Value::Array(ops))
 }
 
 fn map_env<'a>(
@@ -8955,14 +9008,123 @@ mod tests {
     /// request would be admitted without the mutation the policy author required.
     #[tokio::test]
     async fn map_unsupported_patch_type_denies_under_fail() {
-        let spec = json!({"mutations": [{"patchType": "JSONPatch",
-            "jsonPatch": {"expression": "[JSONPatch{op: 'add', path: '/x', value: 1}]"}}]});
+        let spec = json!({"mutations": [{"patchType": "Bogus"}]});
         let err = run_map(spec, deploy(), None).await.expect_err("must deny");
         assert!(
-            err.1.message.contains("unsupported patchType 'JSONPatch'"),
+            err.1.message.contains("unsupported patchType 'Bogus'"),
             "{}",
             err.1.message
         );
+    }
+
+    fn json_patch_mutation(expr: &str) -> serde_json::Value {
+        json!({"patchType": "JSONPatch", "jsonPatch": {"expression": expr}})
+    }
+
+    /// A JSONPatch policy that forces a setting must actually apply it: add, replace and
+    /// remove ops evaluated from CEL (reading `object`) reach the stored object.
+    #[tokio::test]
+    async fn map_json_patch_add_replace_remove_mutate_the_object() {
+        let mut obj = deploy();
+        obj["metadata"]["annotations"] = json!({"drop": "me"});
+        let spec = json!({"mutations": [json_patch_mutation(
+            "[JSONPatch{op: 'add', path: '/metadata/labels', value: {'tier': 'web'}}, \
+              JSONPatch{op: 'replace', path: '/spec/replicas', value: object.spec.replicas + 1}, \
+              JSONPatch{op: 'remove', path: '/metadata/annotations/drop'}]")]});
+        let out = run_map(spec, obj, None).await.unwrap();
+        assert_eq!(out["metadata"]["labels"], json!({"tier": "web"}));
+        assert_eq!(out["spec"]["replicas"], 3);
+        assert_eq!(out["metadata"]["annotations"], json!({}));
+    }
+
+    /// A `test` op that does not hold means the patch does not apply at all (no error, no
+    /// partial mutation), so a policy can guard a mutation on current state.
+    #[tokio::test]
+    async fn map_json_patch_failed_test_op_skips_the_whole_patch_without_error() {
+        let expr = |want: i64| {
+            format!(
+                "[JSONPatch{{op: 'add', path: '/metadata/labels', value: {{'a': 'b'}}}}, \
+                  JSONPatch{{op: 'test', path: '/spec/replicas', value: {want}}}]"
+            )
+        };
+        let out = run_map(
+            json!({"mutations": [json_patch_mutation(&expr(99))]}),
+            deploy(),
+            None,
+        )
+        .await
+        .expect("a failed test op is not an error");
+        assert!(out["metadata"].get("labels").is_none(), "{out}");
+        let out = run_map(
+            json!({"mutations": [json_patch_mutation(&expr(2))]}),
+            deploy(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["metadata"]["labels"]["a"], "b");
+    }
+
+    /// move and copy are RFC 6902 ops upstream supports; a policy using them must not fail.
+    #[tokio::test]
+    async fn map_json_patch_move_and_copy_ops() {
+        let mut obj = deploy();
+        obj["metadata"]["labels"] = json!({"old": "v"});
+        let spec = json!({"mutations": [json_patch_mutation(
+            "[JSONPatch{op: 'move', from: '/metadata/labels/old', path: '/metadata/labels/new'}, \
+              JSONPatch{op: 'copy', from: '/spec/replicas', path: '/spec/minReadySeconds'}]")]});
+        let out = run_map(spec, obj, None).await.unwrap();
+        assert_eq!(out["metadata"]["labels"], json!({"new": "v"}));
+        assert_eq!(out["spec"]["minReadySeconds"], 2);
+    }
+
+    /// `jsonpatch.escapeKey` lets a policy address label keys that contain `/`.
+    #[tokio::test]
+    async fn map_json_patch_escape_key_addresses_slash_keys() {
+        let spec = json!({"mutations": [json_patch_mutation(
+            "[JSONPatch{op: 'add', path: '/metadata/labels', value: {}}, \
+              JSONPatch{op: 'add', path: '/metadata/labels/' + jsonpatch.escapeKey('app.io/tier'), \
+                        value: 'web'}]")]});
+        let out = run_map(spec, deploy(), None).await.unwrap();
+        assert_eq!(out["metadata"]["labels"], json!({"app.io/tier": "web"}));
+    }
+
+    /// A patch that cannot apply (replace of a missing path) denies under Fail and leaves
+    /// the object unmutated, and is dropped under Ignore, as for any other MAP error.
+    #[tokio::test]
+    async fn map_json_patch_failure_follows_failure_policy_and_is_atomic() {
+        let expr = "[JSONPatch{op: 'add', path: '/metadata/labels', value: {'a': 'b'}}, \
+                     JSONPatch{op: 'remove', path: '/spec/nope'}]";
+        let err = run_map(
+            json!({"mutations": [json_patch_mutation(expr)]}),
+            deploy(),
+            None,
+        )
+        .await
+        .expect_err("a failing patch must deny under Fail");
+        assert!(err.1.message.contains("JSON Patch:"), "{}", err.1.message);
+        let out = run_map(
+            json!({"failurePolicy": "Ignore", "mutations": [json_patch_mutation(expr)]}),
+            deploy(),
+            None,
+        )
+        .await
+        .expect("Ignore admits");
+        assert_eq!(out, deploy(), "the failed patch must not half-apply");
+    }
+
+    /// The expression must yield a list of JSONPatch objects; anything else is an error.
+    #[tokio::test]
+    async fn map_json_patch_non_list_result_is_an_error() {
+        for expr in ["{'op': 'add'}", "[1]", "[JSONPatch{op: 'add', bogus: 1}]"] {
+            run_map(
+                json!({"mutations": [json_patch_mutation(expr)]}),
+                deploy(),
+                None,
+            )
+            .await
+            .expect_err(expr);
+        }
     }
 
     /// An applyConfiguration must produce an object.

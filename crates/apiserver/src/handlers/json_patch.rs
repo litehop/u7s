@@ -1031,13 +1031,20 @@ fn apply_one_json_patch_op(
                     Status::unprocessable_entity("'add' operation requires a 'value' field".into())
                 })?
                 .clone();
-            let segs = json_pointer_segments(path);
-            // Plan the inverse before mutating: read-only, so it never observes a
-            // half-applied `add` (add is atomic within itself — see `plan_add_undo`).
-            let undo = plan_add_undo(obj, &segs);
-            // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
-            json_patch_add(obj, path, value)?;
-            undo_log.push(undo);
+            add_with_undo(obj, path, value, undo_log)?;
+        }
+        "copy" | "move" => {
+            let from = op["from"].as_str().ok_or_else(|| {
+                Status::unprocessable_entity(format!(
+                    "'{op_str}' operation requires a 'from' field"
+                ))
+            })?;
+            let value = json_patch_get(obj, from)?.clone();
+            if op_str == "move" {
+                json_patch_remove(obj, from)?;
+                undo_log.push(UndoOp::Add(from.to_string(), value.clone()));
+            }
+            add_with_undo(obj, path, value, undo_log)?;
         }
         "replace" => {
             let value = op
@@ -1066,16 +1073,37 @@ fn apply_one_json_patch_op(
             let actual = json_patch_get(obj, path)?;
             if actual != expected {
                 return Err(Status::unprocessable_entity(format!(
-                    "'test' operation failed: value at path '{path}' does not match expected value"
+                    "{TEST_FAILED_PREFIX}: value at path '{path}' does not match expected value"
                 )));
             }
         }
         other => {
             return Err(Status::unprocessable_entity(format!(
-                "unsupported JSON patch operation '{other}'; supported: add, remove, replace, test"
+                "unsupported JSON patch operation '{other}'; supported: add, remove, replace, \
+                 move, copy, test"
             )));
         }
     }
+    Ok(())
+}
+
+/// Message prefix of the error a failed 'test' operation produces; lets callers that treat a
+/// failed test as "patch does not apply" tell it from a malformed patch.
+pub(crate) const TEST_FAILED_PREFIX: &str = "'test' operation failed";
+
+fn add_with_undo(
+    obj: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+    undo_log: &mut Vec<UndoOp>,
+) -> Result<(), crate::status::StatusError> {
+    let segs = json_pointer_segments(path);
+    // Plan the inverse before mutating: read-only, so it never observes a
+    // half-applied `add` (add is atomic within itself — see `plan_add_undo`).
+    let undo = plan_add_undo(obj, &segs);
+    // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
+    json_patch_add(obj, path, value)?;
+    undo_log.push(undo);
     Ok(())
 }
 
@@ -1640,6 +1668,23 @@ mod tests {
         assert_eq!(
             obj, before,
             "a rolled-back overwriting 'add' must restore the pre-overwrite value"
+        );
+    }
+
+    /// A successful 'move' followed by a failing op must put the moved value back at its
+    /// source and remove it from the destination, or a rejected patch loses data.
+    #[test]
+    fn apply_json_patch_undo_log_reverts_move_on_later_failure() {
+        let mut obj = serde_json::json!({"a": {"x": 1}, "b": {}});
+        let before = obj.clone();
+        let patch = serde_json::json!([
+            {"op": "move", "from": "/a/x", "path": "/b/y"},
+            {"op": "test", "path": "/b/y", "value": 2}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            obj, before,
+            "rolled-back 'move' must restore source and destination"
         );
     }
 

@@ -9266,12 +9266,11 @@ mod pure_logic_tests {
         assert!(result.is_err());
     }
 
-    /// An unsupported op (e.g. "copy") returns 422.
-    /// Only add, remove, replace are supported.
+    /// An unsupported op (e.g. "bogus") returns 422.
     #[test]
     fn apply_json_patch_unsupported_op_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
-        let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
+        let patch = serde_json::json!([{"op": "bogus", "path": "/b"}]);
         let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
