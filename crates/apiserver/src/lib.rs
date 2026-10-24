@@ -397,6 +397,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
     });
     state.deny_service_external_ips = args.deny_service_external_ips;
+    state.local_node_name = args.local_node_name.clone();
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
     state
         .proxy_client_identity_pem
@@ -638,9 +639,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .into_iter()
         .flatten()
         .collect();
+        let local_node_name = args.local_node_name.clone();
         tokio::spawn(async move {
             loop {
-                csr_approver::approve_kubelet_serving_csrs(&approver_state, &apiserver_ips).await;
+                csr_approver::approve_kubelet_serving_csrs(
+                    &approver_state,
+                    &apiserver_ips,
+                    local_node_name.as_deref(),
+                )
+                .await;
                 tokio::select! {
                     _ = tokio::time::sleep(csr_approver::APPROVAL_INTERVAL) => {}
                     _ = csr_approver_shutdown_rx.changed() => break,
@@ -12346,6 +12353,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             deny_service_external_ips: false,
+            local_node_name: None,
             sa_sig_cache_size: None,
             manifest_dir: "/etc/u7s/manifests".into(),
             embedded_scheduler: false,
@@ -13161,6 +13169,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             deny_service_external_ips: false,
+            local_node_name: None,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler: false,
@@ -13360,6 +13369,7 @@ mod tests {
             node_kubelet_port: vec![],
             konnectivity_proxy_addr: None,
             deny_service_external_ips: false,
+            local_node_name: None,
             sa_sig_cache_size: None,
             manifest_dir: manifest_dir.to_string_lossy().into_owned(),
             embedded_scheduler,

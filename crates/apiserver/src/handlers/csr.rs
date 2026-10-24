@@ -340,7 +340,7 @@ pub async fn create_csr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
-    finalize_csr_create(&mut obj.body, &user)?;
+    finalize_csr_create(&state, &mut obj.body, &user).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
     crate::field_manager::WriteIdentity::new(None, &headers).record(
         &serde_json::Value::Null,
@@ -449,11 +449,13 @@ pub(crate) fn preserve_csr_spec(old: &serde_json::Value, new: &mut serde_json::V
 /// subject restriction, then identity re-stamped from the authenticated caller and status
 /// stripped — neither may survive a client, or a mutating webhook, setting them. Spec is
 /// immutable after create; status is the signer's exclusive write.
-pub(crate) fn finalize_csr_create(
+pub(crate) async fn finalize_csr_create<S: Store>(
+    state: &AppState<S>,
     body: &mut serde_json::Value,
     user: &UserInfo,
 ) -> Result<(), crate::status::StatusError> {
     reject_system_masters_client_csr(body)?;
+    reject_bootstrap_node_takeover(state, body, user).await?;
     stamp_csr_identity(body, user);
     if let Some(map) = body.as_object_mut() {
         map.remove("status");
@@ -463,6 +465,59 @@ pub(crate) fn finalize_csr_create(
 
 const KUBE_APISERVER_CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client";
 const OID_ORGANIZATION: &str = "2.5.4.10";
+const OID_COMMON_NAME: &str = "2.5.4.3";
+
+/// The Node name a kubelet client CSR claims via `CN=system:node:<name>`; `Ok(None)` for other
+/// signers or a CN that is not a node identity. Fails closed: an unparseable request, a CN
+/// in a string type `atv_string` does not decode, or anything but exactly one CN is an error,
+/// because x509 auth takes the LAST CN and a decoy CN placed first would hide the real one.
+fn claimed_kubelet_node_name(body: &serde_json::Value) -> Result<Option<String>, String> {
+    let spec = &body["spec"];
+    if spec["signerName"].as_str() != Some(KUBELET_CLIENT_SIGNER) {
+        return Ok(None);
+    }
+    let pem = base64::engine::general_purpose::STANDARD
+        .decode(spec["request"].as_str().unwrap_or(""))
+        .map_err(|e| format!("failed to parse CSR: {e}"))?;
+    let req = CertReq::from_pem(&pem).map_err(|e| format!("failed to parse CSR: {e}"))?;
+    let mut cns = req
+        .info
+        .subject
+        .iter()
+        .filter(|atv| atv.oid.to_string() == OID_COMMON_NAME);
+    let (Some(atv), None) = (cns.next(), cns.next()) else {
+        return Err("CSR subject must contain exactly one CommonName".into());
+    };
+    let cn = crate::auth::atv_string(&atv.value)
+        .ok_or_else(|| "CSR subject CommonName has an undecodable string type".to_string())?;
+    Ok(cn.strip_prefix("system:node:").map(str::to_string))
+}
+
+/// A joiner (member of `system:bootstrappers`, which upstream's `nodeclient` approval is bound
+/// to) may not claim the `--local-node-name` identity: the resulting certificate authorizes the
+/// apiserver-IP kubelet-serving exemption for that node. Other existing Node names stay
+/// claimable, as upstream, so expired-cert recovery and worker re-join work. Nodes renewing
+/// authenticate as `system:node:<name>` and are unaffected.
+async fn reject_bootstrap_node_takeover<S: Store>(
+    state: &AppState<S>,
+    body: &serde_json::Value,
+    user: &UserInfo,
+) -> Result<(), crate::status::StatusError> {
+    if !user.groups.iter().any(|g| g == "system:bootstrappers") {
+        return Ok(());
+    }
+    let Some(node) = claimed_kubelet_node_name(body).map_err(Status::forbidden)? else {
+        return Ok(());
+    };
+    if state.local_node_name.as_deref() == Some(node.as_str()) {
+        return Err(Status::forbidden(format!(
+            "{:?} may not request a client certificate for node {node:?}: it is the \
+             control-plane node (choose a different --node-name)",
+            user.username,
+        )));
+    }
+    Ok(())
+}
 
 /// Upstream CertificateSubjectRestriction: the `kube-apiserver-client` signer must never be
 /// asked for a `system:masters` identity. The cluster CA is trusted for client auth, so a
@@ -1467,6 +1522,276 @@ mod tests {
             "stored spec.groups must be the authenticated caller's real groups, not the \
              client-supplied system:nodes/system:masters spoof"
         );
+    }
+
+    fn kubelet_client_csr_b64(cn: &str) -> String {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "system:nodes");
+        let pem = params
+            .serialize_request(&KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(pem)
+    }
+
+    /// POSTs a kubelet client CSR for `system:node:<node>` as `username`; Ok(()) if created.
+    async fn post_kubelet_client_csr(
+        state: &AppState<u7s_store::SqliteStore>,
+        username: &str,
+        node: &str,
+    ) -> Result<(), crate::status::StatusError> {
+        let body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": format!("csr-{node}")},
+            "spec": {
+                "request": kubelet_client_csr_b64(&format!("system:node:{node}")),
+                "signerName": KUBELET_CLIENT_SIGNER,
+                "usages": ["digital signature", "key encipherment", "client auth"],
+            }
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: username.into(),
+                uid: String::new(),
+                groups: if username.starts_with("system:bootstrap:") {
+                    vec!["system:bootstrappers".into()]
+                } else {
+                    vec!["system:nodes".into()]
+                },
+                extra: Default::default(),
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn csr_stored(state: &AppState<u7s_store::SqliteStore>, node: &str) -> bool {
+        let key = group_object_key(GROUP, PLURAL, None, &format!("csr-{node}"));
+        state.store.get(&key).await.unwrap().is_some()
+    }
+
+    async fn seed_node(state: &AppState<u7s_store::SqliteStore>, name: &str) {
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node", "metadata": {"name": name},
+        });
+        state
+            .store
+            .put(
+                &group_object_key("", "nodes", None, name),
+                serde_json::to_vec(&node).unwrap().into(),
+                Some(0),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn state_with_local_node(name: &str) -> AppState<u7s_store::SqliteStore> {
+        let mut state = make_state();
+        state.local_node_name = Some(name.into());
+        state
+    }
+
+    #[tokio::test]
+    async fn join_token_holder_cannot_claim_the_control_plane_node_name_because_that_identity_unlocks_the_apiserver_ip_serving_cert(
+    ) {
+        let state = state_with_local_node("cp");
+        assert_status(
+            post_kubelet_client_csr(&state, "system:bootstrap:abcdef", "cp").await,
+            StatusCode::FORBIDDEN,
+            "joiner naming itself after the control-plane node",
+        );
+        assert!(
+            !csr_stored(&state, "cp").await,
+            "a refused CSR must not be persisted, or KCM would still approve it"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_token_holder_may_reclaim_an_existing_worker_name_like_upstream_so_expired_cert_recovery_and_rejoin_work(
+    ) {
+        let state = state_with_local_node("cp");
+        seed_node(&state, "worker-1").await;
+        post_kubelet_client_csr(&state, "system:bootstrap:abcdef", "worker-1")
+            .await
+            .unwrap_or_else(|_| {
+                panic!("refusing existing names strands workers with expired certs")
+            });
+        assert!(csr_stored(&state, "worker-1").await);
+    }
+
+    #[tokio::test]
+    async fn guard_keys_on_bootstrappers_group_not_the_username_prefix() {
+        let state = state_with_local_node("cp");
+        let mut body = serde_json::json!({"spec": {
+            "request": kubelet_client_csr_b64("system:node:cp"),
+            "signerName": KUBELET_CLIENT_SIGNER,
+        }});
+        let joiner = crate::auth::UserInfo {
+            username: "custom-joiner".into(),
+            uid: String::new(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: Default::default(),
+        };
+        assert!(
+            finalize_csr_create(&state, &mut body, &joiner)
+                .await
+                .is_err(),
+            "upstream approves nodeclient CSRs by group, so the guard must too"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_token_holder_with_a_fresh_node_name_still_enrolls() {
+        let state = state_with_local_node("cp");
+        seed_node(&state, "worker-1").await;
+        post_kubelet_client_csr(&state, "system:bootstrap:abcdef", "worker-2")
+            .await
+            .unwrap_or_else(|_| panic!("a new node name must enroll or no worker can ever join"));
+        assert!(csr_stored(&state, "worker-2").await);
+    }
+
+    #[tokio::test]
+    async fn existing_node_renews_its_client_cert_with_its_own_credential() {
+        let state = state_with_local_node("cp");
+        seed_node(&state, "worker-1").await;
+        post_kubelet_client_csr(&state, "system:node:worker-1", "worker-1")
+            .await
+            .unwrap_or_else(|_| panic!("renewal by the node itself must keep working"));
+        post_kubelet_client_csr(&state, "system:node:cp", "cp")
+            .await
+            .unwrap_or_else(|_| panic!("the control-plane node renews with its own credential"));
+    }
+
+    /// POST, generic create and server-side-apply create all end in `finalize_csr_create`, so
+    /// the takeover check there covers every path that can create a CSR.
+    #[tokio::test]
+    async fn finalize_csr_create_enforces_the_takeover_check_for_every_create_path() {
+        let state = state_with_local_node("cp");
+        let mut body = serde_json::json!({"spec": {
+            "request": kubelet_client_csr_b64("system:node:cp"),
+            "signerName": KUBELET_CLIENT_SIGNER,
+        }});
+        let joiner = crate::auth::UserInfo {
+            username: "system:bootstrap:abcdef".into(),
+            uid: String::new(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: Default::default(),
+        };
+        assert!(finalize_csr_create(&state, &mut body, &joiner)
+            .await
+            .is_err());
+    }
+
+    fn csr_b64_with_dn(entries: Vec<(rcgen::DnType, rcgen::DnValue)>) -> String {
+        use rcgen::{CertificateParams, KeyPair};
+        let mut params = CertificateParams::default();
+        for (t, v) in entries {
+            params.distinguished_name.push(t, v);
+        }
+        let pem = params
+            .serialize_request(&KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(pem)
+    }
+
+    /// A second CN uses the CN OID as a custom type so rcgen does not dedupe it.
+    fn cn(v: &str) -> (rcgen::DnType, rcgen::DnValue) {
+        (rcgen::DnType::CommonName, v.to_string().into())
+    }
+    fn extra_cn(v: &str) -> (rcgen::DnType, rcgen::DnValue) {
+        (
+            rcgen::DnType::CustomDnType(vec![2, 5, 4, 3]),
+            v.to_string().into(),
+        )
+    }
+
+    async fn joiner_create(
+        entries: Vec<(rcgen::DnType, rcgen::DnValue)>,
+    ) -> Result<(), crate::status::StatusError> {
+        joiner_create_raw(csr_b64_with_dn(entries)).await
+    }
+
+    async fn joiner_create_raw(request: String) -> Result<(), crate::status::StatusError> {
+        let state = state_with_local_node("cp");
+        let mut body = serde_json::json!({"spec": {
+            "request": request,
+            "signerName": KUBELET_CLIENT_SIGNER,
+        }});
+        let joiner = crate::auth::UserInfo {
+            username: "system:bootstrap:abcdef".into(),
+            uid: String::new(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: Default::default(),
+        };
+        finalize_csr_create(&state, &mut body, &joiner).await
+    }
+
+    #[tokio::test]
+    async fn decoy_first_cn_cannot_hide_the_local_node_name_that_auth_reads_last() {
+        joiner_create(vec![cn("decoy"), extra_cn("system:node:cp")])
+            .await
+            .expect_err(
+                "auth takes the LAST CN; a first-CN-only guard lets a joiner mint the \
+                 control-plane node identity",
+            );
+    }
+
+    #[tokio::test]
+    async fn two_decoy_cns_are_rejected_because_cn_count_must_be_exactly_one() {
+        joiner_create(vec![cn("decoy-a"), extra_cn("decoy-b")])
+            .await
+            .expect_err("multi-CN subjects are ambiguous across parsers and must fail closed");
+    }
+
+    #[tokio::test]
+    async fn single_cn_naming_the_local_node_is_rejected() {
+        joiner_create(vec![cn("system:node:cp")])
+            .await
+            .expect_err("joiners may not claim the control-plane node identity");
+    }
+
+    #[tokio::test]
+    async fn single_fresh_cn_is_accepted() {
+        joiner_create(vec![cn("system:node:worker-9")])
+            .await
+            .unwrap_or_else(|_| panic!("a fresh node name must enroll or no worker can join"));
+    }
+
+    #[tokio::test]
+    async fn bmpstring_cn_naming_the_local_node_is_rejected_not_skipped() {
+        let units: Vec<u8> = "system:node:cp"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let bmp = rcgen::DnValue::BmpString(
+            rcgen::string::BmpString::from_utf16be(units).expect("valid bmp string"),
+        );
+        joiner_create(vec![(rcgen::DnType::CommonName, bmp)])
+            .await
+            .expect_err("a CN type the guard cannot decode must fail closed, not bypass it");
+    }
+
+    #[tokio::test]
+    async fn unparseable_request_from_a_joiner_is_rejected() {
+        joiner_create_raw("bm90IGEgY3Ny".into())
+            .await
+            .expect_err("a request the guard cannot read must fail closed, not skip the check");
     }
 
     /// list_csr with label selector must filter results.

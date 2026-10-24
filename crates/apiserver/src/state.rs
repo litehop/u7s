@@ -1028,6 +1028,9 @@ pub struct AppState<S = SqliteStore> {
     /// DenyServiceExternalIPs admission plugin switch. Not part of `AppStateConfig`: `run()`
     /// sets it from `--deny-service-external-ips`; every test gets upstream's default (off).
     pub deny_service_external_ips: bool,
+    /// Name of the Node co-located with this apiserver (`--local-node-name`). Not part of
+    /// `AppStateConfig`: `run()` sets it; tests default to none.
+    pub local_node_name: Option<String>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -1095,6 +1098,7 @@ impl<S> Clone for AppState<S> {
             cert_watch: self.cert_watch.clone(),
             pod_security: self.pod_security.clone(),
             deny_service_external_ips: self.deny_service_external_ips,
+            local_node_name: self.local_node_name.clone(),
         }
     }
 }
@@ -1371,6 +1375,7 @@ impl<S: Store> AppState<S> {
             cert_watch: Default::default(),
             pod_security: Arc::new(crate::pod_security::Config::default()),
             deny_service_external_ips: false,
+            local_node_name: None,
         }
     }
 

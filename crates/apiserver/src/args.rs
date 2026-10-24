@@ -106,6 +106,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) deny_service_external_ips: bool,
 
+    /// Name of the Node that runs on the same host as this apiserver. Only that Node's
+    /// kubelet-serving CSR may carry the apiserver's own address as an IP SAN: its kubelet
+    /// already shares the host (and the CA key) with the apiserver, so the cert grants it
+    /// nothing. Any other Node asking for that address stays Pending.
+    #[arg(long)]
+    pub(crate) local_node_name: Option<String>,
+
     /// Max number of distinct SA-JWT signatures cached to skip the RSA verify (modular
     /// exponentiation) on repeat presentation of the same token. Falls back to the
     /// U7S_SA_SIG_CACHE_SIZE env var, then 512, when unset — see `sa_sig_cache` module doc.
