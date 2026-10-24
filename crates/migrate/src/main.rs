@@ -44,6 +44,13 @@ enum Migrate {
         objects: String,
     },
     /// Recreate the plan's included objects on a u7s apiserver. Re-runnable.
+    ///
+    /// Every created object gets the permanent annotation
+    /// `migrate.u7s.dev/source-uid` (its UID on the source). Do not remove
+    /// it: a re-run adopts only same-named objects carrying it and reports
+    /// any other as a failure, leaving it untouched. Admission
+    /// configurations are created last, once their Services have a ready
+    /// endpoint; the backend port may still be starting at that moment.
     Import {
         /// Target u7s kubeconfig (client-certificate auth).
         #[arg(long)]

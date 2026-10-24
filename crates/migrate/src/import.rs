@@ -71,7 +71,10 @@ pub trait Cluster {
     async fn settle(&mut self, crds: &[ServedCrd]) -> anyhow::Result<()>;
     /// Blocks (bounded) until each (namespace, service) has a ready endpoint.
     /// Admission webhooks created before their backend would reject every
-    /// later create.
+    /// later create. A ready Endpoints address does not prove the container
+    /// port is accepting connections yet, so a webhook may still fail
+    /// briefly right after import; configurations with `failurePolicy: Fail`
+    /// can reject creates until the backend finishes starting.
     async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()>;
 }
 
