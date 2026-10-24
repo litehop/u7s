@@ -342,6 +342,7 @@ const TABLE_FUNCS: &[&str] = &[
     "string",
     "format",
     "quote",
+    "size",
     operators::LESS,
     operators::LESS_EQUALS,
     operators::GREATER,
@@ -366,6 +367,10 @@ fn call_cost_from_table(func: &str, operands: &[Operand], is_member: bool) -> Op
         ("string", [arg]) if !is_member && arg.kind == Kind::Bytes => Some(traversal(arg.size)),
         ("format", [recv, _]) if is_member => Some(traversal(recv.size)),
         ("quote", [arg]) if !is_member => Some(traversal(arg.size)),
+        // cel-go bills `size` as one unit, but the `cel` crate counts a string's
+        // characters on every call, so a loop calling it on a large payload string is
+        // real work. Billing the traversal keeps that loop inside the limit.
+        ("size", [arg]) if arg.kind == Kind::Str => Some(traversal(arg.size).max(1)),
         (
             operators::LESS
             | operators::LESS_EQUALS
@@ -1063,7 +1068,11 @@ mod tests {
             (operators::IN, &[op(1, Other), op(7, Other)], false, None),
             ("split", &[op(1000, Str), op(1, Str)], true, None),
             ("trim", &[op(1000, Str)], true, None),
-            ("size", &[op(1000, Str)], true, None),
+            ("size", &[op(1000, Str)], true, Some(100)),
+            ("size", &[op(1000, Str)], false, Some(100)),
+            ("size", &[op(3, Str)], true, Some(1)),
+            ("size", &[op(1000, List)], true, None),
+            ("size", &[op(1000, Bytes)], true, None),
         ];
         for (func, operands, is_member, expected) in cases {
             assert_eq!(
@@ -1123,6 +1132,30 @@ mod tests {
             None,
         );
         assert!(cost > CALL_COST_LIMIT, "{cost}");
+    }
+
+    /// `size(string)` counts characters on every call, so one per list item over a payload
+    /// string is items x payload bytes of work. Billed as a unit it stayed far under the
+    /// limit; it must be refused by its counted cost.
+    #[test]
+    fn size_of_a_large_string_per_item_exceeds_the_limit() {
+        let schema = big_text_schema();
+        let data = serde_json::json!({ "csv": "a".repeat(110_000), "items": vec!["a"; 20_000] });
+        let cost = live_cost(
+            "self.items.all(a, self.csv.size() > 0)",
+            &schema,
+            &data,
+            None,
+        );
+        assert!(cost > CALL_COST_LIMIT, "{cost}");
+        let cheap = serde_json::json!({ "csv": "abc", "items": vec!["a"; 20_000] });
+        let cost = live_cost(
+            "self.items.all(a, self.csv.size() > 0)",
+            &schema,
+            &cheap,
+            None,
+        );
+        assert!(cost < CALL_COST_LIMIT, "short strings stay cheap: {cost}");
     }
 
     /// A deep method chain is re-evaluated by the call that bills its receiver; once the
