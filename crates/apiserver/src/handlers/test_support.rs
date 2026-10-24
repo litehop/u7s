@@ -225,3 +225,137 @@ pub(crate) fn grant_signer_verb(
         }),
     );
 }
+
+/// Headers of a server-side apply by `manager`, as `resolve_field_manager` forwards them.
+pub(crate) fn apply_headers(manager: &str, force: bool) -> axum::http::HeaderMap {
+    let mut h = content_type_headers("application/apply-patch+yaml");
+    h.insert(
+        "x-u7s-field-manager",
+        axum::http::HeaderValue::from_str(manager).unwrap(),
+    );
+    if force {
+        h.insert("x-u7s-force", axum::http::HeaderValue::from_static("true"));
+    }
+    h
+}
+
+/// A `managedFields` entry for an Update by `manager` owning `fields_v1`.
+pub(crate) fn update_entry(
+    manager: &str,
+    api_version: &str,
+    subresource: Option<&str>,
+    fields_v1: serde_json::Value,
+) -> serde_json::Value {
+    let mut e = serde_json::json!({
+        "manager": manager, "operation": "Update", "apiVersion": api_version,
+        "time": "2026-01-01T00:00:00Z", "fieldsType": "FieldsV1", "fieldsV1": fields_v1
+    });
+    if let Some(s) = subresource {
+        e["subresource"] = s.into();
+    }
+    e
+}
+
+/// The `managedFields` entry of `manager` for `operation` scoped to `subresource`.
+pub(crate) fn managed_entry<'a>(
+    obj: &'a serde_json::Value,
+    manager: &str,
+    operation: &str,
+    subresource: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    obj["metadata"]["managedFields"]
+        .as_array()?
+        .iter()
+        .find(|e| {
+            e["manager"] == manager
+                && e["operation"] == operation
+                && e["subresource"].as_str() == subresource
+        })
+}
+
+pub(crate) async fn response_json(resp: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+type ApplyResult = Result<serde_json::Value, crate::status::StatusError>;
+
+/// A status apply must record `{manager, Apply, subresource: status}` owning what it named
+/// and a later apply that drops a field must remove it. Without the scoped entry, applied
+/// status is owned as an Update, so `kubectl apply --server-side --subresource=status`
+/// can never delete fields it stops sending. Returns the object after each apply.
+pub(crate) async fn assert_status_apply_is_scoped_and_prunes<F, Fut>(
+    apply: F,
+    first_yaml: &str,
+    second_yaml: &str,
+) -> (serde_json::Value, serde_json::Value)
+where
+    F: Fn(&'static str, bool, String) -> Fut,
+    Fut: std::future::Future<Output = ApplyResult>,
+{
+    let first = apply("ctrl", false, first_yaml.to_owned())
+        .await
+        .unwrap_or_else(|e| panic!("first status apply must succeed: {e:?}"));
+    let entry = managed_entry(&first, "ctrl", "Apply", Some("status")).unwrap_or_else(|| {
+        panic!(
+            "a status apply must record an Apply manager scoped to status: {}",
+            first["metadata"]["managedFields"]
+        )
+    });
+    assert!(
+        entry["fieldsV1"]["f:status"].is_object(),
+        "the status-scoped manager must own the status it applied: {entry}"
+    );
+    assert!(
+        managed_entry(&first, "ctrl", "Apply", None).is_none(),
+        "a status apply must not create a main-resource Apply entry"
+    );
+    let second = apply("ctrl", false, second_yaml.to_owned())
+        .await
+        .unwrap_or_else(|e| panic!("second status apply must succeed: {e:?}"));
+    (first, second)
+}
+
+/// A status apply over a field an Update manager owns with a different value must be 409
+/// without force (as upstream) and take ownership with force. `owned_status_key` is the
+/// `status` member the seeded object's Update entry owns and `conflict_yaml` changes.
+pub(crate) async fn assert_status_apply_conflicts_without_force<F, Fut>(
+    apply: F,
+    conflict_yaml: &str,
+    owned_status_key: &str,
+) where
+    F: Fn(&'static str, bool, String) -> Fut,
+    Fut: std::future::Future<Output = ApplyResult>,
+{
+    let err = apply("ctrl", false, conflict_yaml.to_owned())
+        .await
+        .expect_err("a status apply over another manager's field must conflict without force");
+    assert_eq!(
+        err.0,
+        axum::http::StatusCode::CONFLICT,
+        "conflict must be 409 as upstream: {}",
+        err.1.message
+    );
+    let forced = apply("ctrl", true, conflict_yaml.to_owned())
+        .await
+        .unwrap_or_else(|e| panic!("force must override the conflict: {e:?}"));
+    let key = format!("f:{owned_status_key}");
+    assert!(
+        managed_entry(&forced, "ctrl", "Apply", Some("status")).unwrap()["fieldsV1"]["f:status"]
+            .get(&key)
+            .is_some(),
+        "force must give the applier the field: {}",
+        forced["metadata"]["managedFields"]
+    );
+    let loser = forced["metadata"]["managedFields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["operation"] == "Update");
+    assert!(
+        loser.is_none_or(|l| l["fieldsV1"]["f:status"].get(&key).is_none()),
+        "the forced field must leave the previous owner: {loser:?}"
+    );
+}
