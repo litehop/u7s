@@ -58,6 +58,14 @@ fi
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
 #   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
 #                                 physical non-loopback interface).
+#   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12).
+#   --cluster-cidr / U7S_CLUSTER_CIDR   Pod CIDR (default 10.244.0.0/16).
+#   --cluster-dns  / U7S_CLUSTER_DNS    kube-dns ClusterIP (default: tenth host
+#                                       of the service range). Persisted at
+#                                       first install; a conflicting re-run is
+#                                       refused. A migration target inherits
+#                                       k3s with 10.43.0.0/16, 10.42.0.0/16 and
+#                                       10.43.0.10.
 #   --manifest-output-dir / U7S_MANIFEST_OUTPUT_DIR
 #                                 Where vendored manifest YAMLs from the
 #                                 tarball land (default: /etc/u7s/manifests,
@@ -75,9 +83,9 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--manifest-output-dir <path>] [--allow-service-external-ips]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
-  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--cluster-dns <ip>]
 
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
@@ -87,6 +95,14 @@ Usage:
   --node-name <name>    Node identity (default: hostname).
   --iface <iface>       Network interface used for cluster traffic
                          (default: first non-loopback interface).
+  --service-cidr <cidr> Service ClusterIP range (default: 10.96.0.0/12). To inherit
+                         a k3s cluster use 10.43.0.0/16. Fixed at first install.
+  --cluster-cidr <cidr> Pod CIDR (default: 10.244.0.0/16); k3s uses 10.42.0.0/16.
+                         Disjoint from --service-cidr. Fixed at first install.
+  --cluster-dns <ip>    ClusterIP of kube-dns, inside --service-cidr (default:
+                         its tenth host, e.g. 10.96.0.10; k3s: 10.43.0.10).
+                         --join nodes must pass the control plane's value
+                         (--mint-join-token prints it when non-default).
   --manifest-output-dir <path>
                          Where vendored manifest YAMLs from the tarball land
                          (default: /etc/u7s/manifests, the apiserver's
@@ -122,6 +138,13 @@ DEFAULT_TARBALL_URL=""
 
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
+# Empty = not passed; the defaults below apply after the persisted config is
+# consulted (an unset flag on a re-run keeps what the first install chose).
+DEFAULT_SERVICE_CIDR="10.96.0.0/12"
+DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"
+SERVICE_CIDR="${U7S_SERVICE_CIDR:-}"
+POD_CLUSTER_CIDR="${U7S_CLUSTER_CIDR:-}"
+CLUSTER_DNS="${U7S_CLUSTER_DNS:-}"
 MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"
 TARBALL=""
 TARBALL_URL="$DEFAULT_TARBALL_URL"
@@ -147,6 +170,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
+    --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
+    --cluster-cidr) POD_CLUSTER_CIDR="$2"; shift 2 ;;
+    --cluster-dns) CLUSTER_DNS="$2"; shift 2 ;;
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
@@ -420,8 +446,144 @@ stage_binaries() {
   done
 }
 
-# Minimal KubeletConfiguration: CRI-O's socket, cluster DNS matching
-# apiserver's default --service-cluster-ip-range (10.96.0.0/12), and four
+# --- Network ranges: one source of truth -------------------------------------
+#
+# $SERVICE_CIDR, $POD_CLUSTER_CIDR and $CLUSTER_DNS feed every consumer: the
+# apiserver (--service-cluster-ip-range, --kube-dns-cluster-ip; it derives the
+# kubernetes Service VIP and the ServiceCIDR object from them), KCM
+# (--cluster-cidr, --service-cluster-ip-range), kubelet clusterDNS, and the
+# rendered flannel / kube-proxy / beep / CoreDNS manifests.
+
+# Dotted-quad IPv4 -> integer; fails (no output) on anything else.
+ipv4_to_int() {
+  local re='^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$' i
+  [[ "$1" =~ $re ]] || return 1
+  for i in 1 2 3 4; do
+    [ "${BASH_REMATCH[$i]}" -le 255 ] || return 1
+  done
+  echo $(( (BASH_REMATCH[1] << 24) | (BASH_REMATCH[2] << 16) | (BASH_REMATCH[3] << 8) | BASH_REMATCH[4] ))
+}
+
+int_to_ipv4() {
+  echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"
+}
+
+# Parses <cidr> (flag <label>) into CIDR_START/CIDR_END, requiring the
+# canonical network address and a prefix in [min,max].
+parse_cidr() {
+  local label="$1" cidr="$2" min="$3" max="$4" addr prefix start size
+  case "$cidr" in */*) ;; *) echo "error: $label '$cidr' is not a CIDR (expected a.b.c.d/n)" >&2; return 1 ;; esac
+  addr="${cidr%/*}"; prefix="${cidr#*/}"
+  if ! start="$(ipv4_to_int "$addr")" || ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]]; then
+    echo "error: $label '$cidr' is not a valid IPv4 CIDR" >&2; return 1
+  fi
+  if [ "$prefix" -lt "$min" ] || [ "$prefix" -gt "$max" ]; then
+    echo "error: $label '$cidr' has prefix /$prefix; it must be between /$min and /$max" >&2; return 1
+  fi
+  size=$(( 1 << (32 - prefix) ))
+  if [ $(( start & (size - 1) )) -ne 0 ]; then
+    echo "error: $label '$cidr' has host bits set; the network address is $(int_to_ipv4 $(( start & ~(size - 1) )))/$prefix" >&2; return 1
+  fi
+  CIDR_START=$start
+  CIDR_END=$(( start + size - 1 ))
+}
+
+# kubeadm's convention (and the apiserver's default): kube-dns is the tenth host.
+default_cluster_dns() {
+  parse_cidr --service-cidr "$1" 12 28 || return 1
+  int_to_ipv4 $(( CIDR_START + 10 ))
+}
+
+# Fails loud on a combination no consumer can serve. $1=1 on a worker, which
+# runs only kubelet and so only consumes the DNS address (the ranges are the
+# control plane's).
+validate_network_config() {
+  local worker="$1" dns svc_start svc_end
+  if ! dns="$(ipv4_to_int "$CLUSTER_DNS")"; then
+    echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 address" >&2; return 1
+  fi
+  [ "$worker" -eq 1 ] && return 0
+  # /12 is the largest range upstream accepts; /28 leaves room for the
+  # kubernetes (.1) and kube-dns (.10) VIPs plus allocation.
+  parse_cidr --service-cidr "$SERVICE_CIDR" 12 28 || return 1
+  svc_start=$CIDR_START; svc_end=$CIDR_END
+  # /24 is KCM's per-node mask; the 16-bit gap to the mask is its limit.
+  parse_cidr --cluster-cidr "$POD_CLUSTER_CIDR" 8 24 || return 1
+  if [ "$svc_start" -le "$CIDR_END" ] && [ "$CIDR_START" -le "$svc_end" ]; then
+    echo "error: --service-cidr $SERVICE_CIDR and --cluster-cidr $POD_CLUSTER_CIDR overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  fi
+  if [ "$dns" -le "$svc_start" ] || [ "$dns" -ge "$svc_end" ] || [ "$dns" -eq $(( svc_start + 1 )) ]; then
+    echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $SERVICE_CIDR (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( svc_start + 1 ))) are excluded)" >&2; return 1
+  fi
+}
+
+# Resolves flag variable <var> against what the first install persisted:
+# unset keeps the persisted value (or the default for an install that
+# predates persistence, which always ran the defaults); an explicit value that
+# disagrees on an existing install refuses, because Services, pods and every
+# node's kubelet already hold addresses from the old range.
+reconcile_network_flag() {
+  local flag="$1" var="$2" persisted="$3" default="$4" given effective
+  given="${!var}"
+  effective="$default"
+  if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$persisted" ]; then
+    effective="$persisted"
+  fi
+  if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
+    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+    return 1
+  fi
+  printf -v "$var" '%s' "${given:-$effective}"
+}
+
+# Fails when $IFACE_IP (arg 1) sits inside either range: the node's own address
+# would be unreachable behind Service/pod routing.
+check_node_ip_outside_ranges() {
+  local ip range
+  ip="$(ipv4_to_int "$1")" || return 0
+  for range in "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"; do
+    parse_cidr range "$range" 0 32 || return 1
+    if [ "$ip" -ge "$CIDR_START" ] && [ "$ip" -le "$CIDR_END" ]; then
+      echo "error: node address $1 is inside $range; choose --service-cidr/--cluster-cidr ranges that exclude the host network" >&2; return 1
+    fi
+  done
+}
+
+# Writes the install-time placeholders into the vendored manifests in $1.
+# CoreDNS ships its default VIP literally (the dev rigs apply the file as-is),
+# so its clusterIP line is rewritten and then verified.
+render_vendored_manifests() {
+  local dir="$1"
+  if [ -f "$dir/flannel.yaml" ]; then
+    # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
+    # BSD sed, and this redirect-and-replace form works identically on both.
+    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+      "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp"
+    mv "$dir/flannel.yaml.tmp" "$dir/flannel.yaml"
+  fi
+  if [ -f "$dir/kube-proxy.yaml" ]; then
+    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+      "$dir/kube-proxy.yaml" > "$dir/kube-proxy.yaml.tmp"
+    mv "$dir/kube-proxy.yaml.tmp" "$dir/kube-proxy.yaml"
+  fi
+  if [ -f "$dir/beep.yaml" ]; then
+    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+      "$dir/beep.yaml" > "$dir/beep.yaml.tmp"
+    mv "$dir/beep.yaml.tmp" "$dir/beep.yaml"
+  fi
+  if [ -f "$dir/coredns.yaml" ]; then
+    sed -e "s#^  clusterIP: 10\.96\.0\.10\$#  clusterIP: $CLUSTER_DNS#" \
+      "$dir/coredns.yaml" > "$dir/coredns.yaml.tmp"
+    mv "$dir/coredns.yaml.tmp" "$dir/coredns.yaml"
+    if ! grep -qx "  clusterIP: $CLUSTER_DNS" "$dir/coredns.yaml"; then
+      echo "error: $dir/coredns.yaml has no 'clusterIP' line to set to $CLUSTER_DNS (manifest shape changed?)" >&2
+      return 1
+    fi
+  fi
+}
+
+# Minimal KubeletConfiguration: CRI-O's socket, cluster DNS from
+# --cluster-dns (default: the tenth host of the service range), and four
 # settings that are not obvious:
 #
 # resolvConf -- chosen as kubeadm does: when systemd-resolved is active,
@@ -467,7 +629,7 @@ failSwapOn: false
 resolvConf: $resolv_conf
 staticPodPath: /etc/u7s/static-pods
 clusterDNS:
-  - 10.96.0.10
+  - $CLUSTER_DNS
 clusterDomain: cluster.local
 serverTLSBootstrap: true
 authentication:
@@ -519,7 +681,13 @@ mint_join_token() {
   echo "On the joining node, run as root. The command carries no token, so it stays out of shell"
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
-  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
+  local dns_flag="" persisted_dns
+  # shellcheck disable=SC1090
+  persisted_dns="$([ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE" && printf '%s' "${CLUSTER_DNS:-}" || true)"
+  if [ -n "$persisted_dns" ] && [ "$persisted_dns" != "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" ]; then
+    dns_flag=" --cluster-dns $persisted_dns"
+  fi
+  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]$dns_flag"
 }
 
 # base64url without padding, from stdin.
@@ -1097,6 +1265,9 @@ fi
 # conditionally today (for --mint-join-token/--join).
 PERSISTED_NODE_NAME=""
 PERSISTED_IFACE=""
+PERSISTED_SERVICE_CIDR=""
+PERSISTED_POD_CLUSTER_CIDR=""
+PERSISTED_CLUSTER_DNS=""
 normalize_node_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
 NODE_NAME="$(normalize_node_name "$NODE_NAME")"
 if [ -f "$CONFIG_FILE" ]; then
@@ -1106,6 +1277,12 @@ if [ -f "$CONFIG_FILE" ]; then
   PERSISTED_NODE_NAME="$(normalize_node_name "$(. "$CONFIG_FILE"; printf '%s' "${NODE_NAME:-}")")"
   # shellcheck disable=SC1090
   PERSISTED_IFACE="$(. "$CONFIG_FILE"; printf '%s' "${IFACE:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_SERVICE_CIDR="$(. "$CONFIG_FILE"; printf '%s' "${SERVICE_CIDR:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_POD_CLUSTER_CIDR="$(. "$CONFIG_FILE"; printf '%s' "${POD_CLUSTER_CIDR:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_CLUSTER_DNS="$(. "$CONFIG_FILE"; printf '%s' "${CLUSTER_DNS:-}")"
 fi
 
 # On an upgrade, an unset --iface/--node-name defaults to what was persisted
@@ -1130,6 +1307,25 @@ if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_IFACE" ]; then
     exit 1
   fi
 fi
+
+# --- Network ranges: defaults, persisted values, validation -------------------
+#
+# A worker runs only kubelet, which consumes only the DNS address; the ranges
+# are control-plane settings, so passing them with --join is refused rather
+# than silently ignored.
+if [ "$WORKER_MODE" -eq 1 ]; then
+  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ]; then
+    echo "error: --service-cidr/--cluster-cidr are control-plane settings; a joining or already-joined worker takes only --cluster-dns" >&2
+    exit 1
+  fi
+  reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" || exit 1
+else
+  reconcile_network_flag --service-cidr SERVICE_CIDR "$PERSISTED_SERVICE_CIDR" "$DEFAULT_SERVICE_CIDR" || exit 1
+  reconcile_network_flag --cluster-cidr POD_CLUSTER_CIDR "$PERSISTED_POD_CLUSTER_CIDR" "$DEFAULT_POD_CLUSTER_CIDR" || exit 1
+  dns_default="$(default_cluster_dns "$SERVICE_CIDR")" || exit 1
+  reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$dns_default" || exit 1
+fi
+validate_network_config "$WORKER_MODE" || exit 1
 
 # --- Defaults: node name, network interface ----------------------------------
 
@@ -1160,6 +1356,7 @@ if [ -z "$IFACE_IP" ]; then
   echo "error: interface $IFACE has no IPv4 address assigned" >&2
   exit 1
 fi
+[ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$IFACE_IP" || exit 1
 
 if [ "$EXISTING_INSTALL" -eq 1 ]; then
   echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
@@ -1311,10 +1508,12 @@ install -d -m 0755 /etc/u7s/static-pods
 # enforced above), so a bare re-run reuses them and an explicit, disagreeing
 # flag is caught rather than silently changing this node's advertised
 # identity.
-cat > "$CONFIG_FILE" <<EOF
-NODE_NAME="$NODE_NAME"
-IFACE="$IFACE"
-EOF
+{
+  printf 'NODE_NAME="%s"\nIFACE="%s"\nCLUSTER_DNS="%s"\n' "$NODE_NAME" "$IFACE" "$CLUSTER_DNS"
+  if [ "$WORKER_MODE" -eq 0 ]; then
+    printf 'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n' "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"
+  fi
+} > "$CONFIG_FILE"
 
 write_kubelet_config_yaml "$WORKER_MODE"
 # Serving cert minted by an earlier install (10-year, never renewed).
@@ -1486,12 +1685,8 @@ fi
 # writes finished -- so the dependent units are only restarted after
 # wait_for_apiserver_files. Restart=always remains for later crashes.
 
-# Pod CIDR for node-ipam-controller (below) and Flannel's net-conf.json
-# (applied further down) -- one variable so the two can never drift apart.
-# 10.244.0.0/16 is Flannel's own net-conf.json default, and disjoint from the
-# apiserver's fixed 10.96.0.0/12 --service-cluster-ip-range default (install.sh
-# passes no override, so that default always holds).
-POD_CLUSTER_CIDR="10.244.0.0/16"
+# $POD_CLUSTER_CIDR (resolved and validated above) feeds node-ipam-controller
+# and Flannel's net-conf.json -- one variable so the two can never drift apart.
 POD_NODE_CIDR_MASK_SIZE=24
 
 # --- Vendored manifests from the tarball -------------------------------------
@@ -1516,23 +1711,7 @@ if [ "$WORKER_MODE" -eq 0 ]; then
   if [ -n "$TARBALL_MANIFEST_DIR" ] && [ -n "$(find "$TARBALL_MANIFEST_DIR" -maxdepth 1 -name '*.yaml')" ]; then
     install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
     cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"
-    if [ -f "$MANIFEST_OUTPUT_DIR/flannel.yaml" ]; then
-      # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
-      # BSD sed, and this redirect-and-replace form works identically on both.
-      sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
-        "$MANIFEST_OUTPUT_DIR/flannel.yaml" > "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp"
-      mv "$MANIFEST_OUTPUT_DIR/flannel.yaml.tmp" "$MANIFEST_OUTPUT_DIR/flannel.yaml"
-    fi
-    if [ -f "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml" ]; then
-      sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" \
-        "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml" > "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp"
-      mv "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml.tmp" "$MANIFEST_OUTPUT_DIR/kube-proxy.yaml"
-    fi
-    if [ -f "$MANIFEST_OUTPUT_DIR/beep.yaml" ]; then
-      sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
-        "$MANIFEST_OUTPUT_DIR/beep.yaml" > "$MANIFEST_OUTPUT_DIR/beep.yaml.tmp"
-      mv "$MANIFEST_OUTPUT_DIR/beep.yaml.tmp" "$MANIFEST_OUTPUT_DIR/beep.yaml"
-    fi
+    render_vendored_manifests "$MANIFEST_OUTPUT_DIR" || exit 1
   fi
 fi
 
@@ -1553,7 +1732,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
@@ -1617,7 +1796,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/ca.pem --cluster-signing-key-file=$STATE_DIR/ca.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 

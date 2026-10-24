@@ -2837,7 +2837,7 @@ mod tests {
     #[tokio::test]
     async fn dot_ten_reserved_for_kube_dns() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
-        crate::seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12")
+        crate::seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
             .await
             .expect("seed_services must not fail");
 

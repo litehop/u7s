@@ -834,6 +834,8 @@ write_manifest_copy_runner() {
     echo 'POD_CLUSTER_CIDR="${5:-10.244.0.0/16}"'
     echo 'KUBE_VERSION="${6:-1.37.1}"'
     echo 'IFACE_IP="${7:-10.0.0.1}"'
+    echo 'CLUSTER_DNS="${8:-10.96.0.10}"'
+    awk '/^render_vendored_manifests\(\) \{$/,/^\}$/' "$install_script"
     awk '/^if \[ "\$WORKER_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
   } > "$runner"
 }
@@ -850,7 +852,7 @@ write_manifest_copy_runner "$INSTALL" "$MANIFEST_RUNNER"
 # actually reach the folder apiserver's own boot-time scan reads.
 stage1="$MANIFEST_WORK/stage1"
 mkdir -p "$stage1/manifests"
-echo 'kind: ConfigMap' > "$stage1/manifests/coredns.yaml"
+printf 'kind: Service\nspec:\n  clusterIP: 10.96.0.10\n' > "$stage1/manifests/coredns.yaml"
 dest1="$MANIFEST_WORK/dest1"
 bash "$MANIFEST_RUNNER" "$stage1" "$dest1" 0
 assert_true "a manifests/*.yaml file found in the extracted tarball is copied into the (default well-known) output directory" \
@@ -917,7 +919,7 @@ assert_false "flannel.yaml carries no unresolved __IFACE__/__POD_CLUSTER_CIDR__ 
 # would actually catch a reverted substitution step, not just document
 # today's behavior.
 MUTATED_FLANNEL_SUB_INSTALL="$MANIFEST_WORK/install-mutated-flannel-sub.sh"
-sed 's/if \[ -f "\$MANIFEST_OUTPUT_DIR\/flannel.yaml" \]; then/if false; then/' "$INSTALL" \
+sed 's/if \[ -f "\$dir\/flannel.yaml" \]; then/if false; then/' "$INSTALL" \
   > "$MUTATED_FLANNEL_SUB_INSTALL"
 if diff -q "$INSTALL" "$MUTATED_FLANNEL_SUB_INSTALL" > /dev/null 2>&1; then
   assert "mutation self-check: flannel.yaml's substitution guard exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
@@ -952,7 +954,7 @@ assert_false "kube-proxy.yaml carries no unresolved __KUBE_VERSION__/__IFACE_IP_
 # would actually catch a reverted substitution step, not just document
 # today's behavior.
 MUTATED_KUBE_PROXY_SUB_INSTALL="$MANIFEST_WORK/install-mutated-kube-proxy-sub.sh"
-sed 's/if \[ -f "\$MANIFEST_OUTPUT_DIR\/kube-proxy.yaml" \]; then/if false; then/' "$INSTALL" \
+sed 's/if \[ -f "\$dir\/kube-proxy.yaml" \]; then/if false; then/' "$INSTALL" \
   > "$MUTATED_KUBE_PROXY_SUB_INSTALL"
 if diff -q "$INSTALL" "$MUTATED_KUBE_PROXY_SUB_INSTALL" > /dev/null 2>&1; then
   assert "mutation self-check: kube-proxy.yaml's substitution guard exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
@@ -984,7 +986,7 @@ assert_false "beep.yaml carries no unresolved __IFACE__/__POD_CLUSTER_CIDR__ tok
 assert "beep.yaml's images are all digest-pinned, not a floating tag (:latest would change the privileged node-prep image under a running cluster)" \
   "$([ "$(grep -E '^[[:space:]]+image: ' "$BEEP_MANIFEST" | grep -vc '@sha256:[0-9a-f]\{64\}$' || true)" = 0 ] && echo 1 || echo 0)"
 MUTATED_BEEP_SUB_INSTALL="$MANIFEST_WORK/install-mutated-beep-sub.sh"
-sed 's/if \[ -f "\$MANIFEST_OUTPUT_DIR\/beep.yaml" \]; then/if false; then/' "$INSTALL" \
+sed 's/if \[ -f "\$dir\/beep.yaml" \]; then/if false; then/' "$INSTALL" \
   > "$MUTATED_BEEP_SUB_INSTALL"
 if diff -q "$INSTALL" "$MUTATED_BEEP_SUB_INSTALL" > /dev/null 2>&1; then
   assert "mutation self-check: beep.yaml's substitution guard exists in install.sh to mutate" 0
@@ -1044,7 +1046,8 @@ write_persist_config_write_runner() {
     echo 'CONFIG_FILE="$STATE_DIR/config"'
     echo 'NODE_NAME="$2"'
     echo 'IFACE="$3"'
-    grep -A3 -F 'cat > "$CONFIG_FILE" <<EOF' "$install_script"
+    echo 'WORKER_MODE=0; CLUSTER_DNS=10.96.0.10; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
+    awk 'prev == "{" && /NODE_NAME=/ {p=1; print prev} p {print} p && /^} > "\$CONFIG_FILE"$/ {exit} {prev=$0}' "$install_script"
   } > "$runner"
 }
 
@@ -1058,7 +1061,7 @@ write_persist_config_check_runner() {
     echo 'EXISTING_INSTALL="$2"'
     echo 'NODE_NAME="$3"'
     echo 'IFACE="$4"'
-    awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Defaults: node name, network interface/ { if ($0 !~ /^# --- Defaults: node name, network interface/) print }' "$install_script"
+    awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$install_script"
     echo 'echo "NODE_NAME=$NODE_NAME"'
     echo 'echo "IFACE=$IFACE"'
   } > "$runner"
@@ -1167,7 +1170,7 @@ upper_runner="$PERSIST_WORK/upper-name.sh"
   echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL="${3:-0}"'
   echo 'NODE_NAME="$2"; IFACE=eth0'
   echo "hostname() { echo \"  $UPPER_HOST\"; }"
-  awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Defaults: node name, network interface/ { if ($0 !~ /^# --- Defaults: node name, network interface/) print }' "$INSTALL"
+  awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$INSTALL"
   awk '/^# --- Defaults: node name/{f=1} f{print} f&&/^fi$/{exit}' "$INSTALL"
   echo 'echo "NODE_NAME=$NODE_NAME"'
 } > "$upper_runner"
@@ -1338,8 +1341,9 @@ write_join_runner() {
     echo 'date() { if [ "$1" = -u ] && [ "$2" = -d ] && ! command date -u -d @0 +%s >/dev/null 2>&1; then command date -u -r "${3#@}" "${@:4}"; else command date "$@"; fi; }'
     echo 'sleep() { :; }'
     echo 'ensure_jq() { :; }'
+    echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in issue_cp_kubelet_identity current_client_cert wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in ipv4_to_int int_to_ipv4 parse_cidr default_cluster_dns issue_cp_kubelet_identity current_client_cert wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1370,6 +1374,15 @@ mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)" || {
 }
 SECRET_JSON="$JOIN_CA_DIR/created-secret.json"
 mint_field() { jq -r ".stringData[\"$1\"]" "$SECRET_JSON"; }
+
+assert "a default-DNS cluster's join command carries no --cluster-dns" \
+  "$(printf '%s' "$mint_out" | grep -qF -- '--cluster-dns' && echo 0 || echo 1)"
+JOIN_CA_DIR_K3S="$JOIN_WORK/cp-state-k3s"
+cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_K3S"
+echo 'CLUSTER_DNS="10.43.0.10"' > "$JOIN_CA_DIR_K3S/config"
+mint_k3s_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_K3S" 2>&1)"
+assert "a non-default-DNS cluster's join command carries --cluster-dns, else the worker's kubelet would resolve via the default VIP and pods on it lose DNS" \
+  "$(printf '%s' "$mint_k3s_out" | grep -qF -- '--cluster-dns 10.43.0.10' && echo 1 || echo 0)"
 
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
@@ -1723,6 +1736,7 @@ write_worker_branch_runner() {
     echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
     echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
     echo 'ensure_jq() { :; }'
+    echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
@@ -1961,6 +1975,164 @@ assert "a key file carrying the pinned key plus an attacker key is refused, sinc
 assert "both apt keys are installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
   "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 2 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
 rm -rf "$KEY_WORK"
+
+# ---------------------------------------------------------------------------
+# --service-cidr / --cluster-cidr / --cluster-dns: one value per range must
+# reach every consumer, because a migrated cluster keeps its source's
+# ClusterIPs and pod IPs; a single consumer left on the old default (kubelet
+# resolv.conf pointing at a dead DNS VIP, flannel on the wrong pod net) breaks
+# the cluster in a way that only shows under traffic. The functions are
+# extracted from install.sh's real source and executed.
+# ---------------------------------------------------------------------------
+NET_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
+{
+  for fn in ipv4_to_int int_to_ipv4 parse_cidr default_cluster_dns validate_network_config \
+    reconcile_network_flag check_node_ip_outside_ranges render_vendored_manifests write_kubelet_config_yaml; do
+    awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
+  done
+} > "$NET_WORK/fns.sh"
+assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 9 ] && echo 1 || echo 0)"
+
+# net_run <scenario>: runs <scenario> after the extracted functions with the
+# production defaults loaded; sets NET_STATUS/NET_OUT.
+net_run() {
+  {
+    echo 'set -uo pipefail'
+    echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; EXISTING_INSTALL=0'
+    echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s'
+    cat "$NET_WORK/fns.sh"
+    echo "$1"
+  } > "$NET_WORK/scenario.sh"
+  NET_STATUS=0
+  NET_OUT="$(bash "$NET_WORK/scenario.sh" 2>&1)" || NET_STATUS=$?
+}
+# resolve <existing> <persisted svc> <persisted pod> <persisted dns> -- the
+# same sequence the install flow runs after parsing flags.
+RESOLVE='
+resolve() {
+  reconcile_network_flag --service-cidr SERVICE_CIDR "$PERSISTED_SVC" "$DEFAULT_SERVICE_CIDR" || return 1
+  reconcile_network_flag --cluster-cidr POD_CLUSTER_CIDR "$PERSISTED_POD" "$DEFAULT_POD_CLUSTER_CIDR" || return 1
+  local d; d="$(default_cluster_dns "$SERVICE_CIDR")" || return 1
+  reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_DNS" "$d" || return 1
+  validate_network_config 0
+}
+PERSISTED_SVC=""; PERSISTED_POD=""; PERSISTED_DNS=""
+'
+K3S='SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; CLUSTER_DNS=10.43.0.10'
+
+net_run "$RESOLVE"'resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR $CLUSTER_DNS"'
+assert "no flags resolves to today's 10.96.0.0/12, 10.244.0.0/16 and 10.96.0.10 -- an upgrade of an existing install must not move any range" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12 10.244.0.0/16 10.96.0.10" ] && echo 1 || echo 0)"
+
+net_run "$RESOLVE"'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; resolve && echo "$CLUSTER_DNS"'
+assert "k3s ranges without --cluster-dns derive 10.43.0.10, k3s's own DNS VIP, so a migrated pod's resolv.conf stays valid" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.43.0.10" ] && echo 1 || echo 0)"
+
+net_bad() {
+  local why="$1" scenario="$2" expect="$3"
+  net_run "$RESOLVE$scenario"
+  assert "$why" "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- "$expect" && echo 1 || echo 0)"
+}
+net_bad "a non-CIDR --service-cidr is refused by name instead of reaching the apiserver as a crash loop" \
+  'SERVICE_CIDR=10.43.0.0; resolve' "--service-cidr '10.43.0.0' is not a CIDR"
+net_bad "an octet above 255 is refused -- bash arithmetic would otherwise silently wrap it into a different range" \
+  'SERVICE_CIDR=10.300.0.0/16; resolve' "not a valid IPv4 CIDR"
+net_bad "a CIDR with host bits set is refused, since components disagree on which network it names" \
+  'SERVICE_CIDR=10.43.1.0/16; resolve' "host bits set"
+net_bad "a service range wider than /12 is refused, as upstream's apiserver refuses it" \
+  'SERVICE_CIDR=10.0.0.0/8; resolve' "must be between /12 and /28"
+net_bad "overlapping service and pod ranges are refused: a Service VIP would equal a pod IP" \
+  'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.43.128.0/17; resolve' "overlap"
+net_bad "a pod range narrower than the /24 per-node mask is refused instead of leaving KCM unable to allocate a node CIDR" \
+  'POD_CLUSTER_CIDR=10.42.0.0/25; resolve' "must be between /8 and /24"
+net_bad "a --cluster-dns outside --service-cidr is refused: the Service would sit outside the ServiceCIDR object" \
+  "$K3S; CLUSTER_DNS=10.96.0.10; resolve" "not an allocatable host"
+net_bad "--cluster-dns equal to the kubernetes Service VIP (.1) is refused: two Services cannot share a ClusterIP" \
+  "$K3S; CLUSTER_DNS=10.43.0.1; resolve" "not an allocatable host"
+net_bad "--cluster-dns on the broadcast address is refused" \
+  "$K3S; CLUSTER_DNS=10.43.255.255; resolve" "not an allocatable host"
+net_bad "a malformed --cluster-dns is refused" \
+  "$K3S; CLUSTER_DNS=10.43.0; resolve" "--cluster-dns '10.43.0' is not a valid IPv4"
+
+net_run "$RESOLVE$K3S"'; CLUSTER_DNS=10.43.0.53; resolve && echo "$CLUSTER_DNS"'
+assert "an explicit --cluster-dns inside the range is honoured, not overwritten by the derived tenth host" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.43.0.53" ] && echo 1 || echo 0)"
+
+net_run 'CLUSTER_DNS=10.43.0.10; validate_network_config 1 && echo ok'
+assert "a worker validates only --cluster-dns syntax (it has no service range to check against)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+
+net_run 'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; check_node_ip_outside_ranges 10.43.4.4'
+assert "a node address inside the service range is refused: the host would be unreachable behind its own Service routing" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside 10.43.0.0/16' && echo 1 || echo 0)"
+net_run 'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; check_node_ip_outside_ranges 192.168.1.5'
+assert "a node address outside both ranges passes" "$([ "$NET_STATUS" -eq 0 ] && echo 1 || echo 0)"
+
+# Re-install: values persisted by the first install are sticky.
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.43.0.0/16; PERSISTED_POD=10.42.0.0/16; PERSISTED_DNS=10.43.0.10; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR $CLUSTER_DNS"'
+assert "a bare re-run of a k3s-range install keeps the persisted ranges instead of reverting to the defaults" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.43.0.0/16 10.42.0.0/16 10.43.0.10" ] && echo 1 || echo 0)"
+net_bad "re-installing with a different --service-cidr is refused: live Services already hold ClusterIPs from the old range" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.43.0.0/16; SERVICE_CIDR=10.96.0.0/12; resolve' "conflicts with the value in effect since install time (10.43.0.0/16"
+net_bad "re-installing with a different --cluster-cidr is refused: node podCIDRs were already allocated from the old one" \
+  'EXISTING_INSTALL=1; PERSISTED_POD=10.42.0.0/16; POD_CLUSTER_CIDR=10.244.0.0/16; resolve' "--cluster-cidr"
+net_bad "re-installing with a different --cluster-dns is refused: every kubelet's clusterDNS and the CoreDNS Service hold the old VIP" \
+  'EXISTING_INSTALL=1; PERSISTED_DNS=10.96.0.10; CLUSTER_DNS=10.96.0.53; resolve' "--cluster-dns"
+net_bad "an install that predates persistence ran the defaults, so a non-default range on re-run is refused" \
+  'EXISTING_INSTALL=1; SERVICE_CIDR=10.43.0.0/16; resolve' "10.96.0.0/12"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; SERVICE_CIDR=10.96.0.0/12; resolve && echo ok'
+assert "re-passing the defaults to a pre-persistence install is accepted (it is what is already running)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=0; PERSISTED_SVC=10.43.0.0/16; SERVICE_CIDR=10.96.0.0/12; resolve && echo ok'
+assert "a stale config left by a failed first attempt does not block a fresh install with different ranges" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+
+# Every consumer receives the same values: render the REAL vendored manifests
+# and kubelet config with k3s ranges.
+NET_DEST="$NET_WORK/rendered"
+mkdir -p "$NET_DEST"
+cp "$ROOT_DIR"/manifests/*.yaml "$NET_DEST/"
+net_run "$K3S"'; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+render_vendored_manifests "'"$NET_DEST"'" && echo rendered
+STATE_DIR="'"$NET_WORK"'"; systemctl() { return 1; }
+write_kubelet_config_yaml 0 && echo kubelet'
+assert "rendering the real vendored manifests and kubelet config with k3s ranges succeeds" \
+  "$([ "$NET_STATUS" -eq 0 ] && printf '%s' "$NET_OUT" | grep -qx rendered && printf '%s' "$NET_OUT" | grep -qx kubelet && echo 1 || echo 0)"
+assert_true "flannel's net-conf Network is the --cluster-cidr" \
+  grep -qF '"Network": "10.42.0.0/16"' "$NET_DEST/flannel.yaml"
+assert_true "kube-proxy's clusterCIDR is the --cluster-cidr (it masquerades non-pod traffic to Services)" \
+  grep -qx '    clusterCIDR: 10.42.0.0/16' "$NET_DEST/kube-proxy.yaml"
+assert_true "beep's --pod-cidr is the --cluster-cidr" \
+  grep -qF -- '--pod-cidr=10.42.0.0/16' "$NET_DEST/beep.yaml"
+assert_true "the CoreDNS kube-dns Service clusterIP is the --cluster-dns" \
+  grep -qx '  clusterIP: 10.43.0.10' "$NET_DEST/coredns.yaml"
+assert "no rendered manifest keeps the old default service/pod/DNS addresses outside comments" \
+  "$(grep -hv '^[[:space:]]*#' "$NET_DEST/flannel.yaml" "$NET_DEST/kube-proxy.yaml" "$NET_DEST/beep.yaml" "$NET_DEST/coredns.yaml" | grep -qE '10\.96\.0\.|10\.244\.0\.' && echo 0 || echo 1)"
+assert_false "no rendered manifest keeps an unresolved __PLACEHOLDER__" \
+  grep -qE '__[A-Z_]+__' "$NET_DEST/flannel.yaml" "$NET_DEST/kube-proxy.yaml" "$NET_DEST/beep.yaml"
+assert_true "kubelet-config.yaml's clusterDNS is the --cluster-dns, so pods' resolv.conf points at the CoreDNS Service" \
+  grep -qx '  - 10.43.0.10' "$NET_WORK/kubelet-config.yaml"
+
+printf 'kind: Service\nspec:\n  clusterIP: 10.1.2.3\n' > "$NET_WORK/bad-coredns.yaml"
+mkdir -p "$NET_WORK/bad" && cp "$NET_WORK/bad-coredns.yaml" "$NET_WORK/bad/coredns.yaml"
+net_run "$K3S"'; render_vendored_manifests "'"$NET_WORK/bad"'"'
+assert "a CoreDNS manifest whose clusterIP line changed shape fails the install instead of shipping the wrong DNS VIP" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF "no 'clusterIP' line" && echo 1 || echo 0)"
+
+# Units and persistence: structural, like the KCM assertions above.
+assert_true "u7s-apiserver.service passes --service-cluster-ip-range and --kube-dns-cluster-ip from the resolved values (the apiserver derives the kubernetes Service VIP and ServiceCIDR from the range)" \
+  grep -qF -- '--service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS' "$INSTALL"
+assert_true "u7s-kcm.service passes --service-cluster-ip-range=\$SERVICE_CIDR next to --cluster-cidr" \
+  grep -qF -- '--cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR' "$INSTALL"
+assert_true "the config file persists all three values so a re-run can detect a conflict" \
+  grep -qF 'printf '"'"'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n'"'" "$INSTALL"
+assert_true "--mint-join-token prints --cluster-dns for a non-default cluster so a joining worker's kubelet gets the right DNS" \
+  grep -qF 'dns_flag=" --cluster-dns $persisted_dns"' "$INSTALL"
+assert_false "no hardcoded 10.96.0.10 / 10.244.0.0/16 assignment is left outside the defaults block" \
+  grep -nE '^\s*(POD_CLUSTER_CIDR|CLUSTER_DNS)="?10\.' "$INSTALL"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

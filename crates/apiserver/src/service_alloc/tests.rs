@@ -621,7 +621,7 @@ async fn user_service_cannot_claim_the_kubernetes_service_vip() {
         .nth_host(1)
         .unwrap()
         .to_string();
-    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE, None)
         .await
         .unwrap();
     assert_422(
@@ -645,11 +645,11 @@ async fn seed_services_reserves_the_kubernetes_vip_on_an_existing_store() {
         .nth_host(1)
         .unwrap()
         .to_string();
-    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE, None)
         .await
         .unwrap();
     st.store.delete(&ip_key(&first), None).await.unwrap();
-    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE, None)
         .await
         .unwrap();
     assert!(held(&st, &ip_key(&first)).await);
@@ -758,7 +758,7 @@ async fn repair_reports_duplicates_without_failing_or_changing_services() {
 #[tokio::test]
 async fn repair_is_idempotent_and_agrees_with_owned_sentinels() {
     let st = state();
-    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE)
+    crate::seed_services(&st.store, "127.0.0.1", 6443, RANGE, None)
         .await
         .unwrap();
     store_without_sentinels(

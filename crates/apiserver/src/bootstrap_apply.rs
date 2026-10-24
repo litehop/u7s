@@ -871,6 +871,7 @@ mod tests {
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
             service_cluster_ip_range: "10.96.0.0/12".into(),
+            kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
