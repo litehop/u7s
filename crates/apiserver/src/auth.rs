@@ -1207,16 +1207,19 @@ fn log_denial(
     if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
-    // Impersonation denials need an authenticated caller, so their rate is already bounded
-    // by authn and the in-flight limits, and each one is an audit-relevant event.
-    if kind != "impersonation_denied" {
-        let detail = format!(
+    let detail = if kind == "impersonation_denied" {
+        format!(
+            "{} -> {resource}",
+            user.map_or("system:unauthenticated", |u| u.username.as_str())
+        )
+    } else {
+        format!(
             "{} {verb} {resource}",
             user.map_or("system:unauthenticated", |u| u.username.as_str())
-        );
-        if !crate::log_limit::admit(kind, peer.map(|p| p.0.ip()), &detail) {
-            return resp;
-        }
+        )
+    };
+    if !crate::log_limit::admit(kind, peer.map(|p| p.0.ip()), &detail) {
+        return resp;
     }
     tracing::info!(
         kind,

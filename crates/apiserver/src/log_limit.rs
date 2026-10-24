@@ -16,10 +16,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 const BURST: u32 = 5;
+// Impersonation denials are audit events, so they get a larger budget than other kinds.
+const AUDIT_BURST_FACTOR: u32 = 10;
+const AUDIT_KIND: &str = "impersonation_denied";
 const WINDOW: Duration = Duration::from_secs(10);
 const MAX_TRACKED: usize = 4096;
 const MAX_DETAILS: usize = 5;
@@ -124,6 +128,7 @@ struct Inner {
 
 pub(crate) struct LogLimiter {
     burst: u32,
+    audit_burst: u32,
     window: Duration,
     max_tracked: usize,
     inner: Mutex<Inner>,
@@ -133,6 +138,7 @@ impl LogLimiter {
     fn new(burst: u32, window: Duration, max_tracked: usize) -> Self {
         Self {
             burst,
+            audit_burst: burst.saturating_mul(AUDIT_BURST_FACTOR),
             window,
             max_tracked,
             inner: Mutex::new(Inner {
@@ -191,6 +197,11 @@ impl LogLimiter {
         if key.1 == PeerKey::Overflow && b.overflow_peers.len() < MAX_OVERFLOW_PEERS {
             b.overflow_peers.insert(peer);
         }
+        let burst = if kind == AUDIT_KIND {
+            self.audit_burst
+        } else {
+            self.burst
+        };
         let admit = if now.saturating_duration_since(b.window_start) >= self.window {
             summaries.extend(take_summary(key, b));
             b.window_start = now;
@@ -200,7 +211,7 @@ impl LogLimiter {
                 b.overflow_peers.insert(peer);
             }
             true
-        } else if b.logged < self.burst {
+        } else if b.logged < burst {
             b.logged += 1;
             true
         } else {
@@ -245,6 +256,14 @@ pub(crate) fn admit(kind: &'static str, peer: Option<IpAddr>, detail: &str) -> b
 
 /// Background tick so a burst that stops dead still gets its summary.
 pub(crate) fn spawn_flush() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    spawn_flush_once(&STARTED);
+}
+
+fn spawn_flush_once(started: &AtomicBool) -> bool {
+    if started.swap(true, Ordering::SeqCst) {
+        return false;
+    }
     tokio::spawn(async {
         let mut tick = tokio::time::interval(WINDOW);
         loop {
@@ -254,6 +273,7 @@ pub(crate) fn spawn_flush() {
             }
         }
     });
+    true
 }
 
 #[cfg(test)]
@@ -516,5 +536,58 @@ mod tests {
         l.check_at("forbidden", ip(2), "x", t0);
         let (_, s) = l.check_at("forbidden", ip(3), "x", t0 + Duration::from_secs(11));
         assert_eq!(s.iter().map(|s| s.count).collect::<Vec<_>>(), vec![9]);
+    }
+
+    #[test]
+    fn impersonation_denials_get_a_larger_burst_then_a_summary_with_user_to_identity_details() {
+        let l = LogLimiter::new(5, Duration::from_secs(10), 100);
+        let t0 = Instant::now();
+        let n = (0..1000)
+            .filter(|i| {
+                l.check_at(
+                    "impersonation_denied",
+                    ip(1),
+                    &format!("alice -> target{}", i % 8),
+                    t0,
+                )
+                .0
+            })
+            .count();
+        assert_eq!(
+            n, 50,
+            "a low-privilege caller must not mint unbounded audit lines"
+        );
+        let s = l.flush_at(t0 + Duration::from_secs(10));
+        assert_eq!(s[0].count, 950, "summary must carry the true volume");
+        assert_eq!(s[0].details.len(), MAX_DETAILS);
+        assert!(s[0].details[0].0.starts_with("alice -> target"));
+        assert_eq!(
+            logged(&l, "forbidden", ip(2), 1000, t0),
+            5,
+            "other kinds keep the normal burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_task_is_spawned_once_even_if_started_twice() {
+        let started = AtomicBool::new(false);
+        assert!(spawn_flush_once(&started));
+        assert!(
+            !spawn_flush_once(&started),
+            "a second listener must not duplicate summaries"
+        );
+    }
+
+    #[test]
+    fn multibyte_details_truncate_on_a_char_boundary_without_panicking() {
+        let l = LogLimiter::new(1, Duration::from_secs(10), 100);
+        let t0 = Instant::now();
+        let long = "é".repeat(100) + &"日".repeat(100);
+        l.check_at("forbidden", ip(1), "x", t0);
+        l.check_at("forbidden", ip(1), &long, t0);
+        let s = l.flush_at(t0 + Duration::from_secs(10));
+        let d = &s[0].details[0].0;
+        assert_eq!(d.chars().count(), MAX_DETAIL_LEN);
+        assert_eq!(d, &"é".repeat(MAX_DETAIL_LEN), "cut must not split a char");
     }
 }
