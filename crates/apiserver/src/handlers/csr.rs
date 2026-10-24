@@ -713,11 +713,52 @@ pub(crate) fn guard_csr_status_write<S: Store>(
                 .into(),
         ));
     }
+    if csr_certificate(old).is_empty() && !csr_certificate(new).is_empty() {
+        let chained =
+            append_signing_chain(csr_certificate(new), &state.signing_intermediates.get());
+        if let Some(chained) = chained {
+            new["status"]["certificate"] = serde_json::Value::String(chained);
+        }
+    }
     if new["status"]["conditions"].is_array() {
         new["status"]["conditions"] = serde_json::Value::Array(new_conditions);
     }
     populate_condition_timestamps(new, old, &crate::util::utc_now_rfc3339());
     Ok(())
+}
+
+/// A newly issued `status.certificate` (base64 of PEM) with the intermediate that signed it
+/// appended. kube-controller-manager signs with a single-certificate file and returns the bare
+/// leaf, but clients pin only the root, so a leaf alone cannot be verified. The API allows
+/// intermediates after the leaf. None when no known intermediate signed the leaf (e.g. it is
+/// root-signed) or the chain is already there.
+pub(crate) fn append_signing_chain(
+    certificate_b64: &str,
+    intermediates: &[Vec<u8>],
+) -> Option<String> {
+    use base64::Engine as _;
+    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut pem = engine.decode(certificate_b64).ok()?;
+    let certs: Vec<CertificateDer<'_>> = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let leaf = certs.first()?;
+    let issuer = intermediates
+        .iter()
+        .find(|i| crate::pki::ensure_signed_by(leaf, i).is_ok())?;
+    if certs
+        .iter()
+        .skip(1)
+        .any(|c| c.as_ref() == issuer.as_slice())
+    {
+        return None;
+    }
+    if !pem.ends_with(b"\n") {
+        pem.push(b'\n');
+    }
+    pem.extend(crate::tls::pem_encode("CERTIFICATE", issuer));
+    Some(engine.encode(pem))
 }
 
 const KUBELET_CLIENT_SIGNER: &str = "kubernetes.io/kube-apiserver-client-kubelet";
@@ -3192,5 +3233,120 @@ mod tests {
         let c = &s["status"]["conditions"][0];
         assert!(c["lastUpdateTime"].is_string(), "{c}");
         assert!(c["lastTransitionTime"].is_string(), "{c}");
+    }
+
+    /// A root, an intermediate under it, and a leaf under the intermediate, like what KCM
+    /// signs: the leaf alone cannot be verified by a client that pins only the root.
+    fn issued_by_intermediate(
+        intermediate_cn: &str,
+    ) -> (Vec<u8>, Vec<u8>, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
+        let ca = |cn: &str, constraint| {
+            let mut p = CertificateParams::default();
+            p.is_ca = IsCa::Ca(constraint);
+            p.distinguished_name.push(DnType::CommonName, cn);
+            p
+        };
+        let root_key = KeyPair::generate().unwrap();
+        let root_params = ca("test-root", BasicConstraints::Unconstrained);
+        let root = Issuer::new(root_params, root_key);
+        let int_key = KeyPair::generate().unwrap();
+        let int_params = ca(intermediate_cn, BasicConstraints::Constrained(0));
+        let int_cert = int_params.clone().signed_by(&int_key, &root).unwrap();
+        let int_issuer = Issuer::new(int_params, int_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut leaf_params = CertificateParams::default();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, "system:node:n1");
+        let leaf = leaf_params.signed_by(&leaf_key, &int_issuer).unwrap();
+        (leaf.der().to_vec(), int_cert.der().to_vec(), int_issuer)
+    }
+
+    fn pem_b64(der: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(crate::tls::pem_encode("CERTIFICATE", der))
+    }
+
+    fn decoded_chain(certificate_b64: &str) -> Vec<Vec<u8>> {
+        use base64::Engine as _;
+        use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+        let pem = base64::engine::general_purpose::STANDARD
+            .decode(certificate_b64)
+            .unwrap();
+        CertificateDer::pem_slice_iter(&pem)
+            .map(|c| c.unwrap().to_vec())
+            .collect()
+    }
+
+    /// KCM returns the bare leaf; a client that pins only the root can verify it only if the
+    /// signing intermediate follows it, so the stored certificate must carry that chain.
+    #[test]
+    fn issued_certificate_gets_its_signing_intermediate_appended_once() {
+        let (leaf, intermediate, _) = issued_by_intermediate("u7s-intermediate-a");
+        let issued = pem_b64(&leaf);
+        let chained = append_signing_chain(&issued, std::slice::from_ref(&intermediate))
+            .expect("a leaf signed by a known intermediate must get the chain");
+        assert_eq!(decoded_chain(&chained), vec![leaf, intermediate.clone()]);
+        assert_eq!(
+            append_signing_chain(&chained, &[intermediate]),
+            None,
+            "a certificate that already carries its intermediate must not be extended again"
+        );
+    }
+
+    /// After a rotation KCM may still sign with the previous intermediate for a moment; the
+    /// chain must name the one that actually signed, not simply the newest.
+    #[test]
+    fn chain_names_the_intermediate_that_signed_not_the_newest() {
+        let (leaf, signer, _) = issued_by_intermediate("u7s-intermediate-old");
+        let (_, newer, _) = issued_by_intermediate("u7s-intermediate-new");
+        let chained = append_signing_chain(&pem_b64(&leaf), &[newer.clone(), signer.clone()])
+            .expect("the older intermediate is still known");
+        assert_eq!(decoded_chain(&chained)[1], signer);
+        assert_eq!(
+            append_signing_chain(&pem_b64(&leaf), &[newer]),
+            None,
+            "an intermediate that did not sign the leaf must never be appended"
+        );
+    }
+
+    #[test]
+    fn unparseable_certificate_is_left_untouched() {
+        let (_, intermediate, _) = issued_by_intermediate("u7s-intermediate-a");
+        assert_eq!(append_signing_chain("Zm9yZ2Vk", &[intermediate]), None);
+    }
+
+    #[tokio::test]
+    async fn status_write_stores_the_certificate_with_the_signing_chain() {
+        let (leaf, intermediate, _) = issued_by_intermediate("u7s-intermediate-a");
+        for patch in [false, true] {
+            let state = make_state();
+            state
+                .signing_intermediates
+                .set(std::sync::Arc::new(vec![intermediate.clone()]));
+            seed_csr_with(&state, "c1", CLIENT_SIGNER, serde_json::json!({})).await;
+            let signer = user("signer");
+            crate::handlers::test_support::grant_signer_verb(
+                &state,
+                "signer",
+                "sign",
+                CLIENT_SIGNER,
+            );
+            let status = serde_json::json!({"certificate": pem_b64(&leaf)});
+            if patch {
+                status_patch(&state, &signer, "c1", status).await
+            } else {
+                status_put(&state, &signer, "c1", status).await
+            }
+            .expect("signer writes the certificate");
+            let stored = stored_csr(&state, "c1").await;
+            assert_eq!(
+                decoded_chain(stored["status"]["certificate"].as_str().unwrap()),
+                vec![leaf.clone(), intermediate.clone()],
+                "the stored certificate must carry the chain (patch={patch}): the kubelet \
+                 writes it verbatim as its client cert and presents whatever it holds"
+            );
+        }
     }
 }

@@ -14,7 +14,7 @@
 #      the kubelet serving cert against the bundle) work with the bundle in place;
 #   5. removing the file shrinks every one of them back to a single CA and the extra CA's client
 #      cert is rejected again.
-# The bundle is picked up within ~5s, so the whole scenario takes well under a minute.
+# The bundle is picked up within ~10s (5s poll, two matching observations), so the whole scenario takes well under a minute.
 #
 # Needs a running stack, like leaf-rotation.sh:
 #   scripts/e2e-pki-rotation/ca-bundle.sh --kubeconfig temp/u7s/kubeconfig --workdir temp/u7s \

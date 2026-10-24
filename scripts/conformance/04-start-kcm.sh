@@ -49,7 +49,7 @@ fi
 # binary basename instead (the trailing [0-9] also keeps this guard's own
 # quoted pattern text below from matching itself).
 limactl shell "$VM_NAME" bash -c \
-  "if pgrep -f 'kube-controller-manager-[0-9]' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f 'kube-controller-manager-[0-9]' 2>/dev/null || true; sleep 1; fi"
+  "if pgrep -f 'kube-controller-manager-[0-9]' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f 'kube-controller-manager-[0-9]' 2>/dev/null || true; sleep 1; fi; pkill -f 'u7s-kcm-signing-syn[c]' 2>/dev/null || true"
 
 # Copy the crash supervisor onto the VM — it wraps the final binary launch
 # below so a kcm panic gets restarted (bounded exponential backoff) instead
@@ -113,7 +113,7 @@ esac
 
 KCM_BINARY="\$CACHE_DIR/kube-controller-manager-\${K8S_VERSION}-linux-\${ARCH}"
 
-for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/ca.key" "\$WORKDIR/ca-bundle.pem"; do
+for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/intermediate-cert.pem" "\$WORKDIR/intermediate.key" "\$WORKDIR/ca-bundle.pem"; do
   if [ ! -f "\$f" ]; then
     echo "error: missing required file: \$f" >&2
     exit 1
@@ -129,10 +129,18 @@ if [ ! -f "\$KCM_BINARY" ]; then
   echo "Cached at \$KCM_BINARY"
 fi
 
-# ca.crt is written by u7s in DER format; KCM requires PEM.
 TMPDIR_KCM="\$(mktemp -d)"
-openssl x509 -inform DER -in "\$WORKDIR/ca.crt" -out "\$TMPDIR_KCM/ca.pem"
-CA_CERT="\$TMPDIR_KCM/ca.pem"
+
+# KCM reloads --cluster-signing-cert-file/--cluster-signing-key-file on inotify events, which
+# a host-mounted workdir never delivers, so it would keep signing with an intermediate the
+# apiserver has already replaced. Mirror the two files onto the VM's own filesystem (rename
+# into place, as the apiserver does) and point KCM at the mirror.
+SIGNING_DIR=/var/tmp/u7s-kcm-signing
+mkdir -p "\$SIGNING_DIR"
+chmod 700 "\$SIGNING_DIR"
+SYNC_SIGNING=': u7s-kcm-signing-sync; for f in intermediate-cert.pem intermediate.key; do cmp -s "\$1/\$f" "\$2/\$f" || { install -m 600 "\$1/\$f" "\$2/\$f.tmp" && mv "\$2/\$f.tmp" "\$2/\$f"; }; done'
+bash -c "\$SYNC_SIGNING" _ "\$WORKDIR" "\$SIGNING_DIR"
+setsid bash -c "while :; do \$SYNC_SIGNING; sleep 2; done" _ "\$WORKDIR" "\$SIGNING_DIR" >/dev/null 2>&1 &
 
 # The kubeconfig names its cert/key/CA files by absolute path under \$WORKDIR, so the
 # address-rewritten copy below still reads the files the apiserver re-issues in place.
@@ -165,8 +173,8 @@ chmod +x /tmp/kcm-supervisor.sh
 # token; /healthz,/readyz,/livez stay open by default.
 setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
-  --cluster-signing-cert-file="\$CA_CERT" \\
-  --cluster-signing-key-file="\$WORKDIR/ca.key" \\
+  --cluster-signing-cert-file="\$SIGNING_DIR/intermediate-cert.pem" \\
+  --cluster-signing-key-file="\$SIGNING_DIR/intermediate.key" \\
   --cluster-signing-duration="${SIGNING_DURATION}" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\

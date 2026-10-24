@@ -402,6 +402,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     state
         .proxy_client_identity_pem
         .set(Some(Arc::new(proxy_client_identity_pem)));
+    state
+        .signing_intermediates
+        .set(Arc::new(vec![tls_material.rotator.intermediate_der()]));
 
     // Re-issue each leaf before it expires and hand the new one to every in-memory holder of
     // the old one. KCM and the scheduler re-read the rewritten file without a restart.
@@ -414,7 +417,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     tokio::spawn(Arc::clone(&tls_material.rotator).run(Arc::new(
         move |name: &'static str, leaf: &rotation::Leaf| {
             if let Some((_, files)) = rotating_leaf_files.iter().find(|(n, _)| *n == name) {
-                if let Err(e) = tls::write_leaf_pem(files, &leaf.cert_der, &leaf.key_pem) {
+                if let Err(e) = tls::write_leaf_pem(files, leaf) {
                     rotation_inventory.record_failure(
                         name,
                         format_args!("rewrite {}: {e:#}", files.pem().display()),
@@ -425,14 +428,27 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
                     );
                 }
             }
-            let mut identity_pem = tls::pem_encode("CERTIFICATE", &leaf.cert_der);
-            identity_pem.extend_from_slice(&leaf.key_pem);
+            let identity_pem = leaf.identity_pem();
             match name {
                 "kubelet-client" => rotation_state.set_kubelet_identity(identity_pem),
                 "proxy-client" => {
                     rotation_state
                         .proxy_client_identity_pem
                         .set(Some(Arc::new(identity_pem)));
+                }
+                rotation::INTERMEDIATE => {
+                    // Keep the previous intermediate: KCM may sign with it until it
+                    // reloads the new files.
+                    let mut known = vec![leaf.cert_der.clone()];
+                    known.extend(
+                        rotation_state
+                            .signing_intermediates
+                            .get()
+                            .iter()
+                            .take(1)
+                            .cloned(),
+                    );
+                    rotation_state.signing_intermediates.set(Arc::new(known));
                 }
                 _ => {}
             }
@@ -3283,6 +3299,10 @@ const CA_TRUST_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// client-cert verification, outbound kubelet/webhook/aggregation clients, the published
 /// `ca-bundle.pem`, and the in-store ConfigMaps. Already-open connections keep the config
 /// they were accepted with.
+///
+/// A failure in the in-memory swap changes nothing. A failure afterwards (`ca-bundle.pem` or
+/// the ConfigMap seeds) leaves in-memory trust new but the caller's `current` unadvanced, so
+/// the next poll re-applies the same bundle; every step is idempotent.
 async fn apply_trust_bundle(
     ca_cert_path: &str,
     ca_ders: &[Vec<u8>],
@@ -3290,14 +3310,30 @@ async fn apply_trust_bundle(
     state: &state::AppState<SqliteStore>,
     store: &SqliteStore,
 ) -> anyhow::Result<()> {
-    let clients = state
-        .build_ca_bundle_clients(ca_ders)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    rotator.set_client_cas(ca_ders.to_vec())?;
-    state.install_ca_bundle(ca_ders.to_vec(), clients);
+    swap_trust(
+        ca_ders,
+        rotator,
+        |ders| state.build_ca_bundle_clients(ders),
+        |clients| state.install_ca_bundle(ca_ders.to_vec(), clients),
+    )?;
     tls::write_ca_bundle(ca_cert_path, ca_ders)?;
     seed_kube_root_ca(store, ca_ders).await?;
     seed_cluster_info(store, &state.server_address, ca_ders).await
+}
+
+/// The in-memory half of a trust change. Everything fallible (the outbound clients, then the
+/// inbound client-CA config) completes before anything is installed, so a failure leaves the
+/// previous trust fully in force instead of new inbound CAs with old outbound clients.
+fn swap_trust<C>(
+    ca_ders: &[Vec<u8>],
+    rotator: &rotation::Rotator,
+    build_outbound: impl FnOnce(&[Vec<u8>]) -> Result<C, String>,
+    install_outbound: impl FnOnce(C),
+) -> anyhow::Result<()> {
+    let outbound = build_outbound(ca_ders).map_err(|e| anyhow::anyhow!(e))?;
+    rotator.set_client_cas(ca_ders.to_vec())?;
+    install_outbound(outbound);
+    Ok(())
 }
 
 /// Seed the `kube-root-ca.crt` ConfigMap (data: `ca.crt` = the cluster CA bundle) into
