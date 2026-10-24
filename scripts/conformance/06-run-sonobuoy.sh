@@ -718,7 +718,7 @@ if [ "$UNPACK" -eq 1 ]; then
         echo ""
         echo "  Pod logs from failed test namespaces:"
         FAIL_NAMESPACES=$(grep -oE 'namespace "[a-z0-9-]+"' "$E2E_LOG" | \
-          awk '{print $2}' | tr -d '"' | sort -u | grep -v "^$\|^default$\|^kube-system$\|^sonobuoy$" | head -5)
+          awk '{print $2}' | tr -d '"' | sort -u | grep -v "^$\|^default$\|^kube-system$\|^sonobuoy$" | sed -n 1,5p)
         for NS in $FAIL_NAMESPACES; do
           find "$POD_LOGS_DIR/var/log/pods" -maxdepth 1 -type d -name "${NS}_*" 2>/dev/null | head -3 | while read -r POD_DIR; do
             echo "    --- ${POD_DIR##*/} ---"
