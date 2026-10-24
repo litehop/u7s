@@ -3146,6 +3146,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_of_an_invalid_podcertificaterequest_by_the_wrong_node_is_403_not_422_because_validation_must_not_be_an_oracle(
+    ) {
+        let state = node_restriction_state(serde_json::json!({})).await;
+        let mut spec = valid_pcr_spec();
+        spec["maxExpirationSeconds"] = 1.into();
+        let (status, message) =
+            create_pcr_as(&state, node_user("node-2"), "v1", spec.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "got {message}");
+        let (status, message) = create_pcr_as(&state, node_user("node-1"), "v1", spec).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the body must be invalid for the ordering check to mean anything: {message}"
+        );
+    }
+
     async fn apply_pcr_as(
         state: &AppState,
         body: &serde_json::Value,

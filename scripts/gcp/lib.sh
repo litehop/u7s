@@ -49,13 +49,18 @@ gcp_vps_scp() { gcloud compute scp --tunnel-through-iap "$@"; }
 
 # gcp_vps_delete NAME ZONE: refuses instances not labelled u7s-test=1. Never exits the caller:
 # a transient API error is retried (GCP_DELETE_TRIES, GCP_DELETE_SLEEP) and then returned as
-# non-zero so later cleanup still runs. An instance that does not exist counts as deleted.
+# non-zero so later cleanup still runs. An instance that does not exist counts as deleted (a retried
+# gate delete), unless GCP_DELETE_MISSING_RC is set non-zero (interactive `down`: a typo is an error).
 gcp_vps_delete() {
   local label err i tries="${GCP_DELETE_TRIES:-4}" ok=0
   err="$(mktemp)"
   for i in $(seq 1 "$tries"); do
     if label="$(gcloud compute instances describe "$1" --zone="$2" --format='value(labels.u7s-test)' 2>"$err")"; then ok=1; break; fi
-    if grep -q 'was not found' "$err"; then rm -f "$err"; return 0; fi
+    if grep -q 'was not found' "$err"; then
+      rm -f "$err"
+      [ "${GCP_DELETE_MISSING_RC:-0}" = 0 ] || echo "error: $1 does not exist in zone $2" >&2
+      return "${GCP_DELETE_MISSING_RC:-0}"
+    fi
     sleep "${GCP_DELETE_SLEEP:-5}"
   done
   if [ "$ok" = 0 ]; then cat "$err" >&2; rm -f "$err"; echo "error: cannot describe $1 after $tries tries" >&2; return 1; fi
@@ -89,14 +94,19 @@ gcp_print_target() {
 # Did Google reclaim NAME (Spot preemption)? Returns 0 yes, 1 no, 2 the lookup kept failing
 # (GCP_OPS_TRIES, GCP_OPS_SLEEP): unknown, which callers must not read as "no".
 gcp_vps_was_preempted() {
-  local ops i
+  local ops i err project
+  err="$(mktemp)"
   for i in $(seq 1 "${GCP_OPS_TRIES:-3}"); do
     if ops="$(gcloud compute operations list \
       --filter="operationType=compute.instances.preempted AND targetLink~/$1\$" \
-      --format='value(name)')"; then
+      --format='value(name)' 2>"$err")"; then
+      rm -f "$err"
       [ -n "$ops" ]; return $?
     fi
     sleep "${GCP_OPS_SLEEP:-5}"
   done
+  project="$(gcloud config get-value project 2>/dev/null)" || project=
+  sed "s|${project:-@@none@@}|<project>|g" "$err" >&2
+  rm -f "$err"
   return 2
 }

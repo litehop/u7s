@@ -792,6 +792,7 @@ async fn validate_pod<S: Store>(
     let evaluation = evaluate_pod_policy(&policy, &errs, &pod["metadata"], &pod["spec"], true);
     record(&evaluation);
     if let Some(msg) = evaluation.forbidden {
+        crate::metrics::record_admission_rejected("PodSecurity");
         return Err(forbidden_status("", "pods", ctx.name, &msg));
     }
     Ok(())

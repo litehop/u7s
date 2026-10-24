@@ -69,13 +69,62 @@ pub trait Cluster {
     /// Blocks until the just-created CRDs are Established and served, so
     /// their instances can be created.
     async fn settle(&mut self, crds: &[ServedCrd]) -> anyhow::Result<()>;
-    /// Blocks (bounded) until each (namespace, service) has a ready endpoint.
-    /// Admission webhooks created before their backend would reject every
-    /// later create. A ready Endpoints address does not prove the container
-    /// port is accepting connections yet, so a webhook may still fail
-    /// briefly right after import; configurations with `failurePolicy: Fail`
-    /// can reject creates until the backend finishes starting.
-    async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()>;
+    /// One attempt to reach the webhook's backend through the target
+    /// apiserver. True only when the backend answered over TLS at the
+    /// webhook's port: a ready Endpoints address does not prove that, and a
+    /// `failurePolicy: Fail` configuration created earlier would reject
+    /// every later create.
+    async fn backend_serving(&self, b: &Backend) -> anyhow::Result<bool>;
+}
+
+/// The Service a webhook configuration calls.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Backend {
+    pub namespace: String,
+    pub service: String,
+    pub port: u16,
+    pub path: String,
+    /// `<configuration>/<webhook>`, for error messages.
+    pub webhook: String,
+}
+
+const BACKEND_ATTEMPTS: u32 = 90;
+/// Zero under test so the bounded retry runs instantly.
+const BACKEND_DELAY: Duration = if cfg!(test) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
+
+async fn await_backends<C: Cluster>(
+    c: &C,
+    backends: &[Backend],
+    attempts: u32,
+    delay: Duration,
+) -> anyhow::Result<()> {
+    for b in backends {
+        let mut serving = false;
+        for n in 0..attempts {
+            if n > 0 {
+                tokio::time::sleep(delay).await;
+            }
+            if c.backend_serving(b).await? {
+                serving = true;
+                break;
+            }
+        }
+        if !serving {
+            bail!(
+                "webhook {} is not serving: Service {}/{} port {} did not answer after {attempts} attempts; \
+                 the configuration was not created, re-run import once its workload is running",
+                b.webhook,
+                b.namespace,
+                b.service,
+                b.port
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,7 +514,7 @@ pub async fn run<C: Cluster>(c: &mut C, plan: &Plan, objs: &[Value]) -> anyhow::
             c.settle(&served).await?;
         }
         if Some(n) == admission_start {
-            if let Err(e) = c.wait_backends(&backends).await {
+            if let Err(e) = await_backends(c, &backends, BACKEND_ATTEMPTS, BACKEND_DELAY).await {
                 report
                     .failures
                     .push(format!("admission configuration: {e:#}"));
@@ -517,14 +566,14 @@ pub async fn run<C: Cluster>(c: &mut C, plan: &Plan, objs: &[Value]) -> anyhow::
     Ok(report)
 }
 
-/// Services backing the webhooks in `objs` that this import creates, sorted.
-/// Webhooks pointing elsewhere (URL, or a Service not imported) are not waited
-/// for.
+/// Backends of the webhooks in `objs` whose Service this import creates,
+/// sorted. Webhooks pointing elsewhere (URL, or a Service not imported) are
+/// not waited for.
 fn webhook_backends<'a>(
     objs: impl Iterator<Item = &'a Value>,
     imported: &HashSet<(String, String)>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = objs
+) -> Vec<Backend> {
+    let mut out: Vec<Backend> = objs
         .filter(|o| {
             group_of(o) == "admissionregistration.k8s.io"
                 && matches!(
@@ -532,18 +581,30 @@ fn webhook_backends<'a>(
                     "ValidatingWebhookConfiguration" | "MutatingWebhookConfiguration"
                 )
         })
-        .flat_map(|o| o["webhooks"].as_array().into_iter().flatten())
-        .filter_map(|w| {
-            let s = &w["clientConfig"]["service"];
-            Some((
-                s["namespace"].as_str()?.to_string(),
-                s["name"].as_str()?.to_string(),
-            ))
+        .flat_map(|o| {
+            let cfg = name(o).to_string();
+            o["webhooks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |w| (cfg.clone(), w))
         })
-        .filter(|k| imported.contains(k))
+        .filter_map(|(cfg, w)| {
+            let s = &w["clientConfig"]["service"];
+            Some(Backend {
+                namespace: s["namespace"].as_str()?.to_string(),
+                service: s["name"].as_str()?.to_string(),
+                port: s["port"].as_u64().map_or(443, |p| p as u16),
+                path: s["path"].as_str().unwrap_or("/").to_string(),
+                webhook: format!("{cfg}/{}", w["name"].as_str().unwrap_or("?")),
+            })
+        })
+        .filter(|b| imported.contains(&(b.namespace.clone(), b.service.clone())))
         .collect();
     out.sort();
-    out.dedup();
+    out.dedup_by(|a, b| {
+        (&a.namespace, &a.service, a.port, &a.path) == (&b.namespace, &b.service, b.port, &b.path)
+    });
     out
 }
 
@@ -608,12 +669,29 @@ fn crd_established(crd: &Value) -> bool {
         .any(|c| c["type"] == "Established" && c["status"] == "True")
 }
 
-fn endpoints_ready(ep: &Value) -> bool {
-    ep["subsets"]
+/// The apiserver service proxy resolves the URL port against the Endpoints
+/// ports, which carry the target port, not the Service port; address the
+/// port by name when it has one, else by its numeric target.
+fn proxy_port(svc: &Value, port: u16) -> String {
+    let p = svc["spec"]["ports"]
         .as_array()
         .into_iter()
         .flatten()
-        .any(|s| s["addresses"].as_array().is_some_and(|a| !a.is_empty()))
+        .find(|p| p["port"].as_u64() == Some(u64::from(port)));
+    match p {
+        Some(p) => match (p["name"].as_str(), p["targetPort"].as_u64()) {
+            (Some(n), _) if !n.is_empty() => n.to_string(),
+            (_, Some(t)) => t.to_string(),
+            _ => port.to_string(),
+        },
+        None => port.to_string(),
+    }
+}
+
+/// Any answer from the backend proves its TLS port serves; the proxy's own
+/// 502/503/504 mean it could not reach one.
+fn proxied_backend_answered(status: u16) -> bool {
+    !matches!(status, 502..=504)
 }
 
 /// A u7s apiserver reached over the Kubernetes API.
@@ -757,26 +835,25 @@ impl Cluster for Live {
         bail!("target did not establish and serve the imported CRDs within 60s")
     }
 
-    async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()> {
-        for (ns, name) in services {
-            let path = format!("/api/v1/namespaces/{ns}/endpoints/{name}");
-            let mut ready = false;
-            for _ in 0..60 {
-                let (status, body) = self.src.client.request(Method::GET, &path, None).await?;
-                if status.as_u16() == 200 {
-                    let v: Value = serde_json::from_str(&body)?;
-                    ready = endpoints_ready(&v);
-                }
-                if ready {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            if !ready {
-                bail!("Service {ns}/{name} has no ready endpoint after 60s; create the webhook configurations once its workload is running (re-run import)");
-            }
+    async fn backend_serving(&self, b: &Backend) -> anyhow::Result<bool> {
+        let svc_path = format!("/api/v1/namespaces/{}/services/{}", b.namespace, b.service);
+        let (status, body) = self
+            .src
+            .client
+            .request(Method::GET, &svc_path, None)
+            .await?;
+        if status.as_u16() != 200 {
+            return Ok(false);
         }
-        Ok(())
+        let port = proxy_port(&serde_json::from_str(&body)?, b.port);
+        let path = format!(
+            "/api/v1/namespaces/{}/services/https:{}:{port}/proxy/{}",
+            b.namespace,
+            b.service,
+            b.path.trim_start_matches('/')
+        );
+        let (status, _) = self.src.client.request(Method::GET, &path, None).await?;
+        Ok(proxied_backend_answered(status.as_u16()))
     }
 }
 
@@ -787,8 +864,6 @@ mod tests {
     use crate::plan::Source;
     use std::cell::RefCell;
 
-    type Wait = (usize, Vec<(String, String)>);
-
     #[derive(Default)]
     struct Fake {
         store: RefCell<HashMap<ObjId, Value>>,
@@ -796,8 +871,10 @@ mod tests {
         creates: RefCell<Vec<ObjId>>,
         patches: RefCell<Vec<(ObjId, Value)>>,
         settled: Vec<Vec<ServedCrd>>,
-        /// (number of creates so far, services waited for)
-        waits: RefCell<Vec<Wait>>,
+        /// (number of creates so far, backend probed) per probe
+        probes: RefCell<Vec<(usize, Backend)>>,
+        /// The backend answers from this probe number on (1-based); 0 = never.
+        serves_from_probe: usize,
         fail_create_kind: Option<&'static str>,
     }
 
@@ -836,11 +913,10 @@ mod tests {
             self.settled.push(crds.to_vec());
             Ok(())
         }
-        async fn wait_backends(&self, services: &[(String, String)]) -> anyhow::Result<()> {
-            self.waits
-                .borrow_mut()
-                .push((self.creates.borrow().len(), services.to_vec()));
-            Ok(())
+        async fn backend_serving(&self, b: &Backend) -> anyhow::Result<bool> {
+            let mut p = self.probes.borrow_mut();
+            p.push((self.creates.borrow().len(), b.clone()));
+            Ok(self.serves_from_probe != 0 && p.len() >= self.serves_from_probe)
         }
     }
 
@@ -1145,7 +1221,10 @@ mod tests {
     #[tokio::test]
     async fn webhook_configs_are_created_last_after_waiting_for_their_backends() {
         let objs = webhook_app();
-        let mut c = Fake::default();
+        let mut c = Fake {
+            serves_from_probe: 4,
+            ..Fake::default()
+        };
         let r = run(&mut c, &plan_for(&objs), &objs).await.unwrap();
         assert!(r.failures.is_empty());
         let order = c.creates.borrow();
@@ -1159,11 +1238,67 @@ mod tests {
                     .all(|k| !k.ends_with("WebhookConfiguration")),
             "a webhook created before its backend rejects every later create: {kinds:?}"
         );
+        let probes = c.probes.borrow();
         assert_eq!(
-            *c.waits.borrow(),
-            [(2, vec![("app".to_string(), "hook".to_string())])],
-            "the wait must come after the Deployment and Service exist and before any webhook, for the imported Service only"
+            probes.len(),
+            4,
+            "a backend whose port is not serving yet must be probed again, not trusted after one ready Endpoints address"
         );
+        assert!(
+            probes.iter().all(|(n, b)| *n == 2
+                && b.namespace == "app"
+                && b.service == "hook"
+                && b.port == 443),
+            "probes must come after the Deployment and Service exist, before any webhook is created, and only for the imported Service: {probes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_that_never_serves_is_reported_by_name_and_its_configuration_is_not_created() {
+        let objs = webhook_app();
+        let mut c = Fake::default();
+        let r = run(&mut c, &plan_for(&objs), &objs).await.unwrap();
+        assert!(
+            c.creates
+                .borrow()
+                .iter()
+                .all(|i| !i.kind.ends_with("WebhookConfiguration")),
+            "a Fail webhook created over a dead backend would deny every later create in the cluster"
+        );
+        assert_eq!(r.failures.len(), 1);
+        assert!(
+            r.failures[0].contains("mwc/m.example.com") && r.failures[0].contains("app/hook"),
+            "the operator must be told which webhook and Service to look at: {:?}",
+            r.failures[0]
+        );
+        assert_eq!(
+            c.probes.borrow().len(),
+            BACKEND_ATTEMPTS as usize,
+            "the wait must be bounded"
+        );
+    }
+
+    #[test]
+    fn proxy_port_addresses_the_target_port_because_the_proxy_matches_endpoint_ports() {
+        let svc = json!({"spec":{"ports":[
+            {"port":443,"targetPort":8443},
+            {"name":"metrics","port":9090,"targetPort":9091}]}});
+        assert_eq!(proxy_port(&svc, 443), "8443");
+        assert_eq!(proxy_port(&svc, 9090), "metrics");
+        assert_eq!(proxy_port(&svc, 1), "1");
+    }
+
+    #[test]
+    fn proxy_gateway_errors_mean_not_serving_but_any_backend_answer_means_serving() {
+        for s in [502, 503, 504] {
+            assert!(!proxied_backend_answered(s));
+        }
+        for s in [200, 400, 404, 405] {
+            assert!(
+                proxied_backend_answered(s),
+                "a webhook server answers GET with 4xx; that still proves its TLS port is up"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1257,17 +1392,6 @@ mod tests {
         ));
         assert!(crd_established(
             &json!({"status":{"conditions":[{"type":"NamesAccepted","status":"True"},{"type":"Established","status":"True"}]}})
-        ));
-    }
-
-    #[test]
-    fn endpoints_are_ready_only_with_a_ready_address() {
-        assert!(!endpoints_ready(&json!({})));
-        assert!(!endpoints_ready(
-            &json!({"subsets":[{"notReadyAddresses":[{"ip":"10.0.0.1"}]}]})
-        ));
-        assert!(endpoints_ready(
-            &json!({"subsets":[{"addresses":[{"ip":"10.0.0.1"}]}]})
         ));
     }
 }
