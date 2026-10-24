@@ -12,3 +12,4 @@ authentication:
     enabled: false
 authorization:
   mode: AlwaysAllow
+serverTLSBootstrap: true

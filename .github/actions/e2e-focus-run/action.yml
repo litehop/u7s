@@ -252,33 +252,55 @@ runs:
           "    token: $E2E_TOKEN" \
           > "$WORKDIR/kubeconfig"
 
-    - name: Generate kubelet TLS
+    - name: Issue kubelet node identity
+      # The kubelet authenticates as system:node:ci-node, as on a real node: its
+      # serverTLSBootstrap serving CSR is approved only for that requestor.
       shell: bash
       run: |
         WORKDIR="$PWD/temp/u7s"
         openssl x509 -in "$WORKDIR/ca.crt" -inform DER -out "$WORKDIR/ca.pem" -outform PEM
         sudo cp "$WORKDIR/ca.pem" /etc/kubelet-ca.crt
         sudo chmod 644 /etc/kubelet-ca.crt
-        openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/kubelet-tls.key"
-        openssl req -new -key "$WORKDIR/kubelet-tls.key" \
-          -subj "/CN=ci-node" -sha256 \
-          -out "$WORKDIR/kubelet-tls.csr"
-        openssl x509 -req -in "$WORKDIR/kubelet-tls.csr" \
+        openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/kubelet-client.key"
+        openssl req -new -key "$WORKDIR/kubelet-client.key" \
+          -subj "/O=system:nodes/CN=system:node:ci-node" -sha256 \
+          -out "$WORKDIR/kubelet-client.csr"
+        openssl x509 -req -in "$WORKDIR/kubelet-client.csr" \
           -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
           -CAcreateserial -days 365 -sha256 \
-          -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n') \
-          -out "$WORKDIR/kubelet-tls.crt"
-        sudo cp "$WORKDIR/kubelet-tls.crt" /etc/kubelet-tls.crt
-        sudo cp "$WORKDIR/kubelet-tls.key" /etc/kubelet-tls.key
-        sudo chmod 644 /etc/kubelet-tls.crt
-        sudo chmod 600 /etc/kubelet-tls.key
+          -extfile <(printf 'extendedKeyUsage=clientAuth\n') \
+          -out "$WORKDIR/kubelet-client.crt"
+        sudo cp "$WORKDIR/kubelet-client.crt" /etc/kubelet-client.crt
+        sudo cp "$WORKDIR/kubelet-client.key" /etc/kubelet-client.key
+        sudo chmod 644 /etc/kubelet-client.crt
+        sudo chmod 600 /etc/kubelet-client.key
+        printf '%s\n' \
+          'apiVersion: v1' \
+          'kind: Config' \
+          'clusters:' \
+          '- cluster:' \
+          '    server: https://127.0.0.1:6443' \
+          '    certificate-authority: /etc/kubelet-ca.crt' \
+          '  name: u7s' \
+          'contexts:' \
+          '- context:' \
+          '    cluster: u7s' \
+          '    user: system:node:ci-node' \
+          '  name: u7s' \
+          'current-context: u7s' \
+          'users:' \
+          '- name: system:node:ci-node' \
+          '  user:' \
+          '    client-certificate: /etc/kubelet-client.crt' \
+          '    client-key: /etc/kubelet-client.key' \
+          > "$WORKDIR/kubelet-kubeconfig"
 
     - name: Start kubelet
       shell: bash
       run: |
         WORKDIR="$PWD/temp/u7s"
         sudo mkdir -p /tmp/kubelet-pods
-        sudo cp "$WORKDIR/kubeconfig" /etc/kubelet-kubeconfig
+        sudo cp "$WORKDIR/kubelet-kubeconfig" /etc/kubelet-kubeconfig
         sudo chmod 644 /etc/kubelet-kubeconfig
         sudo cp .github/workflows/e2e-focus-resources/kubelet-config.yaml /etc/kubelet-config.yaml
         # kubeadm-style resolvConf: the runner's /etc/resolv.conf is the
@@ -290,8 +312,6 @@ runs:
           --hostname-override=ci-node \
           --logging-format=text \
           --v=2 \
-          --tls-cert-file=/etc/kubelet-tls.crt \
-          --tls-private-key-file=/etc/kubelet-tls.key \
           >"$WORKDIR/kubelet.log" 2>&1 &
 
     - name: Assert node registers
@@ -557,6 +577,7 @@ runs:
           --kubeconfig="$WORKDIR/kcm-kubeconfig" \
           --cluster-signing-cert-file="$WORKDIR/ca.pem" \
           --cluster-signing-key-file="$WORKDIR/ca.key" \
+          --cluster-signing-duration=8760h \
           --root-ca-file="$WORKDIR/ca.pem" \
           --controllers='*,-clusterrole-aggregation-controller,-service-cidr-controller' \
           --allocate-node-cidrs=true \

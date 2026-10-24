@@ -179,8 +179,14 @@
 #   --pki-test-lifetime <secs>  Rebuild u7s-apiserver with --features pki-test-knobs and
 #             start it with U7S_PKI_TEST_LIFETIME_SECS=<secs>, so the apiserver serving
 #             cert and its kubelet-client/proxy-client identities live <secs> seconds
-#             and rotate at 2/3 of that. For scripts/e2e-pki-rotation/leaf-rotation.sh;
+#             and rotate at 2/3 of that; KCM signs with --cluster-signing-duration=<secs>s,
+#             so the kubelet's serving cert (a CSR) is short-lived too. For scripts/e2e-pki-rotation/leaf-rotation.sh;
 #             use with --stack-only. Mutually exclusive with --binary and --profile.
+#   --pki-test-sa-rotation <secs>  As --pki-test-lifetime (same rebuild, same exclusions) but
+#             starts the apiserver with U7S_PKI_TEST_SA_ROTATION_SECS=<secs>: the SA signing
+#             key rotates every <secs> seconds, a successor is published <secs>/4 before it
+#             signs, and tokens live at most <secs>/6 (so projected tokens refresh every
+#             <secs>/6). For scripts/e2e-pki-rotation/sa-key-rotation.sh; use with --stack-only.
 #   --sample-interval  Cadence in seconds for scripts/conformance/sample-run-metrics.sh,
 #             which starts once the node topology is final (after step 5 and any
 #             --extra-node join) and reaps at the same point run-all.sh's own
@@ -217,6 +223,7 @@ NETWORK=""
 PROFILE=0
 DHAT_DEPTH=""
 PKI_TEST_LIFETIME=""
+PKI_TEST_SA_ROTATION=""
 SAMPLE_INTERVAL=""
 PROCS=""
 K8S_VERSION=""
@@ -245,6 +252,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE=1; shift ;;
     --dhat-depth) DHAT_DEPTH="$2"; shift 2 ;;
     --pki-test-lifetime) PKI_TEST_LIFETIME="$2"; shift 2 ;;
+    --pki-test-sa-rotation) PKI_TEST_SA_ROTATION="$2"; shift 2 ;;
     --sample-interval) SAMPLE_INTERVAL="$2"; shift 2 ;;
     --procs) PROCS="$2"; shift 2 ;;
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
@@ -294,10 +302,14 @@ if [ -n "$PKI_TEST_LIFETIME" ]; then
     echo "error: --pki-test-lifetime must be an integer >= 24 seconds, got '$PKI_TEST_LIFETIME'" >&2
     exit 1
   fi
-  if [ -n "$BINARY" ] || [ "$PROFILE" -eq 1 ]; then
-    echo "error: --pki-test-lifetime rebuilds u7s-apiserver with --features pki-test-knobs and is mutually exclusive with --binary and --profile" >&2
-    exit 1
-  fi
+fi
+if [ -n "$PKI_TEST_SA_ROTATION" ] && { ! [[ "$PKI_TEST_SA_ROTATION" =~ ^[0-9]+$ ]] || [ "$PKI_TEST_SA_ROTATION" -lt 60 ]; }; then
+  echo "error: --pki-test-sa-rotation must be an integer >= 60 seconds, got '$PKI_TEST_SA_ROTATION'" >&2
+  exit 1
+fi
+if [ -n "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION" ] && { [ -n "$BINARY" ] || [ "$PROFILE" -eq 1 ]; }; then
+  echo "error: --pki-test-lifetime/--pki-test-sa-rotation rebuild u7s-apiserver with --features pki-test-knobs and are mutually exclusive with --binary and --profile" >&2
+  exit 1
 fi
 
 # Both flags are required together: a 2nd node needs its own kubelet port, and a
@@ -382,6 +394,10 @@ _UNSAFE_FOCUS_ARG=""
 # call sites exist). Unlike RUST_LOG, this isn't tiered further at -vv/-vvv: KCM's
 # own klog verbosity has no third-party-noise problem to scope away from.
 [ "$VERBOSE" -ge 1 ] && _KCM_V_ARG="--kcm-v 5"
+# KCM signs the kubelet-serving certs: with --pki-test-lifetime they live as long as the
+# apiserver leaves, so the kubelet renews its serving cert inside the rotation run.
+_KCM_SIGNING_ARG=""
+[ -n "$PKI_TEST_LIFETIME" ] && _KCM_SIGNING_ARG="--signing-duration ${PKI_TEST_LIFETIME}s"
 # Forwarded to lima-start.sh (and, via add-node.sh, to a 2nd node's lima-start.sh),
 # which raises kubelet to --v=5 (PLEG relist detail) and flips CRI-O's crio.conf.d
 # drop-in to log_level=debug — see lima-start.sh for why both live behind one flag.
@@ -438,10 +454,11 @@ if [ "$PROFILE" -eq 1 ]; then
   export U7S_DHAT_HEAP_FILE="$DHAT_HEAP_FILE"
 fi
 
-if [ -n "$PKI_TEST_LIFETIME" ]; then
+if [ -n "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION" ]; then
   banner "PKI test knobs: rebuilding u7s-apiserver with --features pki-test-knobs"
   cargo build --release -p u7s-apiserver --features pki-test-knobs --manifest-path "$REPO/Cargo.toml"
-  export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
+  [ -z "$PKI_TEST_LIFETIME" ] || export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
+  [ -z "$PKI_TEST_SA_ROTATION" ] || export U7S_PKI_TEST_SA_ROTATION_SECS="$PKI_TEST_SA_ROTATION"
 fi
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.
@@ -499,7 +516,7 @@ bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERV
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG}
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
 
 # Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
 # true already made the apiserver itself schedule: starting both would

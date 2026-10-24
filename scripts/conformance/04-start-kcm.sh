@@ -14,12 +14,14 @@ KCM_LOG="/tmp/kcm.log"
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 KCM_V=""
+SIGNING_DURATION="8760h"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kcm-v) KCM_V="$2"; shift 2 ;;
+    --signing-duration) SIGNING_DURATION="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -165,6 +167,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --kubeconfig="\$KUBECONFIG_FILE" \\
   --cluster-signing-cert-file="\$CA_CERT" \\
   --cluster-signing-key-file="\$WORKDIR/ca.key" \\
+  --cluster-signing-duration="${SIGNING_DURATION}" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\
   --cluster-cidr=10.244.0.0/16 \\
