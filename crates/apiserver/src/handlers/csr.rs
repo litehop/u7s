@@ -488,44 +488,27 @@ fn claimed_kubelet_node_name(body: &serde_json::Value) -> Option<String> {
     name
 }
 
-/// A bootstrap-token holder may only enroll a NEW node identity. The upstream csrapproving
-/// controller approves any `system:node:<name>` client CSR, and the resulting certificate is
-/// what authorizes later kubelet-serving CSRs (including the apiserver-IP exemption for
-/// `--local-node-name`) — so letting a joiner claim the control-plane node's name, or any
-/// existing Node's name, hands it that node's identity. Nodes renewing authenticate as
-/// `system:node:<name>`, not as a bootstrap token, and are unaffected.
+/// A joiner (member of `system:bootstrappers`, which upstream's `nodeclient` approval is bound
+/// to) may not claim the `--local-node-name` identity: the resulting certificate authorizes the
+/// apiserver-IP kubelet-serving exemption for that node. Other existing Node names stay
+/// claimable, as upstream, so expired-cert recovery and worker re-join work. Nodes renewing
+/// authenticate as `system:node:<name>` and are unaffected.
 async fn reject_bootstrap_node_takeover<S: Store>(
     state: &AppState<S>,
     body: &serde_json::Value,
     user: &UserInfo,
 ) -> Result<(), crate::status::StatusError> {
-    if !user
-        .username
-        .starts_with(crate::bootstrap_token::USER_PREFIX)
-    {
+    if !user.groups.iter().any(|g| g == "system:bootstrappers") {
         return Ok(());
     }
     let Some(node) = claimed_kubelet_node_name(body) else {
         return Ok(());
     };
-    let is_local = state.local_node_name.as_deref() == Some(node.as_str());
-    let exists = !is_local
-        && state
-            .store
-            .get(&group_object_key("", "nodes", None, &node))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .is_some();
-    if is_local || exists {
+    if state.local_node_name.as_deref() == Some(node.as_str()) {
         return Err(Status::forbidden(format!(
-            "bootstrap token {:?} may not request a client certificate for node {node:?}: \
-             {} (choose a different --node-name)",
+            "{:?} may not request a client certificate for node {node:?}: it is the \
+             control-plane node (choose a different --node-name)",
             user.username,
-            if is_local {
-                "it is the control-plane node"
-            } else {
-                "a Node with that name already exists"
-            }
         )));
     }
     Ok(())
@@ -1633,15 +1616,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn join_token_holder_cannot_take_over_an_existing_nodes_identity() {
+    async fn join_token_holder_may_reclaim_an_existing_worker_name_like_upstream_so_expired_cert_recovery_and_rejoin_work(
+    ) {
         let state = state_with_local_node("cp");
         seed_node(&state, "worker-1").await;
-        assert_status(
-            post_kubelet_client_csr(&state, "system:bootstrap:abcdef", "worker-1").await,
-            StatusCode::FORBIDDEN,
-            "joiner reusing an existing Node's name",
+        post_kubelet_client_csr(&state, "system:bootstrap:abcdef", "worker-1")
+            .await
+            .unwrap_or_else(|_| {
+                panic!("refusing existing names strands workers with expired certs")
+            });
+        assert!(csr_stored(&state, "worker-1").await);
+    }
+
+    #[tokio::test]
+    async fn guard_keys_on_bootstrappers_group_not_the_username_prefix() {
+        let state = state_with_local_node("cp");
+        let mut body = serde_json::json!({"spec": {
+            "request": kubelet_client_csr_b64("system:node:cp"),
+            "signerName": KUBELET_CLIENT_SIGNER,
+        }});
+        let joiner = crate::auth::UserInfo {
+            username: "custom-joiner".into(),
+            uid: String::new(),
+            groups: vec!["system:bootstrappers".into()],
+            extra: Default::default(),
+        };
+        assert!(
+            finalize_csr_create(&state, &mut body, &joiner)
+                .await
+                .is_err(),
+            "upstream approves nodeclient CSRs by group, so the guard must too"
         );
-        assert!(!csr_stored(&state, "worker-1").await);
     }
 
     #[tokio::test]
