@@ -2426,16 +2426,17 @@ fn apply_map_mutations(
             let ops = eval_json_patch(&env, expr);
             drop(env);
             match ops {
-                Ok(ops) => match crate::handlers::json_patch::apply_json_patch(object, &ops) {
-                    Ok(()) => {}
-                    // Upstream leaves the object untouched, without error, when a
-                    // `test` operation fails.
-                    Err(e)
-                        if e.1
-                            .message
-                            .starts_with(crate::handlers::json_patch::TEST_FAILED_PREFIX) => {}
-                    Err(e) => errors.push(format!("JSON Patch: {}", e.1.message)),
-                },
+                Ok(ops) => {
+                    match crate::handlers::json_patch::apply_json_patch_typed(object, &ops) {
+                        Ok(()) => {}
+                        // Upstream leaves the object untouched, without error, when a
+                        // `test` operation fails.
+                        Err(crate::handlers::json_patch::JsonPatchError::TestFailed(_)) => {}
+                        Err(crate::handlers::json_patch::JsonPatchError::Invalid(e)) => {
+                            errors.push(format!("JSON Patch: {}", e.1.message))
+                        }
+                    }
+                }
                 Err(e) => errors.push(format!("expression '{expr}' resulted in error: {e}")),
             }
             continue;
@@ -9063,6 +9064,53 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out["metadata"]["labels"]["a"], "b");
+    }
+
+    /// "Only mutate objects lacking label X" is expressed as `test` on the absent label key.
+    /// Upstream (evanphx/json-patch) reports a key missing from an existing object as a
+    /// failed test, which skips the patch; erroring instead would deny every object that
+    /// lacks the label under failurePolicy Fail. A missing PARENT stays a hard error.
+    #[tokio::test]
+    async fn map_json_patch_test_on_absent_key_skips_but_absent_parent_errors() {
+        let mut obj = deploy();
+        obj["metadata"]["labels"] = json!({"a": "b"});
+        let expr = |path: &str| {
+            format!(
+                "[JSONPatch{{op: 'test', path: '{path}', value: 'x'}}, \
+                  JSONPatch{{op: 'add', path: '/spec/minReadySeconds', value: 9}}]"
+            )
+        };
+        let out = run_map(
+            json!({"mutations": [json_patch_mutation(&expr("/metadata/labels/absent"))]}),
+            obj.clone(),
+            None,
+        )
+        .await
+        .expect("test on an absent key skips the patch, no deny");
+        assert_eq!(out, obj, "skipped patch must not mutate");
+        let err = run_map(
+            json!({"mutations": [json_patch_mutation(&expr("/metadata/nope/x"))]}),
+            obj,
+            None,
+        )
+        .await
+        .expect_err("a missing parent is an error, not a skip");
+        assert!(err.1.message.contains("JSON Patch:"), "{}", err.1.message);
+    }
+
+    /// RFC 6902 §4.4: moving a location into its own descendant must fail rather than
+    /// silently dropping the subtree; under Fail the policy denies.
+    #[tokio::test]
+    async fn map_json_patch_move_into_own_descendant_denies() {
+        let expr = "[JSONPatch{op: 'move', from: '/spec', path: '/spec/x'}]";
+        let err = run_map(
+            json!({"mutations": [json_patch_mutation(expr)]}),
+            deploy(),
+            None,
+        )
+        .await
+        .expect_err("move into own descendant must deny");
+        assert!(err.1.message.contains("proper prefix"), "{}", err.1.message);
     }
 
     /// move and copy are RFC 6902 ops upstream supports; a policy using them must not fail.
