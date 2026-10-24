@@ -1,42 +1,47 @@
 ---
-updated: 2026-10-23T10:45Z
+updated: 2026-10-24T10:31Z
 ---
-# Dashboard — session 2026-10-23 WRAPPED (main `4579444e`)
-**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream unless incompatible; queue merge on green, never `--admin`. No GCP account/project in git (gcloud config `u7s-gcp`).
-**Priorities (operator 2026-10-23, bd memory `priorities-2026-10-23-pki-then-migration`):** 1 PKI `xdw6u` → **next release when .6/.7/.10/.8 done** (.6 ✅ .10 ✅) · 2 migration MVP `te4sn` (own release when ready) · 3 security P2s on spare slots · post-release: GCP 2–3 node WireGuard playground + Argo CD → Ingress/storage + `vc844` rewrite decision.
-**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons (tick 15m, posture 60m, hygiene 60m). No workers, VMs or VPSes running.
+# Dashboard — session 2026-10-24 WRAPPED (main `8e8f96cf`)
+**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream; queue merge on green, never `--admin`.
+**Priorities:** bd memory `priorities-2026-10-24-release-after-h6h2v`.
+**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. No workers or VMs running.
 
 ## 🎯 Waiting on you
-- `1gfa6`: `v*` tag ruleset (settings on the bead) + `bjuu2` required check (mayor confirms the job-level streak first).
-- `vc844` deferred until playground data.
+- Release: yours to cut once `h6h2v` merges (no rush).
+- `fgxnm`: start a session with `claude --settings .claude/settings.json`; check `claude auto-mode config`.
 
-## ▶ First dispatches next session (briefs are on the beads)
-1. **#1974 `xdw6u.7`** fix round: HIGH non-CA cert accepted as trust anchor; truncated-bundle + half-applied swap; then merge main (conflicts with #1977 — recipe on the bead).
-2. **`xdw6u.8`** two-tier issuance (after .7) → **release** when done. `xdw6u.13` (worker CA refresh) blocks `.9`.
-3. **#1973 `te4sn.3`** live re-run (5 checks on the bead) → un-draft → merge; then `te4sn.4` (needs `uhts0` politeia file-path kubeconfigs).
-4. **#1978 `p3ktl`** fix round: infra failures scored FAIL; preemption-lookup error; non-aborting cleanup. Then `vw7jc` (snapshot FAILs on GCP) on a fresh snapshot; `02f1s` (CN > 64 chars).
-5. Security P2 tail: `6hopk` (kube-system SA priority allowlist) · `qap3i.48` MAP JSONPatch · `qap3i.49` VAP params/authorizer · `xdw6u.14` · `qap3i.35/.36–.39/.41/.42/.45/.47` · `m6666` (timing-test flakes) · `r4umz` · `83irk` item 2.
+## 🚦 Queued at wrap (LGTM; confirm merged, reap worktrees)
+#2008 `edrle` single-node kubelet-serving CSR · #2007 `jn96b` install CIDR flags · #2009 `9a713` pipefail lint · #2010 `xdw6u.16` previous intermediate + CA KeyUsage.
 
-## ✅ Merged this session (#1945–#1981)
-Security audit run-1: all 4 P1s (#1948–#1951) + most P2s (#1958 #1960 #1961 #1962 #1963 #1966 #1967 #1968 #1979 #1980). PKI: SA key rotation #1975 · kubelet serving CSR #1977. KCM per-controller creds #1971. Release: Ed25519 signing #1952 · gate INVALID/FAIL fixes #1955 #1959 · install denies externalIPs #1970. Others: #1953 #1954 #1956 #1957 #1964 (roadmap) #1969 (beads) #1972 (politeia v0.3.1) #1976 (RUSTSEC-2026-0385) · Renovate #1945 #1946 #1965 #1981 · politeia #24 #25.
+## ⏭ First dispatches
+1. **`h6h2v` P1 (release gate):** prove the Rust CSR guard and KCM's Go signer parse CSRs identically.
+2. `te4sn.4` migration cutover (after #2007).
+3. Security P2s: `qap3i.55` · `0c8uw` · `qap3i.54` · `xdw6u.17` · `1xpj7.3` · `qm68h` · `qap3i.35` remainder.
+4. Ops: `i3n1g` · `6t0u2` · `pkh20` · `vny2h` · `0suei` · `zy4j1` · `yp00d`. Deferred: `vc844`.
+
+## 🧭 New memories
+`revert-runs-authorized-run-bare-cargo-no-pipe` · `mayor-only-permissions-stay-in-settings-local`. Queue tip: a PR editing the same line ahead in the queue makes the next UNMERGEABLE — dequeue via GraphQL and hold it as draft.
+
+## ✅ Merged 2026-10-24
+PKI: #1974 · **#1995**. Security: #1986 · #1987 · #1990 · #1993 · #1994 · #1998 · **#2001** · #2002 · **#2004** · #2005. SSA: #1989 · #1997 · #2006. Migration: #1973 · #1988 · #1992 · #2000 (politeia #27/#28). Ops: #1978 · #1985 · #1991 · #1999 · #2003.
 
 ## 🔎 Open PRs
 <!-- BEGIN AUTO: open-prs -->
-- #1978 (needs changes) · #1974 (needs changes, DIRTY) · #1973 (draft, live re-run)
+- #2007, #2008, #2009, #2010 (queued)
 <!-- END AUTO: open-prs -->
 ## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-- 3 worktrees kept for the open PRs above; hygiene clean
+- 9 worker worktrees for the queued PRs; reap after merge.
 <!-- END AUTO: worktrees -->
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
-15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
+Stopped at wrap.
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-10-23T10:45Z — Branch `main` @ `4579444e`.
+As of 2026-10-24T10:31Z — `main` @ `8e8f96cf`.
 <!-- END AUTO: repo-state -->
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
-0 pending review-queue entries.
+0 pending.
 <!-- END AUTO: review-queue -->
