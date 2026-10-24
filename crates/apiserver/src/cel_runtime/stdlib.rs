@@ -265,7 +265,8 @@ fn call_method<'a>(ev: &Evaluator<'a, '_>, name: &str, recv: V<'a>, args: Vec<V<
     match (name, &recv, args.as_slice()) {
         ("size", r, []) => size(r),
         ("matches", V::Str(s), [V::Str(re)]) => strlib::matches(ev, s, re),
-        _ => k8slib::call_method(ev, name, &recv, &args)
+        _ => super::authzlib::call_method(ev, name, &recv, &args)
+            .or_else(|| k8slib::call_method(ev, name, &recv, &args))
             .or_else(|| strlib::call_method(ev, name, &recv, &args))
             .or_else(|| listlib::call_method(ev, name, &recv, &args))
             .or_else(|| timelib::call_method(name, &recv, &args))

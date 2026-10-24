@@ -5,6 +5,7 @@
 //! where every node, iteration and produced byte is charged against a per-expression
 //! budget and exhaustion aborts the expression (never absorbed by `&&`/`||`).
 
+mod authzlib;
 mod format;
 mod interp;
 mod k8slib;
@@ -19,6 +20,10 @@ mod timelib;
 mod url;
 mod value;
 
+pub(crate) use authzlib::{
+    Attributes as AuthzAttributes, AuthorizeFn, Decision as AuthzDecision,
+    Principal as AuthzPrincipal, RequestResource,
+};
 pub(crate) use interp::{Env, Evaluator};
 pub(crate) use parse::check_syntax;
 #[cfg(test)]
