@@ -211,6 +211,28 @@ fn publish_intermediate_pem(files: &LeafFiles, cert_der: &[u8]) -> anyhow::Resul
     replace_file(&path.to_string_lossy(), &pem, false)
 }
 
+fn previous_intermediate_pem_path(files: &LeafFiles) -> std::path::PathBuf {
+    intermediate_cert_pem_path(files).with_file_name("intermediate-previous-cert.pem")
+}
+
+/// The previous intermediate's certificate (public part only), if still on disk, signed by
+/// `root` and unexpired. KCM keeps signing with it until it reloads the new files, so a
+/// restarted apiserver still has to chain what it signs.
+fn load_previous_intermediate(
+    files: &LeafFiles,
+    root: &CaSigner,
+    now: OffsetDateTime,
+) -> Option<Vec<u8>> {
+    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
+    let pem = std::fs::read(previous_intermediate_pem_path(files)).ok()?;
+    let der = CertificateDer::pem_slice_iter(&pem).next()?.ok()?.to_vec();
+    let (_, not_after) = cert_validity(&der).ok()?;
+    (now < not_after
+        && ensure_ca_cert(&der).is_ok()
+        && ensure_signed_by(&der, &root.cert_der).is_ok())
+    .then_some(der)
+}
+
 /// Mint an intermediate under `root`, make it durable, then publish it for KCM. The
 /// crt/key pair is written with the same crash-safe protocol as a leaf, so a crash at any
 /// point restarts into either the previous intermediate or the complete new one.
@@ -386,6 +408,21 @@ impl Rotator {
         self.lock().cluster_ca.cert_der.clone()
     }
 
+    /// Every intermediate that may have signed a still-valid cluster leaf: the current one,
+    /// then the previous one until it expires (leaves never outlive their intermediate).
+    pub(crate) fn signing_intermediates(&self) -> Vec<Vec<u8>> {
+        let mut known = vec![self.intermediate_der()];
+        known.extend(
+            load_previous_intermediate(
+                &self.intermediate_files,
+                &self.root_ca,
+                self.pki.clock.now(),
+            )
+            .filter(|prev| *prev != known[0]),
+        );
+        known
+    }
+
     pub(crate) fn server_config(&self) -> Swap<Arc<ServerConfig>> {
         self.server_config.clone()
     }
@@ -434,6 +471,11 @@ impl Rotator {
         if now < intermediate_due_at(&current.cert_der, self.intermediate_lifetime, self.fraction) {
             return Ok(None);
         }
+        replace_file(
+            &previous_intermediate_pem_path(&self.intermediate_files).to_string_lossy(),
+            &pem_encode("CERTIFICATE", &current.cert_der),
+            false,
+        )?;
         let next = issue_intermediate(
             &self.pki,
             &self.root_ca,
