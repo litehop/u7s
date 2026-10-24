@@ -15932,6 +15932,77 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    async fn pod_status_apply(
+        state: &AppState,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_pod_status(
+            State(state.clone()),
+            Path(("default".to_string(), "my-pod".to_string())),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// The kubelet-adjacent controllers that apply pods/status must own what they named under
+    /// a status-scoped Apply entry and be able to delete it again.
+    #[tokio::test]
+    async fn pod_status_apply_is_scoped_and_prunes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            |m, f, y| pod_status_apply(&state, m, f, y),
+            "status:\n  message: first\n",
+            "status:\n  reason: second\n",
+        )
+        .await;
+        assert!(
+            second["status"].get("message").is_none(),
+            "a field the applier stopped applying must be removed: {second}"
+        );
+        assert_eq!(second["status"]["reason"], "second");
+        assert_eq!(
+            second["status"]["phase"], "Pending",
+            "unowned status must survive"
+        );
+        assert_eq!(
+            second["spec"]["containers"][0]["image"], "nginx",
+            "pods/status must never touch spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn pod_status_apply_over_update_owner_conflicts_without_force() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1",
+                "managedFields": [crate::handlers::test_support::update_entry(
+                    "kubelet", "v1", Some("status"),
+                    serde_json::json!({"f:status": {"f:phase": {}}}),
+                )]
+            }}),
+        )
+        .await;
+        crate::handlers::test_support::assert_status_apply_conflicts_without_force(
+            |m, f, y| pod_status_apply(&state, m, f, y),
+            "status:\n  phase: Running\n",
+            "phase",
+        )
+        .await;
+    }
+
     /// `PATCH /status?dryRun=All` must return the would-be patched status but leave the
     /// stored pod's status untouched. Before this fix, patch_pod_status had no dry-run check.
     #[tokio::test]

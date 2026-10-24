@@ -2499,6 +2499,136 @@ mod tests {
         );
     }
 
+    async fn deployment_status_apply(
+        state: &crate::state::AppState<SqliteStore>,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_namespaced_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "web".into(),
+            )),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            bytes::Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// kubectl/controllers that apply status over a field the kubelet-style Update writers
+    /// own must be told (409) rather than silently stealing it, unless they force.
+    #[tokio::test]
+    async fn namespaced_status_apply_over_update_owner_conflicts_without_force() {
+        use crate::handlers::test_support::{
+            assert_status_apply_conflicts_without_force, update_entry,
+        };
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1", "kind": "Deployment",
+            "metadata": {
+                "name": "web", "namespace": "default",
+                "managedFields": [update_entry(
+                    "deployment-controller", "apps/v1", Some("status"),
+                    serde_json::json!({"f:status": {"f:readyReplicas": {}}}),
+                )]
+            },
+            "spec": { "replicas": 3 },
+            "status": { "readyReplicas": 1 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/web",
+                bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        assert_status_apply_conflicts_without_force(
+            |m, f, y| deployment_status_apply(&state, m, f, y),
+            "status:\n  readyReplicas: 2\n",
+            "readyReplicas",
+        )
+        .await;
+    }
+
+    /// Cluster-scoped `*/status` (PersistentVolume here) has its own handler: it must scope
+    /// the applier to `status` and prune fields it stops applying, like the namespaced one.
+    #[tokio::test]
+    async fn cluster_scoped_status_apply_is_scoped_and_prunes() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pv = serde_json::json!({
+            "apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": { "name": "pv1" },
+            "spec": { "capacity": { "storage": "1Gi" } },
+            "status": { "phase": "Available" }
+        });
+        store
+            .put(
+                &group_object_key("", "persistentvolumes", None, "pv1"),
+                bytes::Bytes::from(serde_json::to_vec(&pv).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let apply = |m: &'static str, f: bool, y: String| {
+            let state = state.clone();
+            async move {
+                let resp = patch_resource_status(
+                    axum::extract::State(state),
+                    axum::extract::Path((
+                        "".into(),
+                        "v1".into(),
+                        "persistentvolumes".into(),
+                        "pv1".into(),
+                    )),
+                    axum::Extension(UserInfo::default()),
+                    crate::handlers::test_support::apply_headers(m, f),
+                    bytes::Bytes::from(y),
+                )
+                .await?
+                .into_response();
+                Ok::<_, crate::status::StatusError>(
+                    crate::handlers::test_support::response_json(resp).await,
+                )
+            }
+        };
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            apply,
+            "status:\n  message: first\n",
+            "status:\n  reason: second\n",
+        )
+        .await;
+        assert!(
+            second["status"].get("message").is_none(),
+            "a field the applier stopped applying must be removed: {second}"
+        );
+        assert_eq!(second["status"]["reason"], "second");
+        assert_eq!(
+            second["status"]["phase"], "Available",
+            "status the applier never owned must survive"
+        );
+    }
+
     /// patch_namespaced_resource_status returns 404 when the object does not exist.
     #[tokio::test]
     async fn patch_namespaced_resource_status_returns_404_for_missing() {

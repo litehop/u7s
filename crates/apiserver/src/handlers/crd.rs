@@ -2434,6 +2434,64 @@ mod tests {
         );
     }
 
+    async fn crd_status_apply(
+        state: &crate::state::AppState,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_crd_status(
+            State(state.clone()),
+            Path("widgets.example.io".to_string()),
+            None,
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    /// An apply to a CRD's /status must be owned under a status-scoped Apply entry and a later
+    /// apply must delete what it stops sending; a CRD's spec is never taken from /status.
+    #[tokio::test]
+    async fn crd_status_apply_is_scoped_and_prunes() {
+        let state = make_state();
+        crate::handlers::test_support::install_namespaced_crd(
+            &state,
+            "example.io",
+            "v1",
+            "widgets",
+            "Widget",
+        )
+        .await;
+        let cond = |t: &str| {
+            format!(
+                "status:\n  conditions:\n  - type: {t}\n    status: \"True\"\n    reason: r\n    message: m\n    lastTransitionTime: \"2026-01-01T00:00:00Z\"\n"
+            )
+        };
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            |m, f, y| crd_status_apply(&state, m, f, y),
+            &cond("Custom1"),
+            &cond("Custom2"),
+        )
+        .await;
+        let types: Vec<&str> = second["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["type"].as_str())
+            .collect();
+        assert!(
+            types.contains(&"Custom2") && !types.contains(&"Custom1"),
+            "a condition the applier stopped sending must be removed: {types:?}"
+        );
+        assert_eq!(
+            second["spec"]["group"], "example.io",
+            "/status must not touch spec"
+        );
+    }
+
     /// `kubectl apply --server-side --dry-run=server -f my-crd.yaml` against a CRD name
     /// that does not exist yet takes patch_crd's SSA create-on-missing branch — a separate
     /// code path from create_crd with its own store.put. This test fails on revert with the

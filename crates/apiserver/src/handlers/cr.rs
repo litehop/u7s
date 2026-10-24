@@ -15831,6 +15831,72 @@ mod tests {
     // patch_cr_status tests
     // ---------------------------------------------------------------------------
 
+    async fn cr_status_apply(
+        state: &AppState,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_cr_status(
+            State(state.clone()),
+            axum::Extension(crate::auth::UserInfo::default()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "ssa-widget".to_string(),
+            )),
+            crate::handlers::test_support::apply_headers(manager, force),
+            Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    async fn seed_ssa_widget(state: &AppState) {
+        install_cluster_crd_with_status_subresource(state).await;
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body("ssa-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+    }
+
+    /// A controller applying a custom resource's /status must own what it named under a
+    /// status-scoped Apply entry and be able to delete it again; spec stays untouched.
+    #[tokio::test]
+    async fn cr_status_apply_is_scoped_and_prunes() {
+        let state = make_state();
+        seed_ssa_widget(&state).await;
+        let (_, second) = crate::handlers::test_support::assert_status_apply_is_scoped_and_prunes(
+            |m, f, y| cr_status_apply(&state, m, f, y),
+            "status:\n  readyToUse: true\n",
+            "status:\n  phase: Done\n",
+        )
+        .await;
+        assert!(
+            second["status"].get("readyToUse").is_none(),
+            "a field the applier stopped applying must be removed: {second}"
+        );
+        assert_eq!(second["status"]["phase"], "Done");
+        assert_eq!(
+            second["spec"]["color"], "blue",
+            "/status must not touch spec"
+        );
+    }
+
     // patch_cr_status must update .status and leave .spec untouched for a cluster-scoped
     // CRD declaring subresources.status. Before patch_cr_status existed, the route wired
     // PATCH directly to the non-CR-aware patch_resource_status, which 404s on any group

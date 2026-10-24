@@ -1413,65 +1413,6 @@ mod tests {
         assert_eq!(live["spec"]["replicas"], 5);
     }
 
-    /// One manager applying to the main resource and to /status holds two independent
-    /// entries, so re-applying one without the other's fields must not delete them. If the
-    /// entries shared a key, `kubectl apply` of the spec would wipe the status a controller
-    /// applied under the same manager name (and the reverse).
-    #[test]
-    fn main_and_status_applies_by_one_manager_never_remove_each_others_fields() {
-        let status_req = Request {
-            subresource: Some("status"),
-            ..req("ctrl")
-        };
-        let mut live = json!({});
-        apply(&mut live, &deployment(Some(3), false), "ctrl", false).unwrap();
-        live["status"] = json!({"readyReplicas": 1});
-        plan_apply(
-            &live,
-            &json!({"status": {"readyReplicas": 1}}),
-            false,
-            &status_req,
-        )
-        .unwrap()
-        .record(&mut live);
-
-        let managers = read_managers(&live);
-        assert!(
-            managers
-                .iter()
-                .any(|m| m.is("ctrl", OPERATION_APPLY, Some("status"))),
-            "status apply must be recorded with subresource=status: {managers:?}"
-        );
-
-        let main_only = deployment(Some(4), false);
-        let plan = plan_apply(
-            &live,
-            &applied_fields(&main_only, true),
-            false,
-            &req("ctrl"),
-        )
-        .unwrap();
-        assert!(
-            plan.removals.is_empty(),
-            "a main-resource apply must not remove status fields: {:?}",
-            plan.removals
-        );
-        plan.record(&mut live);
-
-        let plan = plan_apply(
-            &live,
-            &json!({"status": {"availableReplicas": 2}}),
-            false,
-            &status_req,
-        )
-        .unwrap();
-        assert_eq!(
-            plan.removals,
-            vec![vec!["f:status".to_string(), "f:readyReplicas".to_string()]],
-            "a status apply drops only status fields, never spec.replicas"
-        );
-    }
-
     /// A PUT body carries no managedFields; recording it must keep existing ownership rather
     /// than wiping it, and attribute only what the PUT changed.
     #[test]

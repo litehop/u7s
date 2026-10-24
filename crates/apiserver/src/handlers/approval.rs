@@ -907,6 +907,96 @@ mod tests {
         );
     }
 
+    async fn approval_apply(
+        state: &crate::state::AppState,
+        name: &str,
+        manager: &str,
+        force: bool,
+        yaml: String,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
+        let resp = patch_approval(
+            axum::extract::State(state.clone()),
+            approver(state),
+            axum::extract::Path(name.to_owned()),
+            crate::handlers::test_support::apply_headers(manager, force),
+            bytes::Bytes::from(yaml),
+        )
+        .await?
+        .into_response();
+        Ok(crate::handlers::test_support::response_json(resp).await)
+    }
+
+    const APPROVE_YAML: &str = "status:\n  conditions:\n  - type: Approved\n    status: \"True\"\n    reason: ManualApproval\n    message: approved\n";
+
+    /// An apply to /approval must be recorded as an Apply scoped to `approval` owning the
+    /// conditions it named, and never as a main-resource entry: a later apply of the CSR's
+    /// own spec must not be able to delete the approval.
+    #[tokio::test]
+    async fn approval_apply_records_approval_scoped_apply_manager() {
+        use crate::handlers::test_support::managed_entry;
+        let state = make_state();
+        seed_csr(&state.store, "scoped-csr", None).await;
+        let out = approval_apply(&state, "scoped-csr", "ctrl", false, APPROVE_YAML.into())
+            .await
+            .unwrap_or_else(|e| panic!("approval apply must succeed: {e:?}"));
+        let entry = managed_entry(&out, "ctrl", "Apply", Some("approval")).unwrap_or_else(|| {
+            panic!(
+                "approval apply must record an Apply scoped to approval: {}",
+                out["metadata"]["managedFields"]
+            )
+        });
+        assert!(
+            entry["fieldsV1"]["f:status"]["f:conditions"].is_object(),
+            "the approver must own the conditions it applied: {entry}"
+        );
+        assert!(
+            managed_entry(&out, "ctrl", "Apply", None).is_none()
+                && managed_entry(&out, "ctrl", "Apply", Some("status")).is_none(),
+            "approval must not be recorded under the main or status entry"
+        );
+    }
+
+    /// Approving over a condition another manager set (Update) is a 409 without force, as
+    /// upstream, so two approvers cannot silently overwrite each other.
+    #[tokio::test]
+    async fn approval_apply_over_update_owner_conflicts_without_force() {
+        let state = make_state();
+        let key = seed_csr(&state.store, "owned-csr", None).await;
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let mut csr: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        csr["status"]["conditions"] = json!([{
+            "type": "Approved", "status": "True", "reason": "Other", "message": "other",
+            "lastUpdateTime": "2026-01-01T00:00:00Z"
+        }]);
+        csr["metadata"]["managedFields"] = json!([crate::handlers::test_support::update_entry(
+            "other-approver",
+            "certificates.k8s.io/v1",
+            Some("approval"),
+            json!({"f:status": {"f:conditions": {"k:{\"type\":\"Approved\"}": {
+                ".": {}, "f:reason": {}, "f:message": {}, "f:status": {}, "f:type": {}
+            }}}}),
+        )]);
+        state
+            .store
+            .put(&key, bytes::Bytes::from(csr.to_string()), None)
+            .await
+            .unwrap();
+        let err = approval_apply(&state, "owned-csr", "ctrl", false, APPROVE_YAML.into())
+            .await
+            .expect_err("applying over another manager's condition must conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT, "{}", err.1.message);
+        let forced = approval_apply(&state, "owned-csr", "ctrl", true, APPROVE_YAML.into())
+            .await
+            .unwrap_or_else(|e| panic!("force must override the conflict: {e:?}"));
+        assert!(crate::handlers::test_support::managed_entry(
+            &forced,
+            "ctrl",
+            "Apply",
+            Some("approval")
+        )
+        .is_some());
+    }
+
     /// PATCH /approval with a genuine multi-line YAML apply-patch+yaml body must succeed,
     /// not 400 "invalid patch JSON".
     ///
