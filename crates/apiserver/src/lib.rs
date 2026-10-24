@@ -8869,33 +8869,17 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Every literal-segment route with a bespoke handler must be reached identically when a
-    /// literal segment is percent-encoded: otherwise the request lands on a generic handler
-    /// that skips the bespoke guards (CSR identity stamping/validation, PCR create
-    /// NodeRestriction, PCR status signer guard) while RBAC, which decodes first, still
-    /// authorizes it. Each case's literal outcome is also pinned to the bespoke handler's
-    /// own answer so that a bespoke and a generic handler that happened to agree could not
-    /// make the comparison vacuous.
+    /// Literal-segment routes with a handler whose answer differs from the generic one (CSR
+    /// approval, CTB create) must be reached when a literal segment is percent-encoded:
+    /// otherwise the request lands on a generic handler that skips the bespoke guards while
+    /// RBAC, which decodes first, still authorizes it. Both spellings are pinned to a
+    /// response only the bespoke handler produces. CSR create and PodCertificateRequest
+    /// answer identically on the generic path (their guards live there), so an encoded
+    /// spelling cannot be told apart and is covered by the router/auth matrix instead.
     #[tokio::test]
     async fn encoded_literal_segments_reach_the_same_handler_as_literal_ones() {
         let (app, state) = certificates_app().await;
         use u7s_store::Store as _;
-        state
-            .store
-            .put(
-                "/registry/certificates.k8s.io/podcertificaterequests/default/x".to_owned(),
-                serde_json::to_vec(&serde_json::json!({
-                    "apiVersion": "certificates.k8s.io/v1",
-                    "kind": "PodCertificateRequest",
-                    "metadata": {"name": "x", "namespace": "default", "uid": "u"},
-                    "spec": {"signerName": "example.com/s", "podName": "p", "nodeName": "node-1"}
-                }))
-                .unwrap()
-                .into(),
-                None,
-            )
-            .await
-            .unwrap();
         state
             .store
             .put(
@@ -8912,37 +8896,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let garbage_csr = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"spec":{"request":"","signerName":"","username":"forged"}}"#;
         let approve_csr = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"status":{"conditions":[{"type":"Approved","status":"True","reason":"r","message":"m"}]}}"#;
-        let stub_csr = {
-            use base64::Engine as _;
-            let key = rcgen::KeyPair::generate().unwrap();
-            let csr = rcgen::CertificateParams::default()
-                .serialize_request(&key)
-                .unwrap();
-            base64::engine::general_purpose::STANDARD.encode(csr.der())
-        };
-        let pcr_create = format!(
-            r#"{{"apiVersion":"certificates.k8s.io/v1","kind":"PodCertificateRequest","metadata":{{"name":"y"}},"status":{{"certificateChain":"forged"}},"spec":{{"signerName":"example.com/s","podName":"p","podUID":"pu","serviceAccountName":"sa","serviceAccountUID":"su","nodeName":"node-1","nodeUID":"nu","maxExpirationSeconds":3600,"stubPKCS10Request":"{stub_csr}"}}}}"#
-        );
-        let pcr_status = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"PodCertificateRequest","metadata":{"name":"x","namespace":"default"},"status":{"conditions":[{"type":"Denied","status":"True","reason":"r","message":"m","lastTransitionTime":"2026-01-01T00:00:00Z"}]}}"#;
         let v1 = "/apis/certificates.k8s.io/v1";
-        let b1 = "/apis/certificates.k8s.io/v1";
-        let cases: [(&str, &str, &str, &str, &str); 6] = [
-            (
-                "admin-token",
-                "POST",
-                &format!("{v1}/certificatesigningrequests"),
-                &format!("{v1}/%63ertificatesigningrequests"),
-                garbage_csr,
-            ),
-            (
-                "admin-token",
-                "POST",
-                &format!("{v1}/certificatesigningrequests"),
-                "/apis/%63ertificates.k8s.io/v1/certificatesigningrequests",
-                garbage_csr,
-            ),
+        let cases: [(&str, &str, &str, &str, &str); 2] = [
             (
                 "updater-token",
                 "PUT",
@@ -8957,40 +8913,26 @@ mod tests {
                 &format!("{v1}/%63lustertrustbundles"),
                 r#"{"metadata":{"x":0},"spec":{"trustBundle":"junk"}}"#,
             ),
-            (
-                "node-token",
-                "POST",
-                &format!("{b1}/namespaces/default/podcertificaterequests?dryRun=All"),
-                &format!("{b1}/namespaces/default/%70odcertificaterequests?dryRun=All"),
-                &pcr_create,
-            ),
-            (
-                "updater-token",
-                "PUT",
-                &format!("{b1}/namespaces/default/podcertificaterequests/x/status"),
-                &format!("{b1}/namespaces/default/podcertificaterequests/x/%73tatus"),
-                pcr_status,
-            ),
         ];
-        // A created object carries per-request uid/timestamps; what separates the bespoke PCR
-        // create from the generic one is whether the client-supplied status survived.
-        let shape = |(status, body): (axum::http::StatusCode, String)| {
-            if status.is_success() {
-                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-                (
-                    status,
-                    format!("status kept: {}", v.get("status").is_some()),
-                )
-            } else {
-                (status, body)
-            }
-        };
+        // The answer only the dedicated handler gives; a generic fallthrough would differ.
+        let bespoke: [(u16, &str); 2] = [
+            (
+                403,
+                "user not permitted to approve requests with signerName",
+            ),
+            (422, "spec.trustBundle contains data outside of a PEM block"),
+        ];
         let mut mismatches = Vec::new();
-        for (token, method, literal, encoded, body) in cases {
-            let want = shape(send_as(&app, token, method, literal, body).await);
-            let got = shape(send_as(&app, token, method, encoded, body).await);
-            if got != want {
-                mismatches.push(format!("{method} {encoded}: {got:?} != {want:?}"));
+        for ((token, method, literal, encoded, body), (code, marker)) in
+            cases.into_iter().zip(bespoke)
+        {
+            for path in [literal, encoded] {
+                let (status, text) = send_as(&app, token, method, path, body).await;
+                if status != code || !text.contains(marker) {
+                    mismatches.push(format!(
+                        "{method} {path}: {status} {text} (want {code} containing {marker:?})"
+                    ));
+                }
             }
         }
         assert!(
@@ -9204,6 +9146,80 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    /// `.`/`..`/empty segments, `;` path parameters and NUL bytes are not cleaned or split by
+    /// either layer (Go's apiserver mux does not clean paths and `;` is an ordinary name
+    /// character). What matters is that no spelling is served as a different object than the
+    /// one authorization evaluated: auth either sees the same literal segments the router
+    /// matches, or the router answers 400/404 and no handler runs. `/./x` style paths are
+    /// shifted by auth (`.` becomes the resource) yet 404 in the router, so RBAC for the
+    /// shifted view guards nothing that is served.
+    #[tokio::test]
+    async fn dot_empty_semicolon_and_nul_segments_never_serve_an_object_auth_did_not_see() {
+        let (app, state) = certificates_app().await;
+        use u7s_store::Store as _;
+        state
+            .store
+            .put(
+                "/registry/configmaps/default/x".to_owned(),
+                serde_json::to_vec(&serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"default","uid":"c"}})).unwrap().into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let cm = "/api/v1/namespaces/default";
+        let served = send_as(
+            &app,
+            "admin-token",
+            "GET",
+            &format!("{cm}/configmaps/x"),
+            "",
+        )
+        .await;
+        assert_eq!(
+            served.0, 200,
+            "reference object must be servable: {served:?}"
+        );
+        // Expected router status for an admin on each path.
+        let cases: [(String, u16); 17] = [
+            (format!("{cm}/./configmaps/x"), 404),
+            (format!("{cm}/configmaps/./x"), 404),
+            (format!("{cm}/configmaps/y/../x"), 404),
+            (format!("{cm}/configmaps/%2e%2e/x"), 404),
+            (format!("{cm}/configmaps/%2E/x"), 404),
+            (format!("{cm}/configmaps/x/."), 404),
+            (format!("{cm}/configmaps/.."), 400),
+            (format!("{cm}/configmaps//x"), 404),
+            ("/api/v1//namespaces/default/configmaps/x".into(), 403),
+            (format!("/{cm}/configmaps/x"), 404),
+            (format!("{cm}/configmaps/x/"), 404),
+            (format!("{cm}/configmaps/x;y"), 404),
+            (format!("{cm}/configmaps/x%3By"), 404),
+            (format!("{cm}/configmaps;a=b/x"), 404),
+            (format!("{cm}/configmaps/x%00"), 400),
+            (format!("{cm}/configmaps/%00"), 400),
+            (format!("{cm}/conf%00igmaps/x"), 404),
+        ];
+        for (path, status) in cases {
+            let got = send_as(&app, "admin-token", "GET", &path, "").await;
+            assert_eq!(got.0, status, "{path}: {got:?}");
+            assert!(
+                !got.1.contains("\"kind\":\"ConfigMap\""),
+                "{path} must not serve the configmap: {got:?}"
+            );
+        }
+        for (path, name) in [
+            (format!("{cm}/configmaps/x;y"), "x;y"),
+            (format!("{cm}/configmaps/x%3By"), "x;y"),
+            (format!("{cm}/configmaps/x%00"), "x\0"),
+        ] {
+            assert_eq!(
+                auth::resolved_path_for_test(&path),
+                ["", "v1", "configmaps", "default", name, ""],
+                "{path}: auth and the handler's name validator must agree on the literal name"
+            );
+        }
     }
 
     /// One invalid escape used to make the router skip normalization of the whole path, so an
