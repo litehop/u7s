@@ -3280,6 +3280,10 @@ const CA_TRUST_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// client-cert verification, outbound kubelet/webhook/aggregation clients, the published
 /// `ca-bundle.pem`, and the in-store ConfigMaps. Already-open connections keep the config
 /// they were accepted with.
+///
+/// A failure in the in-memory swap changes nothing. A failure afterwards (`ca-bundle.pem` or
+/// the ConfigMap seeds) leaves in-memory trust new but the caller's `current` unadvanced, so
+/// the next poll re-applies the same bundle; every step is idempotent.
 async fn apply_trust_bundle(
     ca_cert_path: &str,
     ca_ders: &[Vec<u8>],
@@ -3287,14 +3291,30 @@ async fn apply_trust_bundle(
     state: &state::AppState<SqliteStore>,
     store: &SqliteStore,
 ) -> anyhow::Result<()> {
-    let clients = state
-        .build_ca_bundle_clients(ca_ders)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    rotator.set_client_cas(ca_ders.to_vec())?;
-    state.install_ca_bundle(ca_ders.to_vec(), clients);
+    swap_trust(
+        ca_ders,
+        rotator,
+        |ders| state.build_ca_bundle_clients(ders),
+        |clients| state.install_ca_bundle(ca_ders.to_vec(), clients),
+    )?;
     tls::write_ca_bundle(ca_cert_path, ca_ders)?;
     seed_kube_root_ca(store, ca_ders).await?;
     seed_cluster_info(store, &state.server_address, ca_ders).await
+}
+
+/// The in-memory half of a trust change. Everything fallible (the outbound clients, then the
+/// inbound client-CA config) completes before anything is installed, so a failure leaves the
+/// previous trust fully in force instead of new inbound CAs with old outbound clients.
+fn swap_trust<C>(
+    ca_ders: &[Vec<u8>],
+    rotator: &rotation::Rotator,
+    build_outbound: impl FnOnce(&[Vec<u8>]) -> Result<C, String>,
+    install_outbound: impl FnOnce(C),
+) -> anyhow::Result<()> {
+    let outbound = build_outbound(ca_ders).map_err(|e| anyhow::anyhow!(e))?;
+    rotator.set_client_cas(ca_ders.to_vec())?;
+    install_outbound(outbound);
+    Ok(())
 }
 
 /// Seed the `kube-root-ca.crt` ConfigMap (data: `ca.crt` = the cluster CA bundle) into

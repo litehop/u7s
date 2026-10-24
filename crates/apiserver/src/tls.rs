@@ -993,6 +993,11 @@ pub(crate) fn parse_ca_bundle_pem(pem: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
 
 /// The signing CA followed by every distinct extra CA from [`ca_extra_path`]. A present but
 /// empty or garbage extra file is an error rather than being ignored.
+///
+/// Operator contract for `ca-extra.pem`: write a temp file in the same directory and `rename`
+/// it into place. The two-poll debounce in [`settle_bundle`] is best-effort only; a writer
+/// stalled on a certificate boundary for about ten seconds still publishes a truncated,
+/// trust-narrowing bundle.
 pub(crate) fn load_trust_bundle(
     ca_cert_path: &str,
     signing_ca_der: &[u8],
@@ -2620,6 +2625,47 @@ mod tests {
             tls.server_config.get()
         ));
         assert_eq!(state.cluster_ca_ders.get().as_deref(), Some(&next));
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// A bundle that is valid for inbound trust but cannot be built into outbound clients must
+    /// not narrow or widen inbound client CAs: the garbage-DER test above fails on the inbound
+    /// step first, so only this one pins the build-before-set ordering.
+    #[test]
+    fn outbound_build_failure_leaves_inbound_client_cas_unchanged() {
+        let dir = test_temp_dir("swap-atomic");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let (issuer, extra) = extra_ca("successor");
+        let client = client_config_with_identity_from(&tls.ca_cert_der, &issuer);
+        let mut next = tls.ca_bundle_ders.clone();
+        next.push(extra);
+
+        let mut installed = false;
+        crate::swap_trust(
+            &next,
+            &tls.rotator,
+            |_| Err::<(), _>("outbound build refused".to_owned()),
+            |()| installed = true,
+        )
+        .expect_err("a failed outbound build fails the swap");
+        assert!(!installed, "nothing may be installed after a failed build");
+        assert!(
+            !crate::test_tls::handshake_completes(client.clone(), tls.server_config.get()),
+            "inbound client CAs must not change when the outbound build fails"
+        );
+
+        crate::swap_trust(&next, &tls.rotator, |_| Ok(()), |()| installed = true)
+            .expect("swap succeeds when every build succeeds");
+        assert!(installed);
+        assert!(crate::test_tls::handshake_completes(
+            client,
+            tls.server_config.get()
+        ));
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
