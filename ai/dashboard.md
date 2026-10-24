@@ -1,42 +1,47 @@
 ---
-updated: 2026-10-23T10:45Z
+updated: 2026-10-24T15:05Z
 ---
-# Dashboard — session 2026-10-23 WRAPPED (main `4579444e`)
-**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream unless incompatible; queue merge on green, never `--admin`. No GCP account/project in git (gcloud config `u7s-gcp`).
-**Priorities (operator 2026-10-23, bd memory `priorities-2026-10-23-pki-then-migration`):** 1 PKI `xdw6u` → **next release when .6/.7/.10/.8 done** (.6 ✅ .10 ✅) · 2 migration MVP `te4sn` (own release when ready) · 3 security P2s on spare slots · post-release: GCP 2–3 node WireGuard playground + Argo CD → Ingress/storage + `vc844` rewrite decision.
-**Resume:** `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons (tick 15m, posture 60m, hygiene 60m). No workers, VMs or VPSes running.
+# Dashboard — session 2026-10-24 evening WRAPPED (main `284838ee`)
+**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream; queue merge on green, never `--admin`.
+**Priorities:** bd memory `priorities-2026-10-24-release-after-h6h2v`. `pki-rotation-e2e` is advisory: bd memory `pki-rotation-e2e-advisory-observe`.
+**Resume:** start with `claude --settings .claude/settings.json`; paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. No workers or VMs running.
 
 ## 🎯 Waiting on you
-- `1gfa6`: `v*` tag ruleset (settings on the bead) + `bjuu2` required check (mayor confirms the job-level streak first).
-- `vc844` deferred until playground data.
+- **Release: gate cleared** — `h6h2v` merged (#2014). Yours to cut.
 
-## ▶ First dispatches next session (briefs are on the beads)
-1. **#1974 `xdw6u.7`** fix round: HIGH non-CA cert accepted as trust anchor; truncated-bundle + half-applied swap; then merge main (conflicts with #1977 — recipe on the bead).
-2. **`xdw6u.8`** two-tier issuance (after .7) → **release** when done. `xdw6u.13` (worker CA refresh) blocks `.9`.
-3. **#1973 `te4sn.3`** live re-run (5 checks on the bead) → un-draft → merge; then `te4sn.4` (needs `uhts0` politeia file-path kubeconfigs).
-4. **#1978 `p3ktl`** fix round: infra failures scored FAIL; preemption-lookup error; non-aborting cleanup. Then `vw7jc` (snapshot FAILs on GCP) on a fresh snapshot; `02f1s` (CN > 64 chars).
-5. Security P2 tail: `6hopk` (kube-system SA priority allowlist) · `qap3i.48` MAP JSONPatch · `qap3i.49` VAP params/authorizer · `xdw6u.14` · `qap3i.35/.36–.39/.41/.42/.45/.47` · `m6666` (timing-test flakes) · `r4umz` · `83irk` item 2.
+## 🚦 Queued at wrap (LGTM, all checks green or running; confirm merged → tick closes beads, reap worktrees)
+#2013 `fhdqw` pki-rotation-e2e own workflow, parallel suites (21-22 → 10-11 min) · #2012 `mtivc` rusqlite 0.41 · #2011 this bookkeeping.
 
-## ✅ Merged this session (#1945–#1981)
-Security audit run-1: all 4 P1s (#1948–#1951) + most P2s (#1958 #1960 #1961 #1962 #1963 #1966 #1967 #1968 #1979 #1980). PKI: SA key rotation #1975 · kubelet serving CSR #1977. KCM per-controller creds #1971. Release: Ed25519 signing #1952 · gate INVALID/FAIL fixes #1955 #1959 · install denies externalIPs #1970. Others: #1953 #1954 #1956 #1957 #1964 (roadmap) #1969 (beads) #1972 (politeia v0.3.1) #1976 (RUSTSEC-2026-0385) · Renovate #1945 #1946 #1965 #1981 · politeia #24 #25.
+## ⏭ First dispatches
+1. **`te4sn.4`** migration cutover + rollback — VM `k3s-migrate-src`; brief ready (bead notes). Dispatched+stopped at wrap, no edits.
+2. `fgxnm` step 1-2: in a `--settings` session run `claude auto-mode config`, then the throwaway-worker classifier probes.
+3. Security P2s: `6i5b7` CSR CheckSignature (new) · `qap3i.55` · `0c8uw` · `qap3i.54` · `xdw6u.17` · `1xpj7.3` · `qm68h` · `qap3i.35` remainder.
+4. Small: `1tb5u` CRLF CSR test · `z018t` reload assertion · `n07ul` stale doc line · `qh7ko` tick/hygiene merged-branch gap.
+5. Ops: `i3n1g` · `6t0u2` · `pkh20` · `vny2h` · `0suei` · `zy4j1` · `yp00d`. Deferred: `vc844`.
+
+## 🧭 Decisions this session
+`h6h2v`: keep strict CSR parsing (stricter than Go). `fhdqw`: pki-rotation-e2e off required checks; shorter lifetimes + own workflow; re-require later only if it stays well under the 20-min queue timeout.
+
+## ✅ Merged 2026-10-24 evening
+#2010 `xdw6u.16` · #2008 `edrle` · #2009 `9a713` · #2007 `jn96b` · **#2014 `h6h2v`** (release gate).
 
 ## 🔎 Open PRs
 <!-- BEGIN AUTO: open-prs -->
-- #1978 (needs changes) · #1974 (needs changes, DIRTY) · #1973 (draft, live re-run)
+- #2013, #2012, #2011 (queued)
 <!-- END AUTO: open-prs -->
 ## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-- 3 worktrees kept for the open PRs above; hygiene clean
+- 2 worker worktrees for queued #2013/#2012; reap after merge.
 <!-- END AUTO: worktrees -->
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
-15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
+Stopped at wrap.
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-10-23T10:45Z — Branch `main` @ `4579444e`.
+As of 2026-10-24T15:05Z — `main` @ `284838ee`.
 <!-- END AUTO: repo-state -->
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
-0 pending review-queue entries.
+0 pending.
 <!-- END AUTO: review-queue -->
