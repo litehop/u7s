@@ -2936,7 +2936,18 @@ pub(crate) async fn patch_pod_status<S: Store>(
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
         let before_write = current_obj.body.clone();
+        let ssa_plan = super::status::plan_status_apply(
+            &headers,
+            content_type.contains("apply-patch+yaml"),
+            &before_write,
+            &patch,
+            "",
+            "v1",
+        )?;
         current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current_obj.body);
+        }
         current_obj.body = admit_pod_status_update(
             &state,
             ns.as_str(),
@@ -2947,12 +2958,13 @@ pub(crate) async fn patch_pod_status<S: Store>(
             current_obj.body,
         )
         .await?;
-        crate::field_manager::WriteIdentity::new(None, &headers).record(
+        super::status::record_status_write(
+            &headers,
+            ssa_plan.as_ref(),
             &before_write,
             &mut current_obj.body,
+            "",
             "v1",
-            Some("status"),
-            None,
         );
 
         // Dry-run: validation passed; return the would-be patched status without
@@ -9266,12 +9278,11 @@ mod pure_logic_tests {
         assert!(result.is_err());
     }
 
-    /// An unsupported op (e.g. "copy") returns 422.
-    /// Only add, remove, replace are supported.
+    /// An unsupported op (e.g. "bogus") returns 422.
     #[test]
     fn apply_json_patch_unsupported_op_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
-        let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
+        let patch = serde_json::json!([{"op": "bogus", "path": "/b"}]);
         let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }

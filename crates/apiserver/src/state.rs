@@ -94,24 +94,72 @@ pub const MAX_WATCHES_GLOBAL: usize = 512;
 /// Seconds a rejected watch client is told to wait before retrying.
 pub const WATCH_RETRY_AFTER_SECONDS: u64 = 1;
 
+/// Service accounts KCM 1.37 authenticates controllers as under the u7s `--controllers` set.
+/// `selinux-warning-controller` is absent on purpose: it is disabled by default and needs the
+/// SELinuxChangePolicy gate, so `--controllers=*` never starts it.
+pub(crate) const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
+    "attachdetach-controller",
+    "bootstrap-signer",
+    "certificate-controller",
+    "cronjob-controller",
+    "daemon-set-controller",
+    "deployment-controller",
+    "device-taint-eviction-controller",
+    "disruption-controller",
+    "endpoint-controller",
+    "endpointslice-controller",
+    "endpointslicemirroring-controller",
+    "ephemeral-volume-controller",
+    "expand-controller",
+    "generic-garbage-collector",
+    "horizontal-pod-autoscaler",
+    "job-controller",
+    "kube-apiserver-serving-clustertrustbundle-publisher",
+    "legacy-service-account-token-cleaner",
+    "namespace-controller",
+    "node-controller",
+    "persistent-volume-binder",
+    "pod-garbage-collector",
+    "podcertificaterequestcleaner",
+    "pv-protection-controller",
+    "pvc-protection-controller",
+    "replicaset-controller",
+    "replication-controller",
+    "resource-claim-controller",
+    "resourcequota-controller",
+    "root-ca-cert-publisher",
+    "service-account-controller",
+    "statefulset-controller",
+    "storage-version-migrator-controller",
+    "token-cleaner",
+    "ttl-after-finished-controller",
+    "ttl-controller",
+    "validatingadmissionpolicy-status-controller",
+    "volumeattributesclass-protection-controller",
+];
+
 /// Identities whose watches bypass both the per-client and global caps, so a tenant
 /// exhausting the pool cannot lock out the control plane (and the controller-manager's
 /// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
 /// (`system:node:<name>`, O=system:nodes), the controller-manager, the scheduler and the
-/// kube-system ServiceAccounts the controller-manager runs its controllers as.
-/// Mirrors upstream APF's exempt (system:masters), system-nodes, system-leader-election and
-/// kube-system-service-accounts (workload-high) flow schemas. Minting a kube-system
-/// ServiceAccount (or its token) needs write access to kube-system, which is already a
-/// control-plane grant. Matched on username, which is only as trustworthy as the cluster CA's
+/// kube-system ServiceAccounts the controller-manager runs its controllers as
+/// (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts (coredns,
+/// metrics-server, anything user-deployed) draw from the ordinary pools: upstream maps them
+/// to the shared-seat workload-high level, not an exemption.
+/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
+/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
 /// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
 /// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
-/// O=system:masters), so that RBAC grant is effectively a control-plane grant.
+/// O=system:masters), so that RBAC grant is effectively a control-plane grant. Likewise
+/// whoever can mint tokens for a listed kube-system ServiceAccount.
 pub fn is_system_priority_username(username: &str) -> bool {
     matches!(
         username,
         "admin" | "system:kube-controller-manager" | "system:kube-scheduler"
     ) || username.starts_with("system:node:")
-        || username.starts_with("system:serviceaccount:kube-system:")
+        || username
+            .strip_prefix("system:serviceaccount:kube-system:")
+            .is_some_and(|sa| KCM_CONTROLLER_SERVICE_ACCOUNTS.contains(&sa))
 }
 
 /// Watch stream concurrency limiter: a semaphore per authenticated username plus one
@@ -2103,17 +2151,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn priority_is_limited_to_kube_system_service_accounts() {
-        for u in [
-            "system:serviceaccount:kube-system:deployment-controller",
-            "system:kube-controller-manager",
-        ] {
+    fn priority_is_limited_to_kcm_controller_service_accounts() {
+        for sa in KCM_CONTROLLER_SERVICE_ACCOUNTS {
+            let u = format!("system:serviceaccount:kube-system:{sa}");
             assert!(
-                is_system_priority_username(u),
-                "{u} runs control-plane controllers"
+                is_system_priority_username(&u),
+                "{u} runs a KCM controller; starving its watches stalls reconciliation"
             );
         }
+        assert!(is_system_priority_username(
+            "system:kube-controller-manager"
+        ));
         for u in [
+            "system:serviceaccount:kube-system:coredns",
+            "system:serviceaccount:kube-system:metrics-server",
             "system:serviceaccount:default:deployment-controller",
             "system:serviceaccount:kube-system-evil:x",
             "system:serviceaccount:kube-system",
