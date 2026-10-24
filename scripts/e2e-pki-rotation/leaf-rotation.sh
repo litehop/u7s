@@ -135,7 +135,7 @@ kubelet_pem() {
 }
 
 kubelet_chain() {
-  openssl s_client -connect "127.0.0.1:$KUBELET_PORT" -showcerts </dev/null 2>/dev/null |
+  { openssl s_client -connect "127.0.0.1:$KUBELET_PORT" -showcerts </dev/null 2>/dev/null || true; } |
     sed -n '/^-----BEGIN CERTIFICATE-----$/,/^-----END CERTIFICATE-----$/p'
 }
 

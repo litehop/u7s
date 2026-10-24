@@ -44,6 +44,10 @@ is needed only at root succession. kubeadm and k3s use the same 10-year CA with
 - A cluster installed before this change has a root-signed leaf set and no
   intermediate; the intermediate is created at the next start and the leaves are
   re-issued under it. KCM must be restarted onto the new signing flags.
+- A leaf never outlives its intermediate: a leaf issued late in the intermediate's
+  life is shorter than a year, and the 2/3 rotation re-issues every leaf under a
+  fresh intermediate. A credential copied off the host and not refreshed expires
+  with the intermediate it was issued under.
 - A client presenting an intermediate-signed leaf without the intermediate is
   rejected. Kubelets write `status.certificate` verbatim, so the appended chain
   is what they present; certificates signed directly by the root before this

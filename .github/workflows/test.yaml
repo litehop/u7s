@@ -154,9 +154,9 @@ jobs:
         env:
           U7S_PKI_TEST_LIFETIME_SECS: "120"
           U7S_PKI_TEST_SA_ROTATION_SECS: "120"
-          # 3x the leaf lifetime so the leaves it signs are never clamped; rotates at 240s and
-          # then every 240s, re-issuing every leaf under the new intermediate each time.
-          U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS: "360"
+          # 4.5x the leaf lifetime so the leaves it signs are never clamped (and the renewal point of a
+          # clamped leaf never lands in the past); rotates at 360s and then every 360s.
+          U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS: "540"
         run: |
           W="$PWD/temp/pki-e2e"
           mkdir -p "$W/manifests"
@@ -190,7 +190,7 @@ jobs:
         run: |
           scripts/e2e-pki-rotation/intermediate-rotation.sh \
             --kubeconfig temp/pki-e2e/kubeconfig --workdir temp/pki-e2e --port 6443 \
-            --scheduler --intermediate-lifetime 360
+            --scheduler --intermediate-lifetime 540
 
       - name: Leaf rotation e2e (3 iterations)
         run: |
