@@ -555,7 +555,9 @@ impl<'a> Coster<'a> {
                 } else {
                     operand.field(&sel.field)
                 };
-                (c.saturating_add(1), node)
+                // Kubernetes' environment sets PresenceTestHasCost(false): has() adds nothing
+                // beyond its operand.
+                (c.saturating_add(u64::from(!sel.test)), node)
             }
             Expr::Call(call) => {
                 let func = call.func_name.as_str();
@@ -881,6 +883,19 @@ mod tests {
             s["maxItems"] = n.into();
         }
         s
+    }
+
+    #[test]
+    fn has_presence_test_costs_only_its_operand_like_kubernetes() {
+        let obj = serde_json::json!({ "type": "object" });
+        assert_eq!(
+            cost_of("has(self.a) || has(self.b)", &obj),
+            2,
+            "Kubernetes sets PresenceTestHasCost(false), so each has() costs just `self`; \
+             billing the select too doubles the estimate and rejects CRDs (Envoy Gateway \
+             SecurityPolicy) that upstream accepts"
+        );
+        assert_eq!(cost_of("self.a", &obj), 2, "a plain select still costs one");
     }
 
     #[test]
