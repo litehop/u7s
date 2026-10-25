@@ -1,7 +1,7 @@
 ---
 updated: 2026-10-25T08:50Z
 ---
-# Dashboard — session 2026-10-25 WRAPPED (main `1439ecb9`)
+# Dashboard — session 2026-10-25 WRAPPED (main `34d22662`)
 **Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream; queue merge on green, never `--admin`.
 **Priorities:** bd memory `priorities-2026-10-24-release-after-h6h2v` (release not urgent) → `te4sn` → security/Conformance P2s. TLS deferral lifted: bd memory `tls-deferral-lifted-2026-10-25`.
 **Resume:** `claude --settings .claude/settings.json`; paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. No workers, VMs or VPSes running.
@@ -12,7 +12,7 @@ updated: 2026-10-25T08:50Z
 - Stance/priorities not re-confirmed this session.
 
 ## 🚦 Queued at wrap
-#2018 extended-context docs · #2019 this bookkeeping.
+#2019 this bookkeeping.
 
 ## ⏭ First dispatches
 1. `lqu0h` P2 (defaulting/CEL skip map values — security-relevant) · `hkufk` · `jqdf9` · `ddhlo`.
@@ -21,15 +21,15 @@ updated: 2026-10-25T08:50Z
 4. `qh7ko` (hygiene never reaps PR-less merged branches; hit twice) · `1tb5u` · `z018t` · `n07ul` · ops `i3n1g` `6t0u2` `pkh20` `vny2h` `0suei` `zy4j1` `yp00d`. Parked `31bz8`. `fgxnm` needs operator.
 
 ## ✅ Merged 2026-10-25
-#2017 `fvh8w` **P1** CR map data kept by pruning · #2016 `jhtep`+`mqb79` CRD discovery + printer columns · #2015 `n88nk` CEL `has()` cost · #2013 · #2012 · #2011. Also `v0.4.2-snapshot.1`; `s82zr.1`, `g7cts` closed.
+#2018 extended-context (release-gate + L7 state) · #2017 `fvh8w` **P1** CR map data kept by pruning · #2016 `jhtep`+`mqb79` CRD discovery + printer columns · #2015 `n88nk` CEL `has()` cost · #2013 · #2012 · #2011. Also `v0.4.2-snapshot.1`; `s82zr.1`, `g7cts` closed.
 
 ## 🔎 Open PRs
 <!-- BEGIN AUTO: open-prs -->
-- #2018, #2019 (queued)
+- #2019 (queued)
 <!-- END AUTO: open-prs -->
 ## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-- #2018 worker worktree + `temp/review-scratch/wrap-1025`; reap after merge.
+- `temp/review-scratch/wrap-1025` (#2019); reap after merge.
 <!-- END AUTO: worktrees -->
 ## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
@@ -37,7 +37,7 @@ Stopped at wrap.
 <!-- END AUTO: cron-loops -->
 ## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-10-25T08:50Z — `main` @ `1439ecb9`.
+As of 2026-10-25T08:50Z — `main` @ `34d22662`.
 <!-- END AUTO: repo-state -->
 ## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
