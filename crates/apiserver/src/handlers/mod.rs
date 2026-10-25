@@ -17,6 +17,7 @@ pub mod field_selector;
 mod field_selector_tests;
 pub mod generic;
 pub mod json_patch;
+pub(crate) mod jsonpath;
 pub mod metrics;
 pub mod namespaces;
 pub mod oidc;

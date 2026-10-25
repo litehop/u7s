@@ -334,7 +334,13 @@ fn validate_additional_printer_columns(
             if col.json_path.is_empty() {
                 return Err(invalid("JSONPath", "Required value".to_string()));
             }
-            if let Err(e) = crate::handlers::table::parse_json_path(&col.json_path) {
+            if !col.json_path.starts_with('.') {
+                return Err(invalid(
+                    "JSONPath",
+                    "must be a simple json path starting with .".to_string(),
+                ));
+            }
+            if let Err(e) = crate::handlers::jsonpath::parse(&col.json_path) {
                 return Err(invalid("JSONPath", e));
             }
         }
@@ -2548,6 +2554,47 @@ mod tests {
                 err.0,
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "{column}"
+            );
+        }
+    }
+
+    /// Upstream stores every one of these (it only requires a leading `.` and a parseable
+    /// jsonpath); rejecting them breaks `kubectl apply` of common operator CRDs.
+    #[tokio::test]
+    async fn create_crd_accepts_every_json_path_form_upstream_accepts() {
+        for path in [
+            ".status.conditions[?(@.type==\"Ready\")].status",
+            "..name",
+            ".spec.list[0:2]",
+            ".spec.list[-1]",
+            ".metadata.labels['a.b']",
+            ".metadata.labels.app\\.io/x",
+            ".spec.list[0,1]",
+            ".spec.list[*]",
+        ] {
+            let body = crd_with_printer_columns(serde_json::json!([
+                { "name": "C", "type": "string", "jsonPath": path }
+            ]));
+            create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+                .await
+                .unwrap_or_else(|e| panic!("{path} must be accepted, got {}", e.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_crd_rejects_unparseable_json_path() {
+        for path in [".spec.list[", ".spec.list[abc]", ".a[?(@.x==1]"] {
+            let body = crd_with_printer_columns(serde_json::json!([
+                { "name": "C", "type": "string", "jsonPath": path }
+            ]));
+            let err = create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{path} must be rejected"));
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
             );
         }
     }

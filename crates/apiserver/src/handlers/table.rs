@@ -1562,79 +1562,6 @@ fn generic_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Custom resources ──────────────────────────────────────────────────────────
 
-pub(crate) enum PathSeg {
-    Key(String),
-    Index(usize),
-    Wildcard,
-}
-
-/// Parse the simple JSONPath subset CRD printer columns use: `.a.b`, `.a[0]`, `.a['b.c']`,
-/// `.a[*]`, optionally wrapped in `{}`.
-pub(crate) fn parse_json_path(path: &str) -> Result<Vec<PathSeg>, String> {
-    let p = path.trim();
-    let p = p
-        .strip_prefix('{')
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(p);
-    let invalid = || format!("invalid JSONPath {path:?}");
-    if !p.starts_with('.') && !p.starts_with('[') {
-        return Err(invalid());
-    }
-    let mut segs = Vec::new();
-    let mut rest = p;
-    while !rest.is_empty() {
-        if let Some(after) = rest.strip_prefix('.') {
-            let end = after.find(['.', '[']).unwrap_or(after.len());
-            let ident = &after[..end];
-            rest = &after[end..];
-            match ident {
-                "" if segs.is_empty() && rest.is_empty() => {}
-                "" => return Err(invalid()),
-                "*" => segs.push(PathSeg::Wildcard),
-                _ => segs.push(PathSeg::Key(ident.to_string())),
-            }
-        } else if let Some(after) = rest.strip_prefix('[') {
-            let end = after.find(']').ok_or_else(invalid)?;
-            let inner = &after[..end];
-            rest = &after[end + 1..];
-            if inner == "*" {
-                segs.push(PathSeg::Wildcard);
-            } else if let Some(key) = inner
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-                .or_else(|| inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-            {
-                segs.push(PathSeg::Key(key.to_string()));
-            } else {
-                segs.push(PathSeg::Index(inner.parse().map_err(|_| invalid())?));
-            }
-        } else {
-            return Err(invalid());
-        }
-    }
-    Ok(segs)
-}
-
-fn eval_json_path<'a>(segs: &[PathSeg], root: &'a serde_json::Value) -> Vec<&'a serde_json::Value> {
-    let mut current = vec![root];
-    for seg in segs {
-        let mut next = Vec::new();
-        for v in current {
-            match seg {
-                PathSeg::Key(k) => next.extend(v.get(k.as_str())),
-                PathSeg::Index(i) => next.extend(v.get(*i)),
-                PathSeg::Wildcard => match v {
-                    serde_json::Value::Array(a) => next.extend(a),
-                    serde_json::Value::Object(o) => next.extend(o.values()),
-                    _ => {}
-                },
-            }
-        }
-        current = next;
-    }
-    current
-}
-
 /// Table cell for a printer-column value, shaped by the column's declared type like upstream's
 /// `cellForJSONValue`; a value that does not fit the type renders as an empty cell.
 fn printer_cell(column_type: &str, value: &serde_json::Value) -> serde_json::Value {
@@ -1642,7 +1569,7 @@ fn printer_cell(column_type: &str, value: &serde_json::Value) -> serde_json::Val
     match (column_type, value) {
         (_, Value::Null) => Value::Null,
         ("string", Value::String(_)) => value.clone(),
-        ("string", other) => Value::String(other.to_string()),
+        ("string", other) => Value::String(super::jsonpath::print_value(other)),
         ("integer", Value::Number(n)) => n
             .as_i64()
             .or_else(|| n.as_f64().map(|f| f as i64))
@@ -1682,9 +1609,9 @@ pub fn build_cr_table(
     };
     // A column whose path fails to parse yields empty cells; CRD validation rejects those on
     // write, so this only guards CRDs stored before the field was validated.
-    let paths: Vec<Vec<PathSeg>> = columns
+    let paths: Vec<Vec<super::jsonpath::Node>> = columns
         .iter()
-        .map(|c| parse_json_path(&c.json_path).unwrap_or_default())
+        .map(|c| super::jsonpath::parse(&c.json_path).unwrap_or_default())
         .collect();
 
     let mut definitions = vec![serde_json::json!({
@@ -1727,8 +1654,7 @@ pub fn build_cr_table(
             )];
             for (c, segs) in columns.iter().zip(&paths) {
                 cells.push(
-                    eval_json_path(segs, &obj)
-                        .first()
+                    super::jsonpath::first_result(segs, &obj)
                         .map_or(serde_json::Value::Null, |v| printer_cell(&c.column_type, v)),
                 );
             }
@@ -1892,7 +1818,7 @@ mod tests {
         let cols = [
             column("Nested", "string", ".spec.a.b"),
             column("First", "string", ".spec.list[0]"),
-            column("Quoted", "string", ".metadata.labels['app.io/x']"),
+            column("Quoted", "string", ".metadata.labels.app\\.io/x"),
             column("Num", "integer", ".spec.n"),
             column("Missing", "string", ".spec.nope"),
             column("Wrong", "boolean", ".spec.n"),
@@ -1909,11 +1835,64 @@ mod tests {
         );
     }
 
+    /// `kubectl get` on an operator CRD must show the Ready condition status, not an empty
+    /// column: the filter form is what cert-manager and Gateway API ship.
     #[test]
-    fn json_path_rejects_paths_not_rooted_at_dot() {
-        assert!(parse_json_path("spec.x").is_err());
-        assert!(parse_json_path(".spec[").is_err());
-        assert!(parse_json_path("{.spec.x}").is_ok());
+    fn cr_table_cell_follows_condition_filter_path() {
+        let cols = [column(
+            "Ready",
+            "string",
+            ".status.conditions[?(@.type==\"Ready\")].status",
+        )];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "status": { "conditions": [
+                { "type": "Initialized", "status": "True" },
+                { "type": "Ready", "status": "False" }
+            ] }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(t["rows"][0]["cells"], serde_json::json!(["a", "False"]));
+    }
+
+    /// A path that cannot be evaluated against one object must blank that cell, never fail
+    /// the whole list.
+    #[test]
+    fn cr_table_unevaluable_path_is_a_nil_cell_not_an_error() {
+        let cols = [
+            column("Oob", "string", ".spec.list[9]"),
+            column("OnMap", "string", ".spec.m[0]"),
+            column("Ok", "string", ".spec.list[-1]"),
+        ];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "spec": { "list": ["x", "y"], "m": {} }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(
+            t["rows"][0]["cells"],
+            serde_json::json!(["a", null, null, "y"])
+        );
+    }
+
+    /// Upstream prints non-string values in a string column via jsonpath PrintResults:
+    /// maps as JSON, floats as Go would.
+    #[test]
+    fn cr_table_string_column_prints_maps_and_floats_like_upstream() {
+        let cols = [
+            column("Map", "string", ".spec.m"),
+            column("Float", "string", ".spec.f"),
+            column("Bool", "string", ".spec.b"),
+        ];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "spec": { "m": { "b": 1, "a": [1, "x"] }, "f": 1.5, "b": true }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(
+            t["rows"][0]["cells"],
+            serde_json::json!(["a", r#"{"a":[1,"x"],"b":1}"#, "1.5", "true"])
+        );
     }
 
     #[test]
