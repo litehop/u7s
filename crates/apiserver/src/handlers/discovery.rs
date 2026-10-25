@@ -201,35 +201,74 @@ async fn core_and_crd_groups<S: Store>(state: &AppState<S>) -> Vec<APIGroup> {
         )
         .await
     {
-        // Collect (group, versions) pairs from CRDs, deduplicating by group name.
-        // A group already covered by STATIC_GROUPS is skipped.
-        let mut seen: std::collections::HashSet<String> = STATIC_GROUPS
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect();
-
+        // Merge served versions across every CRD in a group (upstream aggregates per group, not
+        // per CRD); a group already covered by STATIC_GROUPS is skipped.
+        let mut crd_groups: Vec<(String, Vec<String>)> = Vec::new();
         for obj in &resp.items {
             let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
                 continue;
             };
-            let group = &crd.spec.group;
-            if seen.contains(group.as_str()) {
+            if STATIC_GROUPS
+                .iter()
+                .any(|(name, _)| *name == crd.spec.group)
+            {
                 continue;
             }
-            seen.insert(group.clone());
-            let preferred = preferred_version(&crd);
-            let served: Vec<&str> = crd
-                .spec
-                .versions
-                .iter()
-                .filter(|v| v.served)
-                .map(|v| v.name.as_str())
-                .collect();
-            groups.push(make_group(group, &preferred, &served));
+            let idx = match crd_groups.iter().position(|(g, _)| *g == crd.spec.group) {
+                Some(i) => i,
+                None => {
+                    crd_groups.push((crd.spec.group.clone(), Vec::new()));
+                    crd_groups.len() - 1
+                }
+            };
+            let versions = &mut crd_groups[idx].1;
+            for v in crd.spec.versions.iter().filter(|v| v.served) {
+                if !versions.contains(&v.name) {
+                    versions.push(v.name.clone());
+                }
+            }
+        }
+        for (group, mut versions) in crd_groups {
+            if versions.is_empty() {
+                continue;
+            }
+            versions.sort_by(|a, b| compare_kube_aware_versions(b, a));
+            let served: Vec<&str> = versions.iter().map(String::as_str).collect();
+            groups.push(make_group(&group, &versions[0], &served));
         }
     }
 
     groups
+}
+
+/// Ascending Kubernetes version priority (apimachinery `CompareKubeAwareVersionStrings`):
+/// GA > beta > alpha > names not shaped like a Kubernetes version; higher major/minor wins
+/// within a stability level; non-matching names compare lexically.
+fn compare_kube_aware_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parse(v: &str) -> Option<(u8, u64, u64)> {
+        let rest = v.strip_prefix('v')?;
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        let major: u64 = rest[..digits].parse().ok()?;
+        let tail = &rest[digits..];
+        if tail.is_empty() {
+            return Some((2, major, 0));
+        }
+        let (stability, minor) = if let Some(m) = tail.strip_prefix("beta") {
+            (1, m)
+        } else {
+            (0, tail.strip_prefix("alpha")?)
+        };
+        if minor.is_empty() || !minor.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((stability, major, minor.parse().ok()?))
+    }
+    match (parse(a), parse(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => a.cmp(b),
+    }
 }
 
 pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
@@ -254,18 +293,7 @@ pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGr
     }
 }
 
-/// Return the preferred (storage=true, else first) version name for a CRD.
-fn preferred_version(crd: &CustomResourceDefinition) -> String {
-    crd.spec
-        .versions
-        .iter()
-        .find(|v| v.storage)
-        .or_else(|| crd.spec.versions.first())
-        .map(|v| v.name.clone())
-        .unwrap_or_default()
-}
-
-/// Build an APIGroup with all served versions listed and the storage version as preferred.
+/// Build an APIGroup with all served versions listed and the given version as preferred.
 fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
     let versions: Vec<GroupVersionForDiscovery> = served
         .iter()
@@ -3524,6 +3552,106 @@ mod tests {
         assert_eq!(
             group.preferred_version.version, "v1",
             "v1 (storage=true) must be the preferredVersion"
+        );
+    }
+
+    #[test]
+    fn kube_aware_version_priority_orders_ga_beta_alpha_then_numbers() {
+        let mut v = vec![
+            "v1alpha2",
+            "foo",
+            "v2",
+            "v10beta3",
+            "v1",
+            "v11alpha2",
+            "v10",
+            "v3beta1",
+        ];
+        v.sort_by(|a, b| compare_kube_aware_versions(b, a));
+        assert_eq!(
+            v,
+            [
+                "v10",
+                "v2",
+                "v1",
+                "v10beta3",
+                "v3beta1",
+                "v11alpha2",
+                "v1alpha2",
+                "foo"
+            ],
+            "preferredVersion is the first entry, so GA must outrank beta/alpha"
+        );
+    }
+
+    // Two CRDs in one group serving different versions (e.g. Gateway API's gateway.networking.k8s.io
+    // shipping v1 and v1alpha2 CRDs separately) must both be discoverable; clients such as helm
+    // fail to find kinds whose version is missing from /apis.
+    #[tokio::test]
+    async fn second_crd_in_same_group_contributes_its_versions_to_every_discovery_surface() {
+        let state = make_state();
+        for (plural, kind, version) in [
+            ("gateways", "Gateway", "v1"),
+            ("tcproutes", "TCPRoute", "v1alpha2"),
+        ] {
+            let body = crd_bytes("gw.example.io", plural, plural, kind, "Namespaced", version);
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("create must succeed");
+        }
+
+        let list = api_group_list_inner(&state).await;
+        let group = list
+            .groups
+            .iter()
+            .find(|g| g.name == "gw.example.io")
+            .expect("gw.example.io must appear in /apis");
+        let versions: Vec<&str> = group.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(
+            versions,
+            ["v1", "v1alpha2"],
+            "legacy /apis must merge versions across CRDs"
+        );
+        assert_eq!(group.preferred_version.version, "v1");
+
+        let agg =
+            build_aggregated_discovery(&state, "v2", false, &UserInfo::default(), "/apis").await;
+        let item = agg
+            .items
+            .iter()
+            .find(|i| i.metadata.name == "gw.example.io")
+            .expect("aggregated discovery must list the group once");
+        let agg_versions: Vec<&str> = item.versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(
+            agg_versions,
+            ["v1", "v1alpha2"],
+            "aggregated discovery must merge versions"
+        );
+        assert_eq!(
+            agg.items
+                .iter()
+                .filter(|i| i.metadata.name == "gw.example.io")
+                .count(),
+            1
+        );
+        let v1alpha2 = item
+            .versions
+            .iter()
+            .find(|v| v.version == "v1alpha2")
+            .unwrap();
+        assert_eq!(
+            v1alpha2
+                .resources
+                .iter()
+                .map(|r| r.resource.as_str())
+                .collect::<Vec<_>>(),
+            ["tcproutes"],
+            "each version lists only the resources of CRDs serving it"
         );
     }
 
