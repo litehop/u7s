@@ -2559,10 +2559,11 @@ fn prune_cr_unknown_fields(
         let props = schema
             .get("properties")
             .and_then(serde_json::Value::as_object);
-        // Upstream: keys not in `properties` are governed by `additionalProperties` (a schema is
-        // pruned recursively; `true` keeps them verbatim) rather than dropped.
+        // Upstream: keys not in `properties` are governed by `additionalProperties` rather than
+        // dropped. A schema is pruned recursively; a bool has no schema, so the value is pruned
+        // against an empty one (the key survives, nested object keys do not).
         let additional = schema.get("additionalProperties");
-        let keep_all_additional = additional.and_then(serde_json::Value::as_bool) == Some(true);
+        let empty_schema = serde_json::json!({});
         let keys: Vec<String> = map.keys().cloned().collect();
         for key in keys {
             if allow_type_meta && (key == "apiVersion" || key == "kind") {
@@ -2584,7 +2585,11 @@ fn prune_cr_unknown_fields(
             }
             let declared = props
                 .and_then(|p| p.get(&key))
-                .or_else(|| additional.filter(|a| a.is_object()));
+                .or_else(|| match additional {
+                    Some(a) if a.is_object() => Some(a),
+                    Some(a) if a.is_boolean() && !preserve_unknown => Some(&empty_schema),
+                    _ => None,
+                });
             match declared {
                 Some(sub_schema) => {
                     let embedded = sub_schema
@@ -2602,7 +2607,7 @@ fn prune_cr_unknown_fields(
                         );
                     }
                 }
-                None if !preserve_unknown && !keep_all_additional => {
+                None if !preserve_unknown => {
                     if track_paths {
                         out.push(join_cr_field_path(path, &key));
                     }
@@ -2613,7 +2618,11 @@ fn prune_cr_unknown_fields(
         }
         return;
     }
-    if let Some(items_schema) = schema.get("items") {
+    let empty_items = serde_json::json!({});
+    let items_schema = schema
+        .get("items")
+        .or_else(|| (!preserve_unknown).then_some(&empty_items));
+    if let Some(items_schema) = items_schema {
         if let Some(arr) = value.as_array_mut() {
             for item in arr.iter_mut() {
                 prune_cr_unknown_fields(
@@ -25635,14 +25644,60 @@ mod tests {
         assert_eq!(out, vec!["spec.extra".to_string()]);
     }
 
-    /// `additionalProperties: true` keeps arbitrary keys verbatim.
+    /// Upstream prunes the value of an `additionalProperties: true` entry against a nil schema:
+    /// the map key and scalar values survive, but nested object keys are removed. Keeping them
+    /// verbatim would persist data a real apiserver drops.
     #[test]
-    fn prune_keeps_additional_properties_true() {
-        let (spec, _) = prune_with(
+    fn prune_additional_properties_true_prunes_nested_object_keys() {
+        let (spec, out) = prune_with(
             serde_json::json!({"type":"object","additionalProperties":true}),
+            serde_json::json!({"a":{"b":1},"s":"x","arr":[{"c":1},2]}),
+        );
+        assert_eq!(spec, serde_json::json!({"a":{},"s":"x","arr":[{},2]}));
+        assert_eq!(out, vec!["spec.a.b".to_string(), "spec.arr.c".to_string()]);
+    }
+
+    /// Under x-kubernetes-preserve-unknown-fields upstream's skipPrune with a nil schema keeps
+    /// the whole map value, so free-form data under a preserving parent must survive.
+    #[test]
+    fn prune_additional_properties_true_under_preserve_unknown_keeps_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","x-kubernetes-preserve-unknown-fields":true,
+                "additionalProperties":true}),
             serde_json::json!({"a":{"b":1}}),
         );
         assert_eq!(spec, serde_json::json!({"a":{"b":1}}));
+        assert!(out.is_empty());
+    }
+
+    /// Inside a map value, an embedded resource keeps apiVersion/kind/metadata (metadata itself
+    /// is pruned to known fields); other undeclared keys go.
+    #[test]
+    fn prune_embedded_resource_in_additional_properties_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "type":"object","x-kubernetes-embedded-resource":true,
+                "x-kubernetes-preserve-unknown-fields":false}}),
+            serde_json::json!({"cm":{"apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"n","bogusmeta":1},"extra":1}}),
+        );
+        assert_eq!(
+            spec,
+            serde_json::json!({"cm":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"n"}}})
+        );
+        assert!(out.contains(&"spec.cm.extra".to_string()), "{out:?}");
+    }
+
+    /// x-kubernetes-preserve-unknown-fields on a map value schema keeps its free-form content.
+    #[test]
+    fn prune_preserve_unknown_inside_additional_properties_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "type":"object","x-kubernetes-preserve-unknown-fields":true}}),
+            serde_json::json!({"k":{"free":{"form":1}}}),
+        );
+        assert_eq!(spec, serde_json::json!({"k":{"free":{"form":1}}}));
+        assert!(out.is_empty());
     }
 
     /// Through the real create and merge-patch handlers a map field must round-trip; the
