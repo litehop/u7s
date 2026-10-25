@@ -222,6 +222,8 @@ pub struct CrContext {
     pub scale: Option<CrScaleConfig>,
     /// The CRD has a deletionTimestamp: its instances are being removed, so creates are refused.
     pub terminating: bool,
+    /// The matched version's `additionalPrinterColumns` (empty means the default Age column).
+    pub printer_columns: Vec<super::crd::CustomResourceColumnDefinition>,
 }
 
 impl CrContext {
@@ -416,6 +418,7 @@ pub async fn find_crd<S: Store>(
                 .collect(),
             scale,
             terminating: crd.metadata.deletion_timestamp.is_some(),
+            printer_columns: matched_version.additional_printer_columns.clone(),
         };
         state.cr_context_cache.insert_if_current(
             cache_key,
@@ -2958,7 +2961,7 @@ pub async fn list_cr<S: Store>(
         let continue_token = resp.continue_key.map(|key| {
             super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
         });
-        let built = super::table::build_table(&group, &plural, items);
+        let built = super::table::build_cr_table(&ctx.printer_columns, items);
         return Ok(Json(super::table::finalize_table(
             built,
             &api_version,
@@ -3048,7 +3051,7 @@ pub async fn get_cr<S: Store>(
                     .as_str()
                     .map(str::to_string);
                 let api_version = super::table::table_api_version(accept);
-                let built = super::table::build_table(&group, &plural, vec![converted_obj]);
+                let built = super::table::build_cr_table(&ctx.printer_columns, vec![converted_obj]);
                 return Ok(Json(super::table::finalize_table(
                     built,
                     &api_version,
@@ -3084,7 +3087,7 @@ pub async fn get_cr<S: Store>(
             .as_str()
             .map(str::to_string);
         let api_version = super::table::table_api_version(accept);
-        let built = super::table::build_table(&group, &plural, vec![obj]);
+        let built = super::table::build_cr_table(&ctx.printer_columns, vec![obj]);
         return Ok(Json(super::table::finalize_table(
             built,
             &api_version,
@@ -3968,7 +3971,7 @@ pub async fn list_cr_namespaced<S: Store>(
         let continue_token = resp.continue_key.map(|key| {
             super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
         });
-        let built = super::table::build_table(&group, &plural, items);
+        let built = super::table::build_cr_table(&ctx.printer_columns, items);
         return Ok(Json(super::table::finalize_table(
             built,
             &api_version,
@@ -4059,7 +4062,7 @@ pub async fn get_cr_namespaced<S: Store>(
                     .as_str()
                     .map(str::to_string);
                 let api_version = super::table::table_api_version(accept);
-                let built = super::table::build_table(&group, &plural, vec![converted_obj]);
+                let built = super::table::build_cr_table(&ctx.printer_columns, vec![converted_obj]);
                 return Ok(Json(super::table::finalize_table(
                     built,
                     &api_version,
@@ -4095,7 +4098,7 @@ pub async fn get_cr_namespaced<S: Store>(
             .as_str()
             .map(str::to_string);
         let api_version = super::table::table_api_version(accept);
-        let built = super::table::build_table(&group, &plural, vec![obj]);
+        let built = super::table::build_cr_table(&ctx.printer_columns, vec![obj]);
         return Ok(Json(super::table::finalize_table(
             built,
             &api_version,
@@ -6768,6 +6771,101 @@ mod tests {
             finalizer_woken(&state).await,
             "collection hard-deletes must wake the CRD finalizer too"
         );
+    }
+
+    /// A CRD's additionalPrinterColumns must reach `kubectl get <cr>` through the Table
+    /// response; without them users see only NAME/AGE and cannot tell CRs apart.
+    #[tokio::test]
+    async fn cr_table_renders_declared_printer_columns_with_json_path_values() {
+        use crate::handlers::crd;
+        let state = make_state();
+        let crd_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Cluster",
+                    "versions": [{
+                        "name": "v1", "served": true, "storage": true,
+                        "additionalPrinterColumns": [
+                            { "name": "Color", "type": "string", "jsonPath": ".spec.color" },
+                            { "name": "Count", "type": "integer", "jsonPath": ".spec.count",
+                              "priority": 1 }
+                        ]
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                crd_body
+            )
+            .await
+            .is_ok(),
+            "install CRD with printer columns"
+        );
+        let cr = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "w1" },
+                "spec": { "color": "blue", "count": 3 }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                cr,
+            )
+            .await
+            .is_ok(),
+            "create CR"
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static("application/json;as=Table;g=meta.k8s.io;v=v1"),
+        );
+        let resp = get_cr(
+            State(state),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w1".to_string(),
+            )),
+            headers,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Table GET must succeed"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v["columnDefinitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Name", "Color", "Count"]);
+        assert_eq!(v["columnDefinitions"][2]["priority"], 1);
+        assert_eq!(v["rows"][0]["cells"], serde_json::json!(["w1", "blue", 3]));
     }
 
     fn widget_body(name: &str) -> Bytes {
@@ -11748,6 +11846,7 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
+            printer_columns: vec![],
         }
     }
 
@@ -11904,6 +12003,7 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
+            printer_columns: vec![],
         };
         // Local to this test (not a shared/global counter) so parallel test execution in
         // the same process cannot pollute the count.
@@ -11956,6 +12056,7 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
+            printer_columns: vec![],
         };
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });
@@ -12025,6 +12126,7 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
+            printer_columns: vec![],
         };
         let cache = crate::state::CrSchemaCache::new();
         let value = serde_json::json!({ "spec": {} });

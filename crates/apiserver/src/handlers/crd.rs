@@ -70,6 +70,27 @@ pub struct SelectableField {
     pub json_path: String,
 }
 
+/// One `additionalPrinterColumns` entry: a Table column whose cell is the `jsonPath` value of
+/// each custom resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomResourceColumnDefinition {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub column_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "priority_is_default")]
+    pub priority: i32,
+    pub json_path: String,
+}
+
+fn priority_is_default(n: &i32) -> bool {
+    *n == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomResourceDefinitionVersion {
@@ -87,6 +108,10 @@ pub struct CustomResourceDefinitionVersion {
     /// every CRD through this struct and silently drop any `selectableFields` the client sent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selectable_fields: Vec<SelectableField>,
+    /// Extra Table columns for this version's custom resources. Without this field every CRD
+    /// round trip drops them and `kubectl get <cr>` shows only NAME/AGE.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_printer_columns: Vec<CustomResourceColumnDefinition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +283,71 @@ pub(crate) fn walk_schema_dos_bounds(
     }
 }
 
+/// Mirrors apiextensions `ValidateCustomResourceColumnDefinition`: name, type and jsonPath are
+/// required, type and format must be from the supported sets, and jsonPath must parse.
+fn validate_additional_printer_columns(
+    spec: &CustomResourceDefinitionSpec,
+) -> Result<(), crate::status::StatusError> {
+    const TYPES: [&str; 5] = ["integer", "number", "string", "boolean", "date"];
+    const FORMATS: [&str; 8] = [
+        "int32",
+        "int64",
+        "float",
+        "double",
+        "byte",
+        "date",
+        "date-time",
+        "password",
+    ];
+    for (vi, version) in spec.versions.iter().enumerate() {
+        for (ci, col) in version.additional_printer_columns.iter().enumerate() {
+            let path = format!("spec.versions[{vi}].additionalPrinterColumns[{ci}]");
+            let invalid = |field: &str, msg: String| {
+                Status::unprocessable_entity(format!("{path}.{field}: {msg}"))
+            };
+            if col.name.is_empty() {
+                return Err(invalid("name", "Required value".to_string()));
+            }
+            if col.column_type.is_empty() {
+                return Err(invalid("type", "Required value".to_string()));
+            }
+            if !TYPES.contains(&col.column_type.as_str()) {
+                return Err(invalid(
+                    "type",
+                    format!(
+                        "Unsupported value: {:?}: supported values: {}",
+                        col.column_type,
+                        TYPES.map(|t| format!("{t:?}")).join(", ")
+                    ),
+                ));
+            }
+            if !col.format.is_empty() && !FORMATS.contains(&col.format.as_str()) {
+                return Err(invalid(
+                    "format",
+                    format!(
+                        "Unsupported value: {:?}: supported values: {}",
+                        col.format,
+                        FORMATS.map(|t| format!("{t:?}")).join(", ")
+                    ),
+                ));
+            }
+            if col.json_path.is_empty() {
+                return Err(invalid("JSONPath", "Required value".to_string()));
+            }
+            if !col.json_path.starts_with('.') {
+                return Err(invalid(
+                    "JSONPath",
+                    "must be a simple json path starting with .".to_string(),
+                ));
+            }
+            if let Err(e) = crate::handlers::jsonpath::parse(&col.json_path) {
+                return Err(invalid("JSONPath", e));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate a CRD's `openAPIV3Schema` (across all versions) against the boon-ReDoS
 /// class of bugs before persisting the CRD. `stored` is the previous CRD on update: its
 /// expressions and unchanged version schemas are ratcheted so an unrelated write cannot
@@ -266,6 +356,7 @@ fn validate_crd_schema(
     spec: &CustomResourceDefinitionSpec,
     stored: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
+    validate_additional_printer_columns(spec)?;
     let mut preexisting = std::collections::HashSet::new();
     if let Some(stored) = stored {
         crate::handlers::cel_rules::collect_expressions(&stored["spec"], &mut preexisting);
@@ -2395,6 +2486,117 @@ mod tests {
                 .is_ok(),
             "correct name widgets.example.io must be accepted"
         );
+    }
+
+    fn crd_with_printer_columns(columns: serde_json::Value) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "widgets", "singular": "widget", "kind": "Widget" },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1", "served": true, "storage": true,
+                        "additionalPrinterColumns": columns
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    /// `kubectl get <cr>` shows custom columns only if the CRD keeps them; a typed struct
+    /// without the field silently dropped them on every create/replace/patch.
+    #[test]
+    fn additional_printer_columns_survive_crd_round_trip() {
+        let columns = serde_json::json!([
+            { "name": "Replicas", "type": "integer", "jsonPath": ".spec.replicas",
+              "description": "desired", "priority": 1, "format": "int32" }
+        ]);
+        let crd = ok_crd(parse_crd(&crd_with_printer_columns(columns.clone())));
+        let out = serde_json::to_value(&crd).unwrap();
+        assert_eq!(
+            out["spec"]["versions"][0]["additionalPrinterColumns"],
+            columns
+        );
+    }
+
+    /// Upstream rejects a column type outside integer/number/string/boolean/date when the CRD
+    /// is written, so a typo surfaces on apply rather than as an empty column forever.
+    #[tokio::test]
+    async fn create_crd_rejects_unsupported_printer_column_type() {
+        let body = crd_with_printer_columns(serde_json::json!([
+            { "name": "Bad", "type": "float", "jsonPath": ".spec.x" }
+        ]));
+        let err = create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+            .await
+            .err()
+            .expect("unsupported column type must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn create_crd_rejects_printer_column_missing_name_or_bad_json_path() {
+        for column in [
+            serde_json::json!({ "type": "string", "jsonPath": ".spec.x" }),
+            serde_json::json!({ "name": "X", "type": "string", "jsonPath": "" }),
+            serde_json::json!({ "name": "X", "type": "string", "jsonPath": "spec.x" }),
+        ] {
+            let body = crd_with_printer_columns(serde_json::json!([column.clone()]));
+            let err = create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{column} must be rejected"));
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{column}"
+            );
+        }
+    }
+
+    /// Upstream stores every one of these (it only requires a leading `.` and a parseable
+    /// jsonpath); rejecting them breaks `kubectl apply` of common operator CRDs.
+    #[tokio::test]
+    async fn create_crd_accepts_every_json_path_form_upstream_accepts() {
+        for path in [
+            ".status.conditions[?(@.type==\"Ready\")].status",
+            "..name",
+            ".spec.list[0:2]",
+            ".spec.list[-1]",
+            ".metadata.labels['a.b']",
+            ".metadata.labels.app\\.io/x",
+            ".spec.list[0,1]",
+            ".spec.list[*]",
+        ] {
+            let body = crd_with_printer_columns(serde_json::json!([
+                { "name": "C", "type": "string", "jsonPath": path }
+            ]));
+            create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+                .await
+                .unwrap_or_else(|e| panic!("{path} must be accepted, got {}", e.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_crd_rejects_unparseable_json_path() {
+        for path in [".spec.list[", ".spec.list[abc]", ".a[?(@.x==1]"] {
+            let body = crd_with_printer_columns(serde_json::json!([
+                { "name": "C", "type": "string", "jsonPath": path }
+            ]));
+            let err = create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{path} must be rejected"));
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
     }
 
     fn dry_run_headers() -> HeaderMap {

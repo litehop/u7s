@@ -1,3 +1,4 @@
+use crate::handlers::crd::CustomResourceColumnDefinition;
 use crate::types::ObjectMeta;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -1559,6 +1560,117 @@ fn generic_row(obj: serde_json::Value) -> serde_json::Value {
     })
 }
 
+// ── Custom resources ──────────────────────────────────────────────────────────
+
+/// Table cell for a printer-column value, shaped by the column's declared type like upstream's
+/// `cellForJSONValue`; a value that does not fit the type renders as an empty cell.
+fn printer_cell(column_type: &str, value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match (column_type, value) {
+        (_, Value::Null) => Value::Null,
+        ("string", Value::String(_)) => value.clone(),
+        ("string", other) => Value::String(super::jsonpath::print_value(other)),
+        ("integer", Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .map_or(Value::Null, Value::from),
+        ("number", Value::Number(_)) | ("boolean", Value::Bool(_)) => value.clone(),
+        ("date", Value::String(s)) => match parse_rfc3339_to_secs(s) {
+            Some(_) => Value::String(age_string(s)),
+            None => Value::String("<invalid>".to_string()),
+        },
+        _ => Value::Null,
+    }
+}
+
+/// Table for custom resources: `Name` plus the CRD version's `additionalPrinterColumns`, or
+/// `Name`/`Age` when the version declares none.
+pub fn build_cr_table(
+    columns: &[CustomResourceColumnDefinition],
+    objects: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let default_age;
+    let columns = if columns.is_empty() {
+        default_age = [CustomResourceColumnDefinition {
+            name: "Age".to_string(),
+            column_type: "date".to_string(),
+            format: String::new(),
+            description: "CreationTimestamp is a timestamp representing the server time when \
+                          this object was created. It is not guaranteed to be set in \
+                          happens-before order across separate operations. Clients may not set \
+                          this value. It is represented in RFC3339 form and is in UTC."
+                .to_string(),
+            priority: 0,
+            json_path: ".metadata.creationTimestamp".to_string(),
+        }];
+        &default_age[..]
+    } else {
+        columns
+    };
+    // A column whose path fails to parse yields empty cells; CRD validation rejects those on
+    // write, so this only guards CRDs stored before the field was validated.
+    let paths: Vec<Vec<super::jsonpath::Node>> = columns
+        .iter()
+        .map(|c| super::jsonpath::parse(&c.json_path).unwrap_or_default())
+        .collect();
+
+    let mut definitions = vec![serde_json::json!({
+        "name": "Name",
+        "type": "string",
+        "format": "name",
+        "description": "Name must be unique within a namespace. Is required when creating \
+                        resources, although some resources may allow a client to request the \
+                        generation of an appropriate name automatically. Name is primarily \
+                        intended for creation idempotence and configuration definition. Cannot \
+                        be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names",
+        "priority": 0
+    })];
+    for c in columns {
+        let description = if c.description.is_empty() {
+            format!(
+                "Custom resource definition column (in JSONPath format): {}",
+                c.json_path
+            )
+        } else {
+            c.description.clone()
+        };
+        let mut def = serde_json::json!({
+            "name": c.name,
+            "type": c.column_type,
+            "description": description,
+            "priority": c.priority
+        });
+        if !c.format.is_empty() {
+            def["format"] = serde_json::Value::from(c.format.clone());
+        }
+        definitions.push(def);
+    }
+
+    let rows: Vec<serde_json::Value> = objects
+        .into_iter()
+        .map(|obj| {
+            let mut cells = vec![serde_json::Value::from(
+                obj["metadata"]["name"].as_str().unwrap_or(""),
+            )];
+            for (c, segs) in columns.iter().zip(&paths) {
+                cells.push(
+                    super::jsonpath::first_result(segs, &obj)
+                        .map_or(serde_json::Value::Null, |v| printer_cell(&c.column_type, v)),
+                );
+            }
+            let object_ref = make_object_ref(&obj, "");
+            serde_json::json!({ "cells": cells, "object": object_ref })
+        })
+        .collect();
+
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "columnDefinitions": definitions,
+        "rows": rows
+    })
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 /// Deserialize `obj.metadata` once per row via the shared `ObjectMeta` type instead of
@@ -1673,6 +1785,115 @@ fn age_string(creation_ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn column(name: &str, ty: &str, path: &str) -> CustomResourceColumnDefinition {
+        CustomResourceColumnDefinition {
+            name: name.to_string(),
+            column_type: ty.to_string(),
+            format: String::new(),
+            description: String::new(),
+            priority: 0,
+            json_path: path.to_string(),
+        }
+    }
+
+    /// kubectl prints an AGE column for every CR; a CRD with no printer columns must still get it.
+    #[test]
+    fn cr_table_without_printer_columns_defaults_to_name_and_age() {
+        let obj = serde_json::json!({
+            "metadata": { "name": "a", "creationTimestamp": "2020-01-01T00:00:00Z" }
+        });
+        let t = build_cr_table(&[], vec![obj]);
+        assert_eq!(t["columnDefinitions"][1]["name"], "Age");
+        assert_eq!(t["columnDefinitions"][1]["type"], "date");
+        let age = t["rows"][0]["cells"][1].as_str().unwrap();
+        assert!(
+            age.ends_with('d'),
+            "an old object renders as days, got {age}"
+        );
+    }
+
+    #[test]
+    fn cr_table_cells_follow_json_path_and_declared_type() {
+        let cols = [
+            column("Nested", "string", ".spec.a.b"),
+            column("First", "string", ".spec.list[0]"),
+            column("Quoted", "string", ".metadata.labels.app\\.io/x"),
+            column("Num", "integer", ".spec.n"),
+            column("Missing", "string", ".spec.nope"),
+            column("Wrong", "boolean", ".spec.n"),
+        ];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a", "labels": { "app.io/x": "lbl" } },
+            "spec": { "a": { "b": "deep" }, "list": ["x", "y"], "n": 7 }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(
+            t["rows"][0]["cells"],
+            serde_json::json!(["a", "deep", "x", "lbl", 7, null, null]),
+            "a missing path or a value not matching the column type is an empty cell"
+        );
+    }
+
+    /// `kubectl get` on an operator CRD must show the Ready condition status, not an empty
+    /// column: the filter form is what cert-manager and Gateway API ship.
+    #[test]
+    fn cr_table_cell_follows_condition_filter_path() {
+        let cols = [column(
+            "Ready",
+            "string",
+            ".status.conditions[?(@.type==\"Ready\")].status",
+        )];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "status": { "conditions": [
+                { "type": "Initialized", "status": "True" },
+                { "type": "Ready", "status": "False" }
+            ] }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(t["rows"][0]["cells"], serde_json::json!(["a", "False"]));
+    }
+
+    /// A path that cannot be evaluated against one object must blank that cell, never fail
+    /// the whole list.
+    #[test]
+    fn cr_table_unevaluable_path_is_a_nil_cell_not_an_error() {
+        let cols = [
+            column("Oob", "string", ".spec.list[9]"),
+            column("OnMap", "string", ".spec.m[0]"),
+            column("Ok", "string", ".spec.list[-1]"),
+        ];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "spec": { "list": ["x", "y"], "m": {} }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(
+            t["rows"][0]["cells"],
+            serde_json::json!(["a", null, null, "y"])
+        );
+    }
+
+    /// Upstream prints non-string values in a string column via jsonpath PrintResults:
+    /// maps as JSON, floats as Go would.
+    #[test]
+    fn cr_table_string_column_prints_maps_and_floats_like_upstream() {
+        let cols = [
+            column("Map", "string", ".spec.m"),
+            column("Float", "string", ".spec.f"),
+            column("Bool", "string", ".spec.b"),
+        ];
+        let obj = serde_json::json!({
+            "metadata": { "name": "a" },
+            "spec": { "m": { "b": 1, "a": [1, "x"] }, "f": 1.5, "b": true }
+        });
+        let t = build_cr_table(&cols, vec![obj]);
+        assert_eq!(
+            t["rows"][0]["cells"],
+            serde_json::json!(["a", r#"{"a":[1,"x"],"b":1}"#, "1.5", "true"])
+        );
+    }
 
     #[test]
     fn wants_table_detects_table_accept_header() {
