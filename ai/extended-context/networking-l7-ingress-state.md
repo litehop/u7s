@@ -32,12 +32,10 @@ archive/mayor-s82zr.1-findings:ai/findings/2026-10-25-mayor-s82zr.1-ingress-tls-
 
 ## CRD bugs the research surfaced
 
-Fixed: `mayor-n88nk` (CEL cost of `has()`, #2015 MERGED).
-
-PR open: `mayor-fvh8w` (structural pruning drops `additionalProperties` map
-fields, #2017); `mayor-jhtep` (`/apis` drops versions when a second CRD
-shares a group) and `mayor-mqb79` (`additionalPrinterColumns` dropped), both
-in #2016.
+`mayor-fvh8w` (structural pruning drops `additionalProperties` map fields),
+`mayor-jhtep` (`/apis` drops versions when a second CRD shares a group),
+`mayor-mqb79` (`additionalPrinterColumns` dropped), `mayor-n88nk` (CEL cost
+of `has()`). Check bead state for status.
 
 Follow-ons, not started: `mayor-lqu0h` (defaulting, CEL rules and patch
 schema lookup ignore `additionalProperties`), `mayor-jqdf9` (bound JSONPath

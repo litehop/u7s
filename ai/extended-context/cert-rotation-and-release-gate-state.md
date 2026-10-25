@@ -28,7 +28,8 @@ pd-standard disk versus e2 shared-core burst-credit exhaustion.
 
 Options awaiting operator decision (none chosen):
 
-- Robust mariadb workload (init tolerant of slow start); mayor recommendation.
+- Robust mariadb workload (init tolerant of slow start); the mayor's recommendation (`vw7jc` note), still pending the
+  operator's decision.
 - Gate waits for mariadb-0 Ready before applying WordPress, and pre-pulls images.
 - pd-balanced boot disk (`scripts/gcp/lib.sh`); pd-standard is deliberate,
   see `docs/dev-setup.md`.
