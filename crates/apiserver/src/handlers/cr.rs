@@ -2562,6 +2562,11 @@ fn prune_cr_unknown_fields(
         let props = schema
             .get("properties")
             .and_then(serde_json::Value::as_object);
+        // Upstream: keys not in `properties` are governed by `additionalProperties` rather than
+        // dropped. A schema is pruned recursively; a bool has no schema, so the value is pruned
+        // against an empty one (the key survives, nested object keys do not).
+        let additional = schema.get("additionalProperties");
+        let empty_schema = serde_json::json!({});
         let keys: Vec<String> = map.keys().cloned().collect();
         for key in keys {
             if allow_type_meta && (key == "apiVersion" || key == "kind") {
@@ -2581,7 +2586,14 @@ fn prune_cr_unknown_fields(
                 }
                 continue;
             }
-            match props.and_then(|p| p.get(&key)) {
+            let declared = props
+                .and_then(|p| p.get(&key))
+                .or_else(|| match additional {
+                    Some(a) if a.is_object() => Some(a),
+                    Some(a) if a.is_boolean() && !preserve_unknown => Some(&empty_schema),
+                    _ => None,
+                });
+            match declared {
                 Some(sub_schema) => {
                     let embedded = sub_schema
                         .get("x-kubernetes-embedded-resource")
@@ -2609,7 +2621,11 @@ fn prune_cr_unknown_fields(
         }
         return;
     }
-    if let Some(items_schema) = schema.get("items") {
+    let empty_items = serde_json::json!({});
+    let items_schema = schema
+        .get("items")
+        .or_else(|| (!preserve_unknown).then_some(&empty_items));
+    if let Some(items_schema) = items_schema {
         if let Some(arr) = value.as_array_mut() {
             for item in arr.iter_mut() {
                 prune_cr_unknown_fields(
@@ -25657,6 +25673,213 @@ mod tests {
         assert!(
             out.is_empty(),
             "a preserved field must not be reported as an unknown-field violation either"
+        );
+    }
+
+    fn prune_with(
+        schema: serde_json::Value,
+        spec: serde_json::Value,
+    ) -> (serde_json::Value, Vec<String>) {
+        let root = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": schema }
+        });
+        let mut obj = serde_json::json!({
+            "apiVersion": "example.io/v1", "kind": "Widget",
+            "metadata": { "name": "w" }, "spec": spec
+        });
+        let mut out = Vec::new();
+        prune_cr_unknown_fields(&mut obj, &root, "", true, true, &mut out);
+        (obj["spec"].take(), out)
+    }
+
+    /// Map<string,string> fields (e.g. labels-like data) were persisted as `{}` because keys
+    /// are not in `properties`; users lost all map data on every write.
+    #[test]
+    fn prune_keeps_additional_properties_string_map_values() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{"type":"string"}}),
+            serde_json::json!({"a":"1","b":"2"}),
+        );
+        assert_eq!(spec, serde_json::json!({"a":"1","b":"2"}));
+        assert!(
+            out.is_empty(),
+            "map keys must not be reported as unknown: {out:?}"
+        );
+    }
+
+    /// Unknown keys INSIDE map values must still be pruned (and reported with full path),
+    /// otherwise strict validation would silently accept typos in map entries.
+    #[test]
+    fn prune_recurses_into_additional_properties_object_values() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "type":"object","properties":{"port":{"type":"integer"}}}}),
+            serde_json::json!({"web":{"port":80,"bogus":1}}),
+        );
+        assert_eq!(spec, serde_json::json!({"web":{"port":80}}));
+        assert_eq!(out, vec!["spec.web.bogus".to_string()]);
+    }
+
+    /// Quantity / int-or-string maps (resource limits style) must keep their scalar values.
+    #[test]
+    fn prune_keeps_int_or_string_map_values() {
+        let (spec, _) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "x-kubernetes-int-or-string":true,
+                "anyOf":[{"type":"integer"},{"type":"string"}]}}),
+            serde_json::json!({"cpu":"500m","pods":10}),
+        );
+        assert_eq!(spec, serde_json::json!({"cpu":"500m","pods":10}));
+    }
+
+    /// A map nested in an array item must survive: Gateway API style lists of objects with
+    /// map fields otherwise lose the map on write.
+    #[test]
+    fn prune_keeps_map_nested_in_array_item() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"array","items":{"type":"object","properties":{
+                "labels":{"type":"object","additionalProperties":{"type":"string"}}}}}),
+            serde_json::json!([{"labels":{"k":"v"},"extra":1}]),
+        );
+        assert_eq!(spec, serde_json::json!([{"labels":{"k":"v"}}]));
+        assert_eq!(out, vec!["spec.extra".to_string()]);
+    }
+
+    /// Upstream prunes the value of an `additionalProperties: true` entry against a nil schema:
+    /// the map key and scalar values survive, but nested object keys are removed. Keeping them
+    /// verbatim would persist data a real apiserver drops.
+    #[test]
+    fn prune_additional_properties_true_prunes_nested_object_keys() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":true}),
+            serde_json::json!({"a":{"b":1},"s":"x","arr":[{"c":1},2]}),
+        );
+        assert_eq!(spec, serde_json::json!({"a":{},"s":"x","arr":[{},2]}));
+        assert_eq!(out, vec!["spec.a.b".to_string(), "spec.arr.c".to_string()]);
+    }
+
+    /// Under x-kubernetes-preserve-unknown-fields upstream's skipPrune with a nil schema keeps
+    /// the whole map value, so free-form data under a preserving parent must survive.
+    #[test]
+    fn prune_additional_properties_true_under_preserve_unknown_keeps_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","x-kubernetes-preserve-unknown-fields":true,
+                "additionalProperties":true}),
+            serde_json::json!({"a":{"b":1}}),
+        );
+        assert_eq!(spec, serde_json::json!({"a":{"b":1}}));
+        assert!(out.is_empty());
+    }
+
+    /// Inside a map value, an embedded resource keeps apiVersion/kind/metadata (metadata itself
+    /// is pruned to known fields); other undeclared keys go.
+    #[test]
+    fn prune_embedded_resource_in_additional_properties_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "type":"object","x-kubernetes-embedded-resource":true,
+                "x-kubernetes-preserve-unknown-fields":false}}),
+            serde_json::json!({"cm":{"apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"n","bogusmeta":1},"extra":1}}),
+        );
+        assert_eq!(
+            spec,
+            serde_json::json!({"cm":{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"n"}}})
+        );
+        assert!(out.contains(&"spec.cm.extra".to_string()), "{out:?}");
+    }
+
+    /// x-kubernetes-preserve-unknown-fields on a map value schema keeps its free-form content.
+    #[test]
+    fn prune_preserve_unknown_inside_additional_properties_value() {
+        let (spec, out) = prune_with(
+            serde_json::json!({"type":"object","additionalProperties":{
+                "type":"object","x-kubernetes-preserve-unknown-fields":true}}),
+            serde_json::json!({"k":{"free":{"form":1}}}),
+        );
+        assert_eq!(spec, serde_json::json!({"k":{"free":{"form":1}}}));
+        assert!(out.is_empty());
+    }
+
+    /// Through the real create and merge-patch handlers a map field must round-trip; the
+    /// user's data was silently lost on write.
+    #[tokio::test]
+    async fn create_and_merge_patch_cr_keep_additional_properties_map_data() {
+        let state = make_state();
+        install_cluster_crd_with_schema(
+            &state,
+            serde_json::json!({"type":"object","properties":{"spec":{
+                "type":"object","properties":{"m":{
+                    "type":"object","additionalProperties":{"type":"string"}}}}}}),
+        )
+        .await;
+        let path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            ))
+        };
+        let body = |m: serde_json::Value| {
+            Bytes::from(
+                serde_json::json!({"apiVersion":"example.io/v1","kind":"Widget",
+                    "metadata":{"name":"w"},"spec":{"m":m}})
+                .to_string(),
+            )
+        };
+        let resp = create_cr(
+            State(state.clone()),
+            path(),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body(serde_json::json!({"a":"1"})),
+        )
+        .await
+        .expect("create");
+        let bytes = axum::body::to_bytes(
+            axum::response::IntoResponse::into_response(resp).into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["spec"]["m"],
+            serde_json::json!({"a":"1"}),
+            "create lost map data"
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let resp = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w".to_string(),
+            )),
+            test_user(),
+            headers,
+            Bytes::from(r#"{"spec":{"m":{"b":"2"}}}"#),
+        )
+        .await
+        .expect("patch");
+        let bytes = axum::body::to_bytes(
+            axum::response::IntoResponse::into_response(resp).into_body(),
+            usize::MAX,
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["spec"]["m"],
+            serde_json::json!({"a":"1","b":"2"}),
+            "merge-patch lost map data"
         );
     }
 
