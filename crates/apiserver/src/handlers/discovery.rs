@@ -3023,6 +3023,7 @@ mod tests {
                     schema: None,
                     subresources: None,
                     selectable_fields: vec![],
+                    additional_printer_columns: vec![],
                 }],
                 conversion: None,
                 preserve_unknown_fields: false,

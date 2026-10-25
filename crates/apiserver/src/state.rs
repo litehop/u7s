@@ -2281,6 +2281,7 @@ mod tests {
             served_versions: Vec::new(),
             scale: None,
             terminating: false,
+            printer_columns: vec![],
         });
         let inserted = cache.insert_if_current(key.clone(), stale_ctx, epoch_before_scan);
 
