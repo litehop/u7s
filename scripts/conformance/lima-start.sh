@@ -46,6 +46,7 @@ _KUBELET_PORT_OVERRIDE=""
 _NETWORK_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _NODE_SUFFIX_OVERRIDE=""
+DUAL_STACK=0
 VERBOSE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
     --network) _NETWORK_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --node-suffix) _NODE_SUFFIX_OVERRIDE="$2"; shift 2 ;;
+    --dual-stack) DUAL_STACK=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -538,8 +540,25 @@ KCEOF
   # needs to be routable off the VM. Reuses POD_SUBNET_OCTET (already unique per
   # node) so a multi-node run never collides. `ip addr replace` is idempotent
   # (unlike `add`, which errors on a 2nd run against the same address).
-  NODE_IPV6="fd85:${POD_SUBNET_OCTET}::1"
-  limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
+  if [ "$DUAL_STACK" -eq 1 ]; then
+    # --dual-stack: one shared /64 plus static neighbours so VM<->VM v6 works
+    # (see _lib.sh). Full mesh over this VM and every other registered node
+    # that is a running rig VM on the same network.
+    NODE_IPV6=$(lan_v6_addr_for "$VM_NAME") || { echo "error: --dual-stack has no v6 host id for $VM_NAME" >&2; exit 1; }
+    limactl shell "$VM_NAME" sudo ip -6 addr del "fd85:${POD_SUBNET_OCTET}::1/64" dev "$LIMA_VM_IFACE" 2>/dev/null || true
+    MESH_VMS=("$VM_NAME")
+    for peer in $(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+      [ "$peer" = "$VM_NAME" ] && continue
+      lan_v6_host_for "$peer" >/dev/null || continue
+      limactl list --format '{{.Name}} {{.Status}}' | grep -qx "$peer Running" || continue
+      [ "$(limactl shell "$peer" ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1 | cut -d. -f1-3)" = "$(echo "$LIMA_VM_IP" | cut -d. -f1-3)" ] || continue
+      MESH_VMS+=("$peer")
+    done
+    lan_v6_seed_mesh "${MESH_VMS[@]}"
+  else
+    NODE_IPV6="fd85:${POD_SUBNET_OCTET}::1"
+    limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
+  fi
 
   # A golden baked before lima/kubelet.yaml set a kubeadm-style resolvConf still carries
   # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
