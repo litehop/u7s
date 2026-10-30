@@ -20,7 +20,7 @@ const MAX_CACHED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = MAX_CACHED_BYTES / 8;
 
 struct Entry {
-    regex: Regex,
+    regex: Arc<Regex>,
     bytes: usize,
     last_used: u64,
 }
@@ -33,14 +33,14 @@ struct RegexCache {
 }
 
 impl RegexCache {
-    fn get(&mut self, pattern: &str) -> Option<Regex> {
+    fn get(&mut self, pattern: &str) -> Option<Arc<Regex>> {
         self.clock += 1;
         let entry = self.entries.get_mut(pattern)?;
         entry.last_used = self.clock;
         Some(entry.regex.clone())
     }
 
-    fn insert_if_absent(&mut self, pattern: &str, regex: &Regex) {
+    fn insert_if_absent(&mut self, pattern: &str, regex: &Arc<Regex>) {
         if self.entries.contains_key(pattern) {
             return;
         }
@@ -98,16 +98,25 @@ fn lookup_or_compile(
     cache: &Mutex<Option<RegexCache>>,
     pattern: &str,
     compile: impl FnOnce(&str) -> Result<Regex, Box<BuildError>>,
-) -> Result<Regex, Box<BuildError>> {
+) -> Result<Arc<Regex>, Box<BuildError>> {
     let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(re) = lock().get_or_insert_with(RegexCache::default).get(pattern) {
         return Ok(re);
     }
-    let re = compile(pattern)?;
+    let re = Arc::new(compile(pattern)?);
     lock()
         .get_or_insert_with(RegexCache::default)
         .insert_if_absent(pattern, &re);
     Ok(re)
+}
+
+/// `BuildError`'s own Display omits the cause ("error parsing pattern 0"); the syntax or
+/// size-limit detail lives in its source.
+fn build_error_message(err: &BuildError) -> String {
+    match std::error::Error::source(err) {
+        Some(cause) => format!("{err}: {cause}"),
+        None => err.to_string(),
+    }
 }
 
 /// `string.matches(re)` and `matches(string, re)`.
@@ -119,7 +128,10 @@ pub(crate) fn cel_matches(
         Ok(re) => Ok(re.is_match(this.as_str())),
         Err(err) => Err(cel::ExecutionError::function_error(
             "matches",
-            format!("'{pattern}' not a valid regex:\n{err}"),
+            format!(
+                "'{pattern}' not a valid regex:\n{}",
+                build_error_message(&err)
+            ),
         )),
     }
 }
@@ -134,6 +146,32 @@ mod tests {
 
     fn cost(pattern: &str) -> usize {
         pattern.len() + Regex::new(pattern).unwrap().memory_usage()
+    }
+
+    /// Cloning a `meta::Regex` allocates a fresh cache pool, which made every `matches()` over
+    /// a list ~3x slower than sharing one handle.
+    #[test]
+    fn cache_hits_share_one_regex_handle() {
+        let cache = Mutex::new(None);
+        let a = lookup_or_compile(&cache, "x+", plain).unwrap();
+        let b = lookup_or_compile(&cache, "x+", |_| panic!("must be a cache hit")).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    /// Without the source, every bad pattern reported only "error parsing pattern 0", leaving
+    /// the CRD author no clue what was wrong.
+    #[test]
+    fn build_errors_keep_syntax_and_size_limit_detail() {
+        let syntax = compile("(").unwrap_err();
+        let msg = build_error_message(&syntax);
+        assert!(msg.contains("unclosed group"), "syntax detail lost: {msg}");
+
+        let big = compile(&format!(r"\pL{{{}}}", 400)).unwrap_err();
+        let msg = build_error_message(&big);
+        assert!(
+            msg.contains("exceeded limit of"),
+            "size-limit detail lost: {msg}"
+        );
     }
 
     /// One slow compile used to hold the process-wide lock, stalling every `matches()` on every

@@ -63,7 +63,7 @@ prometheus      = { version = "0.14", default-features = false, features = ["pro
 chrono-tz       = "0.10"
 chrono          = { version = "0.4", default-features = false, features = ["alloc"] }
 regex           = "1"
-regex-automata  = { version = "0.4", default-features = false, features = ["meta", "syntax", "perf", "unicode"] }
+regex-automata  = { version = "0.4", default-features = false, features = ["meta", "syntax", "perf", "unicode", "hybrid", "dfa-onepass"] }
 dhat            = { version = "0.3", optional = true }
 rlimit          = "0.11"
 socket2         = "0.6"

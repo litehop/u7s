@@ -26,8 +26,16 @@ thread_local! {
     pub(crate) static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it.
+/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it. Applies to CRD
+/// rules, which evaluate on a dedicated big-stack thread.
 pub(crate) const MAX_RECURSION_DEPTH: usize = 250;
+
+/// Deepest policy (VAP/MAP/authorization) expression accepted. Policies evaluate on a
+/// 512 KiB request thread under a stack budget; in a release build the worst shape measured
+/// (index chain) evaluates to 187 levels, so 128 leaves ~45% headroom for frames larger
+/// than any measured. Lower than cel-go's 250 on purpose: an accepted-but-unevaluable
+/// policy would deny all matching traffic under `failurePolicy: Fail`.
+pub(crate) const MAX_POLICY_RECURSION_DEPTH: usize = 128;
 
 /// cel-go's default `ExpressionSizeCodePointLimit`; Kubernetes does not override it.
 const MAX_EXPRESSION_CODE_POINTS: usize = 100_000;
@@ -47,7 +55,7 @@ const IN_PLACE_PARSE_MAX_LEN: usize = 100;
 /// parse thread, where a deep drop has the stack to run.
 pub(crate) fn parse_bounded<T: Send>(
     expr: &str,
-    stack_size: usize,
+    (stack_size, max_depth): (usize, usize),
     parse: impl FnOnce() -> Result<T, String> + Send,
     ast: impl FnOnce(&T) -> &IdedExpr + Send,
 ) -> Result<T, String> {
@@ -60,7 +68,7 @@ pub(crate) fn parse_bounded<T: Send>(
     }
     let run = move || {
         let parsed = parse()?;
-        if depth_exceeds(ast(&parsed), MAX_RECURSION_DEPTH) {
+        if depth_exceeds(ast(&parsed), max_depth) {
             return Err(
                 "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded".into(),
             );
@@ -70,14 +78,80 @@ pub(crate) fn parse_bounded<T: Send>(
     if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
         return run();
     }
+    on_big_stack(stack_size, "parser", run)?
+}
+
+/// Parse threads allowed at once. Each reserves `PARSE_STACK_SIZE` of address space and
+/// touches stack in proportion to the expression it walks; a spray of creates must queue
+/// here instead of spawning one thread each. A parse of a maximal expression takes
+/// milliseconds, so four lanes drain a burst quickly while bounding the reservation to 1 GiB.
+pub(super) const MAX_PARSE_THREADS: usize = 4;
+
+pub(super) struct Lanes {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+static PARSE_LANES: Lanes = Lanes::new(MAX_PARSE_THREADS);
+
+pub(super) struct Lane<'a>(&'a Lanes);
+
+impl Lanes {
+    pub(super) const fn new(lanes: usize) -> Self {
+        Self {
+            free: Mutex::new(lanes),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Callers are synchronous code inside async handlers, so a wait that parked the
+    /// worker would stall every task scheduled on it; `block_in_place` hands the worker's
+    /// queue to another thread for the duration. A current-thread runtime has no other
+    /// worker to hand to, so it waits in place.
+    pub(super) fn acquire(&self) -> Lane<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if *free == 0 {
+            drop(free);
+            let wait = || {
+                let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                while *free == 0 {
+                    free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+                }
+                *free -= 1;
+            };
+            match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+                _ => wait(),
+            }
+        } else {
+            *free -= 1;
+        }
+        Lane(self)
+    }
+}
+
+impl Drop for Lane<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// Runs `work` on a fresh thread with `stack_size` of stack, one of `MAX_PARSE_THREADS`.
+pub(super) fn on_big_stack<T: Send>(
+    stack_size: usize,
+    what: &str,
+    work: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
+    let _lane = PARSE_LANES.acquire();
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(stack_size)
-            .spawn_scoped(s, run)
+            .spawn_scoped(s, work)
             .map_err(|e| format!("compilation failed: {e}"))?
             .join()
-            .map_err(|_| "compilation failed: parser panicked".to_string())
-    })?
+            .map_err(|_| format!("compilation failed: {what} panicked"))
+    })
 }
 
 /// Whether `root` nests deeper than `max` levels, walked with an explicit stack so the
@@ -127,10 +201,10 @@ fn parse_with_stack(expr: &str, stack_size: usize) -> Result<IdedExpr, String> {
     PARSE_COUNT.with(|c| c.set(c.get() + 1));
     parse_bounded(
         expr,
-        stack_size,
+        (stack_size, MAX_POLICY_RECURSION_DEPTH),
         || {
             cel::parser::Parser::new()
-                .max_recursion_depth(MAX_RECURSION_DEPTH as u16)
+                .max_recursion_depth(MAX_POLICY_RECURSION_DEPTH as u16)
                 .enable_optional_syntax(true)
                 .enable_ident_escape_syntax(true)
                 .parse(expr)
@@ -149,7 +223,7 @@ pub(crate) fn parse(expr: &str) -> Result<IdedExpr, String> {
 pub(crate) fn compile_program(source: &str) -> Result<cel::Program, String> {
     parse_bounded(
         source,
-        PARSE_STACK_SIZE,
+        (PARSE_STACK_SIZE, MAX_RECURSION_DEPTH),
         || cel::Program::compile(source).map_err(|e| e.to_string()),
         |p| p.expression(),
     )
@@ -164,17 +238,21 @@ fn check(expr: &str, ast: &IdedExpr, roots: &[&str]) -> Result<(), String> {
         )),
         None => Ok(()),
     };
+    walk_deep(expr, "checker", walk)?
+}
+
+/// Runs a walk that recurses once per AST level of `expr`: a short expression cannot nest
+/// deeply enough to matter and runs in place, a long one runs on the parse stack so a
+/// request thread's 512 KiB cannot overflow.
+pub(crate) fn walk_deep<T: Send>(
+    expr: &str,
+    what: &str,
+    work: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
     if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
-        return walk();
+        return Ok(work());
     }
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .stack_size(PARSE_STACK_SIZE)
-            .spawn_scoped(s, walk)
-            .map_err(|e| format!("compilation failed: {e}"))?
-            .join()
-            .map_err(|_| "compilation failed: checker panicked".to_string())
-    })?
+    on_big_stack(PARSE_STACK_SIZE, what, work)
 }
 
 /// Compile-step analogue: parse errors must stay distinct from eval errors, since the

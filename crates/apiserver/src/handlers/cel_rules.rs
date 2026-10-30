@@ -216,11 +216,14 @@ pub(crate) fn compile_rule(
         scope: vec![("self".into(), self_ty), ("oldSelf".into(), self_ty)],
         errors: Vec::new(),
     };
-    checker.check(program.expression());
-    if checker.errors.is_empty() {
+    let errors = crate::cel_runtime::walk_deep(source, "checker", || {
+        checker.check(program.expression());
+        std::mem::take(&mut checker.errors)
+    })?;
+    if errors.is_empty() {
         Ok(program)
     } else {
-        Err(checker.errors.join("\n"))
+        Err(errors.join("\n"))
     }
 }
 
@@ -324,8 +327,11 @@ fn check_node(
                     }
                 };
                 let node = cel_cost::Node::Schema(schema);
-                let cost =
-                    cel_cost::estimate(&program, node, Some(node), None).saturating_mul(instances);
+                let cost = crate::cel_runtime::walk_deep(src, "cost estimator", || {
+                    cel_cost::estimate(&program, node, Some(node), None)
+                })
+                .map_err(crate::status::Status::unprocessable_entity)?
+                .saturating_mul(instances);
                 *total_cost = total_cost.saturating_add(cost);
                 if cost > cel_cost::STATIC_COST_LIMIT
                     && !ratchet.preexisting.is_some_and(|p| p.contains(src))
@@ -557,5 +563,29 @@ mod tests {
             "{}",
             err.1.message
         );
+    }
+
+    /// The type checker and cost estimator recurse once per AST level. A rule at the depth
+    /// limit used to run them on the 512 KiB request thread, which aborts the whole process
+    /// in a debug build, so a CRD create could kill the apiserver.
+    #[test]
+    fn rule_at_depth_limit_is_checked_without_overflowing_a_request_thread() {
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let calls = crate::cel_runtime::MAX_RECURSION_DEPTH - 5;
+                let schema = serde_json::json!({
+                    "type": "string",
+                    "x-kubernetes-validations": [
+                        {"rule": format!("self{} == 'a'", ".lowerAscii()".repeat(calls))}
+                    ]
+                });
+                check_schema_rules(&schema, "spec", true, &Ratchet { preexisting: None })
+            })
+            .unwrap();
+        handle
+            .join()
+            .expect("deep rule must not crash the request thread")
+            .expect("rule at the depth limit is valid");
     }
 }
