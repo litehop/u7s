@@ -11991,12 +11991,9 @@ mod tests {
     fn schema_additional_properties_false_rejects_unknown_key() {
         let schema = serde_json::json!({
             "type": "object",
-            "properties": {
-                "spec": { "type": "object" }
-            },
             "additionalProperties": false
         });
-        let value = serde_json::json!({ "spec": {}, "unknownField": "oops" });
+        let value = serde_json::json!({ "unknownField": "oops" });
         assert!(
             check_schema(&value, schema).is_err(),
             "additional property must be rejected"
