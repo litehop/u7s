@@ -87,25 +87,45 @@ pub(crate) fn parse_bounded<T: Send>(
 /// milliseconds, so four lanes drain a burst quickly while bounding the reservation to 1 GiB.
 pub(super) const MAX_PARSE_THREADS: usize = 4;
 
-struct Lanes {
+pub(super) struct Lanes {
     free: Mutex<usize>,
     freed: std::sync::Condvar,
 }
 
-static PARSE_LANES: Lanes = Lanes {
-    free: Mutex::new(MAX_PARSE_THREADS),
-    freed: std::sync::Condvar::new(),
-};
+static PARSE_LANES: Lanes = Lanes::new(MAX_PARSE_THREADS);
 
-struct Lane<'a>(&'a Lanes);
+pub(super) struct Lane<'a>(&'a Lanes);
 
 impl Lanes {
-    fn acquire(&self) -> Lane<'_> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
-        while *free == 0 {
-            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+    pub(super) const fn new(lanes: usize) -> Self {
+        Self {
+            free: Mutex::new(lanes),
+            freed: std::sync::Condvar::new(),
         }
-        *free -= 1;
+    }
+
+    /// Callers are synchronous code inside async handlers, so a wait that parked the
+    /// worker would stall every task scheduled on it; `block_in_place` hands the worker's
+    /// queue to another thread for the duration. A current-thread runtime has no other
+    /// worker to hand to, so it waits in place.
+    pub(super) fn acquire(&self) -> Lane<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if *free == 0 {
+            drop(free);
+            let wait = || {
+                let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                while *free == 0 {
+                    free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+                }
+                *free -= 1;
+            };
+            match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+                _ => wait(),
+            }
+        } else {
+            *free -= 1;
+        }
         Lane(self)
     }
 }

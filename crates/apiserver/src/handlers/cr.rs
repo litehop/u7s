@@ -15111,6 +15111,140 @@ mod tests {
         );
     }
 
+    /// `(shape, rule nesting it n levels, data bound as self)`. The rule wraps the shape in
+    /// a bool so every shape is a valid rule evaluating to true; the index chain needs data
+    /// nested as deep as the chain.
+    fn crd_nesting_shapes(n: usize) -> Vec<(&'static str, String, serde_json::Value)> {
+        let nested = (0..n).fold(serde_json::json!(1), |v, _| serde_json::json!({ "a": v }));
+        let rule = |s: String| format!("[{s}].size() == 1");
+        let none = serde_json::json!({});
+        let open = |head: &str| head.repeat(n);
+        vec![
+            ("sum chain", rule(format!("1{}", open("+1"))), none.clone()),
+            (
+                "call chain",
+                rule(format!("'x'{}", open(".lowerAscii()"))),
+                none.clone(),
+            ),
+            (
+                "index chain",
+                rule(format!("self{}", open("['a']"))),
+                nested,
+            ),
+            (
+                "in chain",
+                rule(format!("1 in [1]{}", open(" in [true]"))),
+                none.clone(),
+            ),
+            (
+                "ternary",
+                rule(format!("{}1", open("true ? 2 : "))),
+                none.clone(),
+            ),
+            (
+                "parens",
+                rule(format!("{}1{}", open("("), open(")"))),
+                none.clone(),
+            ),
+            (
+                "list",
+                rule(format!("{}1{}", open("["), open("]"))),
+                none.clone(),
+            ),
+            (
+                "map",
+                rule(format!("{}1{}", open("{'a':"), open("}"))),
+                none.clone(),
+            ),
+            (
+                "all",
+                rule(format!("{}true{}", open("[1].all(x, "), open(")"))),
+                none.clone(),
+            ),
+            (
+                "exists",
+                rule(format!("{}true{}", open("[1].exists(x, "), open(")"))),
+                none.clone(),
+            ),
+            (
+                "map comprehension",
+                rule(format!("{}1{}", open("[1].map(x, "), open(")"))),
+                none,
+            ),
+        ]
+    }
+
+    /// Every depth the compiler accepts must evaluate on whichever path reaches the rule:
+    /// "created fine, aborts or refuses on write" is the failure. Root, list item, map
+    /// value and `oldSelf` transition rules all funnel through the 32 MiB evaluation and
+    /// cost-replay threads; this drives each shape at its deepest accepted depth down
+    /// each path.
+    #[test]
+    fn every_crd_shape_at_the_deepest_accepted_depth_evaluates_on_every_entry_path() {
+        let element = |rule: &str| {
+            serde_json::json!({
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": true,
+                "x-kubernetes-validations": [{ "rule": rule }]
+            })
+        };
+        for (i, (shape, _, _)) in crd_nesting_shapes(0).into_iter().enumerate() {
+            for transition in [false, true] {
+                let at = |n: usize| {
+                    let (_, rule, data) = crd_nesting_shapes(n).swap_remove(i);
+                    let rule = if transition {
+                        format!("{rule} && oldSelf == oldSelf")
+                    } else {
+                        rule
+                    };
+                    (n, rule, data)
+                };
+                let (depth, rule, data) = (1..=crate::cel_runtime::MAX_RECURSION_DEPTH + 1)
+                    .rev()
+                    .map(at)
+                    .find(|(_, rule, _)| crate::cel_runtime::compile_program(rule).is_ok())
+                    .expect(shape);
+                assert!(
+                    depth >= 80,
+                    "{shape}: accepted only to {depth}, not deep enough to matter"
+                );
+
+                let schemas = [
+                    ("root", element(&rule), data.clone()),
+                    (
+                        "list item",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": { "xs": { "type": "array", "items": element(&rule) } }
+                        }),
+                        serde_json::json!({ "xs": [data.clone(), data.clone()] }),
+                    ),
+                    (
+                        "map value",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": { "m": {
+                                "type": "object",
+                                "additionalProperties": element(&rule)
+                            } }
+                        }),
+                        serde_json::json!({ "m": { "k": data.clone() } }),
+                    ),
+                ];
+                for (path, schema, obj) in schemas {
+                    let old = transition.then_some(&obj);
+                    let result = check_schema_with_old(&obj, schema, old);
+                    assert!(
+                        result.is_ok(),
+                        "{shape} (depth {depth}) via {path}, oldSelf rule {transition}: accepted at \
+                         create but fails on write: {:?}",
+                        result.err().map(|e| e.1.message)
+                    );
+                }
+            }
+        }
+    }
+
     // Before this fix, `execute_cel_with_budget`'s spawned thread called `gate.release()`
     // manually *after* `program.execute()` returned. The `cel` crate has reachable
     // `panic!` sites in its evaluator (e.g. cel 0.14.3 objects.rs:1546, :1467), and a

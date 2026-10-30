@@ -712,6 +712,26 @@ fn big_stack_threads_never_exceed_the_lane_limit() {
     );
 }
 
+/// Handlers call the lane gate from async code: with every lane busy, a waiting request
+/// must not park the runtime worker, or one burst of long rules stalls every unrelated
+/// request scheduled on that worker. One worker makes a parked wait observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn waiting_for_a_busy_lane_does_not_block_the_runtime() {
+    static LANES: super::parse::Lanes = super::parse::Lanes::new(1);
+    let held = LANES.acquire();
+    let waiter = tokio::spawn(async {
+        let _lane = LANES.acquire();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move { tx.send(()).unwrap() });
+    // The test thread is not a worker, so a std wait here is safe while the worker is parked.
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a cheap task starved while another waited for a lane");
+    drop(held);
+    waiter.await.unwrap();
+}
+
 /// A policy stored under failurePolicy Fail denies every matching request if it compiles
 /// but evaluates to "nests too deeply", so the depth the compiler accepts must be one the
 /// evaluator finishes. Frame sizes differ per build profile, so the guarantee is for

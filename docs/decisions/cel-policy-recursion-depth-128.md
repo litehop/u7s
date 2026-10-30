@@ -5,7 +5,9 @@
 
 ## Context
 
-cel-go (Kubernetes 1.37.1) rejects expressions nested deeper than 250 levels at
+cel-go v0.29.2 (the version in Kubernetes release-1.37 and v1.37.1 `go.mod`;
+`parser` defaults `maxRecursionDepth` to 250, which Kubernetes does not
+override) rejects expressions nested deeper than 250 levels at
 compile time. u7s evaluates two ways: CRD `x-kubernetes-validations` run on a
 dedicated 32 MiB thread, while ValidatingAdmissionPolicy, MutatingAdmissionPolicy
 and authorization expressions run on a 512 KiB request thread under a 192 KiB
@@ -33,12 +35,16 @@ A count cannot be exact because frame size differs per node kind.
 
 This is a deliberate safe default: pathologically nested expressions cel-go
 accepts are refused here, because the alternative is a stored policy that fails
-closed. No real policy nests near 128.
+closed.
 
 ## Consequences
 
 - Debug builds have larger frames and may refuse expressions below 128;
   the guarantee holds for release builds, covered by
-  `every_depth_the_compiler_accepts_evaluates_in_release` (`cargo test --release`).
+  `every_depth_the_compiler_accepts_evaluates_in_release`, which the `release-invariants`
+  CI job runs with `cargo test --release`.
+- CRD rules are covered per shape and entry path (root, list item, map value,
+  `oldSelf` transition) by
+  `every_crd_shape_at_the_deepest_accepted_depth_evaluates_on_every_entry_path`.
 - A new evaluable shape with larger frames than the measured ones needs the
   limit re-measured.
