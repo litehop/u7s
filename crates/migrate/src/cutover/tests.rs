@@ -351,12 +351,17 @@ async fn cutover_records_original_policy_keeps_retain_until_verified_then_restor
     let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
     let mut host = FakeHost::new(&tgt);
     let paths = work("full");
+    let tarball = std::env::current_exe()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     run(
         &src,
         &mut host,
         &paths,
         true,
-        &["--tarball".into(), "t.tgz".into()],
+        &["--tarball".into(), tarball.clone()],
     )
     .await
     .unwrap();
@@ -388,7 +393,7 @@ async fn cutover_records_original_policy_keeps_retain_until_verified_then_restor
         host.install_args,
         [
             "--tarball",
-            "t.tgz",
+            tarball.as_str(),
             "--service-cidr",
             "10.43.0.0/16",
             "--cluster-cidr",
