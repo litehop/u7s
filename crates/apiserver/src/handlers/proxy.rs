@@ -14,7 +14,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Path, Query, State,
+        FromRequestParts, Path, State,
     },
     response::Response,
 };
@@ -52,6 +52,69 @@ fn outbound_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketCo
 // ---------------------------------------------------------------------------
 // /log — query parameters forwarded to the kubelet
 // ---------------------------------------------------------------------------
+
+/// Query extractor with upstream's url.Values semantics: a repeated scalar
+/// parameter resolves to its first value (apimachinery `Convert_Slice_string_To_*`
+/// take `in[0]`) instead of failing the whole request the way serde_urlencoded's
+/// duplicate-field check does. `command` is multi-valued and forwarded from the raw
+/// query, so it is never collapsed here (`ports` is likewise multi-valued; the
+/// portforward handler reads it from the raw query without this extractor). Bool parameters follow
+/// `Convert_Slice_string_To_bool`: true unless the first value is "0" or "false"
+/// (case-insensitive), including the empty string.
+pub struct FirstValueQuery<T>(pub T);
+
+const BOOL_QUERY_KEYS: [&str; 7] = [
+    "stdin",
+    "stdout",
+    "stderr",
+    "tty",
+    "follow",
+    "previous",
+    "timestamps",
+];
+
+fn upstream_bool(v: &str) -> bool {
+    !(v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
+fn first_value_pairs(raw: &str) -> Result<String, serde_urlencoded::de::Error> {
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw)?;
+    let mut seen = std::collections::HashSet::new();
+    let first: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| k == "command" || seen.insert(k.clone()))
+        .map(|(k, v)| {
+            if BOOL_QUERY_KEYS.contains(&k.as_str()) {
+                let b = upstream_bool(&v).to_string();
+                (k, b)
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    Ok(serde_urlencoded::to_string(&first).expect("string pairs always serialise"))
+}
+
+impl<T, S> FromRequestParts<S> for FirstValueQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = crate::status::StatusError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bad = |e: serde_urlencoded::de::Error| {
+            Status::bad_request(format!("invalid query string: {e}"))
+        };
+        let deduped = first_value_pairs(parts.uri.query().unwrap_or("")).map_err(bad)?;
+        serde_urlencoded::from_str(&deduped)
+            .map(FirstValueQuery)
+            .map_err(bad)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct LogQuery {
@@ -399,7 +462,7 @@ async fn stream_log_over_websocket(
 pub async fn pod_log<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<LogQuery>,
+    FirstValueQuery(query): FirstValueQuery<LogQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
     let (kubelet_url, verify_name) = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
@@ -646,7 +709,7 @@ pub async fn resolve_attach_target<S: Store>(
 pub async fn pod_attach<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<AttachQuery>,
+    FirstValueQuery(query): FirstValueQuery<AttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, crate::status::StatusError> {
     let target = resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
@@ -682,7 +745,7 @@ pub async fn pod_attach<S: Store>(
 pub async fn pod_attach_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<AttachQuery>,
+    FirstValueQuery(query): FirstValueQuery<AttachQuery>,
 ) -> Result<Response, crate::status::StatusError> {
     resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
     Err(crate::status::StatusError(
@@ -983,9 +1046,9 @@ async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::R
 /// Query parameters for /exec — only `container` is needed to build the URL path.
 ///
 /// `command` and the stream flags (stdin/stdout/stderr/tty) are forwarded verbatim
-/// as the raw query string to kubelet. We do NOT parse them with serde because
-/// `command` is multi-valued (`?command=ls&command=-la`) and serde_urlencoded
-/// (used by axum's Query extractor) does not support repeated keys for Vec<String>.
+/// re-encoded from the raw query string for kubelet. They are not deserialised into
+/// this struct because `command` is multi-valued (`?command=ls&command=-la`) and
+/// serde_urlencoded cannot collect repeated keys into a Vec<String>.
 #[derive(Deserialize)]
 pub struct ExecQuery {
     pub container: Option<String>,
@@ -1125,32 +1188,24 @@ pub async fn resolve_exec_target<S: Store>(
     //   Also normalizes boolean values: true→1. Reconstructs the query for kubelet.
     //   command= is multi-valued (?command=ls&command=-la) and is preserved as-is.
     let mut params: Vec<String> = Vec::new();
-    let mut stdin_set = false;
-    let mut stdout_set = false;
-    let mut stderr_set = false;
-    let mut tty_set = false;
+    let mut stdin_set: Option<bool> = None;
+    let mut stdout_set: Option<bool> = None;
+    let mut stderr_set: Option<bool> = None;
+    let mut tty_set: Option<bool> = None;
     for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "stdin" => {
-                if v == "true" || v == "1" {
-                    stdin_set = true;
-                }
+                let _ = stdin_set.get_or_insert(upstream_bool(v));
             }
             "stdout" => {
-                if v == "true" || v == "1" {
-                    stdout_set = true;
-                }
+                let _ = stdout_set.get_or_insert(upstream_bool(v));
             }
             "stderr" => {
-                if v == "true" || v == "1" {
-                    stderr_set = true;
-                }
+                let _ = stderr_set.get_or_insert(upstream_bool(v));
             }
             "tty" => {
-                if v == "true" || v == "1" {
-                    tty_set = true;
-                }
+                let _ = tty_set.get_or_insert(upstream_bool(v));
             }
             "command" | "container" => {
                 // command is multi-valued; container is already in the URL path.
@@ -1168,16 +1223,16 @@ pub async fn resolve_exec_target<S: Store>(
     // Kubelet uses different param names than kubectl on the exec endpoint:
     // kubectl: stdin/stdout/stderr  →  kubelet: input/output/error
     // (k8s.io/api/core/types.go ExecStdinParam="input", ExecStdoutParam="output", ExecStderrParam="error")
-    if stdin_set {
+    if stdin_set == Some(true) {
         params.push("input=1".to_owned());
     }
-    if stdout_set {
+    if stdout_set == Some(true) {
         params.push("output=1".to_owned());
     }
-    if stderr_set {
+    if stderr_set == Some(true) {
         params.push("error=1".to_owned());
     }
-    if tty_set {
+    if tty_set == Some(true) {
         params.push("tty=1".to_owned());
     }
     let qs = params.join("&");
@@ -1236,7 +1291,7 @@ pub async fn resolve_exec_target<S: Store>(
 pub async fn pod_exec<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<ExecQuery>,
+    FirstValueQuery(query): FirstValueQuery<ExecQuery>,
     uri: axum::http::Uri,
     ws: WebSocketUpgrade,
 ) -> Result<Response, crate::status::StatusError> {
@@ -1281,7 +1336,7 @@ pub async fn pod_exec<S: Store>(
 pub async fn pod_exec_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<ExecQuery>,
+    FirstValueQuery(query): FirstValueQuery<ExecQuery>,
     uri: axum::http::Uri,
 ) -> Result<Response, crate::status::StatusError> {
     let raw_query = uri.query().unwrap_or("").to_owned();
@@ -1526,12 +1581,20 @@ async fn run_exec_proxy_spliced(
 
 /// Query parameters for portforward: only `ports` is required.
 ///
-/// kubectl sends `?ports=<port>` (may repeat for multiple ports). Validated by
-/// `validate_ports_param` and forwarded to the kubelet — never trusted verbatim,
-/// since it is hand-interpolated into a raw HTTP/1.1 request line downstream.
-#[derive(Deserialize)]
-pub struct PortforwardQuery {
-    pub ports: Option<String>,
+/// kubectl sends `?ports=<port>` (repeats for multiple ports, like upstream's
+/// `PodPortForwardOptions.Ports`). Every value is joined in order into one
+/// comma-separated list, validated by `validate_ports_param` and forwarded to the
+/// kubelet — never trusted verbatim, since it is hand-interpolated into a raw
+/// HTTP/1.1 request line downstream. An empty entry fails validation, as upstream's
+/// `NewV4Options` rejects an empty `port`.
+fn joined_ports_param(raw_query: &str) -> Option<String> {
+    let ports: Vec<String> = serde_urlencoded::from_str::<Vec<(String, String)>>(raw_query)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k == "ports")
+        .map(|(_, v)| v)
+        .collect();
+    (!ports.is_empty()).then(|| ports.join(","))
 }
 
 /// Validated portforward parameters after all pre-upgrade checks pass.
@@ -1814,10 +1877,10 @@ fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
 pub async fn pod_portforward<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<PortforwardQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let params = validate_portforward(&state, &raw_ns, &pod_name, query.ports.as_deref()).await?;
+    let ports = joined_ports_param(req.uri().query().unwrap_or(""));
+    let params = validate_portforward(&state, &raw_ns, &pod_name, ports.as_deref()).await?;
 
     if is_websocket_upgrade_request(&req) {
         let (mut parts, _body) = req.into_parts();
@@ -2154,31 +2217,90 @@ pub(crate) fn proxied_response(
 // /api/v1/nodes/{name}/proxy/{*path} — forward to kubelet
 // ---------------------------------------------------------------------------
 
-/// Resolve node IP and build the kubelet HTTP URL for node proxy requests.
-///
-/// Separated from the handler for unit-testability: all error paths (404, 502)
-/// are reachable without a real HTTP connection.
-/// Strip a trailing `:port` from a node name as it appears in a proxy URL.
-///
-/// Sonobuoy's dump.go (and kubectl) build node-proxy URLs as
-/// `/api/v1/nodes/<name>:<port>/proxy/...` (e.g. "lima-node:10250").
-/// The node is stored under the bare name without the port suffix.
-/// Node names are DNS-1123 labels (no colons), so a single rsplit_once(':')
-/// on the last colon is safe and sufficient — no full URL parser needed.
-pub fn strip_node_port(node_name: &str) -> &str {
-    node_name
-        .rsplit_once(':')
-        .map(|(bare, _port)| bare)
-        .unwrap_or(node_name)
+/// Parse a node proxy id as upstream `net.SplitSchemeNamePort` does: `name`, `name:port`
+/// or `scheme:name:port` with scheme `http`, `https` or empty. Returns
+/// (scheme, name, port); `None` is upstream's `invalid node request`.
+fn split_node_proxy_id(id: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = id.split(':').collect();
+    let (scheme, name, port) = match parts.as_slice() {
+        [name] => ("", *name, ""),
+        [name, port] => ("", *name, *port),
+        [scheme, name, port] => (*scheme, *name, *port),
+        _ => return None,
+    };
+    (!name.is_empty() && matches!(scheme, "" | "http" | "https")).then_some((scheme, name, port))
 }
 
+/// Go's `net.IP.IsGlobalUnicast`: upstream `isProxyableHostname` rejects a node address
+/// resolving to anything else, so a principal able to write Node status addresses cannot
+/// steer the apiserver at loopback, link-local or unspecified targets.
+fn is_global_unicast(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    let link_local = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    !(ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || link_local)
+}
+
+/// Whether a node proxy target of `ip` is allowed. Loopback is additionally allowed only
+/// in rig builds, whose node address is a loopback port-forward to the VM kubelet.
+/// Compiled only with the `rig-test-knobs` feature, which no shipped build enables.
+#[cfg(feature = "rig-test-knobs")]
+fn node_proxy_ip_allowed(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || is_global_unicast(ip)
+}
+
+#[cfg(not(feature = "rig-test-knobs"))]
+fn node_proxy_ip_allowed(ip: std::net::IpAddr) -> bool {
+    is_global_unicast(ip)
+}
+
+/// Logged once at startup so a rig build is never mistaken for a shipped one.
+#[cfg(feature = "rig-test-knobs")]
+pub(crate) fn warn_rig_test_knobs() {
+    tracing::warn!("rig-test-knobs: node proxy accepts loopback node addresses");
+}
+
+#[cfg(not(feature = "rig-test-knobs"))]
+pub(crate) fn warn_rig_test_knobs() {}
+
+/// Mirrors upstream `isProxyableHostname`: every resolved address must be allowed.
+fn check_node_proxy_addrs(addrs: &[std::net::IpAddr]) -> Result<(), &'static str> {
+    if addrs.is_empty() {
+        return Err("no addresses for hostname");
+    }
+    if addrs.iter().any(|ip| !node_proxy_ip_allowed(*ip)) {
+        return Err("address not allowed");
+    }
+    Ok(())
+}
+
+async fn ensure_proxyable_hostname(host: &str) -> Result<(), crate::status::StatusError> {
+    let addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|e| Status::bad_request(e.to_string()))?
+        .map(|sa| sa.ip())
+        .collect();
+    check_node_proxy_addrs(&addrs).map_err(|e| Status::bad_request(e.to_owned()))
+}
+
+/// Resolve the node address and build the proxy URL for `nodes/<id>/proxy`, mirroring
+/// upstream `ResourceLocation`: the address must be proxyable (400 otherwise), and a
+/// `:port` other than the kubelet's is dialed as requested.
 pub async fn resolve_node_proxy_target<S: Store>(
     state: &AppState<S>,
     node_name: &str,
     path_suffix: &str,
 ) -> Result<(String, reqwest::Client), crate::status::StatusError> {
     validate_path_segment("name", node_name)?;
-    let bare_name = strip_node_port(node_name);
+    let (scheme_req, bare_name, port_req) = split_node_proxy_id(node_name)
+        .ok_or_else(|| Status::bad_request(format!("invalid node request \"{node_name}\"")))?;
     let node_key = cluster_object_key("nodes", bare_name);
     let node_stored = state
         .store
@@ -2203,14 +2325,38 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let client = kubelet_http_client(
-        state,
-        kubelet_verify_name(&node, preferred_address(state)).as_deref(),
-    )?;
+    ensure_proxyable_hostname(&node_ip).await?;
 
     let kp = kubelet_port_for_node(bare_name, &state.node_kubelet_ports, state.kubelet_port);
-    let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
-    Ok((kubelet_url, client))
+    // The kubelet's own port (its real 10250 or the host forward) uses the kubelet
+    // client; any other port is dialed as requested with a plain client.
+    if port_req.is_empty() || port_req == kp.to_string() || port_req == "10250" {
+        let client = kubelet_http_client(
+            state,
+            kubelet_verify_name(&node, preferred_address(state)).as_deref(),
+        )?;
+        let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
+        return Ok((kubelet_url, client));
+    }
+    if scheme_req.is_empty() {
+        return Err(Status::service_unavailable(
+            "error trying to reach service: unsupported protocol scheme \"\"".to_owned(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Status::service_unavailable(format!("proxy client unavailable: {e}")))?;
+    let host = if node_ip.contains(':') {
+        format!("[{node_ip}]")
+    } else {
+        node_ip
+    };
+    let url = format!(
+        "{scheme_req}://{host}:{port_req}/{}",
+        encode_proxy_tail(path_suffix)?
+    );
+    Ok((url, client))
 }
 
 /// Buffer a proxied request body, capped at `MAX_BODY_BYTES`. Proxy subresources are
@@ -3442,6 +3588,158 @@ pub async fn service_proxy_root<S: Store>(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    async fn first_value<T: serde::de::DeserializeOwned>(
+        uri: &str,
+    ) -> Result<T, crate::status::StatusError> {
+        let (mut parts, _) = Request::builder().uri(uri).body(()).unwrap().into_parts();
+        FirstValueQuery::<T>::from_request_parts(&mut parts, &())
+            .await
+            .map(|q| q.0)
+    }
+
+    /// sonobuoy's exec request carries `container=` twice; rejecting it with 400
+    /// breaks `sonobuoy retrieve`.
+    #[tokio::test]
+    async fn repeated_identical_container_param_is_accepted() {
+        let q: ExecQuery = first_value("/exec?container=a&container=a&command=ls")
+            .await
+            .unwrap_or_else(|_| panic!("duplicate container= must not be rejected"));
+        assert_eq!(q.container.as_deref(), Some("a"));
+    }
+
+    /// Upstream's string conversion takes `in[0]`: with differing values the
+    /// first one wins, not the last and not an error.
+    #[tokio::test]
+    async fn repeated_differing_container_param_first_value_wins() {
+        let q: ExecQuery = first_value("/exec?container=a&container=b")
+            .await
+            .unwrap_or_else(|_| panic!("duplicate container= must not be rejected"));
+        assert_eq!(q.container.as_deref(), Some("a"));
+    }
+
+    /// Attach and log share the extractor; repeated bool/int scalars must also
+    /// resolve to the first value.
+    #[tokio::test]
+    async fn attach_and_log_queries_tolerate_repeated_scalars() {
+        let a: AttachQuery = first_value("/attach?container=x&stdin=true&stdin=false&container=y")
+            .await
+            .unwrap_or_else(|_| panic!("attach must tolerate repeats"));
+        assert_eq!(a.container.as_deref(), Some("x"));
+        assert_eq!(a.stdin.as_deref(), Some("true"));
+        let l: LogQuery = first_value("/log?tailLines=5&tailLines=9&follow=true&follow=false")
+            .await
+            .unwrap_or_else(|_| panic!("log must tolerate repeats"));
+        assert_eq!(l.tail_lines, Some(5));
+        assert_eq!(l.follow, Some(true));
+    }
+
+    /// kubectl/client-go bool params follow `Convert_Slice_string_To_bool`: only
+    /// "0"/"false" (any case) are false; "True" and an empty value are true. A
+    /// divergence flips whether stdin/tty are attached for a non-Go client.
+    #[tokio::test]
+    async fn bool_params_follow_upstream_conversion() {
+        let a: AttachQuery = first_value("/attach?stdin=True&tty=&stdout=0&stderr=FALSE")
+            .await
+            .unwrap();
+        assert_eq!(a.stdin.as_deref(), Some("true"), "stdin=True is true");
+        assert_eq!(a.tty.as_deref(), Some("true"), "empty tty= is true");
+        assert_eq!(a.stdout.as_deref(), Some("false"), "stdout=0 is false");
+        assert_eq!(a.stderr.as_deref(), Some("false"), "stderr=FALSE is false");
+        let l: LogQuery = first_value("/log?follow=&previous=False&timestamps=yes")
+            .await
+            .unwrap();
+        assert_eq!(l.follow, Some(true));
+        assert_eq!(l.previous, Some(false));
+        assert_eq!(l.timestamps, Some(true));
+    }
+
+    #[test]
+    fn upstream_bool_only_zero_and_false_are_false() {
+        for v in ["0", "false", "FALSE", "False"] {
+            assert!(!upstream_bool(v), "{v:?} must be false");
+        }
+        for v in ["", "1", "true", "True", "yes", "00"] {
+            assert!(upstream_bool(v), "{v:?} must be true");
+        }
+    }
+
+    #[test]
+    fn joined_ports_keeps_every_value_in_order() {
+        assert_eq!(
+            joined_ports_param("ports=80&ports=81&x=1&ports=82,83").as_deref(),
+            Some("80,81,82,83")
+        );
+        assert_eq!(joined_ports_param("x=1"), None);
+        let joined = joined_ports_param("ports=80&ports=").unwrap();
+        assert!(
+            validate_ports_param(&joined).is_err(),
+            "an empty ports entry must be rejected like upstream's NewV4Options"
+        );
+    }
+
+    /// Each handler must survive a duplicated scalar query param: a handler
+    /// switched back to axum `Query` answers 400 "duplicate field" and breaks
+    /// clients (sonobuoy sends `container=` twice) before any pod lookup.
+    #[tokio::test]
+    async fn every_streaming_handler_tolerates_duplicated_scalar_params() {
+        use axum::http::Method;
+        let base = "/api/v1/namespaces/default/pods/ghost";
+        let cases = [
+            (
+                Method::GET,
+                "log?container=a&container=a&tailLines=1&tailLines=2",
+            ),
+            (Method::GET, "exec?container=a&container=a&command=ls"),
+            (Method::POST, "exec?container=a&container=a&command=ls"),
+            (
+                Method::GET,
+                "attach?container=a&container=a&stdin=true&stdin=true",
+            ),
+            (
+                Method::POST,
+                "attach?container=a&container=a&stdin=true&stdin=true",
+            ),
+            (Method::GET, "portforward?ports=80&ports=81"),
+            (Method::POST, "portforward?ports=80&ports=81"),
+        ];
+        for (method, tail) in cases {
+            let mut router = make_router(make_state());
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(format!("{base}/{tail}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.call(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("invalid query string") && !body.contains("duplicate field"),
+                "{method} {tail} rejected a repeated param ({status}): {body}"
+            );
+            if !(tail.starts_with("exec") && method == Method::GET)
+                && !(tail.starts_with("attach") && method == Method::GET)
+            {
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{method} {tail} must reach the pod lookup: {body}"
+                );
+            }
+        }
+    }
+
+    /// `command` is repeated by design and must survive dedup in order, since it
+    /// is the argv of the exec'd process.
+    #[test]
+    fn command_param_survives_dedup_in_order() {
+        let s = first_value_pairs("command=ls&container=a&command=-la&container=b&command=%2Ftmp")
+            .unwrap();
+        assert_eq!(s, "command=ls&container=a&command=-la&command=%2Ftmp");
+    }
 
     use axum::{
         http::{Request, StatusCode},
@@ -6289,24 +6587,184 @@ mod tests {
         );
     }
 
-    /// strip_node_port must strip the trailing :port from a URL node name.
-    ///
-    /// Sonobuoy's dump.go builds node-proxy URLs as /api/v1/nodes/<name>:<port>/proxy/pods.
-    /// Without stripping, the store lookup uses "lima-node:10250" instead of "lima-node",
-    /// causing every sonobuoy pod-dump to 404 with "Node lima-node:10250 not found".
+    /// The node id must split like upstream `SplitSchemeNamePort`. Sonobuoy's dump.go builds
+    /// /api/v1/nodes/<name>:<port>/proxy/pods; a mis-split looks up "lima-node:10250" in the
+    /// store and 404s every pod-dump.
     #[test]
-    fn strip_node_port_removes_port_suffix() {
+    fn split_node_proxy_id_matches_upstream_split_scheme_name_port() {
+        assert_eq!(split_node_proxy_id("n"), Some(("", "n", "")));
+        assert_eq!(split_node_proxy_id("n:10250"), Some(("", "n", "10250")));
         assert_eq!(
-            super::strip_node_port("lima-node:10250"),
-            "lima-node",
-            "sonobuoy/kubectl node-proxy pod retrieval 404s if :port suffix is not stripped \
-             before the store lookup"
+            split_node_proxy_id("https:n:443"),
+            Some(("https", "n", "443"))
+        );
+        for bad in ["ftp:n:1", "a:b:c:d", ":80", "http::80", ""] {
+            assert_eq!(
+                split_node_proxy_id(bad),
+                None,
+                "{bad:?} must be an invalid node request (400), as upstream"
+            );
+        }
+    }
+
+    fn ips(list: &[&str]) -> Vec<std::net::IpAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    /// Upstream rejects a node whose address resolves to anything but global unicast;
+    /// otherwise anyone able to write Node status addresses aims the apiserver at
+    /// link-local metadata, unspecified or multicast targets.
+    #[test]
+    fn node_proxy_rejects_non_global_unicast_addresses() {
+        for bad in [
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "::",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert_eq!(
+                check_node_proxy_addrs(&ips(&[bad])),
+                Err("address not allowed"),
+                "{bad} must not be a proxyable node address"
+            );
+        }
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["10.0.0.5", "169.254.169.254"])),
+            Err("address not allowed"),
+            "one non-proxyable address among several must reject the hostname"
         );
         assert_eq!(
-            super::strip_node_port("lima-node"),
-            "lima-node",
-            "bare node names (no port suffix) must pass through unchanged"
+            check_node_proxy_addrs(&[]),
+            Err("no addresses for hostname")
         );
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["10.0.0.5", "2001:db8::1"])),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(feature = "rig-test-knobs"))]
+    #[test]
+    fn node_proxy_rejects_loopback_in_default_build() {
+        for bad in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(
+                check_node_proxy_addrs(&ips(&[bad])),
+                Err("address not allowed"),
+                "{bad}: a shipped build must never proxy to loopback"
+            );
+        }
+    }
+
+    #[cfg(feature = "rig-test-knobs")]
+    #[test]
+    fn node_proxy_allows_only_loopback_extra_in_rig_build() {
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["127.0.0.1"])),
+            Ok(()),
+            "the rig's node address is a loopback kubelet port-forward"
+        );
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["169.254.169.254", "0.0.0.0"])),
+            Err("address not allowed"),
+            "the rig knob must relax loopback only"
+        );
+    }
+
+    async fn seed_node_with_address(state: &AppState, addr: &str) {
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": addr}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "n"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+    }
+
+    /// End to end through the resolver: a node address that is (or resolves to) a
+    /// non-proxyable address answers 400 "address not allowed" for every spelling of the id.
+    #[tokio::test]
+    async fn node_proxy_resolver_rejects_unproxyable_node_address() {
+        for addr in ["169.254.169.254", "0.0.0.0", "::", "fe80::1"] {
+            let state = make_state();
+            seed_node_with_address(&state, addr).await;
+            for id in ["n", "n:10250", "https:n:8443"] {
+                let err = resolve_node_proxy_target(&state, id, "healthz")
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.0.as_u16(), 400, "{addr} via {id}");
+                assert_eq!(err.1.message, "address not allowed", "{addr} via {id}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rig-test-knobs"))]
+    #[tokio::test]
+    async fn node_proxy_resolver_rejects_loopback_and_localhost_in_default_build() {
+        for addr in ["127.0.0.1", "::1", "localhost"] {
+            let state = make_state();
+            seed_node_with_address(&state, addr).await;
+            let err = resolve_node_proxy_target(&state, "n", "healthz")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (err.0.as_u16(), err.1.message.as_str()),
+                (400, "address not allowed"),
+                "{addr}: a hostname resolving to loopback must be rejected"
+            );
+        }
+    }
+
+    /// `:port` must be honoured: the kubelet's port keeps the kubelet client, any other port
+    /// is dialed as requested with the requested scheme (upstream ResourceLocation).
+    #[tokio::test]
+    async fn node_proxy_honours_port_suffix() {
+        let state = make_state_with_ca().await;
+        state
+            .kubelet_client
+            .set(AppState::<SqliteStore>::build_kubelet_client(
+                state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
+                None,
+            ));
+        seed_node_with_address(&state, "10.0.0.5").await;
+        let kp = state.kubelet_port;
+
+        let (url, _) = resolve_node_proxy_target(&state, "n", "healthz")
+            .await
+            .unwrap();
+        assert_eq!(url, format!("https://10.0.0.5:{kp}/healthz"));
+        let (url, _) = resolve_node_proxy_target(&state, "n:10250", "healthz")
+            .await
+            .unwrap();
+        assert_eq!(url, format!("https://10.0.0.5:{kp}/healthz"));
+
+        let (url, _) = resolve_node_proxy_target(&state, "https:n:8443", "x/y")
+            .await
+            .unwrap();
+        assert_eq!(url, "https://10.0.0.5:8443/x/y", "requested port ignored");
+        let (url, _) = resolve_node_proxy_target(&state, "http:n:9100", "metrics")
+            .await
+            .unwrap();
+        assert_eq!(url, "http://10.0.0.5:9100/metrics");
+
+        let err = resolve_node_proxy_target(&state, "n:9100", "metrics")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 503, "no scheme for a non-kubelet port");
+        let err = resolve_node_proxy_target(&state, "a:b:c:d", "")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 400);
     }
 
     /// node proxy with a :port suffix in the name must resolve the same node as
@@ -6324,7 +6782,7 @@ mod tests {
             "kind": "Node",
             "metadata": {"name": "lima-node", "resourceVersion": "1"},
             "status": {
-                "addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]
+                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]
             }
         });
         state
@@ -9469,6 +9927,7 @@ mod tests {
     /// empty Content-Type even though the kubelet's body was JSON. A protobuf-
     /// preferring client (any typed clientset) then fails with "provided data does
     /// not appear to be a protobuf message" trying to decode that JSON as protobuf.
+    #[cfg(feature = "rig-test-knobs")]
     #[tokio::test]
     async fn node_proxy_forwards_upstream_content_type() {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};

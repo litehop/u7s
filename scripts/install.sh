@@ -1338,6 +1338,13 @@ if [ -z "$NODE_NAME" ]; then
   echo "error: refusing to continue: empty node name (hostname is empty; pass --node-name)" >&2
   exit 1
 fi
+# openssl req rejects a Subject CN over X.509
+# ub-common-name (64) when building the identity CSR, after packages and state
+# are already laid down. "system:node:" is 12 of those 64.
+if [ "${#NODE_NAME}" -gt 52 ]; then
+  echo "error: node name '$NODE_NAME' is ${#NODE_NAME} chars; the node identity certificate CN 'system:node:<name>' would exceed the X.509 64-char limit that openssl enforces (max node name: 52). Pass a shorter --node-name (e.g. the short hostname instead of the FQDN)." >&2
+  exit 1
+fi
 
 if [ -z "$IFACE" ]; then
   # Whitelist physical-NIC name patterns rather than blacklisting virtual

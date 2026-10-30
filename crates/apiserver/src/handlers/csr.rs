@@ -77,6 +77,172 @@ pub(crate) fn parse_csr_pem(pem: &[u8]) -> Result<CertReq, String> {
     CertReq::from_der(&der).map_err(|e| format!("invalid DER PKCS#10: {e}"))
 }
 
+const UNIMPLEMENTED: &str = "x509: cannot verify signature: algorithm unimplemented";
+
+fn insecure(alg: &str) -> String {
+    format!("x509: cannot verify signature: insecure algorithm {alg}")
+}
+
+/// Go's `CertificateRequest.CheckSignature`: verifies the PKCS#10 self-signature over the
+/// request info with the embedded public key. Errors carry Go's text. ECDSA over P-224 is
+/// not verifiable here although Go accepts it.
+pub(crate) fn check_csr_signature(req: &CertReq) -> Result<(), String> {
+    use aws_lc_rs::signature::{self as sig, VerificationAlgorithm};
+    use x509_cert::der::Encode as _;
+
+    const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+    const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+    const ED25519: &str = "1.3.101.112";
+
+    let sig_oid = req.algorithm.oid.to_string();
+    let spki = &req.info.public_key;
+    let key_oid = spki.algorithm.oid.to_string();
+
+    match sig_oid.as_str() {
+        "1.2.840.113549.1.1.5" => return Err(insecure("SHA1-RSA")),
+        "1.2.840.10045.4.1" => return Err(insecure("ECDSA-SHA1")),
+        "1.2.840.113549.1.1.4" => return Err(insecure("MD5-RSA")),
+        _ => {}
+    }
+    if key_oid == RSA_ENCRYPTION {
+        return check_rsa_signature(req, &sig_oid);
+    }
+
+    let (alg, err): (&'static dyn VerificationAlgorithm, &str) =
+        match (key_oid.as_str(), sig_oid.as_str()) {
+            (
+                EC_PUBLIC_KEY,
+                ecdsa_sig @ ("1.2.840.10045.4.3.2" | "1.2.840.10045.4.3.3" | "1.2.840.10045.4.3.4"),
+            ) => {
+                let curve = spki
+                    .algorithm
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.decode_as::<x509_cert::der::asn1::ObjectIdentifier>().ok())
+                    .map(|o| o.to_string())
+                    .unwrap_or_default();
+                let alg: &'static dyn VerificationAlgorithm = match (curve.as_str(), ecdsa_sig) {
+                    ("1.2.840.10045.3.1.7", "1.2.840.10045.4.3.2") => &sig::ECDSA_P256_SHA256_ASN1,
+                    ("1.2.840.10045.3.1.7", "1.2.840.10045.4.3.3") => &sig::ECDSA_P256_SHA384_ASN1,
+                    ("1.2.840.10045.3.1.7", _) => &sig::ECDSA_P256_SHA512_ASN1,
+                    ("1.3.132.0.34", "1.2.840.10045.4.3.2") => &sig::ECDSA_P384_SHA256_ASN1,
+                    ("1.3.132.0.34", "1.2.840.10045.4.3.3") => &sig::ECDSA_P384_SHA384_ASN1,
+                    ("1.3.132.0.34", _) => &sig::ECDSA_P384_SHA512_ASN1,
+                    ("1.3.132.0.35", "1.2.840.10045.4.3.2") => &sig::ECDSA_P521_SHA256_ASN1,
+                    ("1.3.132.0.35", "1.2.840.10045.4.3.3") => &sig::ECDSA_P521_SHA384_ASN1,
+                    ("1.3.132.0.35", _) => &sig::ECDSA_P521_SHA512_ASN1,
+                    _ => return Err(UNIMPLEMENTED.into()),
+                };
+                (alg, "x509: ECDSA verification failure")
+            }
+            (ED25519, ED25519) => (&sig::ED25519, "x509: Ed25519 verification failure"),
+            _ => return Err(UNIMPLEMENTED.into()),
+        };
+
+    let message = req.info.to_der().map_err(|e| e.to_string())?;
+    let (Some(key), Some(signature)) =
+        (spki.subject_public_key.as_bytes(), req.signature.as_bytes())
+    else {
+        return Err(err.into());
+    };
+    sig::UnparsedPublicKey::new(alg, key)
+        .verify(&message, signature)
+        .map_err(|_| err.into())
+}
+
+#[derive(der::Sequence)]
+struct RsaPublicKey<'a> {
+    modulus: x509_cert::der::asn1::UintRef<'a>,
+    exponent: x509_cert::der::asn1::UintRef<'a>,
+}
+
+#[derive(der::Sequence)]
+struct PssParams {
+    #[asn1(context_specific = "0", tag_mode = "EXPLICIT", optional = "true")]
+    hash: Option<x509_cert::spki::AlgorithmIdentifierOwned>,
+    #[asn1(context_specific = "1", tag_mode = "EXPLICIT", optional = "true")]
+    mask_gen: Option<x509_cert::spki::AlgorithmIdentifierOwned>,
+    #[asn1(context_specific = "2", tag_mode = "EXPLICIT", optional = "true")]
+    salt_len: Option<u32>,
+    #[asn1(context_specific = "3", tag_mode = "EXPLICIT", optional = "true")]
+    trailer: Option<u32>,
+}
+
+const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
+const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
+const SHA512_OID: &str = "2.16.840.1.101.3.4.2.3";
+const MGF1_OID: &str = "1.2.840.113549.1.1.8";
+
+/// Hash OID of an RSASSA-PSS parameter block Go would accept: SHA-2 with MGF1 over the same
+/// hash, salt equal to the digest length (what aws-lc verifies) and the default trailer.
+fn pss_hash_oid(req: &CertReq) -> Option<String> {
+    let params = req
+        .algorithm
+        .parameters
+        .as_ref()?
+        .decode_as::<PssParams>()
+        .ok()?;
+    let hash = params.hash?.oid.to_string();
+    let mgf = params.mask_gen?;
+    let mgf_hash = mgf
+        .parameters?
+        .decode_as::<x509_cert::spki::AlgorithmIdentifierOwned>()
+        .ok()?
+        .oid
+        .to_string();
+    let digest_len = match hash.as_str() {
+        SHA256_OID => 32,
+        SHA384_OID => 48,
+        SHA512_OID => 64,
+        _ => return None,
+    };
+    (mgf.oid.to_string() == MGF1_OID
+        && mgf_hash == hash
+        && params.salt_len? == digest_len
+        && matches!(params.trailer, None | Some(1)))
+    .then_some(hash)
+}
+
+/// RSA is verified by aws-lc only, and only from 2048 bits for both PKCS#1 v1.5 and PSS: a
+/// deliberate divergence from Go, which accepts 1024-bit keys.
+fn check_rsa_signature(req: &CertReq, sig_oid: &str) -> Result<(), String> {
+    use aws_lc_rs::signature::{self as sig, VerificationAlgorithm};
+    use x509_cert::der::{Decode as _, Encode as _};
+
+    let spki = &req.info.public_key;
+    let key = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or("x509: failed to parse public key")?;
+    let pk = RsaPublicKey::from_der(key).map_err(|_| "x509: failed to parse public key")?;
+    let modulus = pk.modulus.as_bytes();
+    let bits = modulus.len() * 8 - modulus.first().map_or(0, |b| b.leading_zeros() as usize);
+    if bits < 2048 {
+        return Err(format!(
+            "crypto/rsa: {bits}-bit RSA keys are not accepted; minimum is 2048"
+        ));
+    }
+
+    let alg: &'static dyn VerificationAlgorithm = match sig_oid {
+        "1.2.840.113549.1.1.11" => &sig::RSA_PKCS1_2048_8192_SHA256,
+        "1.2.840.113549.1.1.12" => &sig::RSA_PKCS1_2048_8192_SHA384,
+        "1.2.840.113549.1.1.13" => &sig::RSA_PKCS1_2048_8192_SHA512,
+        "1.2.840.113549.1.1.10" => match pss_hash_oid(req).as_deref() {
+            Some(SHA256_OID) => &sig::RSA_PSS_2048_8192_SHA256,
+            Some(SHA384_OID) => &sig::RSA_PSS_2048_8192_SHA384,
+            Some(SHA512_OID) => &sig::RSA_PSS_2048_8192_SHA512,
+            _ => return Err(UNIMPLEMENTED.into()),
+        },
+        _ => return Err(UNIMPLEMENTED.into()),
+    };
+    const VERIFY: &str = "crypto/rsa: verification error";
+    let message = req.info.to_der().map_err(|e| e.to_string())?;
+    let signature = req.signature.as_bytes().ok_or(VERIFY)?;
+    sig::UnparsedPublicKey::new(alg, key)
+        .verify(&message, signature)
+        .map_err(|_| VERIFY.into())
+}
+
 /// Validate spec.request and spec.signerName, returning 422 on any violation.
 ///
 /// Extracted as a pure function so it can be unit-tested without an HTTP stack.
@@ -104,10 +270,24 @@ pub(crate) fn validate_csr_spec(
             Status::unprocessable_entity(format!("spec.request is not valid base64: {e}"))
         })?;
 
-    parse_csr_pem(&pem_bytes).map_err(|e| {
+    let req = parse_csr_pem(&pem_bytes).map_err(|e| {
         Status::unprocessable_entity(format!(
             "spec.request does not contain a valid PEM-encoded PKCS#10 CertificationRequest: {e}"
         ))
+    })?;
+    check_csr_signature(&req).map_err(|e| {
+        let name = body["metadata"]["name"].as_str().unwrap_or_default();
+        let cause = format!("Invalid value: {:?}: {e}", spec.request);
+        let mut err = Status::unprocessable_entity(format!(
+            "{KIND}.{GROUP} \"{name}\" is invalid: spec.request: {cause}"
+        ));
+        err.1.details = Some(Box::new(serde_json::json!({
+            "name": name,
+            "group": GROUP,
+            "kind": KIND,
+            "causes": [{"reason": "FieldValueInvalid", "message": cause, "field": "spec.request"}]
+        })));
+        err
     })?;
 
     // spec.signerName: required, non-empty.
@@ -335,8 +515,6 @@ pub async fn create_csr<S: Store>(
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    validate_csr_spec(&obj.body)?;
-
     // Captured before resolve_name mutates metadata.name, so a store collision below
     // knows whether it's allowed to retry under a freshly generated name.
     let generate_name_prefix = wants_generate_name(&obj);
@@ -346,6 +524,7 @@ pub async fn create_csr<S: Store>(
         "certificatesigningrequests",
         "CertificateSigningRequest",
     )?;
+    validate_csr_spec(&obj.body)?;
     stamp_metadata(&mut obj);
 
     let admission_ctx = AdmissionContext {
@@ -1863,10 +2042,198 @@ mod tests {
         );
     }
 
+    fn signed_csr_pem(cn: &str, key: &rcgen::KeyPair) -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn.to_string());
+        params.serialize_request(key).unwrap().pem().unwrap()
+    }
+
+    /// `openssl req -new -newkey rsa:2048 -subj /CN=system:node:aaa -sha256`; rcgen cannot
+    /// generate RSA keys with this backend.
+    const RSA_2048_CSR: &str = "-----BEGIN CERTIFICATE REQUEST-----
+MIICXzCCAUcCAQAwGjEYMBYGA1UEAwwPc3lzdGVtOm5vZGU6YWFhMIIBIjANBgkq
+hkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoJVTKJS7+rxkEEXPNrqm9u8man9RV5WT
+DDdE8EvrqIgZUKTjODSflD6+xjPzWv5yN/N3cHeW6PcRQTzfvMyXS8kWpXb6AO0c
+6aU4InMtEZieI5avdrGaQINzPcGdy97WWP1jJei8DFeUtA070fQb3jeKSRcssJhU
+EYqLpyaEWkuHE+LtxHiY5wQop5+yVGq4H3H4XT8l56sWbSQnAeeY5JNF0wHWZPPE
+WlMNy2iLlkMLRiQxKbCKqOKPcNaY/N7vz0kt0HxC10b5eNKGfbjVN9y8cujCjQm5
+akuhd9/k6o+UXpfgYEEjaK0CVlQUBJC5jSR1ObHB1pVUv/dEjqUydwIDAQABoAAw
+DQYJKoZIhvcNAQELBQADggEBADFEduLVXwteRzJ3SNe2WJV7fkmGrH4/FysrU7Si
+v710/gOZxdqpmwMmyI82YxX+6vWfeHS4Nv8wx8/aXW/Km1tS4QxTPWG3aDcZiJ4u
+LzVTYci9xSVsFbMPXnBebY9/VGZckOle2JRgf6gSkHAlZS200qKzb5XbnciOmSMs
+a3Rad9ZG/JeHaFvNJe904AjR/AY6TheEWkmZ712jTAIlDdzMrOS3Z7O/l6T4tXO1
+rAOgUk5Fly7dDCDGKj0xh1y+Dvy0q/iCmAL/OpgMyExJFP3fKl2gHajLraIjXiKW
+jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
+-----END CERTIFICATE REQUEST-----
+";
+
+    // `openssl req -new -subj /CN=system:node:aaa` over RSA keys of 2048 (-sha384/-sha512 and
+    // `-sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32`), 1024 (-sha256, -sha1, PSS)
+    // and 768 bits, over secp521r1 with -sha512 and over secp224r1.
+    const RSA_2048_SHA384: &str = include_str!("csr_fixtures/r2048_sha384.pem");
+    const RSA_2048_SHA512: &str = include_str!("csr_fixtures/r2048_sha512.pem");
+    const RSA_2048_PSS: &str = include_str!("csr_fixtures/r2048_pss.pem");
+    const RSA_1024_SHA256: &str = include_str!("csr_fixtures/r1024_sha256.pem");
+    const RSA_1024_SHA1: &str = include_str!("csr_fixtures/r1024_sha1.pem");
+    const RSA_1024_PSS: &str = include_str!("csr_fixtures/r1024_pss.pem");
+    const RSA_768_SHA256: &str = include_str!("csr_fixtures/r768.pem");
+    const ECDSA_P521: &str = include_str!("csr_fixtures/p521.pem");
+    const ECDSA_P224: &str = include_str!("csr_fixtures/p224.pem");
+
+    fn rejection(pem: &str) -> String {
+        let body = serde_json::json!({
+            "metadata": {"name": "csr-1"},
+            "spec": {"request": b64(pem), "signerName": "x"}
+        });
+        let err = validate_csr_spec(&body).expect_err("CSR must be rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        let prefix = format!(
+            "CertificateSigningRequest.certificates.k8s.io \"csr-1\" is invalid: spec.request: Invalid value: {:?}: ",
+            b64(pem)
+        );
+        err.1
+            .message
+            .strip_prefix(&prefix)
+            .unwrap_or_else(|| panic!("unexpected message prefix: {}", err.1.message))
+            .to_string()
+    }
+
+    #[test]
+    fn rsa_pss_and_every_pkcs1_sha2_hash_are_accepted_at_2048_bits_because_clients_sign_with_either_scheme(
+    ) {
+        for pem in [RSA_2048_PSS, RSA_2048_SHA384, RSA_2048_SHA512] {
+            validate_csr_spec(&spec_with(pem)).unwrap();
+        }
+    }
+
+    #[test]
+    fn deliberate_divergence_rsa_1024_is_rejected_for_pkcs1_and_pss_because_u7s_floors_rsa_at_2048_where_go_accepts_1024(
+    ) {
+        for pem in [RSA_1024_SHA256, RSA_1024_PSS] {
+            assert_eq!(
+                rejection(pem),
+                "crypto/rsa: 1024-bit RSA keys are not accepted; minimum is 2048"
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_key_below_1024_bits_is_rejected_with_the_same_floor_message() {
+        assert_eq!(
+            rejection(RSA_768_SHA256),
+            "crypto/rsa: 768-bit RSA keys are not accepted; minimum is 2048"
+        );
+    }
+
+    #[test]
+    fn sha1_signed_csr_is_rejected_with_go_text_because_go_refuses_insecure_signature_algorithms() {
+        assert_eq!(
+            rejection(RSA_1024_SHA1),
+            "x509: cannot verify signature: insecure algorithm SHA1-RSA"
+        );
+    }
+
+    #[test]
+    fn deliberate_divergence_p224_csr_is_rejected_because_no_hand_rolled_verifier_is_allowed_and_aws_lc_has_none(
+    ) {
+        assert_eq!(
+            rejection(ECDSA_P224),
+            "x509: cannot verify signature: algorithm unimplemented"
+        );
+    }
+
+    #[test]
+    fn rsa_pss_with_wrong_salt_length_is_rejected_as_unimplemented_because_go_only_knows_salt_equal_to_hash_length(
+    ) {
+        let mut der = der_of(RSA_2048_PSS);
+        // The PSS params end with `a2 03 02 01 20` (salt length 32).
+        let at = der
+            .windows(5)
+            .position(|w| w == [0xa2, 0x03, 0x02, 0x01, 0x20])
+            .unwrap();
+        der[at + 4] = 0x10;
+        assert_eq!(
+            rejection(&pem_of_der(&der)),
+            "x509: cannot verify signature: algorithm unimplemented"
+        );
+    }
+
+    #[test]
+    fn rejection_message_names_the_object_like_upstream_so_kubectl_prints_the_same_error() {
+        let mut der = der_of(RSA_2048_CSR);
+        let at = der.windows(3).position(|w| w == b"aaa").unwrap();
+        der[at..at + 3].copy_from_slice(b"bbb");
+        assert_eq!(
+            rejection(&pem_of_der(&der)),
+            "crypto/rsa: verification error"
+        );
+    }
+
+    fn csrs_per_algorithm() -> Vec<(&'static str, String)> {
+        let mut out = vec![
+            ("rsa-2048", RSA_2048_CSR.to_string()),
+            ("rsa-2048-sha384", RSA_2048_SHA384.to_string()),
+            ("rsa-2048-sha512", RSA_2048_SHA512.to_string()),
+            ("rsa-2048-pss-sha256", RSA_2048_PSS.to_string()),
+            ("ecdsa-p521", ECDSA_P521.to_string()),
+        ];
+        for (name, alg) in [
+            ("ecdsa-p256", &rcgen::PKCS_ECDSA_P256_SHA256),
+            ("ecdsa-p384", &rcgen::PKCS_ECDSA_P384_SHA384),
+            ("ed25519", &rcgen::PKCS_ED25519),
+        ] {
+            let key = rcgen::KeyPair::generate_for(alg).unwrap();
+            out.push((name, signed_csr_pem("system:node:aaa", &key)));
+        }
+        out
+    }
+
+    fn spec_with(pem: &str) -> serde_json::Value {
+        serde_json::json!({"spec": {"request": b64(pem), "signerName": "x"}})
+    }
+
+    #[test]
+    fn validly_signed_csr_is_accepted_for_every_key_algorithm_so_kubelet_and_kubectl_csrs_still_enroll(
+    ) {
+        for (name, pem) in csrs_per_algorithm() {
+            let body = spec_with(&pem);
+            validate_csr_spec(&body).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn subject_edited_after_signing_is_rejected_for_every_key_algorithm_because_signer_would_issue_an_identity_the_key_holder_never_asked_for(
+    ) {
+        for (name, pem) in csrs_per_algorithm() {
+            let mut der = der_of(&pem);
+            let at = der.windows(3).position(|w| w == b"aaa").unwrap();
+            der[at..at + 3].copy_from_slice(b"bbb");
+            let err = validate_csr_spec(&spec_with(&pem_of_der(&der)))
+                .expect_err(&format!("{name}: tampered subject must be rejected"));
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+            let msg = err.1.message;
+            assert!(msg.contains("spec.request: Invalid value"), "{name}: {msg}");
+            assert!(
+                msg.ends_with("verification error") || msg.ends_with("verification failure"),
+                "{name}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_terminated_block_is_accepted_because_go_pem_decode_accepts_windows_authored_files() {
+        let pem = csr_pem_for("system:node:w1").replace('\n', "\r\n");
+        assert!(pem.contains("\r\n"));
+        parse_csr_pem(pem.as_bytes()).expect("CRLF-encoded CSR must parse like in Go");
+    }
+
     /// Go signs the first block and ignores the rest; a parser that picked another block would
     /// let the guard approve a decoy while KCM signs the claimed control-plane name.
     #[test]
-    fn two_blocks_are_rejected_in_either_order_so_guard_and_signer_cannot_pick_different_ones() {
+    fn loosening_guard_two_blocks_are_rejected_in_either_order_so_guard_and_signer_cannot_pick_different_ones(
+    ) {
         let (decoy, real) = (
             csr_pem_for("system:node:fresh"),
             csr_pem_for("system:node:cp"),
@@ -1877,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn data_around_the_block_is_rejected_because_go_skips_it_silently() {
+    fn loosening_guard_data_around_the_block_is_rejected_because_go_skips_it_silently() {
         let pem = csr_pem_for("system:node:w1");
         for bad in [
             format!("junk\n{pem}"),
@@ -1889,14 +2256,15 @@ mod tests {
     }
 
     #[test]
-    fn wrong_block_type_is_rejected_because_go_requires_certificate_request() {
+    fn loosening_guard_wrong_block_type_is_rejected_because_go_requires_certificate_request() {
         let pem =
             csr_pem_for("system:node:w1").replace("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST");
         parse_csr_pem(pem.as_bytes()).expect_err("block type must be CERTIFICATE REQUEST");
     }
 
     #[test]
-    fn pem_headers_are_rejected_because_go_accepts_them_and_parsers_disagree_on_them() {
+    fn loosening_guard_pem_headers_are_rejected_because_go_accepts_them_and_parsers_disagree_on_them(
+    ) {
         let pem = csr_pem_for("system:node:w1").replacen(
             "-----BEGIN CERTIFICATE REQUEST-----\n",
             "-----BEGIN CERTIFICATE REQUEST-----\nProc-Type: 4,ENCRYPTED\n\n",

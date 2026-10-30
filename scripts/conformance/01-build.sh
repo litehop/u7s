@@ -13,5 +13,5 @@ if [[ -n "${U7S_TARGET_DIR:-}" ]]; then
 fi
 
 echo "=== [01] Build u7s-apiserver, u7s-scheduler ==="
-cargo build --release -p u7s-apiserver -p u7s-scheduler --manifest-path "$REPO/Cargo.toml" "${TARGET_DIR_ARGS[@]+"${TARGET_DIR_ARGS[@]}"}"
+cargo build --release -p u7s-apiserver -p u7s-scheduler --features u7s-apiserver/rig-test-knobs --manifest-path "$REPO/Cargo.toml" "${TARGET_DIR_ARGS[@]+"${TARGET_DIR_ARGS[@]}"}"
 echo "Build complete: ${U7S_TARGET_DIR:-$REPO/target}/release/{u7s-apiserver,u7s-scheduler}"
