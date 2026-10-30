@@ -2915,7 +2915,10 @@ async fn seed_services(
                 "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
             }
         },
-        "addressType": "IPv4",
+        "addressType": apiserver_ip
+            .parse::<std::net::IpAddr>()
+            .map_or(state::IpFamily::of(&kubernetes_cluster_ip), |ip| state::IpFamily::of(&ip))
+            .as_str(),
         "endpoints": [{
             "addresses": [apiserver_ip],
             "conditions": { "ready": true, "serving": true, "terminating": false }
@@ -7885,6 +7888,36 @@ mod tests {
             Some(6443),
             "EndpointSlice port must be the actual apiserver port, not the service port 443"
         );
+    }
+
+    #[tokio::test]
+    async fn kubernetes_endpointslice_address_type_follows_advertise_family() {
+        for (advertise, range, want) in [
+            ("fd00::2", "fd00:96::/108", "IPv6"),
+            ("fd00::2", "fd00:96::/108,10.96.0.0/12", "IPv6"),
+            ("192.168.5.2", "10.96.0.0/12", "IPv4"),
+            ("cp.example.com", "fd00:96::/108", "IPv6"),
+        ] {
+            let store = make_store();
+            seed_namespaces(&store).await.unwrap();
+            seed_services(&store, advertise, 6443, range, None)
+                .await
+                .unwrap();
+            let key = keys::group_object_key(
+                "discovery.k8s.io",
+                "endpointslices",
+                Some("default"),
+                "kubernetes",
+            );
+            let obj = store.get(&key).await.unwrap().unwrap();
+            let eps: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
+            assert_eq!(
+                eps["addressType"].as_str(),
+                Some(want),
+                "advertise {advertise} range {range}: a v6 address in an IPv4 slice is rejected by \
+                 kube-proxy, leaving in-cluster clients without the kubernetes Service backend"
+            );
+        }
     }
 
     /// reconcile_kubernetes_endpointslice must propagate EndpointSlice addresses AND ports

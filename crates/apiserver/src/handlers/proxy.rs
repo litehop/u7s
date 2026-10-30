@@ -262,7 +262,8 @@ fn kubelet_endpoint_url(
             "invalid path segment '{s}': may not be '.' or '..'"
         )));
     }
-    let mut url = reqwest::Url::parse(&format!("{scheme}://{host}:{port}/"))
+    reject_zone_id(host)?;
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{}/", host_port(host, port)))
         .map_err(|e| Status::internal(format!("invalid kubelet address '{host}': {e}")))?;
     url.path_segments_mut()
         .map_err(|()| Status::internal("kubelet URL cannot carry a path".into()))?
@@ -1844,13 +1845,9 @@ fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
     let path = format!("/{path}");
     axum::http::uri::PathAndQuery::try_from(path.as_str())
         .map_err(|e| anyhow::anyhow!("kubelet URL path/query is not request-line-safe: {e}"))?;
-    let (host, port_str) = authority
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow::anyhow!("kubelet URL missing port: {url}"))?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid kubelet port '{port_str}': {e}"))?;
-    Ok((host.to_owned(), port, path))
+    let (host, port) = split_host_port(authority)
+        .map_err(|e| anyhow::anyhow!("invalid kubelet URL {url}: {e}"))?;
+    Ok((host, port, path))
 }
 
 /// portforward proxy: kubectl (or a raw v4.channel.k8s.io websocket client) →
@@ -1928,6 +1925,18 @@ pub async fn pod_portforward<S: Store>(
     portforward_proxy_raw_upgrade(req, params).await
 }
 
+fn portforward_post_request(path: &str, host: &str, port: u16) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Connection: Upgrade\r\n\
+         Upgrade: SPDY/3.1\r\n\
+         X-Stream-Protocol-Version: {PORTFORWARD_KUBELET_PROTOCOL}\r\n\
+         Content-Length: 0\r\n\r\n",
+        host_port(host, port)
+    )
+}
+
 /// Dial kubelet's legacy raw-SPDY-over-HTTP portForward endpoint.
 ///
 /// This is the only wire shape kubelet's `handleHTTPStreams` accepts unconditionally
@@ -1959,14 +1968,7 @@ async fn dial_kubelet_portforward(
         .connect(server_name, tcp)
         .await?;
 
-    let request = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         Connection: Upgrade\r\n\
-         Upgrade: SPDY/3.1\r\n\
-         X-Stream-Protocol-Version: {PORTFORWARD_KUBELET_PROTOCOL}\r\n\
-         Content-Length: 0\r\n\r\n"
-    );
+    let request = portforward_post_request(&path, &host, port);
     tls.write_all(request.as_bytes()).await?;
 
     // Kubelet may pipeline the first SPDY frame in the same TCP segment as the
@@ -2282,6 +2284,7 @@ fn check_node_proxy_addrs(addrs: &[std::net::IpAddr]) -> Result<(), &'static str
 }
 
 async fn ensure_proxyable_hostname(host: &str) -> Result<(), crate::status::StatusError> {
+    reject_zone_id(host)?;
     let addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, 0))
         .await
         .map_err(|e| Status::bad_request(e.to_string()))?
@@ -2335,7 +2338,11 @@ pub async fn resolve_node_proxy_target<S: Store>(
             state,
             kubelet_verify_name(&node, preferred_address(state)).as_deref(),
         )?;
-        let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
+        let kubelet_url = format!(
+            "https://{}/{}",
+            host_port(&node_ip, kp),
+            encode_proxy_tail(path_suffix)?
+        );
         return Ok((kubelet_url, client));
     }
     if scheme_req.is_empty() {
@@ -2347,11 +2354,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Status::service_unavailable(format!("proxy client unavailable: {e}")))?;
-    let host = if node_ip.contains(':') {
-        format!("[{node_ip}]")
-    } else {
-        node_ip
-    };
+    let host = bracket_host(&node_ip);
     let url = format!(
         "{scheme_req}://{host}:{port_req}/{}",
         encode_proxy_tail(path_suffix)?
@@ -2556,31 +2559,82 @@ fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true iff `ip` is a well-formed IPv4 address contained in the well-formed IPv4
-/// CIDR `cidr`. Any parse failure (malformed CIDR, non-IPv4 `ip`, prefix > 32) returns
-/// false — fail closed, since this only gates the podIP-in-podCIDR SSRF allowlist below.
-fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+/// Returns true iff `ip` is a well-formed address contained in the well-formed CIDR `cidr`
+/// of the same family. Any parse failure (malformed CIDR, family mismatch, prefix beyond the
+/// family width) returns false — fail closed, since this only gates the podIP-in-podCIDR
+/// SSRF allowlist below.
+fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
     let Some((net_str, prefix_str)) = cidr.split_once('/') else {
         return false;
     };
-    let Ok(net) = net_str.parse::<std::net::Ipv4Addr>() else {
+    let (Ok(net), Ok(prefix), Ok(addr)) = (
+        net_str.parse::<std::net::IpAddr>(),
+        prefix_str.parse::<u8>(),
+        ip.parse::<std::net::IpAddr>(),
+    ) else {
         return false;
     };
-    let Ok(prefix) = prefix_str.parse::<u32>() else {
-        return false;
-    };
-    if prefix > 32 {
+    if prefix > if net.is_ipv4() { 32 } else { 128 } {
         return false;
     }
-    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
-    let mask: u32 = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    (u32::from(addr) & mask) == (u32::from(net) & mask)
+    crate::csr_approver::cidr_contains(net, prefix, addr)
+}
+
+/// `host:port` authority for URLs, Host headers and CONNECT lines; IPv6 literals are
+/// bracketed, DNS names and IPv4 pass through.
+fn host_port(host: &str, port: u16) -> String {
+    format!("{}:{port}", bracket_host(host))
+}
+
+/// Brackets an IPv6 literal for use inside a URL authority; DNS names and IPv4 pass through.
+fn bracket_host(host: &str) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => format!("[{v6}]"),
+        Err(_) => host.to_owned(),
+    }
+}
+
+/// Zone-ID literals (`fe80::1%eth0`) are neither valid URL hosts nor dialable through
+/// rustls, so they are refused up front instead of surfacing as an opaque 500.
+fn reject_zone_id(host: &str) -> Result<(), crate::status::StatusError> {
+    if host.contains('%') {
+        return Err(Status::bad_request(format!(
+            "address {host:?}: IPv6 zone IDs ('%') are not supported"
+        )));
+    }
+    Ok(())
+}
+
+/// Splits `host:port` / `[v6]:port` into the unbracketed host and port; the inverse of
+/// `host_port`.
+fn split_host_port(authority: &str) -> Result<(String, u16), String> {
+    if authority.contains('%') {
+        return Err(format!(
+            "address {authority:?}: IPv6 zone IDs ('%') are not supported"
+        ));
+    }
+    let (host, port_str) = authority
+        .rsplit_once(':')
+        .ok_or_else(|| format!("address missing port: {authority}"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("invalid port '{port_str}' in {authority}: {e}"))?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok((host.to_owned(), port))
+}
+
+/// Raw CONNECT request that asks konnectivity to tunnel to `host:port`.
+fn connect_request(host: &str, port: u16) -> String {
+    let authority = host_port(host, port);
+    format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")
+}
+
+/// `<scheme>://<host>:<port>/<path_with_query>` for direct pod / endpoint proxying.
+fn proxy_target_url(scheme: &str, host: &str, port: u16, path_with_query: &str) -> String {
+    format!("{scheme}://{}/{path_with_query}", host_port(host, port))
 }
 
 /// CIDR-membership allowlist for a pod's `status.podIP`, composed on top of
@@ -2656,12 +2710,21 @@ async fn validate_pod_ip_against_node<S: Store>(
     // out pod IPs independently of it. The CIDR-membership allowlist activates
     // automatically the moment a real per-node podCIDR is assigned; until then this
     // check is a no-op rather than an outage for every real pod's proxy subresource.
-    match node["spec"]["podCIDR"].as_str().filter(|s| !s.is_empty()) {
-        Some(pod_cidr) if ipv4_in_cidr(pod_ip, pod_cidr) => Ok(()),
-        Some(pod_cidr) => Err(format!(
-            "pod IP is not within node \"{node_name}\"'s podCIDR {pod_cidr}"
-        )),
-        None => Ok(()),
+    let pod_cidrs: Vec<&str> = node["spec"]["podCIDRs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain([&node["spec"]["podCIDR"]])
+        .filter_map(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if pod_cidrs.is_empty() || pod_cidrs.iter().any(|c| ip_in_cidr(pod_ip, c)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pod IP is not within node \"{node_name}\"'s podCIDRs {}",
+            pod_cidrs.join(",")
+        ))
     }
 }
 
@@ -2800,17 +2863,8 @@ async fn pod_proxy_via_connect_tunnel(
     use tokio_rustls::TlsConnector;
 
     // 1. Parse konnectivity host and port.
-    let (kconn_host, kconn_port) = {
-        let mut parts = konnectivity_addr.rsplitn(2, ':');
-        let p: u16 = parts
-            .next()
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| format!("invalid konnectivity addr: {konnectivity_addr}"))?;
-        let h = parts
-            .next()
-            .ok_or_else(|| format!("invalid konnectivity addr (no host): {konnectivity_addr}"))?;
-        (h.to_owned(), p)
-    };
+    let (kconn_host, kconn_port) = split_host_port(konnectivity_addr)
+        .map_err(|e| format!("invalid konnectivity addr: {e}"))?;
 
     // 2. Build a TLS client config pinned to the cluster CA.
     let tls_config = build_kubelet_tls_config(ca_ders, client_identity_pem)
@@ -2818,7 +2872,7 @@ async fn pod_proxy_via_connect_tunnel(
     let connector = TlsConnector::from(tls_config);
 
     // 3. Open a TCP connection to konnectivity-server.
-    let tcp = TcpStream::connect(format!("{kconn_host}:{kconn_port}"))
+    let tcp = TcpStream::connect((kconn_host.as_str(), kconn_port))
         .await
         .map_err(|e| format!("konnectivity TCP connect: {e}"))?;
 
@@ -2832,7 +2886,7 @@ async fn pod_proxy_via_connect_tunnel(
 
     // 4. Send HTTP CONNECT to ask konnectivity to tunnel to pod_ip:port.
     //    konnectivity-server (proxy-agent v0.35.0) accepts CONNECT only.
-    let connect_req = format!("CONNECT {pod_ip}:{port} HTTP/1.1\r\nHost: {pod_ip}:{port}\r\n\r\n");
+    let connect_req = connect_request(pod_ip, port);
     tls_stream
         .write_all(connect_req.as_bytes())
         .await
@@ -2903,7 +2957,7 @@ async fn pod_proxy_via_connect_tunnel(
     let hyper_req = hyper::Request::builder()
         .method(method.as_str())
         .uri(&uri)
-        .header("Host", format!("{pod_ip}:{port}"))
+        .header("Host", host_port(pod_ip, port))
         .body(axum::body::Body::from(body_bytes))
         .map_err(|e| format!("build pod request: {e}"))?;
 
@@ -3121,7 +3175,7 @@ async fn pod_proxy_dispatch<S: Store>(
 
     // No konnectivity proxy — direct connection to pod IP.
     let scheme = if is_https { "https" } else { "http" };
-    let target_url = format!("{scheme}://{pod_ip}:{port}/{path_with_query}");
+    let target_url = proxy_target_url(scheme, &pod_ip, port, &path_with_query);
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -3487,7 +3541,7 @@ async fn service_proxy_dispatch<S: Store>(
     }
 
     let scheme = if is_https { "https" } else { "http" };
-    let target_url = format!("{scheme}://{ep_ip}:{port}/{path_with_query}");
+    let target_url = proxy_target_url(scheme, &ep_ip, port, &path_with_query);
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -4146,6 +4200,266 @@ mod tests {
                  pod's proxy subresource would ever work",
             );
         assert_eq!(ip, "10.244.0.5");
+    }
+
+    #[tokio::test]
+    async fn pod_proxy_checks_v6_pod_ip_against_every_node_pod_cidr() {
+        let state = make_state();
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "node-v6", "resourceVersion": "1"},
+            "spec": {"podCIDR": "10.244.0.0/24", "podCIDRs": ["10.244.0.0/24", "fd00:244::/64"]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-v6"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let pod = |name: &str, ip: &str| {
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+                "spec": {"nodeName": "node-v6", "containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"podIP": ip}
+            })
+        };
+        for (name, ip, ok) in [
+            ("in6", "fd00:244::5", true),
+            ("out6", "fd00:999::5", false),
+            ("in4", "10.244.0.9", true),
+            ("out4", "10.99.0.9", false),
+        ] {
+            state
+                .store
+                .put(
+                    &crate::keys::object_key("pods", "default", name),
+                    bytes::Bytes::from(pod(name, ip).to_string()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+            let res = resolve_pod_proxy_target(&state, "default", name).await;
+            assert_eq!(
+                res.is_ok(),
+                ok,
+                "podIP {ip} vs podCIDRs [10.244.0.0/24, fd00:244::/64]: a v6 pod must proxy \
+                 inside its v6 range (the old v4-only check rejected every v6 pod) and an \
+                 out-of-range v6 IP must stay blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_in_cidr_is_family_aware_and_fails_closed_on_mismatch() {
+        assert!(ip_in_cidr("fd00::1", "fd00::/64"));
+        assert!(!ip_in_cidr("fd01::1", "fd00::/64"));
+        assert!(!ip_in_cidr("10.0.0.1", "fd00::/64"), "family mismatch");
+        assert!(!ip_in_cidr("fd00::1", "10.0.0.0/8"), "family mismatch");
+        assert!(!ip_in_cidr("fd00::1", "fd00::/129"), "prefix too long");
+        assert!(ip_in_cidr("10.0.0.5", "10.0.0.0/24"));
+    }
+
+    #[test]
+    fn host_port_brackets_only_ipv6_literals() {
+        assert_eq!(host_port("fd00::1", 8080), "[fd00::1]:8080");
+        assert_eq!(host_port("10.0.0.1", 80), "10.0.0.1:80");
+        assert_eq!(host_port("node.example", 443), "node.example:443");
+    }
+
+    #[test]
+    fn kubelet_endpoint_url_accepts_ipv6_node_address() {
+        let url = kubelet_endpoint_url("https", "fd00::7", 10250, &["containerLogs", "a"], None)
+            .expect("an IPv6 InternalIP must produce a parseable kubelet URL");
+        assert_eq!(url, "https://[fd00::7]:10250/containerLogs/a");
+    }
+
+    #[test]
+    fn parse_https_url_unbrackets_ipv6_kubelet_host() {
+        let (host, port, path) =
+            parse_https_url("https://[fd00::7]:10250/portForward/ns/p?port=80").unwrap();
+        assert_eq!(host, "fd00::7");
+        assert_eq!(port, 10250);
+        assert_eq!(path, "/portForward/ns/p?port=80");
+        let sa: std::net::SocketAddr = host_port(&host, port).parse().unwrap();
+        assert_eq!(sa, "[fd00::7]:10250".parse().unwrap());
+        assert!(
+            matches!(
+                rustls::pki_types::ServerName::try_from(host).unwrap(),
+                rustls::pki_types::ServerName::IpAddress(_)
+            ),
+            "a v6 kubelet host must verify as an IP SAN, not a DNS name"
+        );
+    }
+
+    #[test]
+    fn zone_id_hosts_are_rejected_with_a_clear_error() {
+        assert!(parse_https_url("https://[fe80::1%eth0]:10250/x")
+            .unwrap_err()
+            .to_string()
+            .contains("zone"),);
+        assert!(split_host_port("[fe80::1%eth0]:8132").is_err());
+        let err = kubelet_endpoint_url("https", "fe80::1%eth0", 10250, &["x"], None).unwrap_err();
+        assert!(format!("{err:?}").contains("zone"), "got {err:?}");
+        assert!(reject_zone_id("fe80::1%eth0").is_err());
+        assert!(reject_zone_id("fd00::1").is_ok());
+    }
+
+    #[test]
+    fn split_host_port_handles_konnectivity_v6_and_v4_forms() {
+        assert_eq!(
+            split_host_port("[fd00::1]:8132").unwrap(),
+            ("fd00::1".to_owned(), 8132)
+        );
+        assert_eq!(
+            split_host_port("10.0.0.1:8132").unwrap(),
+            ("10.0.0.1".to_owned(), 8132)
+        );
+        assert_eq!(
+            split_host_port("konn.local:8132").unwrap(),
+            ("konn.local".to_owned(), 8132)
+        );
+        assert!(split_host_port("[fd00::1]").is_err());
+    }
+
+    #[test]
+    fn connect_line_and_host_header_bracket_ipv6_pod_ip() {
+        assert_eq!(
+            connect_request("fd00::9", 8080),
+            "CONNECT [fd00::9]:8080 HTTP/1.1\r\nHost: [fd00::9]:8080\r\n\r\n",
+            "an unbracketed v6 CONNECT target is ambiguous and konnectivity rejects it"
+        );
+        assert_eq!(
+            connect_request("10.0.0.9", 80),
+            "CONNECT 10.0.0.9:80 HTTP/1.1\r\nHost: 10.0.0.9:80\r\n\r\n"
+        );
+        let req = portforward_post_request("/portForward/ns/p", "fd00::7", 10250);
+        assert!(req.contains("\r\nHost: [fd00::7]:10250\r\n"), "{req}");
+    }
+
+    #[test]
+    fn proxy_target_url_and_node_host_bracket_ipv6() {
+        assert_eq!(
+            proxy_target_url("http", "fd00::9", 80, "a?b=c"),
+            "http://[fd00::9]:80/a?b=c"
+        );
+        reqwest::Url::parse(&proxy_target_url("https", "fd00::9", 443, "")).unwrap();
+        assert_eq!(bracket_host("fd00::1"), "[fd00::1]");
+        assert_eq!(bracket_host("[fd00::1]"), "[fd00::1]");
+        assert_eq!(bracket_host("10.0.0.1"), "10.0.0.1");
+    }
+
+    /// TLS server on `[::1]` whose cert has a `::1` IP SAN; returns (port, CA der).
+    async fn spawn_v6_tls_listener() -> (tokio::net::TcpListener, tokio_rustls::TlsAcceptor, Vec<u8>)
+    {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let cert = rcgen::generate_simple_self_signed(vec!["::1".to_string()]).unwrap();
+        let der = cert.cert.der().to_vec();
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(der.clone())],
+                PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("[::1]:0")
+            .await
+            .expect("IPv6 loopback must be available");
+        (
+            listener,
+            tokio_rustls::TlsAcceptor::from(Arc::new(cfg)),
+            der,
+        )
+    }
+
+    /// exec/attach/portforward must all reach a kubelet at a bracketed IPv6 address:
+    /// URL authority, TCP dial, TLS server name (IP SAN) and Host header.
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn kubelet_legs_dial_ipv6_loopback_kubelet() {
+        let (listener, acceptor, ca) = spawn_v6_tls_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let tls_config =
+            build_kubelet_tls_config_for(Some(std::slice::from_ref(&ca)), None, None).unwrap();
+
+        let ws_url =
+            kubelet_endpoint_url("wss", "::1", port, &["exec", "ns", "p", "c"], None).unwrap();
+        assert!(
+            ws_url.starts_with(&format!("wss://[::1]:{port}/")),
+            "{ws_url}"
+        );
+
+        let acc = acceptor.clone();
+        let server = tokio::spawn(async move {
+            // exec, attach, then portforward.
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let tls = acc.accept(tcp).await.unwrap();
+                let _ws = tokio_tungstenite::accept_hdr_async(
+                    tls,
+                    |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        resp.headers_mut().insert(
+                            "Sec-WebSocket-Protocol",
+                            EXEC_KUBELET_SUBPROTOCOL.parse().unwrap(),
+                        );
+                        Ok(resp)
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acc.accept(tcp).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(
+                &mut tls,
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        dial_kubelet_exec(
+            &ExecTarget {
+                kubelet_ws_url: ws_url.clone(),
+                tls_config: tls_config.clone(),
+            },
+            EXEC_KUBELET_SUBPROTOCOL,
+        )
+        .await
+        .expect("exec websocket leg must dial a bracketed v6 kubelet");
+        dial_kubelet_attach(
+            &AttachTarget {
+                kubelet_ws_url: ws_url,
+                tls_config,
+            },
+            EXEC_KUBELET_SUBPROTOCOL,
+        )
+        .await
+        .expect("attach websocket leg must dial a bracketed v6 kubelet");
+
+        dial_kubelet_portforward(&PortforwardParams {
+            kubelet_url: format!("https://[::1]:{port}/portForward/ns/p"),
+            cluster_ca_ders: Some(vec![ca]),
+            client_identity_pem: None,
+            verify_name: None,
+        })
+        .await
+        .expect("SPDY portforward leg must dial a bracketed v6 kubelet");
+
+        let req = server.await.unwrap();
+        assert!(
+            req.contains(&format!("\r\nHost: [::1]:{port}\r\n")),
+            "Host header must be bracketed: {req}"
+        );
     }
 
     /// A non-hostNetwork pod whose node has no spec.podCIDR assigned must still be

@@ -557,7 +557,7 @@ fn advertise_host(advertise_address: Option<&str>) -> anyhow::Result<Option<Stri
 }
 
 /// Build the full SAN list for the server certificate.
-/// Always includes localhost, 127.0.0.1, host.lima.internal, and the kubernetes
+/// Always includes localhost, 127.0.0.1, ::1, host.lima.internal, and the kubernetes
 /// Service's ClusterIP derived from `--service-cluster-ip-range` (first host —
 /// same offset `bootstrap_service_ips` uses to seed the `default/kubernetes`
 /// Service, e.g. 10.96.0.1 for the default 10.96.0.0/12 range). In-cluster
@@ -573,6 +573,7 @@ fn build_server_sans(
     let mut sans: Vec<SanType> = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
         SanType::IpAddress(kubernetes_ip),
         SanType::DnsName("kubernetes".try_into()?),
@@ -1423,6 +1424,25 @@ mod tests {
             .iter()
             .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "192.168.5.1"));
         assert!(has_ip, "advertise IP 192.168.5.1 must be in SANs");
+    }
+
+    #[test]
+    fn server_sans_include_ipv6_loopback_and_primary_family_cluster_ip() {
+        let loopback6 = SanType::IpAddress("::1".parse().unwrap());
+        let sans = build_server_sans(None, "10.96.0.0/12").unwrap();
+        assert!(
+            sans.contains(&loopback6),
+            "a client dialing https://[::1]:6443 fails TLS verification without the ::1 SAN"
+        );
+        let sans = build_server_sans(None, "fd00:96::/108,10.96.0.0/12").unwrap();
+        assert!(
+            sans.contains(&SanType::IpAddress("fd00:96::1".parse().unwrap())),
+            "IPv6-primary cluster: in-cluster KUBERNETES_SERVICE_HOST is the v6 ClusterIP"
+        );
+        assert!(
+            !sans.contains(&SanType::IpAddress("10.96.0.1".parse().unwrap())),
+            "kubernetes Service is single-stack on the primary family; the secondary-family IP is not a valid host"
+        );
     }
 
     #[test]
@@ -2852,7 +2872,7 @@ mod tests {
     fn extra_sans(advertise: &str) -> Vec<SanType> {
         let host = advertise_host(Some(advertise)).unwrap();
         let sans = build_server_sans(host.as_deref(), "10.96.0.0/12").unwrap();
-        sans[8..].to_vec()
+        sans[9..].to_vec()
     }
 
     /// An IPv6-literal advertise URL must yield an IP SAN; the old ':' split produced

@@ -212,7 +212,7 @@ impl IpContext {
     }
 }
 
-fn cidr_contains(base: IpAddr, len: u8, ip: IpAddr) -> bool {
+pub(crate) fn cidr_contains(base: IpAddr, len: u8, ip: IpAddr) -> bool {
     let (b, i, bits) = match (base, ip) {
         (IpAddr::V4(b), IpAddr::V4(i)) => (u128::from(u32::from(b)), u128::from(u32::from(i)), 32),
         (IpAddr::V6(b), IpAddr::V6(i)) => (u128::from(b), u128::from(i), 128),
