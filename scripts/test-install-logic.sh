@@ -1228,6 +1228,30 @@ assert_true "the control-plane kubelet CSR name is built from NODE_NAME (so the 
 assert_true "the CSR subject CN uses NODE_NAME, so it is the lowercase system:node:<name> the node authorizer expects" \
   grep -qF -- '-subj "/O=system:nodes/CN=system:node:$NODE_NAME"' "$INSTALL"
 
+# Case 6a: a GCP FQDN hostname (<name>.c.<project>.internal) can push the
+# identity CN past X.509's 64 chars, which openssl req refuses mid-install.
+# install.sh must refuse up front, at the node-name default, with a clear error.
+long_runner="$PERSIST_WORK/long-name.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'NODE_NAME="$1"; IFACE=eth0'
+  awk '/^# --- Defaults: node name/{f=1} f&&/^if \[ -z "\$IFACE" \]/{exit} f{print}' "$INSTALL"
+  echo 'echo "NODE_NAME=$NODE_NAME"'
+} > "$long_runner"
+LONG_NAME="$(printf 'a%.0s' $(seq 1 53))"
+OK_NAME="$(printf 'a%.0s' $(seq 1 52))"
+long_rc=0
+long_out="$(bash "$long_runner" "$LONG_NAME" 2>&1)" || long_rc=$?
+assert "a 53-char node name (CN 65 chars) is refused with a message naming the 64-char limit, instead of failing later inside openssl req" \
+  "$([ "$long_rc" -ne 0 ] && printf '%s' "$long_out" | grep -q '64-char' && echo 1 || echo 0)"
+ok_out="$(bash "$long_runner" "$OK_NAME" 2>&1 || true)"
+assert "a 52-char node name (CN exactly 64 chars) is accepted -- the guard must not reject names openssl can sign" \
+  "$(printf '%s' "$ok_out" | grep -qx "NODE_NAME=$OK_NAME" && echo 1 || echo 0)"
+cn_ok="$(openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout /dev/null -subj "/O=system:nodes/CN=system:node:$OK_NAME" 2>&1 >/dev/null || true)"
+assert "openssl really signs a 64-char CN (so the 52-char bound is not needlessly strict)" \
+  "$(printf '%s' "$cn_ok" | grep -q 'too long' && echo 0 || echo 1)"
+
 # Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
 # (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
 # itself under NodeRestriction, so install.sh does it with the admin kubeconfig.
