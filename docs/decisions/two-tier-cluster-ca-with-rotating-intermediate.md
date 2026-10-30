@@ -17,18 +17,17 @@ replaced by redistributing trust to every client.
   1 year, `pathlen:0`. It signs every cluster leaf, including what KCM issues
   through the CSR API. The front-proxy CA stays single-tier.
 - The apiserver re-issues the intermediate at 2/3 of its life, writing the pair
-  with the leaf protocol (both temp files fsynced, cert renamed, then key; a
-  crash between the renames rolls forward). Every leaf signed by a previous
-  intermediate is re-issued in the same pass, and again on resume after a crash.
-  A half-present pair refuses startup.
+  with the leaf protocol (a crash between the renames rolls forward). Every leaf
+  signed by a previous intermediate is re-issued in the same pass, and again on
+  resume after a crash. A half-present pair refuses startup.
 - Leaves are served and written with their intermediate after them
-  (`admin.pem`, `kcm.pem`, `scheduler.pem`, the kubelet-client identity, the
-  serving chain). The root is never part of a chain.
+  (`admin.pem`, `kcm.pem`, `scheduler.pem`, kubelet-client, serving). The root
+  is never part of a chain.
 - KCM's `--cluster-signing-cert-file` is `intermediate-cert.pem` (the same
   certificate, PEM) with `--cluster-signing-key-file=intermediate.key`; KCM
   reloads both files. KCM rejects a signing file with more than one certificate
   and returns the bare leaf, so the apiserver appends the signing intermediate
-  to `status.certificate` when the signer writes it.
+  to `status.certificate`.
 - An old intermediate keeps verifying every leaf already issued, because each
   leaf presents it; nothing server-side lists intermediates as trust anchors.
 
@@ -36,21 +35,22 @@ replaced by redistributing trust to every client.
 
 Routine rotation then changes only material the apiserver and KCM own; no
 kubeconfig, bundle, ConfigMap or kubelet `clientCAFile` changes. Cross-signing
-is needed only at root succession. kubeadm and k3s use the same 10-year CA with
-1-year leaves.
+is needed only at root succession.
 
 ## Consequences
 
 - A cluster installed before this change has a root-signed leaf set and no
   intermediate; the intermediate is created at the next start and the leaves are
   re-issued under it. KCM must be restarted onto the new signing flags.
-- A leaf never outlives its intermediate: a leaf issued late in the intermediate's
-  life is shorter than a year, and the 2/3 rotation re-issues every leaf under a
-  fresh intermediate. A credential copied off the host and not refreshed expires
-  with the intermediate it was issued under.
+- A leaf never outlives its intermediate: the 2/3 rotation re-issues every leaf
+  under a fresh intermediate, and a credential copied off the host and not
+  refreshed expires with the intermediate it was issued under.
 - A client presenting an intermediate-signed leaf without the intermediate is
-  rejected. Kubelets write `status.certificate` verbatim, so the appended chain
-  is what they present; certificates signed directly by the root before this
-  change verify without a chain until they renew.
-- The `pki-test-knobs` build compresses the intermediate life
-  (`U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS`).
+  rejected.
+- Divergence from upstream: `status.certificate` holds leaf plus intermediate;
+  upstream returns the leaf only. Clients pin only the root and present it
+  verbatim, so the chain must be in it. Upstream e2e `[sig-auth] Certificates
+  API [Privileged:ClusterAdmin] should support building a client with a CSR`
+  expects one certificate and fails by design (not Conformance). Rejected:
+  leaf-only with the apiserver trusting intermediates in-process, which changes
+  the trust model and breaks root-only verifiers.
