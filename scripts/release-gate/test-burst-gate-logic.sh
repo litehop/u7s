@@ -453,6 +453,36 @@ assert "forced failure whose run passed is NOT OK (the gate failed to fail)" \
 assert "forced failure failing only (e) webhook is NOT OK (not a burst/OOM criterion)" \
   "$(good | sed 's/^webhook_ok=.*/webhook_ok=0/' > "$TMP/ff-wh.env"; rg_forced_failure_check "$TMP/ff-wh.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
 
+# --- vm-sampler.sh attribution records ---
+SR="$TMP/sroot"; SO="$TMP/sout"
+mkdir -p "$SR/proc/pressure" "$SR/proc/42" "$SR/sys/fs/cgroup/init.scope" "$SR/sys/fs/cgroup/system.slice/snapd.service" "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice" "$SO"
+echo wordpress > "$SO/phase"
+echo 'some avg10=72.00 avg60=50.00 avg300=20.00 total=123456' > "$SR/proc/pressure/io"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=5\n' > "$SR/proc/pressure/cpu"
+echo 'some avg10=0.00 avg60=0.00 avg300=0.00 total=1' > "$SR/proc/pressure/memory"
+echo 'cpu  100 5 50 1000 300 0 0 40 0 0' > "$SR/proc/stat"
+printf '   8       0 sda 111 0 2222 0 333 0 4444 0 0 555 0\n   8       1 sda1 1 0 2 0 3 0 4 0 0 5 0\n   7       0 loop0 9 0 9 0 9 0 9 0 0 9 0\n' > "$SR/proc/diskstats"
+echo 'MemAvailable:   500000 kB' > "$SR/proc/meminfo"
+echo '42 (my proc) S 1 1 1 0 -1 0 0 0 0 0 70 30 0 0 20 0 1 0 1 0 0' > "$SR/proc/42/stat"
+printf 'rchar: 1\nwchar: 2\nread_bytes: 8192\nwrite_bytes: 4096\n' > "$SR/proc/42/io"
+printf 'usage_usec 5000000\nthrottled_usec 250\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/cpu.stat"
+printf '8:0 rbytes=1000 wbytes=2000 rios=3 wios=4 dbytes=0 dios=0\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/io.stat"
+printf 'usage_usec 900\nthrottled_usec 800\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/cpu.stat"
+printf 'usage_usec 42\nthrottled_usec 0\n' > "$SR/sys/fs/cgroup/init.scope/cpu.stat"
+SAMPLER_ROOT="$SR" SAMPLER_ONCE=1bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
+attrib_has() { awk -F'\t' -v w="$1" '{l=$3; for (i=4;i<=NF;i++) l=l "\t" $i; if (l == w && $2 == "wordpress") f=1} END {exit !f}' "$SO/attrib.tsv"; }
+assert "sampler records io PSI total (the 72% io stall was previously only hand-read)" "$(attrib_has "$(printf 'PSI\tio\t123456\t0')" && echo 1 || echo 0)"
+assert "sampler records cpu PSI some and full totals" "$(attrib_has "$(printf 'PSI\tcpu\t7\t5')" && echo 1 || echo 0)"
+assert "sampler records /proc/stat steal and iowait (separates platform steal from our load)" "$(attrib_has "$(printf 'STAT\t105\t50\t300\t40')" && echo 1 || echo 0)"
+assert "sampler records boot-disk sectors and ops but not partitions/loop devices" \
+  "$(attrib_has "$(printf 'DISK\tsda\t111\t2222\t333\t4444\t555')" && ! grep -qE 'DISK.sda1|DISK.loop' "$SO/attrib.tsv" && echo 1 || echo 0)"
+assert "sampler attributes CPU and throttling to each system.slice unit" "$(attrib_has "$(printf 'CG\t/system.slice/snapd.service\t5000000\t250')" && echo 1 || echo 0)"
+assert "sampler attributes IO bytes/ops to each system.slice unit" "$(attrib_has "$(printf 'CGIO\t/system.slice/snapd.service\t1000\t2000\t3\t4')" && echo 1 || echo 0)"
+assert "sampler attributes CPU to kubepods sub-slices" "$(attrib_has "$(printf 'CG\t/kubepods.slice/kubepods-burstable.slice\t900\t800')" && echo 1 || echo 0)"
+assert "sampler attributes CPU to init.scope (PID 1 work is otherwise missing from the per-cgroup sum)" "$(attrib_has "$(printf 'CG\t/init.scope\t42\t0')" && echo 1 || echo 0)"
+assert "sampler records per-process CPU ticks and read/write bytes with spaces in comm" "$(attrib_has "$(printf 'PROC\t42\tmy proc\t100\t8192\t4096')" && echo 1 || echo 0)"
+assert "sampler still writes MemAvailable to samples.tsv (the gate verdict reads it)" "$(grep -q "MEM.500000" "$SO/samples.tsv" && echo 1 || echo 0)"
+
 # --- burst-gate.sh end to end with stubs ---
 assert "--mem-hog-mib reaches the VM env" "$("$HERE/burst-gate.sh" --runs 1 --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-hog" >/dev/null 2>&1; grep -qx 'HOG_MIB=400' "$TMP/out-hog/stage/gate.env" && echo 1 || echo 0)"
 assert "HOG_MIB defaults to 0" "$(grep -qx 'HOG_MIB=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
