@@ -671,5 +671,33 @@ unset GCLOUD_SSH_OK GCLOUD_RESULTS
 assert "release path unchanged: gate.env of a --release run installs zero-arg (no INSTALL_TARBALL)" \
   "$(grep -q '^INSTALL_TARBALL=$' "$TMP/out-gpass/stage/gate.env" && echo 1 || echo 0)"
 
+# --- vm-gate sampler lifecycle ---
+VG="$TMP/vg"; mkdir -p "$VG/out"
+cp "$HERE/lib.sh" "$VG/lib.sh"
+echo 'RG_CAL_MIN_SAMPLES=0' > "$VG/gate.env"
+cat > "$VG/vm-sampler.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "SAMPLER_LEAK_OUT"; echo "SAMPLER_LEAK_ERR" >&2
+echo $$ > "$(dirname "$0")/sampler.pid"
+exec sleep 300
+STUB
+cat > "$VG/install.sh" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+[ -s "$(dirname "$0")/sampler.pid" ] && echo up > "$(dirname "$0")/sampler-up-at-install"
+exit 1
+STUB
+vg_t0=$SECONDS; vg_rc=0
+RG_DIR="$VG" timeout 60 bash "$HERE/vm-gate.sh" > "$TMP/vg.out" 2>&1 || vg_rc=$?
+vg_secs=$((SECONDS - vg_t0))
+sleep 0.5
+assert "sampler is already running when install.sh starts (the install-time memory spike is the thing to see)" \
+  "$([ -f "$VG/sampler-up-at-install" ] && echo 1 || echo 0)"
+assert "a failed install exits non-zero and promptly" "$([ "$vg_rc" = 1 ] && [ "$vg_secs" -lt 20 ] && echo 1 || echo 0)"
+assert "a failed install leaves no sampler running (an orphan would hold the ssh session open)" \
+  "$(kill -0 "$(cat "$VG/sampler.pid")" 2>/dev/null && echo 0 || echo 1)"
+assert "sampler stdout/stderr go to its own log, not the gate's stream (a held pipe stalls ssh/limactl)" \
+  "$(! grep -q SAMPLER_LEAK "$TMP/vg.out" && grep -q SAMPLER_LEAK_OUT "$VG/out/sampler.log" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
