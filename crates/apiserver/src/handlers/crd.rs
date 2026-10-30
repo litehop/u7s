@@ -5031,6 +5031,32 @@ mod tests {
         );
     }
 
+    /// Without this, a rule on a map's object values (`self.n` on each value) could never be
+    /// installed, so per-value validation of map fields was unusable.
+    #[tokio::test]
+    async fn create_crd_accepts_rule_on_additional_properties_object_value() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "properties": { "m": {
+                    "type": "object",
+                    "maxProperties": 10,
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": { "n": { "type": "integer" } },
+                        "x-kubernetes-validations": [{ "rule": "self.n > 0" }]
+                    }
+                } }
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        create_crd(State(state), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("rule on map value fields must type-check");
+    }
+
     /// A rule that does not parse must be refused at install time for the same reason.
     #[tokio::test]
     async fn create_crd_rejects_validation_rule_with_syntax_error() {

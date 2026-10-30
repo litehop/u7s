@@ -142,12 +142,38 @@ impl<'a> Checker<'a, '_> {
                 }
             }
             Expr::Call(call) => {
+                let mut target_ty = Ty::Dyn;
                 if let Some(target) = &call.target {
                     // `math.greatest(..)`-style namespaces are idents with no binding.
                     let is_namespace = matches!(&target.expr, Expr::Ident(n)
                         if !self.scope.iter().any(|(s, _)| s == n));
                     if !is_namespace {
-                        self.check(target);
+                        target_ty = self.check(target);
+                    }
+                }
+                // Two-variable macros arrive as plain calls whose first two args bind names.
+                if let (Some(_), [k, v, rest @ ..]) = (&call.target, call.args.as_slice()) {
+                    if let (Expr::Ident(k), Expr::Ident(v)) = (&k.expr, &v.expr) {
+                        if matches!(
+                            call.func_name.as_str(),
+                            "all"
+                                | "exists"
+                                | "exists_one"
+                                | "existsOne"
+                                | "transformList"
+                                | "transformMap"
+                                | "transformMapEntry"
+                        ) {
+                            let range = target_ty;
+                            let depth = self.scope.len();
+                            self.scope.push((k.clone(), Ty::Dyn));
+                            self.scope.push((v.clone(), range.elem()));
+                            for a in rest {
+                                self.check(a);
+                            }
+                            self.scope.truncate(depth);
+                            return Ty::Dyn;
+                        }
                     }
                 }
                 let arg_tys: Vec<_> = call.args.iter().map(|a| self.check(a)).collect();
@@ -587,5 +613,107 @@ mod tests {
             .join()
             .expect("deep rule must not crash the request thread")
             .expect("rule at the depth limit is valid");
+    }
+
+    fn crd_with_spec(spec: J) -> J {
+        serde_json::json!({ "type": "object", "properties": { "spec": spec } })
+    }
+
+    fn check_crd(schema: &J) -> Result<(), String> {
+        check_schema_rules(schema, "S", true, &Ratchet::default()).map_err(|e| e.1.message)
+    }
+
+    fn int_obj() -> J {
+        serde_json::json!({ "type": "object", "properties": { "n": { "type": "integer" } } })
+    }
+
+    fn with_rules(mut node: J, rules: &[&str]) -> J {
+        let rules: Vec<J> = rules
+            .iter()
+            .map(|r| serde_json::json!({ "rule": r }))
+            .collect();
+        node["x-kubernetes-validations"] = J::Array(rules);
+        node
+    }
+
+    fn map_of(value: J) -> J {
+        serde_json::json!({ "type": "object", "maxProperties": 10, "additionalProperties": value })
+    }
+
+    /// A rule on a map's object values must see the value's declared fields, otherwise
+    /// no rule on map values with sub-fields can ever be created.
+    #[test]
+    fn rule_on_additional_properties_object_value_sees_its_fields() {
+        let spec = map_of(with_rules(int_obj(), &["self.n > 0"]));
+        check_crd(&crd_with_spec(spec)).expect("self.n is declared on the map value");
+        let bad = map_of(with_rules(int_obj(), &["self.z > 0"]));
+        let err = check_crd(&crd_with_spec(bad)).unwrap_err();
+        assert!(err.contains("undefined field 'z'"), "{err}");
+    }
+
+    #[test]
+    fn rule_on_additional_properties_value_of_a_spec_property() {
+        let spec = serde_json::json!({ "type": "object", "properties": {
+            "m": map_of(with_rules(int_obj(), &["self.n > 0"])) } });
+        check_crd(&crd_with_spec(spec)).expect("self.n is declared on the map value");
+    }
+
+    #[test]
+    fn rule_on_nested_additional_properties_sees_inner_value_fields() {
+        let inner = map_of(with_rules(int_obj(), &["self.n > 0"]));
+        let spec = map_of(with_rules(inner, &["self.all(k, self[k].n > 0)"]));
+        check_crd(&crd_with_spec(spec)).expect("map of maps of objects");
+        let bad = map_of(map_of(with_rules(int_obj(), &["self.z > 0"])));
+        assert!(check_crd(&crd_with_spec(bad)).is_err());
+    }
+
+    #[test]
+    fn rule_on_additional_properties_under_array_items_sees_value_fields() {
+        let items = map_of(with_rules(int_obj(), &["self.n > 0"]));
+        let spec = serde_json::json!({ "type": "array", "maxItems": 10, "items": items });
+        check_crd(&crd_with_spec(spec)).expect("array of maps of objects");
+        let spec = serde_json::json!({ "type": "array", "maxItems": 10,
+            "items": with_rules(map_of(int_obj()), &["self.all(k, self[k].n > 0)"]) });
+        check_crd(&crd_with_spec(spec)).expect("rule on the map inside array items");
+    }
+
+    #[test]
+    fn additional_properties_true_has_no_value_fields_to_check() {
+        let spec = with_rules(
+            serde_json::json!({ "type": "object", "additionalProperties": true }),
+            &["self.anything == 1"],
+        );
+        check_crd(&crd_with_spec(spec)).expect("untyped map is dynamic");
+    }
+
+    #[test]
+    fn preserve_unknown_fields_under_additional_properties_is_dynamic() {
+        let value = with_rules(
+            serde_json::json!({ "type": "object", "x-kubernetes-preserve-unknown-fields": true }),
+            &["self.anything == 1"],
+        );
+        check_crd(&crd_with_spec(map_of(value))).expect("preserve-unknown value is dynamic");
+    }
+
+    #[test]
+    fn rule_on_the_map_itself_indexes_values_and_selects_their_fields() {
+        let spec = with_rules(
+            map_of(int_obj()),
+            &[
+                "self['a'].n > 0",
+                "self.all(k, self[k].n > 0)",
+                "self.all(k, v, v.n > 0)",
+            ],
+        );
+        check_crd(&crd_with_spec(spec)).expect("map value fields are typed");
+        let bad = with_rules(map_of(int_obj()), &["self['a'].z > 0"]);
+        let err = check_crd(&crd_with_spec(bad)).unwrap_err();
+        assert!(err.contains("undefined field 'z'"), "{err}");
+    }
+
+    #[test]
+    fn transition_rule_on_additional_properties_value_types_old_self() {
+        let spec = map_of(with_rules(int_obj(), &["self.n >= oldSelf.n"]));
+        check_crd(&crd_with_spec(spec)).expect("oldSelf is the value object");
     }
 }
