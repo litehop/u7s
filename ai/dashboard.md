@@ -22,8 +22,8 @@ updated: 2026-10-30T10:25Z
 ## 🔎 Open PRs
 #2039 (draft, `i4bvb`) · #2045 (draft, `8w6at.11`) · #2030 Renovate.
 
-## ✅ Merged 2026-10-30 (25)
-#2050 wrap docs · #2047 `8w6at.6` · #2049 `4qoe5` · #2048 `3h794` · #2046 `vnmcw` · #2044 `0jw45` · #2043 `kbpw7` · #2042 `xpftc` · #2041 `086v6` · #2040 `8w6at.5` · #2038 `luxwl` · #2037 `8w6at.3` · #2036 `8w6at.4` · #2035 `qap3i.55` · #2034 `csud5` · #2033 `4r9zh` · #2032 `uaasp` · #2031 `hkufk` · #2029 `te4sn.4` · #2028 `lrqbx` · #2027 `lqu0h` · #2026 `0c8uw` · #2025 `qm68h` · #2024 `6i5b7`+`1tb5u` · #2023 `02f1s`
+## ✅ Merged 2026-10-30
+25 PRs, #2023–#2050 (`git log --merges 0bf3bb79..5553cf03`).
 
 <!-- BEGIN AUTO: open-prs -->
 #2039 · #2045 · #2030
