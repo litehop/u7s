@@ -77,6 +77,22 @@ fn upstream_bool(v: &str) -> bool {
     !(v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
+/// Kubelet stream query params. The kubelet names them input/output/error
+/// (k8s.io/api/core/types.go ExecStdinParam etc.), not the API's stdin/stdout/stderr,
+/// and only accepts "1" as true.
+fn kubelet_stream_params(stdin: bool, stdout: bool, stderr: bool, tty: bool) -> Vec<String> {
+    [
+        (stdin, "input=1"),
+        (stdout, "output=1"),
+        (stderr, "error=1"),
+        (tty, "tty=1"),
+    ]
+    .into_iter()
+    .filter(|&(on, _)| on)
+    .map(|(_, p)| p.to_owned())
+    .collect()
+}
+
 fn first_value_pairs(raw: &str) -> Result<String, serde_urlencoded::de::Error> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw)?;
     let mut seen = std::collections::HashSet::new();
@@ -622,24 +638,9 @@ pub async fn resolve_attach_target<S: Store>(
 
     // Build kubelet attach URL.
     //   Kubelet attach endpoint: wss://<node-ip>:10250/attach/<ns>/<pod>/<container>
-    let mut params: Vec<(&str, &str)> = vec![("container", container.as_str())];
-    if stdin {
-        params.push(("stdin", "1"));
-    }
-    if stdout {
-        params.push(("stdout", "1"));
-    }
-    if stderr {
-        params.push(("stderr", "1"));
-    }
-    if tty {
-        params.push(("tty", "1"));
-    }
-    let qs: String = params
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("&");
+    let mut params = vec![format!("container={container}")];
+    params.extend(kubelet_stream_params(stdin, stdout, stderr, tty));
+    let qs = params.join("&");
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     validate_container_name(&container)?;
     let kubelet_ws_url = kubelet_endpoint_url(
@@ -1224,18 +1225,12 @@ pub async fn resolve_exec_target<S: Store>(
     // Kubelet uses different param names than kubectl on the exec endpoint:
     // kubectl: stdin/stdout/stderr  →  kubelet: input/output/error
     // (k8s.io/api/core/types.go ExecStdinParam="input", ExecStdoutParam="output", ExecStderrParam="error")
-    if stdin_set == Some(true) {
-        params.push("input=1".to_owned());
-    }
-    if stdout_set == Some(true) {
-        params.push("output=1".to_owned());
-    }
-    if stderr_set == Some(true) {
-        params.push("error=1".to_owned());
-    }
-    if tty_set == Some(true) {
-        params.push("tty=1".to_owned());
-    }
+    params.extend(kubelet_stream_params(
+        stdin_set == Some(true),
+        stdout_set == Some(true),
+        stderr_set == Some(true),
+        tty_set == Some(true),
+    ));
     let qs = params.join("&");
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     validate_container_name(&container)?;
@@ -5149,6 +5144,93 @@ mod tests {
         );
     }
 
+    /// The kubelet rejects attach with 400 "you must specify at least 1 of stdin, stdout,
+    /// stderr" unless streams are named input/output/error=1; sending the API's
+    /// stdin/stdout/stderr names makes every `kubectl attach` fail.
+    #[tokio::test]
+    async fn attach_target_sends_kubelet_stream_param_names_for_each_flag_combo() {
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_keys: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_ders: Some(vec![cert.cert.der().to_vec()]),
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "n1", "containers": [{"name": "app", "image": "busybox"}]}
+        });
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "p"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "n1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let t = |b: bool| Some(if b { "true" } else { "false" }.to_owned());
+        for (stdin, stdout, stderr, tty, want) in [
+            (false, true, true, false, "container=app&output=1&error=1"),
+            (
+                true,
+                true,
+                true,
+                false,
+                "container=app&input=1&output=1&error=1",
+            ),
+            (
+                true,
+                true,
+                false,
+                true,
+                "container=app&input=1&output=1&tty=1",
+            ),
+        ] {
+            let query = AttachQuery {
+                container: Some("app".into()),
+                stdin: t(stdin),
+                stdout: t(stdout),
+                stderr: t(stderr),
+                tty: t(tty),
+            };
+            let target = resolve_attach_target(&state, "default", "p", &query)
+                .await
+                .expect("resolve must succeed");
+            let qs = target.kubelet_ws_url.split_once('?').unwrap().1;
+            assert_eq!(
+                qs,
+                want,
+                "kubelet attach query for {query_dbg:?}",
+                query_dbg = (stdin, stdout, stderr, tty)
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // pod_attach: resolve_attach_target pure-function tests
     //
@@ -5371,13 +5453,13 @@ mod tests {
             target.kubelet_ws_url
         );
         assert!(
-            target.kubelet_ws_url.contains("stdin=1"),
-            "kubelet URL must include stdin param: {}",
+            target.kubelet_ws_url.contains("input=1"),
+            "kubelet URL must include input param (kubelet name for stdin): {}",
             target.kubelet_ws_url
         );
         assert!(
-            target.kubelet_ws_url.contains("stdout=1"),
-            "kubelet URL must include stdout param: {}",
+            target.kubelet_ws_url.contains("output=1"),
+            "kubelet URL must include output param (kubelet name for stdout): {}",
             target.kubelet_ws_url
         );
     }
