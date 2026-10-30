@@ -22,7 +22,6 @@ use axum::{
 };
 use base64::Engine as _;
 use bytes::Bytes;
-use num_bigint::BigUint;
 use serde::Deserialize;
 use x509_cert::der::Decode as _;
 use x509_cert::request::CertReq;
@@ -151,241 +150,97 @@ pub(crate) fn check_csr_signature(req: &CertReq) -> Result<(), String> {
         .map_err(|_| err.into())
 }
 
-/// One DER TLV: (tag, content, rest). Single-byte tags, definite lengths only.
-fn der_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let (&tag, b) = b.split_first()?;
-    let (&l0, b) = b.split_first()?;
-    let (len, b) = if l0 < 0x80 {
-        (usize::from(l0), b)
-    } else {
-        let n = usize::from(l0 & 0x7f);
-        if n == 0 || n > 4 || b.len() < n {
-            return None;
-        }
-        let len = b[..n]
-            .iter()
-            .fold(0usize, |a, &x| (a << 8) | usize::from(x));
-        (len, &b[n..])
-    };
-    (b.len() >= len).then(|| (tag, &b[..len], &b[len..]))
+#[derive(der::Sequence)]
+struct RsaPublicKey<'a> {
+    modulus: x509_cert::der::asn1::UintRef<'a>,
+    exponent: x509_cert::der::asn1::UintRef<'a>,
 }
 
-/// SHA-256/384/512 AlgorithmIdentifier (NULL or absent parameters) -> last OID arc (1, 2, 3).
-fn der_sha2_alg(alg: &[u8]) -> Option<u8> {
-    const SHA2_ARC: [u8; 8] = [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02];
-    let (0x30, seq, []) = der_tlv(alg)? else {
-        return None;
-    };
-    let (0x06, oid, rest) = der_tlv(seq)? else {
-        return None;
-    };
-    let (&id, arc) = oid.split_last()?;
-    (arc == SHA2_ARC && (1..=3).contains(&id) && matches!(rest, [] | [0x05, 0x00])).then_some(id)
+#[derive(der::Sequence)]
+struct PssParams {
+    #[asn1(context_specific = "0", tag_mode = "EXPLICIT", optional = "true")]
+    hash: Option<x509_cert::spki::AlgorithmIdentifierOwned>,
+    #[asn1(context_specific = "1", tag_mode = "EXPLICIT", optional = "true")]
+    mask_gen: Option<x509_cert::spki::AlgorithmIdentifierOwned>,
+    #[asn1(context_specific = "2", tag_mode = "EXPLICIT", optional = "true")]
+    salt_len: Option<u32>,
+    #[asn1(context_specific = "3", tag_mode = "EXPLICIT", optional = "true")]
+    trailer: Option<u32>,
 }
 
-/// Go accepts RSASSA-PSS only as SHA-256/384/512 with MGF1 over the same hash, a salt of the
-/// digest length and the default trailer; anything else is an unimplemented algorithm.
-fn pss_params_hash(params: &[u8]) -> Option<u8> {
-    const MGF1: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08];
-    let (0x30, body, []) = der_tlv(params)? else {
-        return None;
+const SHA256_OID: &str = "2.16.840.1.101.3.4.2.1";
+const SHA384_OID: &str = "2.16.840.1.101.3.4.2.2";
+const SHA512_OID: &str = "2.16.840.1.101.3.4.2.3";
+const MGF1_OID: &str = "1.2.840.113549.1.1.8";
+
+/// Hash OID of an RSASSA-PSS parameter block Go would accept: SHA-2 with MGF1 over the same
+/// hash, salt equal to the digest length (what aws-lc verifies) and the default trailer.
+fn pss_hash_oid(req: &CertReq) -> Option<String> {
+    let params = req
+        .algorithm
+        .parameters
+        .as_ref()?
+        .decode_as::<PssParams>()
+        .ok()?;
+    let hash = params.hash?.oid.to_string();
+    let mgf = params.mask_gen?;
+    let mgf_hash = mgf
+        .parameters?
+        .decode_as::<x509_cert::spki::AlgorithmIdentifierOwned>()
+        .ok()?
+        .oid
+        .to_string();
+    let digest_len = match hash.as_str() {
+        SHA256_OID => 32,
+        SHA384_OID => 48,
+        SHA512_OID => 64,
+        _ => return None,
     };
-    let (0xa0, hash_alg, rest) = der_tlv(body)? else {
-        return None;
-    };
-    let hash = der_sha2_alg(hash_alg)?;
-    let (0xa1, mgf, rest) = der_tlv(rest)? else {
-        return None;
-    };
-    let (0x30, mgf_seq, []) = der_tlv(mgf)? else {
-        return None;
-    };
-    let (0x06, mgf_oid, mgf_hash) = der_tlv(mgf_seq)? else {
-        return None;
-    };
-    if mgf_oid != MGF1 || der_sha2_alg(mgf_hash)? != hash {
-        return None;
-    }
-    let (0xa2, salt, rest) = der_tlv(rest)? else {
-        return None;
-    };
-    let (0x02, [salt], []) = der_tlv(salt)? else {
-        return None;
-    };
-    if usize::from(*salt) != hash_len(hash) {
-        return None;
-    }
-    match rest {
-        [] => Some(hash),
-        _ => {
-            let (0xa3, trailer, []) = der_tlv(rest)? else {
-                return None;
-            };
-            matches!(der_tlv(trailer)?, (0x02, [1], [])).then_some(hash)
-        }
-    }
+    (mgf.oid.to_string() == MGF1_OID
+        && mgf_hash == hash
+        && params.salt_len? == digest_len
+        && matches!(params.trailer, None | Some(1)))
+    .then_some(hash)
 }
 
-fn hash_len(id: u8) -> usize {
-    16 * (usize::from(id) + 1)
-}
-
-fn sha2_digest(id: u8, data: &[u8]) -> Vec<u8> {
-    use sha2::Digest as _;
-    match id {
-        1 => sha2::Sha256::digest(data).to_vec(),
-        2 => sha2::Sha384::digest(data).to_vec(),
-        _ => sha2::Sha512::digest(data).to_vec(),
-    }
-}
-
-fn mgf1(id: u8, seed: &[u8], len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len + hash_len(id));
-    let mut counter = 0u32;
-    while out.len() < len {
-        out.extend(sha2_digest(id, &[seed, &counter.to_be_bytes()].concat()));
-        counter += 1;
-    }
-    out.truncate(len);
-    out
-}
-
-fn emsa_pss_verify(id: u8, em_bits: usize, m: &BigUint, mhash: &[u8]) -> bool {
-    let h_len = hash_len(id);
-    let em_len = em_bits.div_ceil(8);
-    let m = m.to_bytes_be();
-    if m.len() > em_len || em_len < 2 * h_len + 2 {
-        return false;
-    }
-    let mut em = vec![0u8; em_len - m.len()];
-    em.extend(m);
-    if em[em_len - 1] != 0xbc {
-        return false;
-    }
-    let (masked, rest) = em.split_at(em_len - h_len - 1);
-    let h = &rest[..h_len];
-    let top = (0xff00u16 >> (8 * em_len - em_bits)) as u8;
-    if masked[0] & top != 0 {
-        return false;
-    }
-    let mut db: Vec<u8> = masked
-        .iter()
-        .zip(mgf1(id, h, masked.len()))
-        .map(|(a, b)| a ^ b)
-        .collect();
-    db[0] &= !top;
-    let ps_len = em_len - 2 * h_len - 2;
-    if db[..ps_len].iter().any(|&b| b != 0) || db[ps_len] != 1 {
-        return false;
-    }
-    let salt = &db[ps_len + 1..];
-    sha2_digest(id, &[&[0u8; 8], mhash, salt].concat()) == h
-}
-
-fn emsa_pkcs1_verify(id: u8, k: usize, m: &BigUint, mhash: &[u8]) -> bool {
-    let len = hash_len(id);
-    let mut t = vec![
-        0x30,
-        0x11 + len as u8,
-        0x30,
-        0x0d,
-        0x06,
-        0x09,
-        0x60,
-        0x86,
-        0x48,
-        0x01,
-        0x65,
-        0x03,
-        0x04,
-        0x02,
-        id,
-        0x05,
-        0x00,
-        0x04,
-        len as u8,
-    ];
-    t.extend(mhash);
-    if k < t.len() + 11 {
-        return false;
-    }
-    let mut expected = vec![0x00, 0x01];
-    expected.resize(k - t.len() - 1, 0xff);
-    expected.push(0x00);
-    expected.extend(t);
-    let m = m.to_bytes_be();
-    m.len() <= k && {
-        let mut em = vec![0u8; k - m.len()];
-        em.extend(m);
-        em == expected
-    }
-}
-
-/// `rsa.VerifyPKCS1v15` / `rsa.VerifyPSS` as called by Go's x509: keys under 1024 bits are
-/// refused, everything else is verified by raw RSA plus the EMSA encoding check.
+/// RSA is verified by aws-lc only, and only from 2048 bits for both PKCS#1 v1.5 and PSS: a
+/// deliberate divergence from Go, which accepts 1024-bit keys.
 fn check_rsa_signature(req: &CertReq, sig_oid: &str) -> Result<(), String> {
-    use x509_cert::der::Encode as _;
+    use aws_lc_rs::signature::{self as sig, VerificationAlgorithm};
+    use x509_cert::der::{Decode as _, Encode as _};
 
-    const VERIFY: &str = "crypto/rsa: verification error";
-    let (id, pss) = match sig_oid {
-        "1.2.840.113549.1.1.11" => (1, false),
-        "1.2.840.113549.1.1.12" => (2, false),
-        "1.2.840.113549.1.1.13" => (3, false),
-        "1.2.840.113549.1.1.10" => {
-            let params = req
-                .algorithm
-                .parameters
-                .as_ref()
-                .and_then(|p| p.to_der().ok());
-            (
-                params
-                    .as_deref()
-                    .and_then(pss_params_hash)
-                    .ok_or(UNIMPLEMENTED)?,
-                true,
-            )
-        }
-        _ => return Err(UNIMPLEMENTED.into()),
-    };
-    let key = req.info.public_key.subject_public_key.as_bytes();
-    let (n, e) = key
-        .and_then(|k| {
-            let (0x30, seq, []) = der_tlv(k)? else {
-                return None;
-            };
-            let (0x02, n, rest) = der_tlv(seq)? else {
-                return None;
-            };
-            let (0x02, e, []) = der_tlv(rest)? else {
-                return None;
-            };
-            Some((BigUint::from_bytes_be(n), BigUint::from_bytes_be(e)))
-        })
+    let spki = &req.info.public_key;
+    let key = spki
+        .subject_public_key
+        .as_bytes()
         .ok_or("x509: failed to parse public key")?;
-    let bits = n.bits() as usize;
-    if bits < 1024 {
+    let pk = RsaPublicKey::from_der(key).map_err(|_| "x509: failed to parse public key")?;
+    let modulus = pk.modulus.as_bytes();
+    let bits = modulus.len() * 8 - modulus.first().map_or(0, |b| b.leading_zeros() as usize);
+    if bits < 2048 {
         return Err(format!(
-            "crypto/rsa: {bits}-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)"
+            "crypto/rsa: {bits}-bit RSA keys are not accepted; minimum is 2048"
         ));
     }
-    let k = bits.div_ceil(8);
-    let signature = req.signature.as_bytes().ok_or(VERIFY)?;
-    let s = BigUint::from_bytes_be(signature);
-    if signature.len() != k || s >= n {
-        return Err(VERIFY.into());
-    }
-    let mhash = sha2_digest(id, &req.info.to_der().map_err(|e| e.to_string())?);
-    let m = s.modpow(&e, &n);
-    let ok = if pss {
-        emsa_pss_verify(id, bits - 1, &m, &mhash)
-    } else {
-        emsa_pkcs1_verify(id, k, &m, &mhash)
+
+    let alg: &'static dyn VerificationAlgorithm = match sig_oid {
+        "1.2.840.113549.1.1.11" => &sig::RSA_PKCS1_2048_8192_SHA256,
+        "1.2.840.113549.1.1.12" => &sig::RSA_PKCS1_2048_8192_SHA384,
+        "1.2.840.113549.1.1.13" => &sig::RSA_PKCS1_2048_8192_SHA512,
+        "1.2.840.113549.1.1.10" => match pss_hash_oid(req).as_deref() {
+            Some(SHA256_OID) => &sig::RSA_PSS_2048_8192_SHA256,
+            Some(SHA384_OID) => &sig::RSA_PSS_2048_8192_SHA384,
+            Some(SHA512_OID) => &sig::RSA_PSS_2048_8192_SHA512,
+            _ => return Err(UNIMPLEMENTED.into()),
+        },
+        _ => return Err(UNIMPLEMENTED.into()),
     };
-    if ok {
-        Ok(())
-    } else {
-        Err(VERIFY.into())
-    }
+    const VERIFY: &str = "crypto/rsa: verification error";
+    let message = req.info.to_der().map_err(|e| e.to_string())?;
+    let signature = req.signature.as_bytes().ok_or(VERIFY)?;
+    sig::UnparsedPublicKey::new(alg, key)
+        .verify(&message, signature)
+        .map_err(|_| VERIFY.into())
 }
 
 /// Validate spec.request and spec.signerName, returning 422 on any violation.
@@ -2214,15 +2069,16 @@ jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
 -----END CERTIFICATE REQUEST-----
 ";
 
-    // `openssl req -new -subj /CN=system:node:aaa` over a 1024-bit RSA key (-sha256/384/512),
-    // with `-sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32` for PSS, over secp521r1
-    // with -sha512, with -sha1, over a 768-bit key and over secp224r1.
+    // `openssl req -new -subj /CN=system:node:aaa` over RSA keys of 2048 (-sha384/-sha512 and
+    // `-sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32`), 1024 (-sha256, -sha1, PSS)
+    // and 768 bits, over secp521r1 with -sha512 and over secp224r1.
+    const RSA_2048_SHA384: &str = include_str!("csr_fixtures/r2048_sha384.pem");
+    const RSA_2048_SHA512: &str = include_str!("csr_fixtures/r2048_sha512.pem");
+    const RSA_2048_PSS: &str = include_str!("csr_fixtures/r2048_pss.pem");
     const RSA_1024_SHA256: &str = include_str!("csr_fixtures/r1024_sha256.pem");
-    const RSA_1024_SHA384: &str = include_str!("csr_fixtures/r1024_sha384.pem");
-    const RSA_1024_SHA512: &str = include_str!("csr_fixtures/r1024_sha512.pem");
     const RSA_1024_SHA1: &str = include_str!("csr_fixtures/r1024_sha1.pem");
+    const RSA_1024_PSS: &str = include_str!("csr_fixtures/r1024_pss.pem");
     const RSA_768_SHA256: &str = include_str!("csr_fixtures/r768.pem");
-    const RSA_PSS_SHA256: &str = include_str!("csr_fixtures/rpss.pem");
     const ECDSA_P521: &str = include_str!("csr_fixtures/p521.pem");
     const ECDSA_P224: &str = include_str!("csr_fixtures/p224.pem");
 
@@ -2245,23 +2101,29 @@ jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
     }
 
     #[test]
-    fn rsa_pss_csr_is_accepted_because_go_checks_pss_self_signatures_and_clients_that_sign_with_pss_would_otherwise_fail_to_enroll(
+    fn rsa_pss_and_every_pkcs1_sha2_hash_are_accepted_at_2048_bits_because_clients_sign_with_either_scheme(
     ) {
-        validate_csr_spec(&spec_with(RSA_PSS_SHA256)).unwrap();
-    }
-
-    #[test]
-    fn rsa_1024_csr_is_accepted_for_sha256_384_512_because_go_only_rejects_keys_below_1024_bits() {
-        for pem in [RSA_1024_SHA256, RSA_1024_SHA384, RSA_1024_SHA512] {
+        for pem in [RSA_2048_PSS, RSA_2048_SHA384, RSA_2048_SHA512] {
             validate_csr_spec(&spec_with(pem)).unwrap();
         }
     }
 
     #[test]
-    fn rsa_key_below_1024_bits_is_rejected_with_go_text_because_go_refuses_to_verify_with_it() {
+    fn deliberate_divergence_rsa_1024_is_rejected_for_pkcs1_and_pss_because_u7s_floors_rsa_at_2048_where_go_accepts_1024(
+    ) {
+        for pem in [RSA_1024_SHA256, RSA_1024_PSS] {
+            assert_eq!(
+                rejection(pem),
+                "crypto/rsa: 1024-bit RSA keys are not accepted; minimum is 2048"
+            );
+        }
+    }
+
+    #[test]
+    fn rsa_key_below_1024_bits_is_rejected_with_the_same_floor_message() {
         assert_eq!(
             rejection(RSA_768_SHA256),
-            "crypto/rsa: 768-bit keys are insecure (see https://go.dev/pkg/crypto/rsa#hdr-Minimum_key_size)"
+            "crypto/rsa: 768-bit RSA keys are not accepted; minimum is 2048"
         );
     }
 
@@ -2274,7 +2136,8 @@ jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
     }
 
     #[test]
-    fn p224_csr_is_rejected_as_unimplemented_because_the_verifier_has_no_p224_support() {
+    fn deliberate_divergence_p224_csr_is_rejected_because_no_hand_rolled_verifier_is_allowed_and_aws_lc_has_none(
+    ) {
         assert_eq!(
             rejection(ECDSA_P224),
             "x509: cannot verify signature: algorithm unimplemented"
@@ -2284,7 +2147,7 @@ jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
     #[test]
     fn rsa_pss_with_wrong_salt_length_is_rejected_as_unimplemented_because_go_only_knows_salt_equal_to_hash_length(
     ) {
-        let mut der = der_of(RSA_PSS_SHA256);
+        let mut der = der_of(RSA_2048_PSS);
         // The PSS params end with `a2 03 02 01 20` (salt length 32).
         let at = der
             .windows(5)
@@ -2311,10 +2174,9 @@ jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
     fn csrs_per_algorithm() -> Vec<(&'static str, String)> {
         let mut out = vec![
             ("rsa-2048", RSA_2048_CSR.to_string()),
-            ("rsa-1024-sha256", RSA_1024_SHA256.to_string()),
-            ("rsa-1024-sha384", RSA_1024_SHA384.to_string()),
-            ("rsa-1024-sha512", RSA_1024_SHA512.to_string()),
-            ("rsa-pss-sha256", RSA_PSS_SHA256.to_string()),
+            ("rsa-2048-sha384", RSA_2048_SHA384.to_string()),
+            ("rsa-2048-sha512", RSA_2048_SHA512.to_string()),
+            ("rsa-2048-pss-sha256", RSA_2048_PSS.to_string()),
             ("ecdsa-p521", ECDSA_P521.to_string()),
         ];
         for (name, alg) in [
