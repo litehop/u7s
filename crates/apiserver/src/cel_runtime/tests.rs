@@ -649,3 +649,30 @@ fn maps_built_by_expressions_round_trip_to_json() {
         json!({"a": 1, "b": [1.5, "x"], "c": "aGk=", "d": "1970-01-01T00:00:00Z", "e": null})
     );
 }
+
+/// Every long rule gets a thread that reserves 256 MiB of address space; a burst of
+/// creates must queue for a few lanes rather than reserve a thread's worth each.
+#[test]
+fn big_stack_threads_never_exceed_the_lane_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..(super::parse::MAX_PARSE_THREADS * 4) {
+            s.spawn(|| {
+                super::parse::on_big_stack(1 << 20, "test", || {
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            });
+        }
+    });
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        (1..=super::parse::MAX_PARSE_THREADS).contains(&peak),
+        "peak concurrent big-stack threads was {peak}"
+    );
+}

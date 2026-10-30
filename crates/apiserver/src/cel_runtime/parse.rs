@@ -70,14 +70,60 @@ pub(crate) fn parse_bounded<T: Send>(
     if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
         return run();
     }
+    on_big_stack(stack_size, "parser", run)?
+}
+
+/// Parse threads allowed at once. Each reserves `PARSE_STACK_SIZE` of address space and
+/// touches stack in proportion to the expression it walks; a spray of creates must queue
+/// here instead of spawning one thread each. A parse of a maximal expression takes
+/// milliseconds, so four lanes drain a burst quickly while bounding the reservation to 1 GiB.
+pub(super) const MAX_PARSE_THREADS: usize = 4;
+
+struct Lanes {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+static PARSE_LANES: Lanes = Lanes {
+    free: Mutex::new(MAX_PARSE_THREADS),
+    freed: std::sync::Condvar::new(),
+};
+
+struct Lane<'a>(&'a Lanes);
+
+impl Lanes {
+    fn acquire(&self) -> Lane<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        Lane(self)
+    }
+}
+
+impl Drop for Lane<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// Runs `work` on a fresh thread with `stack_size` of stack, one of `MAX_PARSE_THREADS`.
+pub(super) fn on_big_stack<T: Send>(
+    stack_size: usize,
+    what: &str,
+    work: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
+    let _lane = PARSE_LANES.acquire();
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(stack_size)
-            .spawn_scoped(s, run)
+            .spawn_scoped(s, work)
             .map_err(|e| format!("compilation failed: {e}"))?
             .join()
-            .map_err(|_| "compilation failed: parser panicked".to_string())
-    })?
+            .map_err(|_| format!("compilation failed: {what} panicked"))
+    })
 }
 
 /// Whether `root` nests deeper than `max` levels, walked with an explicit stack so the
@@ -167,14 +213,7 @@ fn check(expr: &str, ast: &IdedExpr, roots: &[&str]) -> Result<(), String> {
     if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
         return walk();
     }
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .stack_size(PARSE_STACK_SIZE)
-            .spawn_scoped(s, walk)
-            .map_err(|e| format!("compilation failed: {e}"))?
-            .join()
-            .map_err(|_| "compilation failed: checker panicked".to_string())
-    })?
+    on_big_stack(PARSE_STACK_SIZE, "checker", walk)?
 }
 
 /// Compile-step analogue: parse errors must stay distinct from eval errors, since the
