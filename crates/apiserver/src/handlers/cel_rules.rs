@@ -7,7 +7,7 @@
 //! identifier that is not in scope. Anything it cannot type statically is treated as
 //! dynamic and accepted, so it never rejects a rule upstream would accept.
 
-use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr};
+use cel::common::ast::{operators, EntryExpr, Expr, IdedExpr, LiteralValue};
 use serde_json::Value as J;
 
 use crate::handlers::cel_cost;
@@ -25,6 +25,220 @@ enum Ty<'a> {
     },
     List(&'a J),
     Map(&'a J),
+    Bool,
+    Int,
+    Str,
+}
+
+/// Schema of a collection whose element type the checker does not track.
+static OPAQUE: J = J::Null;
+
+/// Two-variable comprehension macros (cel-go `ext.TwoVarComprehensions`) and the argument
+/// counts they accept, counting the two loop variables; any other count is an ordinary call
+/// to an undeclared function.
+pub(crate) fn two_var_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>> {
+    match name {
+        "all" | "exists" | "exists_one" | "existsOne" => Some(3..=3),
+        "transformList" | "transformMap" | "transformMapEntry" => Some(3..=4),
+        _ => None,
+    }
+}
+
+/// The comprehension a well-formed two-variable macro call expands to, built like cel-go's
+/// `ext/comprehensions.go`, so the cost model sees exactly the loop upstream costs.
+///
+/// With `lowered` the loop is one the `cel` interpreter can run, which has no second loop
+/// variable: it iterates `@pairs(range)` and each body binds `k`/`v` to the pair's halves.
+pub(crate) fn two_var_comprehension(
+    e: &IdedExpr,
+    lowered: bool,
+) -> Option<cel::common::ast::ComprehensionExpr> {
+    use cel::common::ast::{CallExpr, ComprehensionExpr, ListExpr, MapExpr};
+    let Expr::Call(call) = &e.expr else {
+        return None;
+    };
+    let target = call.target.as_deref()?;
+    if !two_var_arity(&call.func_name)?.contains(&call.args.len()) {
+        return None;
+    }
+    let (Expr::Ident(k), Expr::Ident(v)) = (&call.args[0].expr, &call.args[1].expr) else {
+        return None;
+    };
+    let id = e.id;
+    let mk = |expr| IdedExpr { id, expr };
+    let accu = || mk(Expr::Ident("@result".into()));
+    let op = |f: &str, args: Vec<IdedExpr>| {
+        mk(Expr::Call(CallExpr {
+            func_name: f.into(),
+            target: None,
+            args,
+        }))
+    };
+    let boolean = |b: bool| mk(Expr::Literal(LiteralValue::Boolean(b.into())));
+    let int = |n: i64| mk(Expr::Literal(LiteralValue::Int(n.into())));
+    let pair_half = |n: i64| {
+        op(
+            operators::INDEX,
+            vec![mk(Expr::Ident("@it".into())), int(n)],
+        )
+    };
+    let bind = |var: &String, init: IdedExpr, body: IdedExpr| {
+        mk(Expr::Comprehension(Box::new(ComprehensionExpr {
+            iter_range: mk(Expr::List(ListExpr::default())),
+            iter_var: "@unused".into(),
+            iter_var2: None,
+            accu_var: var.clone(),
+            accu_init: init,
+            loop_cond: boolean(false),
+            loop_step: mk(Expr::Ident(var.clone())),
+            result: body,
+        })))
+    };
+    let rest: Vec<IdedExpr> = call.args[2..]
+        .iter()
+        .map(|a| {
+            if lowered {
+                bind(k, pair_half(0), bind(v, pair_half(1), a.clone()))
+            } else {
+                a.clone()
+            }
+        })
+        .collect();
+    let (map_insert, key) = if lowered {
+        ("@mapInsert", pair_half(0))
+    } else {
+        ("cel.@mapInsert", mk(Expr::Ident(k.clone())))
+    };
+    let name = call.func_name.as_str();
+    let (init, cond, step, result) = match name {
+        "all" => (
+            boolean(true),
+            op(operators::NOT_STRICTLY_FALSE, vec![accu()]),
+            op(operators::LOGICAL_AND, vec![accu(), rest[0].clone()]),
+            accu(),
+        ),
+        "exists" => (
+            boolean(false),
+            op(
+                operators::NOT_STRICTLY_FALSE,
+                vec![op(operators::LOGICAL_NOT, vec![accu()])],
+            ),
+            op(operators::LOGICAL_OR, vec![accu(), rest[0].clone()]),
+            accu(),
+        ),
+        "exists_one" | "existsOne" => (
+            int(0),
+            boolean(true),
+            op(
+                operators::CONDITIONAL,
+                vec![
+                    rest[0].clone(),
+                    op(operators::ADD, vec![accu(), int(1)]),
+                    accu(),
+                ],
+            ),
+            op(operators::EQUALS, vec![accu(), int(1)]),
+        ),
+        _ => {
+            let transform = rest[rest.len() - 1].clone();
+            let mut step = match name {
+                "transformList" => op(
+                    operators::ADD,
+                    vec![
+                        accu(),
+                        mk(Expr::List(ListExpr {
+                            elements: vec![transform],
+                            optional_indices: vec![],
+                        })),
+                    ],
+                ),
+                "transformMap" => op(map_insert, vec![accu(), key, transform]),
+                _ => op(map_insert, vec![accu(), transform]),
+            };
+            if rest.len() == 2 {
+                step = op(operators::CONDITIONAL, vec![rest[0].clone(), step, accu()]);
+            }
+            let init = if name == "transformList" {
+                mk(Expr::List(ListExpr::default()))
+            } else {
+                mk(Expr::Map(MapExpr::default()))
+            };
+            (init, boolean(true), step, accu())
+        }
+    };
+    let (iter_range, iter_var, iter_var2) = if lowered {
+        (op("@pairs", vec![target.clone()]), "@it".to_string(), None)
+    } else {
+        (target.clone(), k.clone(), Some(v.clone()))
+    };
+    Some(ComprehensionExpr {
+        iter_range,
+        iter_var,
+        iter_var2,
+        accu_var: "@result".into(),
+        accu_init: init,
+        loop_cond: cond,
+        loop_step: step,
+        result,
+    })
+}
+
+/// `expr` with every two-variable macro call replaced by a loop the `cel` interpreter can
+/// run; `None` when it has none.
+pub(crate) fn lower_two_var_macros(expr: &IdedExpr) -> Option<IdedExpr> {
+    fn lower(e: &mut IdedExpr) -> bool {
+        let mut changed = false;
+        match &mut e.expr {
+            Expr::Select(s) => changed |= lower(&mut s.operand),
+            Expr::Call(c) => {
+                if let Some(t) = c.target.as_deref_mut() {
+                    changed |= lower(t);
+                }
+                for a in &mut c.args {
+                    changed |= lower(a);
+                }
+            }
+            Expr::List(l) => {
+                for el in &mut l.elements {
+                    changed |= lower(el);
+                }
+            }
+            Expr::Map(m) => {
+                for entry in &mut m.entries {
+                    if let EntryExpr::MapEntry(me) = &mut entry.expr {
+                        changed |= lower(&mut me.key);
+                        changed |= lower(&mut me.value);
+                    }
+                }
+            }
+            Expr::Struct(s) => {
+                for entry in &mut s.entries {
+                    if let EntryExpr::StructField(f) = &mut entry.expr {
+                        changed |= lower(&mut f.value);
+                    }
+                }
+            }
+            Expr::Comprehension(c) => {
+                for part in [
+                    &mut c.iter_range,
+                    &mut c.accu_init,
+                    &mut c.loop_cond,
+                    &mut c.loop_step,
+                    &mut c.result,
+                ] {
+                    changed |= lower(part);
+                }
+            }
+            Expr::Ident(_) | Expr::Literal(_) | Expr::Unspecified => {}
+        }
+        if let Some(comprehension) = two_var_comprehension(e, true) {
+            e.expr = Expr::Comprehension(Box::new(comprehension));
+            changed = true;
+        }
+        changed
+    }
+    let mut lowered = expr.clone();
+    lower(&mut lowered).then_some(lowered)
 }
 
 pub(crate) const CEL_TYPE_IDENTS: &[&str] = &[
@@ -62,11 +276,29 @@ fn ty_of(schema: &J, is_root: bool) -> Ty<'_> {
             }
         }
         Some("array") => Ty::List(schema),
+        Some("boolean") => Ty::Bool,
+        Some("integer") => Ty::Int,
+        Some("string") if schema.get("format").is_none() => Ty::Str,
         _ => Ty::Dyn,
     }
 }
 
 impl<'a> Ty<'a> {
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Ty::Bool => Some("bool"),
+            Ty::Int => Some("int"),
+            Ty::Str => Some("string"),
+            Ty::List(_) => Some("list(dyn)"),
+            Ty::Map(_) => Some("map(string, dyn)"),
+            Ty::Dyn | Ty::Obj { .. } => None,
+        }
+    }
+
+    fn is_scalar(self) -> bool {
+        matches!(self, Ty::Bool | Ty::Int | Ty::Str)
+    }
+
     fn elem(self) -> Ty<'a> {
         match self {
             Ty::List(s) => s.get("items").map_or(Ty::Dyn, |i| ty_of(i, false)),
@@ -116,6 +348,74 @@ impl<'a> Checker<'a, '_> {
             .push(format!("ERROR: <input>:{line}:{col}: {msg}"));
     }
 
+    /// A two-variable macro with an accepted argument count: the loop variables are typed as
+    /// cel-go's checker types them (map key / list index, then the element) and the result
+    /// by macro.
+    fn check_two_var(
+        &mut self,
+        e: &IdedExpr,
+        call: &cel::common::ast::CallExpr,
+        range: Ty<'a>,
+    ) -> Ty<'a> {
+        let mut names = Vec::new();
+        for arg in &call.args[..2] {
+            match &arg.expr {
+                Expr::Ident(n) => names.push(n.clone()),
+                _ => {
+                    self.error(arg.id, "argument must be a simple name".into());
+                    return Ty::Dyn;
+                }
+            }
+        }
+        if names[0] == names[1] {
+            self.error(
+                call.args[1].id,
+                format!("duplicate variable name: {}", names[0]),
+            );
+            return Ty::Dyn;
+        }
+        if let Some((i, _)) = names
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.as_str() == "__result__")
+        {
+            self.error(
+                call.args[i].id,
+                "iteration variable overwrites accumulator variable".into(),
+            );
+            return Ty::Dyn;
+        }
+        let (key, value) = match range {
+            Ty::List(_) => (Ty::Int, range.elem()),
+            Ty::Map(_) => (Ty::Str, range.elem()),
+            Ty::Dyn | Ty::Obj { .. } => (Ty::Dyn, Ty::Dyn),
+            other => {
+                if let Some(name) = other.name() {
+                    self.error(
+                        call.target.as_ref().map_or(e.id, |t| t.id),
+                        format!(
+                            "expression of type '{name}' cannot be range of a comprehension \
+                             (must be list, map, or dynamic)"
+                        ),
+                    );
+                }
+                (Ty::Dyn, Ty::Dyn)
+            }
+        };
+        let depth = self.scope.len();
+        self.scope.push((names[0].clone(), key));
+        self.scope.push((names[1].clone(), value));
+        for a in &call.args[2..] {
+            self.check(a);
+        }
+        self.scope.truncate(depth);
+        match call.func_name.as_str() {
+            "transformList" => Ty::List(&OPAQUE),
+            "transformMap" | "transformMapEntry" => Ty::Map(&OPAQUE),
+            _ => Ty::Bool,
+        }
+    }
+
     fn check(&mut self, e: &IdedExpr) -> Ty<'a> {
         match &e.expr {
             Expr::Ident(name) => {
@@ -132,6 +432,13 @@ impl<'a> Checker<'a, '_> {
             }
             Expr::Select(sel) => {
                 let operand = self.check(&sel.operand);
+                if let Some(name) = operand.name().filter(|_| operand.is_scalar()) {
+                    self.error(
+                        e.id,
+                        format!("type '{name}' does not support field selection"),
+                    );
+                    return Ty::Dyn;
+                }
                 match operand.field(&sel.field) {
                     Some(ty) if !sel.test => ty,
                     Some(_) => Ty::Dyn,
@@ -151,34 +458,43 @@ impl<'a> Checker<'a, '_> {
                         target_ty = self.check(target);
                     }
                 }
-                // Two-variable macros arrive as plain calls whose first two args bind names.
-                if let (Some(_), [k, v, rest @ ..]) = (&call.target, call.args.as_slice()) {
-                    if let (Expr::Ident(k), Expr::Ident(v)) = (&k.expr, &v.expr) {
-                        if matches!(
-                            call.func_name.as_str(),
-                            "all"
-                                | "exists"
-                                | "exists_one"
-                                | "existsOne"
-                                | "transformList"
-                                | "transformMap"
-                                | "transformMapEntry"
-                        ) {
-                            let range = target_ty;
-                            let depth = self.scope.len();
-                            self.scope.push((k.clone(), Ty::Dyn));
-                            self.scope.push((v.clone(), range.elem()));
-                            for a in rest {
-                                self.check(a);
-                            }
-                            self.scope.truncate(depth);
-                            return Ty::Dyn;
-                        }
+                let macro_arity = two_var_arity(&call.func_name).filter(|_| call.target.is_some());
+                if let (Some(arity), Some(_)) = (&macro_arity, &call.target) {
+                    if arity.contains(&call.args.len()) {
+                        return self.check_two_var(e, call, target_ty);
                     }
                 }
                 let arg_tys: Vec<_> = call.args.iter().map(|a| self.check(a)).collect();
+                if macro_arity.is_some() {
+                    self.error(
+                        e.id,
+                        format!(
+                            "undeclared reference to '{}' (in container '')",
+                            call.func_name
+                        ),
+                    );
+                    return Ty::Dyn;
+                }
                 if call.func_name == operators::INDEX {
                     return arg_tys.first().map_or(Ty::Dyn, |t| t.elem());
+                }
+                if let ([a, b], true) = (arg_tys.as_slice(), call.func_name == operators::ADD) {
+                    let same_kind = |a: Ty, b: Ty| {
+                        matches!(
+                            (a, b),
+                            (Ty::Int, Ty::Int) | (Ty::Str, Ty::Str) | (Ty::List(_), Ty::List(_))
+                        )
+                    };
+                    if let (Some(an), Some(bn)) = (a.name(), b.name()) {
+                        if !same_kind(*a, *b) {
+                            self.error(
+                                e.id,
+                                format!(
+                                    "found no matching overload for '_+_' applied to '({an}, {bn})'"
+                                ),
+                            );
+                        }
+                    }
                 }
                 Ty::Dyn
             }
@@ -223,6 +539,9 @@ impl<'a> Checker<'a, '_> {
                 }
                 Ty::Dyn
             }
+            Expr::Literal(LiteralValue::Int(_)) => Ty::Int,
+            Expr::Literal(LiteralValue::String(_)) => Ty::Str,
+            Expr::Literal(LiteralValue::Boolean(_)) => Ty::Bool,
             Expr::Literal(_) | Expr::Unspecified => Ty::Dyn,
         }
     }
@@ -715,5 +1034,177 @@ mod tests {
     fn transition_rule_on_additional_properties_value_types_old_self() {
         let spec = map_of(with_rules(int_obj(), &["self.n >= oldSelf.n"]));
         check_crd(&crd_with_spec(spec)).expect("oldSelf is the value object");
+    }
+
+    fn two_var_schema() -> J {
+        serde_json::json!({ "type": "object", "properties": {
+            "m": { "type": "object", "maxProperties": 10,
+                   "additionalProperties": { "type": "string" } },
+            "l": { "type": "array", "maxItems": 10, "items": { "type": "integer" } },
+        } })
+    }
+
+    fn check_two_var(rule: &str) -> Result<(), String> {
+        compile_rule(rule, &two_var_schema(), false).map(|_| ())
+    }
+
+    #[test]
+    fn two_var_macros_accept_exactly_the_upstream_argument_counts() {
+        for rule in [
+            "self.l.all(i, v, v > 0)",
+            "self.l.exists(i, v, v > 0)",
+            "self.l.existsOne(i, v, v > 0)",
+            "self.l.exists_one(i, v, v > 0)",
+            "self.l.transformList(i, v, v)",
+            "self.l.transformList(i, v, v > 0, v)",
+            "self.l.transformMap(i, v, v)",
+            "self.l.transformMap(i, v, v > 0, v)",
+            "self.l.transformMapEntry(i, v, {v: i})",
+            "self.l.transformMapEntry(i, v, v > 0, {v: i})",
+            "self.m.all(k, v, v != '')",
+        ] {
+            check_two_var(rule).unwrap_or_else(|e| panic!("{rule}: {e}"));
+        }
+    }
+
+    #[test]
+    fn two_var_macros_with_any_other_argument_count_are_rejected_like_an_undeclared_function() {
+        for (rule, name) in [
+            ("self.l.all(i, v, true, true)", "all"),
+            ("self.l.exists(i, v, true, true)", "exists"),
+            ("self.l.existsOne(i, v, true, true)", "existsOne"),
+            ("self.l.exists_one(i, v, true, true)", "exists_one"),
+            ("self.l.all()", "all"),
+            ("self.l.transformList(i, v)", "transformList"),
+            ("self.l.transformList(i, v, true, v, v)", "transformList"),
+            ("self.l.transformMap(i, v)", "transformMap"),
+            ("self.l.transformMap(i, v, true, v, v)", "transformMap"),
+            ("self.l.transformMapEntry(i, v)", "transformMapEntry"),
+            (
+                "self.l.transformMapEntry(i, v, true, {v: i}, 1)",
+                "transformMapEntry",
+            ),
+        ] {
+            let err = check_two_var(rule)
+                .expect_err(&format!("{rule}: the runtime cannot evaluate this arity"));
+            assert!(
+                err.contains(&format!(
+                    "undeclared reference to '{name}' (in container '')"
+                )),
+                "{rule}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_var_loop_variables_must_be_distinct_simple_names() {
+        let err = check_two_var("self.l.all(i, i, true)").unwrap_err();
+        assert!(err.contains("duplicate variable name: i"), "{err}");
+        let err = check_two_var("self.l.all(i, 1, true)").unwrap_err();
+        assert!(err.contains("argument must be a simple name"), "{err}");
+    }
+
+    #[test]
+    fn two_var_loop_variables_are_typed_like_upstream() {
+        let err = check_two_var("self.m.all(k, v, k.foo == 1)").unwrap_err();
+        assert!(
+            err.contains("type 'string' does not support field selection"),
+            "map keys are strings: {err}"
+        );
+        let err = check_two_var("self.l.all(i, v, i.foo == 1)").unwrap_err();
+        assert!(
+            err.contains("type 'int' does not support field selection"),
+            "list indexes are ints: {err}"
+        );
+        let err = check_two_var("self.l.all(i, v, v.foo == 1)").unwrap_err();
+        assert!(
+            err.contains("type 'int' does not support field selection"),
+            "the second variable is the element type: {err}"
+        );
+        check_two_var("self.l.all(i, v, i < v) && self.m.all(k, v, k + v != '')")
+            .expect("int index and string key/value are usable as such");
+    }
+
+    #[test]
+    fn two_var_results_are_typed_per_macro() {
+        for rule in [
+            "self.l.all(i, v, true) + 1",
+            "self.l.exists(i, v, true) + 1",
+            "self.l.existsOne(i, v, true) + 1",
+            "self.l.transformList(i, v, v) + 1",
+            "self.l.transformMap(i, v, v) + 1",
+            "self.l.transformMapEntry(i, v, {v: i}) + 1",
+        ] {
+            let err = check_two_var(rule).unwrap_err();
+            assert!(
+                err.contains("found no matching overload for '_+_'"),
+                "{rule}: {err}"
+            );
+        }
+        check_two_var("self.l.transformList(i, v, v) + [1]").expect("list + list");
+        check_two_var("self.l.transformMap(i, v, v).size() == 1").expect("map result");
+    }
+
+    fn nested_list_rule(max: Option<u64>, rule: &str) -> J {
+        let mut outer = serde_json::json!({ "type": "array" });
+        let mut inner = serde_json::json!({
+            "type": "array", "items": { "type": "string" },
+            "x-kubernetes-validations": [{ "rule": rule }]
+        });
+        if let Some(n) = max {
+            outer["maxItems"] = n.into();
+            inner["maxItems"] = n.into();
+            inner["items"]["maxLength"] = 10.into();
+        }
+        outer["items"] = inner;
+        serde_json::json!({ "type": "object", "properties": { "spec": outer } })
+    }
+
+    #[test]
+    fn over_budget_two_var_rule_is_rejected_at_create_like_the_one_var_form() {
+        for rule in [
+            "self.all(i, s, s == 'string constant')",
+            "self.exists(i, s, s == 'string constant')",
+            "self.transformList(i, s, s == 'x').size() > 0",
+        ] {
+            let err = check_crd(&nested_list_rule(None, rule)).unwrap_err();
+            assert!(
+                err.contains("estimated rule cost exceeds budget by factor of"),
+                "{rule}: an unbounded two-variable loop must be refused at create, not left \
+                 to blow the runtime budget: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_two_var_rule_is_accepted_at_create() {
+        check_crd(&nested_list_rule(
+            Some(10),
+            "self.all(i, s, s == 'string constant')",
+        ))
+        .expect("maxItems-bounded two-variable loop is within budget");
+    }
+
+    #[test]
+    fn two_var_macro_costs_the_same_as_the_equivalent_one_var_comprehension() {
+        let schema = two_var_schema();
+        let cost = |rule: &str| {
+            let program = compile_rule(rule, &schema, false).unwrap();
+            let node = cel_cost::Node::Schema(&schema);
+            cel_cost::estimate(&program, node, Some(node), None)
+        };
+        assert_eq!(
+            cost("self.l.all(i, v, v > 0)"),
+            cost("self.l.all(v, v > 0)"),
+            "upstream expands both to the same loop shape"
+        );
+        assert_eq!(
+            cost("self.l.exists(i, v, v > 0)"),
+            cost("self.l.exists(v, v > 0)")
+        );
+        assert!(
+            cost("self.l.transformList(i, v, v > 0, v)") > cost("self.l.transformList(i, v, v)"),
+            "the filter is evaluated per element"
+        );
     }
 }

@@ -560,6 +560,15 @@ impl<'a> Coster<'a> {
                 (c.saturating_add(u64::from(!sel.test)), node)
             }
             Expr::Call(call) => {
+                if let Some(comprehension) =
+                    crate::handlers::cel_rules::two_var_comprehension(e, false)
+                {
+                    let expanded = IdedExpr {
+                        id: e.id,
+                        expr: Expr::Comprehension(Box::new(comprehension)),
+                    };
+                    return self.cost(&expanded, ctx);
+                }
                 let func = call.func_name.as_str();
                 if let (Some(ctx), true) = (
                     ctx,
