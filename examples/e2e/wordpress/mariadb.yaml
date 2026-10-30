@@ -117,9 +117,10 @@ spec:
             runAsUser: 999
             runAsGroup: 999
           # healthcheck.sh logs in as the image-created `healthcheck` user (credentials in
-          # /var/lib/mysql/.my-healthcheck.cnf, written once first init finishes), so a server
-          # whose init was cut short never reports healthy. startupProbe budget: 90 x 10 s = 15 min
-          # for a cold small disk, where image init + first start takes 2-5 min.
+          # /var/lib/mysql/.my-healthcheck.cnf, written partway through first init), and
+          # --connect fails while the entrypoint's temporary server runs with skip-networking,
+          # so a server whose init was cut short never reports healthy. startupProbe budget:
+          # 90 x 10 s = 15 min for a cold small disk, where image init + first start takes 2-5 min.
           startupProbe:
             exec:
               command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
