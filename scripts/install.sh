@@ -1024,32 +1024,65 @@ label_control_plane_node() {
 
 # Control-plane success condition: the node is Ready and every workload this
 # script itself ships (CLUSTER_WORKLOADS, "<ns>/<kind>/<name>" entries) is
-# rolled out, so a user's first apply does not compete with our own image
-# pulls. Default timeout is 20 min: a fresh 10 GB pd-standard e2-micro measured
-# 4-10 min to pull and start everything; 2x headroom. U7S_READY_TIMEOUT_SECONDS
-# overrides it. Returns non-zero naming each unready item on timeout.
+# fully rolled out and all its selected pods are Ready, so a user's first apply
+# does not compete with our own image pulls. All checks read structured fields
+# via jsonpath; an error, NotFound or empty field is "not ready". Default
+# timeout is 20 min: a fresh 10 GB pd-standard e2-micro measured 4-10 min to
+# pull and start everything; 2x headroom. U7S_READY_TIMEOUT_SECONDS overrides
+# it. The deadline is wall time ($SECONDS), checked before every kubectl call,
+# so it overruns by at most one request timeout. Returns non-zero naming each
+# unready item on timeout.
 CLUSTER_WORKLOADS=""
 READY_POLL_SECONDS=5
 READY_PROGRESS_EVERY=6
+READY_DEADLINE=0
+ready_kubectl() {
+  [ "$SECONDS" -lt "$READY_DEADLINE" ] || return 1
+  kubectl --kubeconfig="$STATE_DIR/kubeconfig" --request-timeout=10s "$@" 2>/dev/null
+}
+# Ready iff generation is observed, every replica is updated/ready/available,
+# the desired count is > 0, and the pods selected by the object's own
+# spec.selector.matchLabels are exactly that many, all Ready, none Terminating.
+workload_is_ready() {
+  local ns="$1" kind="$2" name="$3" row
+  local gen obs desired updated ready avail cond labels sel pods
+  case "$kind" in
+    deployment)
+      row="$(ready_kubectl -n "$ns" get "$kind/$name" -o jsonpath='{.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.availableReplicas}|{.status.conditions[?(@.type=="Available")].status}|{.spec.selector.matchLabels}')" || return 1
+      IFS='|' read -r gen obs desired updated ready avail cond labels <<< "$row"
+      [ "$cond" = True ] || return 1 ;;
+    daemonset)
+      row="$(ready_kubectl -n "$ns" get "$kind/$name" -o jsonpath='{.metadata.generation}|{.status.observedGeneration}|{.status.desiredNumberScheduled}|{.status.updatedNumberScheduled}|{.status.numberReady}|{.status.numberAvailable}|{.spec.selector.matchLabels}')" || return 1
+      IFS='|' read -r gen obs desired updated ready avail labels <<< "$row" ;;
+    *) return 1 ;;
+  esac
+  case "$gen$obs$desired" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$gen" = "$obs" ] && [ "$desired" -gt 0 ] || return 1
+  [ "$updated" = "$desired" ] && [ "$ready" = "$desired" ] && [ "$avail" = "$desired" ] || return 1
+  sel="$(printf '%s' "$labels" | sed -e 's/^{//' -e 's/}$//' -e 's/"//g' -e 's/:/=/g')"
+  [ -n "$sel" ] || return 1
+  pods="$(ready_kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{range .items[*]}{.metadata.deletionTimestamp}|{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}')" || return 1
+  [ -n "$pods" ] || return 1
+  [ "$(printf '%s\n' "$pods" | wc -l | tr -d ' ')" = "$desired" ] || return 1
+  [ "$(printf '%s\n' "$pods" | grep -cxF '|True')" = "$desired" ]
+}
 wait_for_cluster_ready() {
   local timeout="${U7S_READY_TIMEOUT_SECONDS:-1200}"
   case "$timeout" in
     ''|*[!0-9]*) echo "error: U7S_READY_TIMEOUT_SECONDS must be a whole number of seconds, got '$timeout'" >&2; return 1 ;;
   esac
-  local kc=(kubectl --kubeconfig="$STATE_DIR/kubeconfig" --request-timeout=10s)
-  local polls=$(( (timeout + READY_POLL_SECONDS - 1) / READY_POLL_SECONDS )) i w ns kind name
-  local pending=""
+  local start="$SECONDS" i=0 w ns kind name
+  local pending="node/$NODE_NAME $CLUSTER_WORKLOADS"
+  READY_DEADLINE=$(( start + timeout ))
   echo "Waiting up to ${timeout}s for node $NODE_NAME and ${CLUSTER_WORKLOADS:-no vendored workloads} to be Ready..."
-  for i in $(seq 0 "$polls"); do
+  while [ "$SECONDS" -lt "$READY_DEADLINE" ]; do
     pending=""
-    if [ "$("${kc[@]}" get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)" != "True" ]; then
+    if [ "$(ready_kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')" != "True" ]; then
       pending="node/$NODE_NAME"
     fi
     for w in $CLUSTER_WORKLOADS; do
       IFS=/ read -r ns kind name <<< "$w"
-      # --watch=false exits 0 even when unfinished (--timeout=0 would block
-      # forever), so success is the "successfully rolled out" line.
-      if ! "${kc[@]}" -n "$ns" rollout status "$kind/$name" --watch=false 2>&1 | grep -q 'successfully rolled out'; then
+      if ! workload_is_ready "$ns" "$kind" "$name"; then
         pending="${pending:+$pending }$w"
       fi
     done
@@ -1057,10 +1090,10 @@ wait_for_cluster_ready() {
       echo "Node $NODE_NAME and all vendored workloads are Ready."
       return 0
     fi
-    [ "$i" -eq "$polls" ] && break
     if [ $(( i % READY_PROGRESS_EVERY )) -eq 0 ]; then
-      echo "  still waiting ($(( i * READY_POLL_SECONDS ))s/${timeout}s): $pending"
+      echo "  still waiting ($(( SECONDS - start ))s/${timeout}s): $pending"
     fi
+    i=$(( i + 1 ))
     sleep "$READY_POLL_SECONDS"
   done
   echo "error: not Ready after ${timeout}s: $pending" >&2
