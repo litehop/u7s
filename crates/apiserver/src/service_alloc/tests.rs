@@ -1264,7 +1264,7 @@ async fn primary_cluster_ip_cannot_change_and_secondary_release_needs_single_sta
     let (_, v) = create(
         &st,
         "i",
-        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        json!({"ipFamilyPolicy": "RequireDualStack", "clusterIPs": ["10.96.0.40", "fd00:96::40"], "ports": [{"port": 80}]}),
         false,
     )
     .await
