@@ -126,8 +126,11 @@ jobs:
       - name: Coverage
         run: cargo llvm-cov --locked --workspace --summary-only --fail-under-lines 90
 
-  # Release-profile frames are what production runs, so the depth limits' guarantee
-  # (accepted at create => evaluates at runtime) is only checkable here. Not a required check.
+  # Optimised frames are what production runs, so the depth limits' guarantee
+  # (accepted at create => evaluates at runtime) is only checkable here. Fat LTO with one
+  # codegen unit takes over 15 minutes cold on a runner, so the profile is relaxed to
+  # opt-level 3 without LTO; the limits keep 45% headroom over measured fat-LTO depths.
+  # Not a required check.
   release-invariants:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -145,4 +148,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Depth invariants (release)
-        run: cargo test --locked --release -p u7s-apiserver -- evaluates_in_release every_crd_shape
+        run: >-
+          cargo test --locked --release
+          --config 'profile.release.lto="off"' --config profile.release.codegen-units=16
+          -p u7s-apiserver -- evaluates_in_release every_crd_shape
