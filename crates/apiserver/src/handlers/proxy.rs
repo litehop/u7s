@@ -56,9 +56,26 @@ fn outbound_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketCo
 /// Query extractor with upstream's url.Values semantics: a repeated scalar
 /// parameter resolves to its first value (apimachinery `Convert_Slice_string_To_*`
 /// take `in[0]`) instead of failing the whole request the way serde_urlencoded's
-/// duplicate-field check does. `command` is multi-valued and forwarded from the
-/// raw query, so it is never collapsed here.
+/// duplicate-field check does. `command` is multi-valued and forwarded from the raw
+/// query, so it is never collapsed here (`ports` is likewise multi-valued; the
+/// portforward handler reads it from the raw query without this extractor). Bool parameters follow
+/// `Convert_Slice_string_To_bool`: true unless the first value is "0" or "false"
+/// (case-insensitive), including the empty string.
 pub struct FirstValueQuery<T>(pub T);
+
+const BOOL_QUERY_KEYS: [&str; 7] = [
+    "stdin",
+    "stdout",
+    "stderr",
+    "tty",
+    "follow",
+    "previous",
+    "timestamps",
+];
+
+fn upstream_bool(v: &str) -> bool {
+    !(v == "0" || v.eq_ignore_ascii_case("false"))
+}
 
 fn first_value_pairs(raw: &str) -> Result<String, serde_urlencoded::de::Error> {
     let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw)?;
@@ -66,6 +83,14 @@ fn first_value_pairs(raw: &str) -> Result<String, serde_urlencoded::de::Error> {
     let first: Vec<(String, String)> = pairs
         .into_iter()
         .filter(|(k, _)| k == "command" || seen.insert(k.clone()))
+        .map(|(k, v)| {
+            if BOOL_QUERY_KEYS.contains(&k.as_str()) {
+                let b = upstream_bool(&v).to_string();
+                (k, b)
+            } else {
+                (k, v)
+            }
+        })
         .collect();
     Ok(serde_urlencoded::to_string(&first).expect("string pairs always serialise"))
 }
@@ -1021,9 +1046,9 @@ async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::R
 /// Query parameters for /exec — only `container` is needed to build the URL path.
 ///
 /// `command` and the stream flags (stdin/stdout/stderr/tty) are forwarded verbatim
-/// as the raw query string to kubelet. We do NOT parse them with serde because
-/// `command` is multi-valued (`?command=ls&command=-la`) and serde_urlencoded
-/// (used by axum's Query extractor) does not support repeated keys for Vec<String>.
+/// re-encoded from the raw query string for kubelet. They are not deserialised into
+/// this struct because `command` is multi-valued (`?command=ls&command=-la`) and
+/// serde_urlencoded cannot collect repeated keys into a Vec<String>.
 #[derive(Deserialize)]
 pub struct ExecQuery {
     pub container: Option<String>,
@@ -1171,16 +1196,16 @@ pub async fn resolve_exec_target<S: Store>(
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "stdin" => {
-                let _ = stdin_set.get_or_insert(v == "true" || v == "1");
+                let _ = stdin_set.get_or_insert(upstream_bool(v));
             }
             "stdout" => {
-                let _ = stdout_set.get_or_insert(v == "true" || v == "1");
+                let _ = stdout_set.get_or_insert(upstream_bool(v));
             }
             "stderr" => {
-                let _ = stderr_set.get_or_insert(v == "true" || v == "1");
+                let _ = stderr_set.get_or_insert(upstream_bool(v));
             }
             "tty" => {
-                let _ = tty_set.get_or_insert(v == "true" || v == "1");
+                let _ = tty_set.get_or_insert(upstream_bool(v));
             }
             "command" | "container" => {
                 // command is multi-valued; container is already in the URL path.
@@ -1556,12 +1581,20 @@ async fn run_exec_proxy_spliced(
 
 /// Query parameters for portforward: only `ports` is required.
 ///
-/// kubectl sends `?ports=<port>` (may repeat for multiple ports). Validated by
-/// `validate_ports_param` and forwarded to the kubelet — never trusted verbatim,
-/// since it is hand-interpolated into a raw HTTP/1.1 request line downstream.
-#[derive(Deserialize)]
-pub struct PortforwardQuery {
-    pub ports: Option<String>,
+/// kubectl sends `?ports=<port>` (repeats for multiple ports, like upstream's
+/// `PodPortForwardOptions.Ports`). Every value is joined in order into one
+/// comma-separated list, validated by `validate_ports_param` and forwarded to the
+/// kubelet — never trusted verbatim, since it is hand-interpolated into a raw
+/// HTTP/1.1 request line downstream. An empty entry fails validation, as upstream's
+/// `NewV4Options` rejects an empty `port`.
+fn joined_ports_param(raw_query: &str) -> Option<String> {
+    let ports: Vec<String> = serde_urlencoded::from_str::<Vec<(String, String)>>(raw_query)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| k == "ports")
+        .map(|(_, v)| v)
+        .collect();
+    (!ports.is_empty()).then(|| ports.join(","))
 }
 
 /// Validated portforward parameters after all pre-upgrade checks pass.
@@ -1844,10 +1877,10 @@ fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
 pub async fn pod_portforward<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    FirstValueQuery(query): FirstValueQuery<PortforwardQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let params = validate_portforward(&state, &raw_ns, &pod_name, query.ports.as_deref()).await?;
+    let ports = joined_ports_param(req.uri().query().unwrap_or(""));
+    let params = validate_portforward(&state, &raw_ns, &pod_name, ports.as_deref()).await?;
 
     if is_websocket_upgrade_request(&req) {
         let (mut parts, _body) = req.into_parts();
@@ -3516,10 +3549,104 @@ mod tests {
             .unwrap_or_else(|_| panic!("log must tolerate repeats"));
         assert_eq!(l.tail_lines, Some(5));
         assert_eq!(l.follow, Some(true));
-        let p: PortforwardQuery = first_value("/pf?ports=80&ports=81")
+    }
+
+    /// kubectl/client-go bool params follow `Convert_Slice_string_To_bool`: only
+    /// "0"/"false" (any case) are false; "True" and an empty value are true. A
+    /// divergence flips whether stdin/tty are attached for a non-Go client.
+    #[tokio::test]
+    async fn bool_params_follow_upstream_conversion() {
+        let a: AttachQuery = first_value("/attach?stdin=True&tty=&stdout=0&stderr=FALSE")
             .await
-            .unwrap_or_else(|_| panic!("portforward must tolerate repeats"));
-        assert_eq!(p.ports.as_deref(), Some("80"));
+            .unwrap();
+        assert_eq!(a.stdin.as_deref(), Some("true"), "stdin=True is true");
+        assert_eq!(a.tty.as_deref(), Some("true"), "empty tty= is true");
+        assert_eq!(a.stdout.as_deref(), Some("false"), "stdout=0 is false");
+        assert_eq!(a.stderr.as_deref(), Some("false"), "stderr=FALSE is false");
+        let l: LogQuery = first_value("/log?follow=&previous=False&timestamps=yes")
+            .await
+            .unwrap();
+        assert_eq!(l.follow, Some(true));
+        assert_eq!(l.previous, Some(false));
+        assert_eq!(l.timestamps, Some(true));
+    }
+
+    #[test]
+    fn upstream_bool_only_zero_and_false_are_false() {
+        for v in ["0", "false", "FALSE", "False"] {
+            assert!(!upstream_bool(v), "{v:?} must be false");
+        }
+        for v in ["", "1", "true", "True", "yes", "00"] {
+            assert!(upstream_bool(v), "{v:?} must be true");
+        }
+    }
+
+    #[test]
+    fn joined_ports_keeps_every_value_in_order() {
+        assert_eq!(
+            joined_ports_param("ports=80&ports=81&x=1&ports=82,83").as_deref(),
+            Some("80,81,82,83")
+        );
+        assert_eq!(joined_ports_param("x=1"), None);
+        let joined = joined_ports_param("ports=80&ports=").unwrap();
+        assert!(
+            validate_ports_param(&joined).is_err(),
+            "an empty ports entry must be rejected like upstream's NewV4Options"
+        );
+    }
+
+    /// Each handler must survive a duplicated scalar query param: a handler
+    /// switched back to axum `Query` answers 400 "duplicate field" and breaks
+    /// clients (sonobuoy sends `container=` twice) before any pod lookup.
+    #[tokio::test]
+    async fn every_streaming_handler_tolerates_duplicated_scalar_params() {
+        use axum::http::Method;
+        let base = "/api/v1/namespaces/default/pods/ghost";
+        let cases = [
+            (
+                Method::GET,
+                "log?container=a&container=a&tailLines=1&tailLines=2",
+            ),
+            (Method::GET, "exec?container=a&container=a&command=ls"),
+            (Method::POST, "exec?container=a&container=a&command=ls"),
+            (
+                Method::GET,
+                "attach?container=a&container=a&stdin=true&stdin=true",
+            ),
+            (
+                Method::POST,
+                "attach?container=a&container=a&stdin=true&stdin=true",
+            ),
+            (Method::GET, "portforward?ports=80&ports=81"),
+            (Method::POST, "portforward?ports=80&ports=81"),
+        ];
+        for (method, tail) in cases {
+            let mut router = make_router(make_state());
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(format!("{base}/{tail}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.call(req).await.unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("invalid query string") && !body.contains("duplicate field"),
+                "{method} {tail} rejected a repeated param ({status}): {body}"
+            );
+            if !(tail.starts_with("exec") && method == Method::GET)
+                && !(tail.starts_with("attach") && method == Method::GET)
+            {
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "{method} {tail} must reach the pod lookup: {body}"
+                );
+            }
+        }
     }
 
     /// `command` is repeated by design and must survive dedup in order, since it
