@@ -2,14 +2,26 @@
 
 Bead: mayor-uaasp (feeds mayor-vw7jc)
 
-**The saturation is ours, not the OS's or the platform's: on a pd-standard
-e2-micro, the u7s install and then container image pull + unpack plus
-MariaDB/WordPress start-up drive the boot disk to 85-93% busy and PSI to
-cpu ~57% / io ~73%; a VM with no u7s is quiet after its first ~1 minute, and
-the same saturation reproduces on a 55-minute-old VM, so "a fresh VM is
-saturated for ~20 min" is wrong.** The disk is the bottleneck resource, but
-it is loaded by our workload; no CPU burst-credit effect was visible
-(steal <= 1.8 s in any minute).
+**Disk I/O saturation is attributable to our install, image pull and
+MariaDB/WordPress bring-up; CPU saturation is not attributed: the harness
+cgroup alone used 20-23 CPU-s/min (~0.33-0.38 vCPU) under load and the whole
+node 30-100 CPU-s/min (0.5-1.7 vCPU) in min 46-54, against a documented
+e2-micro sustained share of 0.25 vCPU (2 vCPUs at 12.5% each; 100% burst
+for ~30 s, token bucket), with mariadb CFS-throttled for 78.5 s, so a
+platform CPU cap may be part of it and was not excluded.** Evidence for the
+I/O half: on a pd-standard e2-micro the u7s install, then container image
+pull + unpack plus MariaDB/WordPress start-up, drive the boot disk to 85-93%
+busy and PSI to cpu ~57% / io ~73%; a VM with no u7s is quiet after its
+first ~1 minute, and the same saturation reproduces on a 55-minute-old VM, so
+"a fresh VM is saturated for ~20 min" is wrong. Burst-credit exhaustion was
+not observed via steal (<= 1.8 s in any minute), but steal does not reliably
+expose shared-core capping, so it is not excluded. No single VM did the
+first-boot install and WordPress back to back: gate2's install phase ran on a
+fresh VM and its bring-up on a 47-minute-old one with cached packages.
+
+Source for the e2-micro figures: Google Cloud docs, "General-purpose machine
+family", E2 shared-core machine types and CPU bursting
+(docs.cloud.google.com/compute/docs/general-purpose-machines, read 2026-10-30).
 
 ## Method
 
@@ -28,8 +40,8 @@ started (~45 s after boot) is lost, only its time resolution.
 
 Total VM wall-clock about 103 min; all deleted. gate2 therefore has a real
 first-boot install phase (min 1-3) and a bring-up + WordPress phase measured
-on an aged VM (min 45-56). Raw samples: `temp/e2e/uaasp-2026-10-30/` in the
-mayor checkout, if still present.
+on an aged VM (min 45-56). The numbers quoted here are the evidence; the
+raw samples are not kept.
 
 ## Control VM (no u7s), minutes since sampler start
 
@@ -123,9 +135,10 @@ length of the whole run, not a boot property.
 - **(c) platform: the disk is the saturated resource (85-93% busy at
   ~250 read IOPS), which turns our I/O burst into PSI.** Not tested against
   a faster disk (the pd-standard choice is deliberate), so how much a
-  pd-balanced disk would shorten it is unmeasured. CPU burst-credit
-  exhaustion: no sign (steal ~0; cgroup throttling is the mariadb 375m
-  limit, ours).
+  pd-balanced disk would shorten it is unmeasured. **CPU: not established.**
+  Node CPU use (0.5-1.7 vCPU for 9 min) exceeds the 0.25 vCPU sustained
+  share, so burst budget was being spent; exhaustion is not visible in steal
+  and is not excluded. mariadb's throttling is its own 375m limit.
 
 ## Recommendation for vw7jc
 
@@ -153,13 +166,11 @@ sequencing is the first lever, ahead of changing the disk:
   0.84 CPU-s/min per sampler at idle (control). The cgroup holds only the
   sampler and `kubectl wait`; per-pid CPU of its short-lived forks is not
   attributable. The sampler's own cost under load is therefore an unresolved
-  confound (a re-run with the sampler at 30 s would settle it; the VM cap
-  was reached).
+  confound (a re-run with per-pid sampling off would settle it; the VM cap
+  was reached). The sampler now walks per-pid files only every 30 s; on a
+  synthetic 500-pid fixture (macOS, not a VM) a sample cost 0.145 s CPU with
+  the walk vs 0.064 s without.
 - Per-pid I/O folds reaped children into the parent; use cgroup numbers.
-- gate2's bring-up ran after a failed first install on a 47-minute-old VM
-  with cached packages; the first-boot install phase and the aged
-  bring-up/WordPress phase are each real, but one VM never did both
-  back-to-back from a clean boot.
 - Side finding: `install.sh` fails with `string too long` when
   `system:node:<fqdn>` exceeds 64 characters (GCE FQDN is
   `<name>.c.<project>.internal`, so the limit depends on the project id

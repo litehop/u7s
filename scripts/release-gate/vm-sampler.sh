@@ -8,7 +8,8 @@
 #   DISK  <dev> <rd_ios> <rd_sectors> <wr_ios> <wr_sectors> <io_ms>
 #   CG    <cgroup> <usage_usec> <throttled_usec>                    (root, top slices+scopes, system.slice/*, kubepods.slice/*)
 #   CGIO  <cgroup> <rbytes> <wbytes> <rios> <wios>
-#   PROC  <pid> <comm> <cpu_jiffies> <read_bytes> <write_bytes>     (pids with any activity; reaped children's
+#   PROC  <pid> <comm> <cpu_jiffies> <read_bytes> <write_bytes>     (pids with any activity, only every
+#         SAMPLER_PROC_INTERVAL=30 s: the walk reads 2 files per pid; reaped children's
 #         IO is folded into the parent, their CPU is not, so use CG for CPU attribution)
 # <phase> is the current content of $OUT/phase. Pure /proc reads: no kubectl, no forks
 # beyond pgrep and one awk per sample, so the probe stays cheap on a 1 vCPU box.
@@ -16,6 +17,8 @@
 set -u
 OUT="${1:?usage: $0 <out-dir> [interval-secs]}"
 INTERVAL="${2:-5}"
+PROC_INTERVAL="${SAMPLER_PROC_INTERVAL:-30}"
+last_proc=0
 R="${SAMPLER_ROOT:-}"
 
 # component:comm (comm is the kernel's 15-char truncated process name)
@@ -24,11 +27,12 @@ COMPONENTS="apiserver:u7s-apiserver kcm:kube-controller kubelet:kubelet crio:cri
 shopt -s nullglob
 
 sample_attrib() {
-  local ts="$1" phase="$2" cg="$R/sys/fs/cgroup"
+  local ts="$1" phase="$2" with_proc="$3" cg="$R/sys/fs/cgroup" procfiles=()
+  [ "$with_proc" = 1 ] && procfiles=("$R"/proc/[0-9]*/stat "$R"/proc/[0-9]*/io)
   # tail -n +1 prints a "==> file <==" header per file and skips unreadable ones (a pid that exits
   # mid-sample, kernel-thread io); awk would abort on them. [x] globs match only existing files.
   tail -n +1 -- "$R"/proc/pressure/* "$R"/proc/s[t]at "$R"/proc/diskstat[s] \
-    "$R"/proc/[0-9]*/stat "$R"/proc/[0-9]*/io \
+    ${procfiles[@]+"${procfiles[@]}"} \
     "$cg"/[c]pu.stat "$cg"/[i]o.stat "$cg"/*.slice/cpu.stat "$cg"/*.slice/io.stat "$cg"/*.scope/cpu.stat "$cg"/*.scope/io.stat \
     "$cg"/system.slice/*/cpu.stat "$cg"/system.slice/*/io.stat \
     "$cg"/kubepods.slice/*/cpu.stat "$cg"/kubepods.slice/*/*/cpu.stat \
@@ -95,7 +99,8 @@ sample_attrib() {
 while true; do
   ts="$(date +%s)"
   phase="$(cat "$OUT/phase" 2>/dev/null || echo none)"
-  sample_attrib "$ts" "$phase"
+  if [ "$ts" -ge $((last_proc + PROC_INTERVAL)) ]; then with_proc=1; last_proc="$ts"; else with_proc=0; fi
+  sample_attrib "$ts" "$phase" "$with_proc"
   awk -v ts="$ts" -v ph="$phase" '/^MemAvailable:/ {printf "%s\t%s\tMEM\t%s\n", ts, ph, $2}' "$R/proc/meminfo" >> "$OUT/samples.tsv"
   for entry in $COMPONENTS; do
     name="${entry%%:*}"; comm="${entry#*:}"

@@ -469,7 +469,9 @@ printf 'usage_usec 5000000\nthrottled_usec 250\n' > "$SR/sys/fs/cgroup/system.sl
 printf '8:0 rbytes=1000 wbytes=2000 rios=3 wios=4 dbytes=0 dios=0\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/io.stat"
 printf 'usage_usec 900\nthrottled_usec 800\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/cpu.stat"
 printf 'usage_usec 42\nthrottled_usec 0\n' > "$SR/sys/fs/cgroup/init.scope/cpu.stat"
-SAMPLER_ROOT="$SR" SAMPLER_ONCE=1bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
+SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
+SO2="$TMP/sout2"; mkdir -p "$SO2"
+SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 SAMPLER_PROC_INTERVAL=100000000000 bash "$HERE/vm-sampler.sh" "$SO2" 1 >/dev/null 2>&1
 attrib_has() { awk -F'\t' -v w="$1" '{l=$3; for (i=4;i<=NF;i++) l=l "\t" $i; if (l == w && $2 == "wordpress") f=1} END {exit !f}' "$SO/attrib.tsv"; }
 assert "sampler records io PSI total (the 72% io stall was previously only hand-read)" "$(attrib_has "$(printf 'PSI\tio\t123456\t0')" && echo 1 || echo 0)"
 assert "sampler records cpu PSI some and full totals" "$(attrib_has "$(printf 'PSI\tcpu\t7\t5')" && echo 1 || echo 0)"
@@ -481,6 +483,8 @@ assert "sampler attributes IO bytes/ops to each system.slice unit" "$(attrib_has
 assert "sampler attributes CPU to kubepods sub-slices" "$(attrib_has "$(printf 'CG\t/kubepods.slice/kubepods-burstable.slice\t900\t800')" && echo 1 || echo 0)"
 assert "sampler attributes CPU to init.scope (PID 1 work is otherwise missing from the per-cgroup sum)" "$(attrib_has "$(printf 'CG\t/init.scope\t42\t0')" && echo 1 || echo 0)"
 assert "sampler records per-process CPU ticks and read/write bytes with spaces in comm" "$(attrib_has "$(printf 'PROC\t42\tmy proc\t100\t8192\t4096')" && echo 1 || echo 0)"
+assert "per-pid walk is skipped between PROC intervals while PSI still sampled (per-pid cost must not run inside the gate's measured window every 5 s)" \
+  "$(! grep -q "PROC" "$SO2/attrib.tsv" && grep -q "PSI.io" "$SO2/attrib.tsv" && echo 1 || echo 0)"
 assert "sampler still writes MemAvailable to samples.tsv (the gate verdict reads it)" "$(grep -q "MEM.500000" "$SO/samples.tsv" && echo 1 || echo 0)"
 
 # --- burst-gate.sh end to end with stubs ---
