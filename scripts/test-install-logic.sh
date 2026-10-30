@@ -2181,6 +2181,146 @@ assert_true "--mint-join-token prints --cluster-dns for a non-default cluster so
 assert_false "no hardcoded 10.96.0.10 / 10.244.0.0/16 assignment is left outside the defaults block" \
   grep -nE '^\s*(POD_CLUSTER_CIDR|CLUSTER_DNS)="?10\.' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# wait_for_cluster_ready: install must not exit 0 while the node or a
+# kube-system workload it shipped is still pulling images, or the user's first
+# apply competes with those pulls on a small disk. Extracted from install.sh
+# and run against a fake kubectl; sleep is stubbed.
+# ---------------------------------------------------------------------------
+RDY_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK" "$RDY_WORK"' EXIT
+mkdir -p "$RDY_WORK/bin"
+cat > "$RDY_WORK/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+# Models the fields the readiness check reads. Knobs:
+#   FAKE_NODE_READY      node Ready status (default True)
+#   FAKE_READY_AFTER     kube-proxy DaemonSet reports 0 ready for this many
+#                        gets (or "never")
+#   FAKE_COREDNS_OBS     coredns status.observedGeneration (generation is 2);
+#                        counters stay "ready" to model a stale status
+#   FAKE_COREDNS_POD2    Ready status of the second coredns pod
+#   FAKE_COREDNS_POD2_TERMINATING  set => second coredns pod has deletionTimestamp
+#   FAKE_DS_DESIRED      desiredNumberScheduled of the DaemonSets (default 1)
+#   FAKE_ERR             every call fails like an unreachable/NotFound API
+#   FAKE_CALL_SLEEP      every call takes this many real seconds
+# Pods are only returned for the exact selector the object's spec carries, so
+# a check that hard-codes labels sees no pods.
+args="$*"
+[ -n "${FAKE_CALL_SLEEP:-}" ] && sleep "$FAKE_CALL_SLEEP"
+if [ -n "${FAKE_ERR:-}" ]; then echo 'Error from server (NotFound): not found' >&2; exit 1; fi
+sel=""; prev=""
+for a in "$@"; do [ "$prev" = "-l" ] && sel="$a"; prev="$a"; done
+case "$args" in
+  *"get node"*) echo "${FAKE_NODE_READY:-True}" ;;
+  *"get deployment/coredns"*)
+    printf '2|%s|2|2|2|2|True|{"k8s-app":"kube-dns"}' "${FAKE_COREDNS_OBS:-2}" ;;
+  *"get daemonset/"*)
+    name="${args##*get daemonset/}"; name="${name%% *}"
+    d="${FAKE_DS_DESIRED:-1}"; r="$d"
+    if [ "$name" = kube-proxy ]; then
+      n=$(( $(cat "$FAKE_STATE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_STATE"
+      if [ "${FAKE_READY_AFTER:-0}" = never ] || [ "$n" -le "${FAKE_READY_AFTER:-0}" ]; then r=0; fi
+    fi
+    printf '1|1|%s|%s|%s|%s|{"k8s-app":"%s","tier":"node"}' "$d" "$d" "$r" "$r" "$name" ;;
+  *"get pods"*)
+    case "$sel" in
+      "k8s-app=kube-dns")
+        echo "|True"
+        if [ -n "${FAKE_COREDNS_POD2_TERMINATING:-}" ]; then echo "2026-01-01T00:00:00Z|True"; else echo "|${FAKE_COREDNS_POD2:-True}"; fi ;;
+      "k8s-app="*",tier=node") if [ "${FAKE_DS_DESIRED:-1}" -gt 0 ]; then echo "|True"; fi ;;
+    esac ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$RDY_WORK/bin/kubectl"
+{
+  echo 'set -uo pipefail'
+  echo 'STATE_DIR=/nonexistent; NODE_NAME=n1'
+  echo 'sleep() { SECONDS=$(( SECONDS + $1 )); echo "$1" >> "$FAKE_STATE.sleeps"; }'
+  grep -E '^(READY_POLL_SECONDS|READY_PROGRESS_EVERY|READY_DEADLINE)=' "$INSTALL"
+  for fn in ready_kubectl workload_is_ready wait_for_cluster_ready; do
+    awk -v f="$fn() {" '$0 == f {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
+  done
+  echo 'CLUSTER_WORKLOADS="kube-system/deployment/coredns kube-system/daemonset/kube-proxy kube-system/daemonset/servicelb-controller"'
+  echo 'wait_for_cluster_ready'
+} > "$RDY_WORK/scenario.sh"
+rdy_run() {
+  rm -f "$RDY_WORK/state" "$RDY_WORK/state.sleeps"
+  RDY_STATUS=0
+  RDY_OUT="$(PATH="$RDY_WORK/bin:$PATH" FAKE_STATE="$RDY_WORK/state" "$@" bash "$RDY_WORK/scenario.sh" 2>&1)" || RDY_STATUS=$?
+}
+rdy_not_ready() { # $1 = exactly the items that must be named unready
+  [ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF "not Ready after 10s: $1" && echo 1 || echo 0
+}
+assert "the wait scenario was extracted with the real functions (if this fails the wait tests below test nothing)" \
+  "$(grep -q 'workload_is_ready()' "$RDY_WORK/scenario.sh" && grep -q 'ready_kubectl()' "$RDY_WORK/scenario.sh" && grep -q '^READY_POLL_SECONDS=' "$RDY_WORK/scenario.sh" && echo 1 || echo 0)"
+
+rdy_run env FAKE_READY_AFTER=0 U7S_READY_TIMEOUT_SECONDS=600
+assert "everything Ready (counters, generation, selected pods) exits 0 so install may report done" \
+  "$([ "$RDY_STATUS" -eq 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'all vendored workloads are Ready' && echo 1 || echo 0)"
+
+rdy_run env FAKE_READY_AFTER=3 U7S_READY_TIMEOUT_SECONDS=600
+assert "install keeps polling while a workload is not ready and returns 0 only once it is, so a user's first apply never races our image pulls" \
+  "$([ "$RDY_STATUS" -eq 0 ] && [ "$(cat "$RDY_WORK/state")" -eq 4 ] && printf '%s' "$RDY_OUT" | grep -qF 'still waiting' && printf '%s' "$RDY_OUT" | grep -qF 'kube-system/daemonset/kube-proxy' && echo 1 || echo 0)"
+
+rdy_run env FAKE_READY_AFTER=never U7S_READY_TIMEOUT_SECONDS=20
+assert "a workload that never becomes ready fails the install non-zero, naming only it with a describe hint -- no silent success" \
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'not Ready after 20s: kube-system/daemonset/kube-proxy' && printf '%s' "$RDY_OUT" | grep -qF 'describe daemonset/kube-proxy' && ! printf '%s' "$RDY_OUT" | grep -qF 'describe deployment/coredns' && echo 1 || echo 0)"
+assert "the timeout is bounded by the configured seconds (20s at 5s polls = 4 sleeps), not unbounded" \
+  "$([ "$(wc -l < "$RDY_WORK/state.sleeps")" -eq 4 ] && echo 1 || echo 0)"
+
+rdy_run env FAKE_NODE_READY=False U7S_READY_TIMEOUT_SECONDS=10
+assert "a node that is not Ready fails the install even when every workload is ready" \
+  "$([ "$(rdy_not_ready node/n1)" = 1 ] && printf '%s' "$RDY_OUT" | grep -qF 'describe node n1' && echo 1 || echo 0)"
+
+rdy_run env FAKE_COREDNS_OBS=1 U7S_READY_TIMEOUT_SECONDS=10
+assert "stale Deployment status (observedGeneration < generation, counters still 'ready') is not ready: that is the false done after a restart" \
+  "$(rdy_not_ready kube-system/deployment/coredns)"
+
+rdy_run env FAKE_COREDNS_POD2=False U7S_READY_TIMEOUT_SECONDS=10
+assert "counters say ready but a selected pod is Ready=False: not ready, because controller counters lag real pod state" \
+  "$(rdy_not_ready kube-system/deployment/coredns)"
+
+rdy_run env FAKE_COREDNS_POD2_TERMINATING=1 U7S_READY_TIMEOUT_SECONDS=10
+assert "a Terminating pod that still reports Ready is not ready" \
+  "$(rdy_not_ready kube-system/deployment/coredns)"
+
+rdy_run env FAKE_DS_DESIRED=0 U7S_READY_TIMEOUT_SECONDS=10
+assert "a DaemonSet with desiredNumberScheduled=0 is not ready: zero pods trivially match every counter, but nothing runs" \
+  "$(rdy_not_ready 'kube-system/daemonset/kube-proxy kube-system/daemonset/servicelb-controller')"
+
+rdy_run env FAKE_ERR=1 U7S_READY_TIMEOUT_SECONDS=10
+assert "kubectl errors / NotFound on every call are never treated as ready: polling continues, then exit 1 naming every item" \
+  "$(rdy_not_ready 'node/n1 kube-system/deployment/coredns kube-system/daemonset/kube-proxy kube-system/daemonset/servicelb-controller')"
+
+rdy_start=$SECONDS
+rdy_run env FAKE_CALL_SLEEP=2 FAKE_READY_AFTER=never U7S_READY_TIMEOUT_SECONDS=5
+rdy_elapsed=$(( SECONDS - rdy_start ))
+assert "the deadline is wall time checked before every kubectl call: with 2s calls and a 5s bound the wait ends within one call of it (took ${rdy_elapsed}s), not after a full poll's worth of calls" \
+  "$([ "$RDY_STATUS" -ne 0 ] && [ "$rdy_elapsed" -le 8 ] && echo 1 || echo 0)"
+
+rdy_run env U7S_READY_TIMEOUT_SECONDS=abc
+assert "a malformed U7S_READY_TIMEOUT_SECONDS is rejected rather than silently treated as 0" \
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'must be a whole number' && echo 1 || echo 0)"
+
+# Structural: the workload list is what the vendored manifests actually ship,
+# and only the control-plane path waits (a worker's node identity cannot read
+# workloads; its own Ready+serving-cert wait is wait_for_joined_node).
+wl_line="$(grep -F 'CLUSTER_WORKLOADS="kube-system' "$INSTALL")"
+wl_ok=1
+for spec in "coredns.yaml Deployment coredns" "kube-proxy.yaml DaemonSet kube-proxy" "beep.yaml DaemonSet servicelb-controller" "flannel.yaml DaemonSet kube-flannel-ds"; do
+  read -r f k n <<< "$spec"
+  awk -v k="$k" '$0=="kind: " k {s=1} s && /^  name: / {print $2; exit}' "$ROOT_DIR/manifests/$f" | grep -qx "$n" || wl_ok=0
+  printf '%s' "$wl_line" | grep -qF "/$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]')/$n" || wl_ok=0
+done
+assert "CLUSTER_WORKLOADS lists exactly the Deployment/DaemonSets the vendored manifests define (a new or renamed workload must be waited on)" "$wl_ok"
+assert "no vendored manifest defines a Deployment/DaemonSet/StatefulSet beyond the four waited on" \
+  "$([ "$(grep -hE '^kind: (Deployment|DaemonSet|StatefulSet)$' "$ROOT_DIR"/manifests/*.yaml | wc -l)" -eq 4 ] && echo 1 || echo 0)"
+assert "the control-plane install waits after labelling the node, as its last step before reporting success" \
+  "$(awk '/^label_control_plane_node \|\| exit 1$/ {l=NR} /^wait_for_cluster_ready \|\| exit 1$/ {w=NR} /^echo "u7s bootstrap complete/ {b=NR} END {print (l && w>l && b>w) ? 1 : 0}' "$INSTALL")"
+assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
+  "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
