@@ -77,6 +77,79 @@ pub(crate) fn parse_csr_pem(pem: &[u8]) -> Result<CertReq, String> {
     CertReq::from_der(&der).map_err(|e| format!("invalid DER PKCS#10: {e}"))
 }
 
+/// Go's `CertificateRequest.CheckSignature`: verifies the PKCS#10 self-signature over the
+/// request info with the embedded public key. Errors carry Go's text. RSA-PSS and SHA-1
+/// signatures are not supported (Go rejects SHA-1 outright).
+pub(crate) fn check_csr_signature(req: &CertReq) -> Result<(), String> {
+    use aws_lc_rs::signature::{self as sig, VerificationAlgorithm};
+    use x509_cert::der::Encode as _;
+
+    const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+    const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
+    const ED25519: &str = "1.3.101.112";
+    const UNIMPLEMENTED: &str = "x509: cannot verify signature: algorithm unimplemented";
+
+    let sig_oid = req.algorithm.oid.to_string();
+    let spki = &req.info.public_key;
+    let key_oid = spki.algorithm.oid.to_string();
+
+    let (alg, err): (&'static dyn VerificationAlgorithm, &str) =
+        match (key_oid.as_str(), sig_oid.as_str()) {
+            (RSA_ENCRYPTION, "1.2.840.113549.1.1.11") => (
+                &sig::RSA_PKCS1_2048_8192_SHA256,
+                "crypto/rsa: verification error",
+            ),
+            (RSA_ENCRYPTION, "1.2.840.113549.1.1.12") => (
+                &sig::RSA_PKCS1_2048_8192_SHA384,
+                "crypto/rsa: verification error",
+            ),
+            (RSA_ENCRYPTION, "1.2.840.113549.1.1.13") => (
+                &sig::RSA_PKCS1_2048_8192_SHA512,
+                "crypto/rsa: verification error",
+            ),
+            (
+                EC_PUBLIC_KEY,
+                ecdsa_sig @ ("1.2.840.10045.4.3.2" | "1.2.840.10045.4.3.3" | "1.2.840.10045.4.3.4"),
+            ) => {
+                let curve = spki
+                    .algorithm
+                    .parameters
+                    .as_ref()
+                    .and_then(|p| p.decode_as::<x509_cert::der::asn1::ObjectIdentifier>().ok())
+                    .map(|o| o.to_string())
+                    .unwrap_or_default();
+                let alg: &'static dyn VerificationAlgorithm = match (curve.as_str(), ecdsa_sig) {
+                    ("1.2.840.10045.3.1.7", "1.2.840.10045.4.3.2") => &sig::ECDSA_P256_SHA256_ASN1,
+                    ("1.2.840.10045.3.1.7", "1.2.840.10045.4.3.3") => &sig::ECDSA_P256_SHA384_ASN1,
+                    ("1.2.840.10045.3.1.7", _) => &sig::ECDSA_P256_SHA512_ASN1,
+                    ("1.3.132.0.34", "1.2.840.10045.4.3.2") => &sig::ECDSA_P384_SHA256_ASN1,
+                    ("1.3.132.0.34", "1.2.840.10045.4.3.3") => &sig::ECDSA_P384_SHA384_ASN1,
+                    ("1.3.132.0.34", _) => &sig::ECDSA_P384_SHA512_ASN1,
+                    ("1.3.132.0.35", "1.2.840.10045.4.3.2") => &sig::ECDSA_P521_SHA256_ASN1,
+                    ("1.3.132.0.35", "1.2.840.10045.4.3.3") => &sig::ECDSA_P521_SHA384_ASN1,
+                    ("1.3.132.0.35", _) => &sig::ECDSA_P521_SHA512_ASN1,
+                    _ => return Err(UNIMPLEMENTED.into()),
+                };
+                (alg, "x509: ECDSA verification failure")
+            }
+            (ED25519, ED25519) => (&sig::ED25519, "x509: Ed25519 verification failure"),
+            (_, "1.2.840.113549.1.1.5" | "1.2.840.10045.4.1") => {
+                return Err("x509: cannot verify signature: insecure algorithm SHA1".into())
+            }
+            _ => return Err(UNIMPLEMENTED.into()),
+        };
+
+    let message = req.info.to_der().map_err(|e| e.to_string())?;
+    let (Some(key), Some(signature)) =
+        (spki.subject_public_key.as_bytes(), req.signature.as_bytes())
+    else {
+        return Err(err.into());
+    };
+    sig::UnparsedPublicKey::new(alg, key)
+        .verify(&message, signature)
+        .map_err(|_| err.into())
+}
+
 /// Validate spec.request and spec.signerName, returning 422 on any violation.
 ///
 /// Extracted as a pure function so it can be unit-tested without an HTTP stack.
@@ -104,9 +177,15 @@ pub(crate) fn validate_csr_spec(
             Status::unprocessable_entity(format!("spec.request is not valid base64: {e}"))
         })?;
 
-    parse_csr_pem(&pem_bytes).map_err(|e| {
+    let req = parse_csr_pem(&pem_bytes).map_err(|e| {
         Status::unprocessable_entity(format!(
             "spec.request does not contain a valid PEM-encoded PKCS#10 CertificationRequest: {e}"
+        ))
+    })?;
+    check_csr_signature(&req).map_err(|e| {
+        Status::unprocessable_entity(format!(
+            "CertificateSigningRequest.certificates.k8s.io is invalid: spec.request: Invalid value: {:?}: {e}",
+            spec.request
         ))
     })?;
 
@@ -1861,6 +1940,78 @@ mod tests {
             crate::auth::atv_string(&atv.value).unwrap(),
             "system:node:w1"
         );
+    }
+
+    fn signed_csr_pem(cn: &str, key: &rcgen::KeyPair) -> String {
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn.to_string());
+        params.serialize_request(key).unwrap().pem().unwrap()
+    }
+
+    /// `openssl req -new -newkey rsa:2048 -subj /CN=system:node:aaa -sha256`; rcgen cannot
+    /// generate RSA keys with this backend.
+    const RSA_2048_CSR: &str = "-----BEGIN CERTIFICATE REQUEST-----
+MIICXzCCAUcCAQAwGjEYMBYGA1UEAwwPc3lzdGVtOm5vZGU6YWFhMIIBIjANBgkq
+hkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoJVTKJS7+rxkEEXPNrqm9u8man9RV5WT
+DDdE8EvrqIgZUKTjODSflD6+xjPzWv5yN/N3cHeW6PcRQTzfvMyXS8kWpXb6AO0c
+6aU4InMtEZieI5avdrGaQINzPcGdy97WWP1jJei8DFeUtA070fQb3jeKSRcssJhU
+EYqLpyaEWkuHE+LtxHiY5wQop5+yVGq4H3H4XT8l56sWbSQnAeeY5JNF0wHWZPPE
+WlMNy2iLlkMLRiQxKbCKqOKPcNaY/N7vz0kt0HxC10b5eNKGfbjVN9y8cujCjQm5
+akuhd9/k6o+UXpfgYEEjaK0CVlQUBJC5jSR1ObHB1pVUv/dEjqUydwIDAQABoAAw
+DQYJKoZIhvcNAQELBQADggEBADFEduLVXwteRzJ3SNe2WJV7fkmGrH4/FysrU7Si
+v710/gOZxdqpmwMmyI82YxX+6vWfeHS4Nv8wx8/aXW/Km1tS4QxTPWG3aDcZiJ4u
+LzVTYci9xSVsFbMPXnBebY9/VGZckOle2JRgf6gSkHAlZS200qKzb5XbnciOmSMs
+a3Rad9ZG/JeHaFvNJe904AjR/AY6TheEWkmZ712jTAIlDdzMrOS3Z7O/l6T4tXO1
+rAOgUk5Fly7dDCDGKj0xh1y+Dvy0q/iCmAL/OpgMyExJFP3fKl2gHajLraIjXiKW
+jM1qzaNxAp+05IBrgXkfOr8eqwGpH7/ICzhwsSKgc4Z0+d0=
+-----END CERTIFICATE REQUEST-----
+";
+
+    fn csrs_per_algorithm() -> Vec<(&'static str, String)> {
+        let mut out = vec![("rsa-2048", RSA_2048_CSR.to_string())];
+        for (name, alg) in [
+            ("ecdsa-p256", &rcgen::PKCS_ECDSA_P256_SHA256),
+            ("ecdsa-p384", &rcgen::PKCS_ECDSA_P384_SHA384),
+            ("ed25519", &rcgen::PKCS_ED25519),
+        ] {
+            let key = rcgen::KeyPair::generate_for(alg).unwrap();
+            out.push((name, signed_csr_pem("system:node:aaa", &key)));
+        }
+        out
+    }
+
+    fn spec_with(pem: &str) -> serde_json::Value {
+        serde_json::json!({"spec": {"request": b64(pem), "signerName": "x"}})
+    }
+
+    #[test]
+    fn validly_signed_csr_is_accepted_for_every_key_algorithm_so_kubelet_and_kubectl_csrs_still_enroll(
+    ) {
+        for (name, pem) in csrs_per_algorithm() {
+            let body = spec_with(&pem);
+            validate_csr_spec(&body).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn subject_edited_after_signing_is_rejected_for_every_key_algorithm_because_signer_would_issue_an_identity_the_key_holder_never_asked_for(
+    ) {
+        for (name, pem) in csrs_per_algorithm() {
+            let mut der = der_of(&pem);
+            let at = der.windows(3).position(|w| w == b"aaa").unwrap();
+            der[at..at + 3].copy_from_slice(b"bbb");
+            let err = validate_csr_spec(&spec_with(&pem_of_der(&der)))
+                .expect_err(&format!("{name}: tampered subject must be rejected"));
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "{name}");
+            let msg = err.1.message;
+            assert!(msg.contains("spec.request: Invalid value"), "{name}: {msg}");
+            assert!(
+                msg.ends_with("verification error") || msg.ends_with("verification failure"),
+                "{name}: {msg}"
+            );
+        }
     }
 
     #[test]
