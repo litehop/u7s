@@ -168,11 +168,11 @@ if cutover "$GUEST/does-not-exist.tar.gz"; then
 fi
 echo "k3s active after the failed cutover: $(vm systemctl is-active k3s || true)"
 vm sudo test -d /var/lib/rancher/k3s/storage || fail "k3s data dir lost"
-if vm pgrep -f containerd-shim >/dev/null; then fail "k3s containerd-shims survived cutover's k3s-killall"; fi
+if vm pgrep containerd-shim >/dev/null; then fail "k3s containerd-shims survived cutover's k3s cleanup"; fi
 for nic in cni0 flannel.1; do
-  if vm ip link show "$nic" >/dev/null 2>&1; then fail "$nic survived cutover's k3s-killall"; fi
+  if vm ip link show "$nic" >/dev/null 2>&1; then fail "$nic survived cutover's k3s cleanup"; fi
 done
-echo "PASS killall: no containerd-shim processes, cni0 and flannel.1 gone, k3s data dir present"
+echo "PASS k3s cleanup: no containerd-shim processes, cni0 and flannel.1 gone, k3s data dir present"
 vm sudo "$GUEST/u7s" migrate rollback --work-dir "$GUEST/work"
 wait_for 180 "writer ready on k3s after rollback" ready_on k3s
 logs_have k3s || fail "marker not readable after rollback"
