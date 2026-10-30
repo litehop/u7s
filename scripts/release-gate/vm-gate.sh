@@ -19,6 +19,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
+INSTALL_TARBALL=""; INSTALL_ONLY=0
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
 
@@ -143,8 +144,10 @@ fi
 
 phase install
 calibrate_boundary
-log "zero-arg install.sh"
-if ! bash "$RG/install.sh" > "$OUT/install.log" 2>&1; then
+install_args=()
+if [ -n "$INSTALL_TARBALL" ]; then log "install.sh --tarball $INSTALL_TARBALL (experiment)"; install_args=(--tarball "$INSTALL_TARBALL"); else log "zero-arg install.sh"; fi
+install_t0=$SECONDS
+if ! bash "$RG/install.sh" "${install_args[@]}" > "$OUT/install.log" 2>&1; then
   log "install.sh failed (tail of $OUT/install.log):"; tail -20 "$OUT/install.log" | tee -a "$OUT/run.log"
   res install_ok 0; exit 1
 fi
@@ -155,6 +158,8 @@ for _ in $(seq 1 120); do
 done
 if [ "$ready_wait_ok" != 1 ]; then log "node never Ready after install"; res install_ok 0; exit 1; fi
 res install_ok 1
+res install_secs "$((SECONDS - install_t0))"
+if [ "$INSTALL_ONLY" = 1 ]; then log "install-only: stopping after node Ready"; exit 0; fi
 NODE="$(k get nodes -o jsonpath='{.items[0].metadata.name}')"
 rm -f "$RG"/u7s-gate-*.tar.gz*
 

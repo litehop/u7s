@@ -35,7 +35,7 @@
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
 # A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
 #
-# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
+# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 50); the verdict names it
@@ -62,6 +62,12 @@
 #   --backend B       lima (default; local arm64 VM) or gcp (needs --release; rejects --memory and
 #                     --tarball-dir)
 #   --release TAG     gcp only: mirror release to install, e.g. v0.4.1-snapshot.1
+#   --tarball PATH    gcp only, EXPERIMENT mode, exclusive with --release and --confirm: install an
+#                     unpublished x86_64 tarball built by build-experiment-tarball.sh (its
+#                     install.sh and .source file must sit beside it) with install.sh --tarball.
+#                     The output dir, run dirs, verdicts, summaries and backend.txt all say
+#                     EXPERIMENT plus the source ref/sha, and the run is never release-authoritative.
+#   --install-only    experiment only: stop after install + node Ready (no WordPress, no bursts)
 # Requires: lima: limactl (vz), cargo-zigbuild + zig (unless --tarball-dir); gcp: the u7s-gcp
 # gcloud configuration and scripts/gcp/setup.sh run once. Both: network access.
 set -uo pipefail
@@ -72,7 +78,7 @@ COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
 BURST_CAP_SECS=300
-BACKEND=lima; RELEASE=""
+BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
 MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
 RG_RETRY_WAIT_SECS="${RG_RETRY_WAIT_SECS:-300}"
@@ -95,6 +101,8 @@ while [ $# -gt 0 ]; do
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
     --release) RELEASE="$2"; shift 2 ;;
+    --tarball) EXP_TARBALL="$2"; shift 2 ;;
+    --install-only) INSTALL_ONLY=1; shift ;;
     --out) OUT="$2"; shift 2 ;;
     -h|--help) sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -117,11 +125,20 @@ esac
 # shellcheck source=backend.sh
 . "$HERE/backend.sh"
 
+exp_err="$(rg_experiment_args_error "$BACKEND" "$RELEASE" "$EXP_TARBALL" "$CONFIRM" "$INSTALL_ONLY")"
+[ -z "$exp_err" ] || { echo "$exp_err" >&2; exit 2; }
+if [ -n "$EXP_TARBALL" ]; then
+  [ -f "$EXP_TARBALL" ] && [ -f "$EXP_TARBALL.source" ] && [ -f "$(dirname "$EXP_TARBALL")/install.sh" ] \
+    || { echo "--tarball needs the output of build-experiment-tarball.sh (tarball, <tarball>.source and install.sh side by side): $EXP_TARBALL" >&2; exit 2; }
+  EXP_TAG="$(rg_experiment_tag "$EXP_TARBALL.source")" \
+    || { echo "$EXP_TARBALL.source does not name a ref and a full sha" >&2; exit 2; }
+fi
+
 case "$BACKEND" in
   lima)
     [ -z "$RELEASE" ] || { echo "--release is only for --backend gcp (lima builds the tarball from this checkout)" >&2; exit 2; } ;;
   gcp)
-    [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "--backend gcp needs --release <tag> (e.g. v0.4.1-snapshot.1), got '$RELEASE'" >&2; exit 2; }
+    [ -n "$EXP_TARBALL" ] || [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "--backend gcp needs --release <tag> (e.g. v0.4.1-snapshot.1), got '$RELEASE'" >&2; exit 2; }
     [ -z "$MEMORY" ] || { echo "--memory is not supported with --backend gcp (the e2-micro is fixed at 1 GiB)" >&2; exit 2; }
     [ -z "$TARBALL_DIR" ] || { echo "--tarball-dir is not supported with --backend gcp (the release is installed from the mirror)" >&2; exit 2; }
     # shellcheck source=../gcp/lib.sh
@@ -145,8 +162,11 @@ if [ -n "$RAMP" ]; then
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${OUT:-$PWD/temp/release-gate/$STAMP}"
+OUT_PREFIX=""; RUN_PREFIX=run
+[ -z "$EXP_TAG" ] || { OUT_PREFIX="EXPERIMENT-"; RUN_PREFIX=EXPERIMENT-run; }
+OUT="${OUT:-$PWD/temp/release-gate/$OUT_PREFIX$STAMP}"
 mkdir -p "$OUT"
+[ -z "$EXP_TAG" ] || echo "$EXP_TAG" > "$OUT/EXPERIMENT.txt"
 VMS=""
 cleanup() {
   [ "$KEEP" = 1 ] && return
@@ -190,9 +210,14 @@ mkdir -p "$STAGE/wordpress"
 if [ "$BACKEND" = lima ]; then
   cp "$TARBALL_DIR"/u7s-gate-*.tar.gz "$TARBALL_DIR"/u7s-gate-*.tar.gz.sha256 "$TARBALL_DIR/install.sh" "$STAGE/"
 fi
+INSTALL_TARBALL=""
+if [ -n "$EXP_TARBALL" ]; then
+  cp "$EXP_TARBALL" "$(dirname "$EXP_TARBALL")/install.sh" "$STAGE/"
+  INSTALL_TARBALL="/var/tmp/rg/$(basename "$EXP_TARBALL")"
+fi
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\n' \
-  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" "$INSTALL_TARBALL" "$INSTALL_ONLY" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -227,7 +252,8 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   # certificate CN is "system:node:<hostname>" and openssl rejects a CN over 64 characters, so
   # the gcp name stays short.
   if [ "$BACKEND" = gcp ]; then VM="u7s-rg-${STAMP:4:2}${STAMP:6:2}${STAMP:9:6}-$attempt"; else VM="u7s-rg-$STAMP-$attempt"; fi
-  RUN_OUT="$OUT/run-$attempt"; mkdir -p "$RUN_OUT"
+  RUN_OUT="$OUT/$RUN_PREFIX-$attempt"; mkdir -p "$RUN_OUT"
+  [ -z "$EXP_TAG" ] || echo "$EXP_TAG"
   echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid, preempted $preempted, cap $MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
   status=""
@@ -257,7 +283,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       [ -e "$f" ] && stage_files+=("$f")
     done
     vm_copy_to "$VM" /var/tmp/rg "${stage_files[@]}" || echo "warning: could not copy the gate scripts to $VM" >&2
-    if [ "$BACKEND" = gcp ]; then
+    if [ "$BACKEND" = gcp ] && [ -z "$EXP_TARBALL" ]; then
       vm_shell "$VM" curl -fsSL "https://u7s.dekiru.tech/$RELEASE/install.sh" -o /var/tmp/rg/install.sh \
         || echo "warning: could not fetch install.sh for $RELEASE from the mirror" >&2
     fi
@@ -296,11 +322,18 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
   if [ -z "$status" ]; then
     echo "---- attempt $attempt verdict ----"
-    if [ -n "$RAMP" ]; then
+    if [ "$INSTALL_ONLY" = 1 ]; then
+      if [ "$(rg_get "$RUN_OUT/out/results.env" install_ok)" = 1 ]; then
+        echo "RESULT: PASS (install and node Ready only; no bursts ran)" > "$RUN_OUT/verdict.txt"; rc=0
+      else
+        echo "RESULT: FAIL (install or node Ready; no bursts ran)" > "$RUN_OUT/verdict.txt"; rc=1
+      fi
+    elif [ -n "$RAMP" ]; then
       rg_ramp_verdict "$RUN_OUT/out/results.env" "$RAMP_SIZES" "$RUN_OUT/out/samples.tsv" > "$RUN_OUT/verdict.txt"; rc=$?
     else
       rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
     fi
+    [ -z "$EXP_TAG" ] || { { echo "$EXP_TAG"; cat "$RUN_OUT/verdict.txt"; } > "$RUN_OUT/verdict.tmp"; mv "$RUN_OUT/verdict.tmp" "$RUN_OUT/verdict.txt"; }
     cat "$RUN_OUT/verdict.txt"
     status="$(rg_run_status "$rc" "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env")"
     if [ "$status" != INVALID ] && [ "$HOG_MIB" -gt 0 ]; then
@@ -332,7 +365,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
-  [ -s "$RUN_OUT/out/samples.tsv" ] && "$HERE/summarize.sh" "$RUN_OUT/out" | tee "$RUN_OUT/summary.md"
+  [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out"; } | tee "$RUN_OUT/summary.md"
   [ "$KEEP" = 1 ] || { vm_delete "$VM" && VMS="${VMS/ $VM/}"; }
 done
 
@@ -342,7 +375,10 @@ if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
 elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED (only $valid/$RUNS valid runs; $preempted preempted, $invalid invalid)"; rc=3
 elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
 else verdict=PASS; rc=0; fi
-if [ "$BACKEND" = gcp ]; then
+if [ -n "$EXP_TAG" ]; then
+  echo "backend=gcp experiment=yes machine=e2-micro arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
+  verdict="EXPERIMENT $verdict [$EXP_TAG]"
+elif [ "$BACKEND" = gcp ]; then
   echo "backend=gcp release=$RELEASE machine=e2-micro arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
   verdict="$verdict [release-authoritative: x86_64 GCP e2-micro Spot, mirror release $RELEASE]"
 fi

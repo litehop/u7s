@@ -521,3 +521,25 @@ rg_confirm_verdict() {
   echo "CONFIRM: FAIL -- no size passed on every run; no gated no-swap ceiling"
   return 1
 }
+
+# Experiment mode (burst-gate.sh --backend gcp --tarball): an unpublished tarball, never a release.
+# Echoes why the flag combination is refused, or nothing. $1 backend, $2 --release, $3 --tarball,
+# $4 --confirm (0|1), $5 --install-only (0|1).
+rg_experiment_args_error() {
+  if [ -n "$3" ] && [ -n "$2" ]; then echo "--tarball and --release are mutually exclusive (an experiment installs an unpublished tarball, a release run installs from the mirror)"
+  elif [ -n "$3" ] && [ "$1" != gcp ]; then echo "--tarball is only for --backend gcp (lima builds its own tarball; use --tarball-dir)"
+  elif [ -n "$3" ] && [ "$4" = 1 ]; then echo "--confirm is the release gate and refuses an EXPERIMENT (unpublished tarball) run"
+  elif [ -z "$3" ] && [ "$5" = 1 ]; then echo "--install-only is only for an experiment (--tarball)"
+  fi
+}
+
+# One-line EXPERIMENT tag from a build-experiment-tarball.sh ".source" file ($1); non-zero if the
+# file does not name a ref and sha (an experiment must say what it ran).
+rg_experiment_tag() {
+  local src ref sha
+  src="$(cat "$1" 2>/dev/null)" || return 1
+  ref="$(echo "$src" | sed -n 's/^ref=\([^ ]*\) sha=.*/\1/p')"
+  sha="$(echo "$src" | sed -n 's/^ref=[^ ]* sha=\([0-9a-f]\{40\}\)$/\1/p')"
+  [ -n "$ref" ] && [ -n "$sha" ] || return 1
+  echo "EXPERIMENT (unpublished tarball, ref=$ref sha=${sha:0:12}; NOT a release verdict)"
+}
