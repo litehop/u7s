@@ -469,6 +469,9 @@ printf 'usage_usec 5000000\nthrottled_usec 250\n' > "$SR/sys/fs/cgroup/system.sl
 printf '8:0 rbytes=1000 wbytes=2000 rios=3 wios=4 dbytes=0 dios=0\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/io.stat"
 printf 'usage_usec 900\nthrottled_usec 800\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/cpu.stat"
 printf 'usage_usec 42\nthrottled_usec 0\n' > "$SR/sys/fs/cgroup/init.scope/cpu.stat"
+printf 'pgfault 9\npgmajfault 77\nworkingset_refault_file 1234\nworkingset_refault_anon 55\npgscan_kswapd 600\npgscan_direct 70\npgsteal_kswapd 500\npgsteal_direct 60\nworkingset_refault 1289\n' > "$SR/proc/vmstat"
+echo 123456789 > "$SR/sys/fs/cgroup/system.slice/snapd.service/memory.current"
+echo 987654321 > "$SR/sys/fs/cgroup/kubepods.slice/memory.current"
 SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
 SO2="$TMP/sout2"; mkdir -p "$SO2"
 SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 SAMPLER_PROC_INTERVAL=100000000000 bash "$HERE/vm-sampler.sh" "$SO2" 1 >/dev/null 2>&1
@@ -485,6 +488,12 @@ assert "sampler attributes CPU to init.scope (PID 1 work is otherwise missing fr
 assert "sampler records per-process CPU ticks and read/write bytes with spaces in comm" "$(attrib_has "$(printf 'PROC\t42\tmy proc\t100\t8192\t4096')" && echo 1 || echo 0)"
 assert "per-pid walk is skipped between PROC intervals while PSI still sampled (per-pid cost must not run inside the gate's measured window every 5 s)" \
   "$(! grep -q "PROC" "$SO2/attrib.tsv" && grep -q "PSI.io" "$SO2/attrib.tsv" && echo 1 || echo 0)"
+assert "sampler records file/anon refault counters (the only way to tell page-cache thrash from pull I/O)" \
+  "$(attrib_has "$(printf 'VM\tworkingset_refault_file\t1234')" && attrib_has "$(printf 'VM\tworkingset_refault_anon\t55')" && echo 1 || echo 0)"
+assert "sampler records pgmajfault and pgscan/pgsteal per reclaimer but not unrelated vmstat counters" \
+  "$(attrib_has "$(printf 'VM\tpgmajfault\t77')" && attrib_has "$(printf 'VM\tpgscan_direct\t70')" && attrib_has "$(printf 'VM\tpgsteal_kswapd\t500')" && ! grep -qE 'VM.(pgfault|workingset_refault)	' "$SO/attrib.tsv" && echo 1 || echo 0)"
+assert "sampler records memory.current of system.slice units and kubepods.slice (who holds the memory)" \
+  "$(attrib_has "$(printf 'CGMEM\t/system.slice/snapd.service\t123456789')" && attrib_has "$(printf 'CGMEM\t/kubepods.slice\t987654321')" && echo 1 || echo 0)"
 assert "sampler still writes MemAvailable to samples.tsv (the gate verdict reads it)" "$(grep -q "MEM.500000" "$SO/samples.tsv" && echo 1 || echo 0)"
 
 # --- burst-gate.sh end to end with stubs ---

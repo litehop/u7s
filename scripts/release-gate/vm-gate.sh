@@ -143,6 +143,8 @@ fi
 
 phase install
 calibrate_boundary
+bash "$RG/vm-sampler.sh" "$OUT" 5 &
+SAMPLER_PID=$!
 log "zero-arg install.sh"
 if ! bash "$RG/install.sh" > "$OUT/install.log" 2>&1; then
   log "install.sh failed (tail of $OUT/install.log):"; tail -20 "$OUT/install.log" | tee -a "$OUT/run.log"
@@ -176,8 +178,6 @@ WATCH_T0="$(date +%s)"
     sleep 5
   done ) &
 WATCH_PID=$!
-bash "$RG/vm-sampler.sh" "$OUT" 5 &
-SAMPLER_PID=$!
 CAPTURE_PID=""
 [ "$CAPTURE" = 1 ] && { bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 5 & CAPTURE_PID=$!; }
 stop_bg() {
