@@ -625,5 +625,42 @@ assert "the wall-clock watchdog kills the ssh client under the redaction pipe, s
   "$([ -n "$hang_pid" ] && [ "$alive" = 0 ] && [ "$gate_ended" = 1 ] && grep -q 'wall-clock cap 2s hit' "$TMP/out-ghang.out" && echo 1 || echo 0)"
 unset GCLOUD_SSH_OK
 
+# --- experiment mode: an unpublished tarball must never be mistaken for a release verdict ---
+XP="$TMP/xp"; mkdir -p "$XP"
+SHA40=0123456789abcdef0123456789abcdef01234567
+: > "$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz"; echo '#!/bin/sh' > "$XP/install.sh"
+echo "ref=origin/main sha=$SHA40" > "$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz.source"
+XT="$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz"
+xp_gate() { # out-dir, extra args...; sets rc
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/$1"
+  rc=0; "$HERE/burst-gate.sh" "${@:2}" --out "$TMP/$1" >"$TMP/$1.out" 2>&1 || rc=$?
+}
+for bad in "--backend gcp --tarball $XT --release v1.0.0" "--backend lima --tarball $XT" "--backend gcp --tarball $XT --confirm" \
+           "--backend gcp --tarball $TMP/missing.tar.gz" "--backend gcp --install-only --release v1.0.0"; do
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rc=0
+  # shellcheck disable=SC2086
+  "$HERE/burst-gate.sh" $bad --out "$TMP/out-xbad" >/dev/null 2>&1 || rc=$?
+  assert "'${bad//$TMP/<tmp>}' rejected with exit 2 before any VM exists (an experiment must not blur into the release gate or bill a VM)" \
+    "$([ "$rc" = 2 ] && ! grep -q 'instances create' "$GCLOUD_CALLS" && echo 1 || echo 0)"
+done
+echo "ref=origin/main sha=short" > "$XP/bad.tar.gz.source"; : > "$XP/bad.tar.gz"
+xp_gate out-xnosha --backend gcp --tarball "$XP/bad.tar.gz"
+assert "a tarball whose .source lacks a full sha is refused (an experiment must say exactly what it ran)" \
+  "$([ "$rc" = 2 ] && ! grep -q 'instances create' "$GCLOUD_CALLS" && echo 1 || echo 0)"
+export GCLOUD_SSH_OK=1 GCLOUD_RESULTS="$TMP/good.env"
+xp_gate out-xpass --backend gcp --tarball "$XT" --runs 1
+assert "experiment run installs the uploaded tarball and install.sh, not the mirror (the point is to test unpublished code)" \
+  "$(grep -q 'compute scp.*u7s-gate-experiment-0123456789ab-x86_64.tar.gz' "$GCLOUD_CALLS" && ! grep -q 'u7s.dekiru.tech' "$GCLOUD_CALLS" && grep -q '^INSTALL_TARBALL=/var/tmp/rg/u7s-gate-experiment-0123456789ab-x86_64.tar.gz$' "$TMP/out-xpass/stage/gate.env" && echo 1 || echo 0)"
+assert "every experiment artefact carries EXPERIMENT and the sha: out dir, run dir, verdict file, backend.txt, GATE line" \
+  "$([ -f "$TMP/out-xpass/EXPERIMENT.txt" ] && [ -d "$TMP/out-xpass/EXPERIMENT-run-1" ] && head -1 "$TMP/out-xpass/EXPERIMENT-run-1/verdict.txt" | grep -q '^EXPERIMENT .*sha=0123456789ab' && grep -q 'experiment=yes' "$TMP/out-xpass/backend.txt" && grep -q '^==== GATE: .*EXPERIMENT PASS' "$TMP/out-xpass.out" && echo 1 || echo 0)"
+assert "an experiment is never release-authoritative, even when it passes" \
+  "$(grep -q 'release-authoritative=no' "$TMP/out-xpass/backend.txt" && ! grep -q 'release-authoritative=yes\|release-authoritative: ' "$TMP/out-xpass/backend.txt" "$TMP/out-xpass.out" && echo 1 || echo 0)"
+xp_gate out-xdefault --backend gcp --tarball "$XT" --runs 1 --install-only
+assert "--install-only reaches the VM and an install-only experiment is judged on install alone (the smoke must not need bursts)" \
+  "$(grep -q '^INSTALL_ONLY=1$' "$TMP/out-xdefault/stage/gate.env" && [ "$rc" = 0 ] && grep -q 'install and node Ready only' "$TMP/out-xdefault/EXPERIMENT-run-1/verdict.txt" && echo 1 || echo 0)"
+unset GCLOUD_SSH_OK GCLOUD_RESULTS
+assert "release path unchanged: gate.env of a --release run installs zero-arg (no INSTALL_TARBALL)" \
+  "$(grep -q '^INSTALL_TARBALL=$' "$TMP/out-gpass/stage/gate.env" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
