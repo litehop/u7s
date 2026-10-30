@@ -116,22 +116,31 @@ spec:
             runAsNonRoot: true
             runAsUser: 999
             runAsGroup: 999
+          # healthcheck.sh logs in as the image-created `healthcheck` user (credentials in
+          # /var/lib/mysql/.my-healthcheck.cnf, written once first init finishes), so a server
+          # whose init was cut short never reports healthy. startupProbe budget: 90 x 10 s = 15 min
+          # for a cold small disk, where image init + first start takes 2-5 min.
+          startupProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 90
           readinessProbe:
             exec:
-              command: ["/bin/bash", "-ec", "mariadb-admin ping -uroot -p\"${MARIADB_ROOT_PASSWORD:-}\""]
-            initialDelaySeconds: 30
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 5
             successThreshold: 1
             failureThreshold: 3
           livenessProbe:
             exec:
-              command: ["/bin/bash", "-ec", "mariadb-admin status -uroot -p\"${MARIADB_ROOT_PASSWORD:-}\""]
-            initialDelaySeconds: 120
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
             periodSeconds: 10
-            timeoutSeconds: 1
+            timeoutSeconds: 5
             successThreshold: 1
-            failureThreshold: 3
+            failureThreshold: 6
           volumeMounts:
             - name: data
               mountPath: /var/lib/mysql
