@@ -283,6 +283,71 @@ pub(crate) fn walk_schema_dos_bounds(
     }
 }
 
+/// Mirrors the `additionalProperties`/`properties` exclusivity rule in upstream
+/// `ValidateCustomResourceDefinitionOpenAPISchema` (only `additionalProperties: true` may
+/// coexist with `properties`), recursing into the same sub-schema positions upstream does.
+pub(crate) fn check_properties_additional_properties_exclusive(
+    node: &serde_json::Value,
+    path: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(map) = node.as_object() else {
+        return Ok(());
+    };
+    let has_properties = map
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .is_some_and(|p| !p.is_empty());
+    if let Some(ap) = map.get("additionalProperties") {
+        if has_properties && *ap != serde_json::Value::Bool(true) {
+            return Err(Status::unprocessable_entity(format!(
+                "{path}.additionalProperties: Forbidden: additionalProperties and properties are mutual exclusive"
+            )));
+        }
+        check_properties_additional_properties_exclusive(
+            ap,
+            &format!("{path}.additionalProperties"),
+        )?;
+    }
+    for key in ["properties", "definitions", "dependencies"] {
+        if let Some(children) = map.get(key).and_then(|v| v.as_object()) {
+            for (name, child) in children {
+                check_properties_additional_properties_exclusive(
+                    child,
+                    &format!("{path}.{key}[{name}]"),
+                )?;
+            }
+        }
+    }
+    if let Some(not) = map.get("not") {
+        check_properties_additional_properties_exclusive(not, &format!("{path}.not"))?;
+    }
+    for key in ["allOf", "oneOf", "anyOf"] {
+        if let Some(children) = map.get(key).and_then(|v| v.as_array()) {
+            for (i, child) in children.iter().enumerate() {
+                check_properties_additional_properties_exclusive(
+                    child,
+                    &format!("{path}.{key}[{i}]"),
+                )?;
+            }
+        }
+    }
+    match map.get("items") {
+        Some(serde_json::Value::Array(items)) => {
+            for (i, child) in items.iter().enumerate() {
+                check_properties_additional_properties_exclusive(
+                    child,
+                    &format!("{path}.items[{i}]"),
+                )?;
+            }
+        }
+        Some(items) => {
+            check_properties_additional_properties_exclusive(items, &format!("{path}.items"))?;
+        }
+        None => {}
+    }
+    Ok(())
+}
+
 /// Mirrors apiextensions `ValidateCustomResourceColumnDefinition`: name, type and jsonPath are
 /// required, type and format must be from the supported sets, and jsonPath must parse.
 fn validate_additional_printer_columns(
@@ -371,6 +436,7 @@ fn validate_crd_schema(
         };
         let path = format!("spec.versions[{}].schema.openAPIV3Schema", version.name);
         walk_schema_dos_bounds(schema, &path)?;
+        check_properties_additional_properties_exclusive(schema, &path)?;
         let ratchet = crate::handlers::cel_rules::Ratchet {
             preexisting: stored.map(|_| &preexisting),
         };
@@ -4797,6 +4863,149 @@ mod tests {
                 .contains("patternProperties is not supported"),
             "error must echo upstream's exact wording so K8s clients parse it identically: {json}"
         );
+    }
+
+    const AP_PROPS_MSG: &str = "additionalProperties and properties are mutual exclusive";
+
+    fn ap_and_props() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "a": { "type": "string" } },
+            "additionalProperties": { "type": "string" }
+        })
+    }
+
+    fn exclusive_err(schema: serde_json::Value) -> String {
+        check_properties_additional_properties_exclusive(&schema, "S")
+            .expect_err("must be rejected")
+            .1
+            .message
+    }
+
+    /// A CRD upstream refuses must not install here: besides portability, a CEL rule on the
+    /// additionalProperties value schema is skipped for keys also listed in properties.
+    #[test]
+    fn properties_with_additional_properties_rejected_at_every_schema_position_with_upstream_text()
+    {
+        assert_eq!(
+            exclusive_err(ap_and_props()),
+            format!("S.additionalProperties: Forbidden: {AP_PROPS_MSG}")
+        );
+        let wrap = |k: &str, v: serde_json::Value| serde_json::json!({ k: v });
+        let cases = [
+            (
+                serde_json::json!({ "properties": { "n": ap_and_props() } }),
+                "S.properties[n].additionalProperties",
+            ),
+            (
+                wrap("items", ap_and_props()),
+                "S.items.additionalProperties",
+            ),
+            (
+                wrap("items", serde_json::json!([ap_and_props()])),
+                "S.items[0].additionalProperties",
+            ),
+            (
+                wrap("additionalProperties", ap_and_props()),
+                "S.additionalProperties.additionalProperties",
+            ),
+            (wrap("not", ap_and_props()), "S.not.additionalProperties"),
+            (
+                wrap("allOf", serde_json::json!([{}, ap_and_props()])),
+                "S.allOf[1].additionalProperties",
+            ),
+            (
+                wrap("anyOf", serde_json::json!([ap_and_props()])),
+                "S.anyOf[0].additionalProperties",
+            ),
+            (
+                wrap("oneOf", serde_json::json!([ap_and_props()])),
+                "S.oneOf[0].additionalProperties",
+            ),
+        ];
+        for (schema, path) in cases {
+            assert_eq!(
+                exclusive_err(schema),
+                format!("{path}: Forbidden: {AP_PROPS_MSG}")
+            );
+        }
+    }
+
+    /// Upstream only forbids a schema or `false` next to properties; `true` is legal and
+    /// widely used, and empty `properties` does not count.
+    #[test]
+    fn additional_properties_true_or_empty_properties_remain_accepted() {
+        for schema in [
+            serde_json::json!({ "properties": { "a": {} }, "additionalProperties": true }),
+            serde_json::json!({ "properties": {}, "additionalProperties": { "type": "string" } }),
+            serde_json::json!({ "additionalProperties": false }),
+            serde_json::json!({ "default": { "properties": { "a": 1 }, "additionalProperties": 1 } }),
+        ] {
+            check_properties_additional_properties_exclusive(&schema, "S")
+                .expect("valid shape must be accepted");
+        }
+        assert!(
+            check_properties_additional_properties_exclusive(
+                &serde_json::json!({ "properties": { "a": {} }, "additionalProperties": false }),
+                "S"
+            )
+            .is_err(),
+            "additionalProperties:false next to properties is rejected upstream"
+        );
+    }
+
+    /// Every version's schema is checked, not just the first, on create.
+    #[tokio::test]
+    async fn create_crd_rejects_properties_with_additional_properties_in_second_version() {
+        let versions = serde_json::json!([
+            { "name": "v1", "served": true, "storage": true,
+              "schema": { "openAPIV3Schema": { "type": "object" } } },
+            { "name": "v2", "served": true, "storage": false,
+              "schema": { "openAPIV3Schema": { "type": "object",
+                  "properties": { "spec": ap_and_props() } } } }
+        ]);
+        let body = crd_with_versions("applications.argoproj.io", versions, None);
+        let err =
+            err_status(create_crd(State(make_state()), test_user(), HeaderMap::new(), body).await);
+        assert_eq!(err.1.code, 422);
+        assert!(
+            err.1.message.contains(&format!(
+                "spec.versions[v2].schema.openAPIV3Schema.properties[spec].additionalProperties: Forbidden: {AP_PROPS_MSG}"
+            )),
+            "{}",
+            err.1.message
+        );
+    }
+
+    /// Upstream does not ratchet this rule, so an update introducing the shape is refused.
+    #[tokio::test]
+    async fn replace_crd_rejects_introducing_properties_with_additional_properties() {
+        let state = make_state();
+        let name = "applications.argoproj.io";
+        let ver = |schema: serde_json::Value| {
+            serde_json::json!([{ "name": "v1", "served": true, "storage": true,
+                "schema": { "openAPIV3Schema": schema } }])
+        };
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            crd_with_versions(name, ver(serde_json::json!({ "type": "object" })), None),
+        )
+        .await
+        .expect("create");
+        let err = err_status(
+            replace_crd(
+                State(state),
+                Path(name.to_string()),
+                test_user(),
+                HeaderMap::new(),
+                crd_with_versions(name, ver(ap_and_props()), None),
+            )
+            .await,
+        );
+        assert_eq!(err.1.code, 422);
+        assert!(err.1.message.contains(AP_PROPS_MSG), "{}", err.1.message);
     }
 
     /// A rule naming a property the schema never declared can never hold; accepting the
