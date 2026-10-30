@@ -3438,6 +3438,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "criterion",
+ "der",
  "dhat",
  "futures-core",
  "futures-util",
