@@ -405,11 +405,44 @@ impl<'a> Checker<'a, '_> {
         let depth = self.scope.len();
         self.scope.push((names[0].clone(), key));
         self.scope.push((names[1].clone(), value));
-        for a in &call.args[2..] {
-            self.check(a);
-        }
+        let body_tys: Vec<Ty<'a>> = call.args[2..].iter().map(|a| self.check(a)).collect();
         self.scope.truncate(depth);
-        match call.func_name.as_str() {
+        let name = call.func_name.as_str();
+        let rest = &call.args[2..];
+        let not_bool = |t: Ty| t.name().is_some() && !matches!(t, Ty::Bool);
+        let has_predicate =
+            matches!(name, "all" | "exists" | "exists_one" | "existsOne") || rest.len() == 2;
+        if has_predicate && not_bool(body_tys[0]) {
+            let found = body_tys[0].name().unwrap_or("dyn");
+            let applied = match name {
+                "all" => format!("_&&_' applied to '(bool, {found})"),
+                "exists" => format!("_||_' applied to '(bool, {found})"),
+                "exists_one" | "existsOne" => format!("_?_:_' applied to '({found}, int, int)"),
+                "transformList" => {
+                    format!("_?_:_' applied to '({found}, list(dyn), list(dyn))")
+                }
+                _ => format!("_?_:_' applied to '({found}, map(dyn, dyn), map(dyn, dyn))"),
+            };
+            self.error(
+                rest[0].id,
+                format!("found no matching overload for '{applied}'"),
+            );
+            return Ty::Dyn;
+        }
+        if name == "transformMapEntry" {
+            let body = body_tys[body_tys.len() - 1];
+            if let Some(found) = body.name().filter(|_| !matches!(body, Ty::Map(_))) {
+                self.error(
+                    rest[rest.len() - 1].id,
+                    format!(
+                        "found no matching overload for 'cel.@mapInsert' applied to \
+                         '(map(dyn, dyn), {found})'"
+                    ),
+                );
+                return Ty::Dyn;
+            }
+        }
+        match name {
             "transformList" => Ty::List(&OPAQUE),
             "transformMap" | "transformMapEntry" => Ty::Map(&OPAQUE),
             _ => Ty::Bool,
@@ -493,6 +526,8 @@ impl<'a> Checker<'a, '_> {
                                     "found no matching overload for '_+_' applied to '({an}, {bn})'"
                                 ),
                             );
+                        } else {
+                            return *a;
                         }
                     }
                 }
@@ -1143,6 +1178,29 @@ mod tests {
         }
         check_two_var("self.l.transformList(i, v, v) + [1]").expect("list + list");
         check_two_var("self.l.transformMap(i, v, v).size() == 1").expect("map result");
+    }
+
+    #[test]
+    fn two_var_predicates_and_entry_bodies_are_typed_so_a_write_cannot_hit_a_type_error() {
+        for (rule, overload) in [
+            ("self.l.all(i, v, v + 1)", "'_&&_'"),
+            ("self.l.exists(i, v, v + 1)", "'_||_'"),
+            ("self.l.existsOne(i, v, v + 1)", "'_?_:_'"),
+            ("self.l.transformList(i, v, v + 1, v)", "'_?_:_'"),
+            ("self.m.transformMap(k, v, v, k)", "'_?_:_'"),
+            ("self.m.transformMapEntry(k, v, v)", "'cel.@mapInsert'"),
+            ("self.m.transformMapEntry(k, v, k, {k: v})", "'_?_:_'"),
+        ] {
+            let err = check_two_var(rule).expect_err(rule);
+            assert!(
+                err.contains(&format!("found no matching overload for {overload}")),
+                "{rule}: {err}"
+            );
+        }
+        check_two_var(
+            "self.l.all(i, v, v + 1 > 0) && self.m.transformMapEntry(k, v, {k: v}).size() > 0",
+        )
+        .expect("bool predicate and map body");
     }
 
     fn nested_list_rule(max: Option<u64>, rule: &str) -> J {

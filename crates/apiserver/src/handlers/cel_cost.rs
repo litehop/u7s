@@ -187,6 +187,20 @@ impl<'a> Node<'a> {
 
 type Ctx<'c, 'p> = Option<&'c cel::Context<'p, 'static>>;
 
+/// Evaluates `expr` the way the executor does: two-variable macro calls inside it are
+/// lowered first, since the interpreter cannot resolve them as written. Without this a
+/// replayed loop whose range, predicate or step holds such a call would fail to resolve
+/// and be billed as if it never short-circuited.
+fn resolve_lowered(
+    ctx: &cel::Context<'_, 'static>,
+    expr: &IdedExpr,
+) -> Result<cel::Value, cel::ExecutionError> {
+    match crate::handlers::cel_rules::lower_two_var_macros(expr) {
+        Some(lowered) => ctx.resolve(&lowered),
+        None => ctx.resolve(expr),
+    }
+}
+
 static NULL: J = J::Null;
 
 /// One pass of a comprehension: the key (or index) and element it visits, as sizes and,
@@ -247,7 +261,7 @@ fn passes<'a>(
             }
             _ => None,
         },
-        _ => match live?.resolve(expr).ok()? {
+        _ => match resolve_lowered(live?, expr).ok()? {
             cel::Value::List(l) => Some((
                 l.iter()
                     .enumerate()
@@ -514,7 +528,7 @@ impl<'a> Coster<'a> {
                 if self.is_cancelled() {
                     return Some(self.limit.saturating_add(1));
                 }
-                operands.push(operand_of_value(&ctx.resolve(expr).ok()?, deep));
+                operands.push(operand_of_value(&resolve_lowered(ctx, expr).ok()?, deep));
             }
         } else {
             if let Some(target) = &call.target {
@@ -584,7 +598,7 @@ impl<'a> Coster<'a> {
                     if head > self.limit {
                         return (head, Node::Unknown);
                     }
-                    let head_value = ctx.resolve(&call.args[0]).ok();
+                    let head_value = resolve_lowered(ctx, &call.args[0]).ok();
                     let branch = match (func, head_value) {
                         (operators::LOGICAL_AND, Some(cel::Value::Bool(false)))
                         | (operators::LOGICAL_OR, Some(cel::Value::Bool(true))) => {
@@ -663,7 +677,7 @@ impl<'a> Coster<'a> {
                 }
                 let depth = self.scope.len();
                 self.scope.push((c.accu_var.clone(), Node::Unknown));
-                let mut accu = ctx.and_then(|ctx| ctx.resolve(&c.accu_init).ok());
+                let mut accu = ctx.and_then(|ctx| resolve_lowered(ctx, &c.accu_init).ok());
                 // `map` and `filter` loop unconditionally and nothing in them reads the
                 // accumulator, so only a conditional loop (`all`, `exists`) needs it tracked.
                 let track_accu = !matches!(c.loop_cond.expr, Expr::Literal(_));
@@ -714,7 +728,10 @@ impl<'a> Coster<'a> {
                             }
                             if track_accu
                                 && pass_ctx.is_some_and(|ctx| {
-                                    !matches!(ctx.resolve(&c.loop_cond), Ok(cel::Value::Bool(true)))
+                                    !matches!(
+                                        resolve_lowered(ctx, &c.loop_cond),
+                                        Ok(cel::Value::Bool(true))
+                                    )
                                 })
                             {
                                 break;
@@ -727,7 +744,7 @@ impl<'a> Coster<'a> {
                             }
                             if track_accu {
                                 if let Some(next) =
-                                    pass_ctx.and_then(|ctx| ctx.resolve(&c.loop_step).ok())
+                                    pass_ctx.and_then(|ctx| resolve_lowered(ctx, &c.loop_step).ok())
                                 {
                                     accu = Some(next);
                                 }

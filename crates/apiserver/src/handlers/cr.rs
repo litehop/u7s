@@ -2207,7 +2207,7 @@ fn cel_map_insert(
     let mut map = (*base.map).clone();
     let mut insert = |key: cel::objects::Key, value: V| match map.entry(key) {
         std::collections::hash_map::Entry::Occupied(o) => Err(err(format!(
-            "insert failed: key '{:?}' already exists",
+            "insert failed: key '{}' already exists",
             o.key()
         ))),
         std::collections::hash_map::Entry::Vacant(v) => {
@@ -13621,6 +13621,61 @@ mod tests {
         );
     }
 
+    /// Replaying a two-variable macro must bill what its one-variable twin bills, short-circuits
+    /// included; a chained or nested one that fell back to the static bound would reject writes
+    /// upstream's runtime cost accepts.
+    #[test]
+    fn replay_of_two_var_macros_short_circuits_and_chains_like_the_one_var_twin() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "l": { "type": "array", "maxItems": 100000, "items": { "type": "integer" } }
+            }
+        });
+        let data = serde_json::json!({ "l": (1..=2000).collect::<Vec<_>>() });
+        let replay = |rule: &str| {
+            let program = cel::Program::compile(rule).unwrap();
+            let mut ctx = cel::Context::default();
+            register_cel_extensions(&mut ctx);
+            ctx.add_variable_from_value("self", json_to_cel_value(&schema, &data).unwrap());
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &data,
+                schema: Some(&schema),
+            };
+            crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx))
+        };
+        let pairs = [
+            (
+                "self.l.all(i, v, v < 0 && self.l.exists(j, w, w > 0))",
+                "self.l.all(v, v < 0 && self.l.exists(w, w > 0))",
+            ),
+            (
+                "self.l.exists(i, v, v > 0 || self.l.all(j, w, w > 0))",
+                "self.l.exists(v, v > 0 || self.l.all(w, w > 0))",
+            ),
+            (
+                "self.l.transformList(i, v, v).all(j, w, w < 0)",
+                "self.l.map(v, v).all(w, w < 0)",
+            ),
+            (
+                "self.l.transformList(i, v, v).transformList(j, w, w).all(x, x < 0)",
+                "self.l.map(v, v).map(w, w).all(x, x < 0)",
+            ),
+        ];
+        for (two, one) in pairs {
+            let two_cost = replay(two);
+            assert_eq!(
+                two_cost,
+                replay(one),
+                "{two}: replay must bill like its one-variable twin"
+            );
+            assert!(
+                two_cost < crate::handlers::cel_cost::CALL_COST_LIMIT,
+                "{two}: an early exit must not be billed as a full scan: {two_cost}"
+            );
+        }
+    }
+
     const SLOW: std::time::Duration = std::time::Duration::from_nanos(1);
 
     fn slow_quadratic_schema_and_obj(items: usize) -> (serde_json::Value, serde_json::Value) {
@@ -14755,7 +14810,54 @@ mod tests {
                 &bad_l,
             ),
         ];
-        for (rule, good, bad) in cases {
+        let both = serde_json::json!({ "m": { "a": 1, "b": 2 }, "l": [1, 2] });
+        let bad_both = serde_json::json!({ "m": { "a": 0 }, "l": [7, 8] });
+        let zero_m = serde_json::json!({ "m": { "a": 0, "b": 2 } });
+        let zero_l = serde_json::json!({ "l": [0] });
+        let chains = [
+            (
+                "self.m.transformMapEntry(k, v, {k: v}).all(k2, v2, v2 > 0)",
+                &good_m,
+                &zero_m,
+            ),
+            (
+                "self.m.transformList(k, v, v * 2).all(x, x > 1)",
+                &good_m,
+                &zero_m,
+            ),
+            (
+                "self.l.transformMap(i, v, v * 2).exists(x, x == 2)",
+                &good_l,
+                &bad_l,
+            ),
+            ("self.l.map(x, x * 2).all(i, v, v > i)", &good_l, &zero_l),
+            (
+                "self.l.all(x, self.m.exists(k, v, v == x))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.m.all(k, v, self.l.exists(x, x == v))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.m.exists(k, v, self.l.existsOne(i, w, w == v))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.l.exists(i, v, v == 1 || self.m.all(k, w, w > 0))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.l.transformMapEntry(i, v, {v: i}).all(k, w, w >= 0 && k > 0)",
+                &good_l,
+                &zero_l,
+            ),
+        ];
+        for (rule, good, bad) in cases.into_iter().chain(chains) {
             let schema = schema(rule);
             crate::handlers::cel_rules::compile_rule(rule, &schema, true)
                 .unwrap_or_else(|e| panic!("{rule}: rejected at create: {e}"));
@@ -14768,6 +14870,25 @@ mod tests {
                 err.1.message
             );
         }
+    }
+
+    #[test]
+    fn transform_map_entry_duplicate_key_error_names_the_key_like_cel_go() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "m": { "type": "object", "maxProperties": 10,
+                                   "additionalProperties": { "type": "integer" } } },
+            "x-kubernetes-validations": [{
+                "rule": "self.m.transformMapEntry(k, v, {'x': v}).size() > 0"
+            }]
+        });
+        let err = check_schema(&serde_json::json!({ "m": { "a": 1, "b": 2 } }), schema)
+            .expect_err("two entries map to the same key");
+        assert!(
+            err.1.message.contains("key 'x' already exists"),
+            "kubectl users read this error: {}",
+            err.1.message
+        );
     }
 
     // A different shape of 2-variable comprehension than the Gateway fixture above:
