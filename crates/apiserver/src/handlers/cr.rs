@@ -1701,7 +1701,12 @@ fn execute_cel_with_budget(
     (gate, crd): (&'static ConcurrencyGate, &str),
 ) -> Result<Result<cel::Value, cel::ExecutionError>, CelEvalOverBudget> {
     let program = std::sync::Arc::clone(program);
-    run_within_budget(budget, (gate, crd), move || program.execute(&cel_ctx))
+    run_within_budget(budget, (gate, crd), move || {
+        match crate::handlers::cel_rules::lower_two_var_macros(program.expression()) {
+            Some(lowered) => cel_ctx.resolve(&lowered),
+            None => program.execute(&cel_ctx),
+        }
+    })
 }
 
 /// Runs `work` on a dedicated thread under the same wall-clock and concurrency bounds as
@@ -2155,6 +2160,78 @@ pub(crate) fn register_cel_extensions(ctx: &mut cel::Context) {
         .expect("list extension name must not collide with a cel builtin");
     ctx.add_function("max", cel_max)
         .expect("list extension name must not collide with a cel builtin");
+    ctx.add_function("@pairs", cel_pairs)
+        .expect("internal name must not collide with a cel builtin");
+    ctx.add_function("@mapInsert", cel_map_insert)
+        .expect("internal name must not collide with a cel builtin");
+}
+
+/// `[[key-or-index, value], ...]` of a list or map: what a lowered two-variable macro
+/// iterates, since the `cel` interpreter's comprehensions have a single loop variable.
+fn cel_pairs(
+    cel::extractors::Arguments(args): cel::extractors::Arguments,
+) -> Result<cel::Value, cel::ExecutionError> {
+    use cel::Value as V;
+    let pair = |k: V, v: V| V::List(std::sync::Arc::new(vec![k, v]));
+    let pairs: Vec<V> = match args.first() {
+        Some(V::List(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, v)| pair(V::Int(i as i64), v.clone()))
+            .collect(),
+        Some(V::Map(m)) => m
+            .map
+            .iter()
+            .map(|(k, v)| pair(k.into(), v.clone()))
+            .collect(),
+        _ => {
+            return Err(cel::ExecutionError::function_error(
+                "transformMap",
+                "range must be a list or a map",
+            ))
+        }
+    };
+    Ok(V::List(std::sync::Arc::new(pairs)))
+}
+
+/// cel-go `cel.@mapInsert`: `(map, key, value)` or `(map, map)`; a key already present is
+/// an error, like upstream's `transformMap`/`transformMapEntry` accumulation.
+fn cel_map_insert(
+    cel::extractors::Arguments(args): cel::extractors::Arguments,
+) -> Result<cel::Value, cel::ExecutionError> {
+    use cel::Value as V;
+    let err = |m: String| cel::ExecutionError::function_error("cel.@mapInsert", m);
+    let Some(V::Map(base)) = args.first() else {
+        return Err(err("accumulator is not a map".into()));
+    };
+    let mut map = (*base.map).clone();
+    let mut insert = |key: cel::objects::Key, value: V| match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(o) => Err(err(format!(
+            "insert failed: key '{}' already exists",
+            o.key()
+        ))),
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(value);
+            Ok(())
+        }
+    };
+    match args.as_slice() {
+        [_, key, value] => insert(
+            key.clone()
+                .try_into()
+                .map_err(|_| err("unsupported map key type".into()))?,
+            value.clone(),
+        )?,
+        [_, V::Map(update)] => {
+            for (k, v) in update.map.iter() {
+                insert(k.clone(), v.clone())?;
+            }
+        }
+        _ => return Err(err("expected a key and a value, or a map".into())),
+    }
+    Ok(V::Map(cel::objects::Map {
+        map: std::sync::Arc::new(map),
+    }))
 }
 
 fn cel_list_receiver(
@@ -13544,6 +13621,61 @@ mod tests {
         );
     }
 
+    /// Replaying a two-variable macro must bill what its one-variable twin bills, short-circuits
+    /// included; a chained or nested one that fell back to the static bound would reject writes
+    /// upstream's runtime cost accepts.
+    #[test]
+    fn replay_of_two_var_macros_short_circuits_and_chains_like_the_one_var_twin() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "l": { "type": "array", "maxItems": 100000, "items": { "type": "integer" } }
+            }
+        });
+        let data = serde_json::json!({ "l": (1..=2000).collect::<Vec<_>>() });
+        let replay = |rule: &str| {
+            let program = cel::Program::compile(rule).unwrap();
+            let mut ctx = cel::Context::default();
+            register_cel_extensions(&mut ctx);
+            ctx.add_variable_from_value("self", json_to_cel_value(&schema, &data).unwrap());
+            let node = crate::handlers::cel_cost::Node::Data {
+                value: &data,
+                schema: Some(&schema),
+            };
+            crate::handlers::cel_cost::estimate(&program, node, None, Some(&ctx))
+        };
+        let pairs = [
+            (
+                "self.l.all(i, v, v < 0 && self.l.exists(j, w, w > 0))",
+                "self.l.all(v, v < 0 && self.l.exists(w, w > 0))",
+            ),
+            (
+                "self.l.exists(i, v, v > 0 || self.l.all(j, w, w > 0))",
+                "self.l.exists(v, v > 0 || self.l.all(w, w > 0))",
+            ),
+            (
+                "self.l.transformList(i, v, v).all(j, w, w < 0)",
+                "self.l.map(v, v).all(w, w < 0)",
+            ),
+            (
+                "self.l.transformList(i, v, v).transformList(j, w, w).all(x, x < 0)",
+                "self.l.map(v, v).map(w, w).all(x, x < 0)",
+            ),
+        ];
+        for (two, one) in pairs {
+            let two_cost = replay(two);
+            assert_eq!(
+                two_cost,
+                replay(one),
+                "{two}: replay must bill like its one-variable twin"
+            );
+            assert!(
+                two_cost < crate::handlers::cel_cost::CALL_COST_LIMIT,
+                "{two}: an early exit must not be billed as a full scan: {two_cost}"
+            );
+        }
+    }
+
     const SLOW: std::time::Duration = std::time::Duration::from_nanos(1);
 
     fn slow_quadratic_schema_and_obj(items: usize) -> (serde_json::Value, serde_json::Value) {
@@ -14581,6 +14713,180 @@ mod tests {
         assert!(
             err.1.message.contains("listener names must be unique"),
             "duplicate listener names must be rejected (got: {})",
+            err.1.message
+        );
+    }
+
+    // Every two-variable macro form the CRD checker accepts must also evaluate on a real
+    // object, otherwise a CRD is created whose every CR write fails.
+    #[test]
+    fn every_two_variable_macro_form_accepted_at_create_evaluates_on_a_cr() {
+        let schema = |rule: &str| {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "m": { "type": "object", "maxProperties": 10,
+                           "additionalProperties": { "type": "integer" } },
+                    "l": { "type": "array", "maxItems": 10, "items": { "type": "integer" } }
+                },
+                "x-kubernetes-validations": [{ "rule": rule, "message": "rule failed" }]
+            })
+        };
+        let good_m = serde_json::json!({ "m": { "a": 1, "b": 2 } });
+        let bad_m = serde_json::json!({ "m": { "a": 1 } });
+        let good_l = serde_json::json!({ "l": [1, 2, 3] });
+        let bad_l = serde_json::json!({ "l": [1] });
+        let cases = [
+            (
+                "self.m.all(k, v, v > 0)",
+                &good_m,
+                &serde_json::json!({ "m": { "a": 0 } }),
+            ),
+            ("self.m.exists(k, v, v == 2)", &good_m, &bad_m),
+            ("self.m.existsOne(k, v, v == 2)", &good_m, &bad_m),
+            ("self.m.exists_one(k, v, v == 2)", &good_m, &bad_m),
+            ("self.m.transformList(k, v, v).size() == 2", &good_m, &bad_m),
+            (
+                "self.m.transformList(k, v, v > 1, k).size() == 1",
+                &good_m,
+                &bad_m,
+            ),
+            (
+                "self.m.transformMap(k, v, v + 1).size() == 2",
+                &good_m,
+                &bad_m,
+            ),
+            (
+                "self.m.transformMap(k, v, v > 1, v).size() == 1",
+                &good_m,
+                &bad_m,
+            ),
+            (
+                "self.m.transformMapEntry(k, v, {k: v}).size() == 2",
+                &good_m,
+                &bad_m,
+            ),
+            (
+                "self.m.transformMapEntry(k, v, v > 1, {k: v}).size() == 1",
+                &good_m,
+                &bad_m,
+            ),
+            (
+                "self.l.all(i, v, i < v)",
+                &good_l,
+                &serde_json::json!({ "l": [0] }),
+            ),
+            ("self.l.exists(i, v, v == 3)", &good_l, &bad_l),
+            ("self.l.existsOne(i, v, v == 3)", &good_l, &bad_l),
+            ("self.l.exists_one(i, v, v == 3)", &good_l, &bad_l),
+            (
+                "self.l.transformList(i, v, i + v).size() == 3",
+                &good_l,
+                &bad_l,
+            ),
+            (
+                "self.l.transformList(i, v, v > 1, v).size() == 2",
+                &good_l,
+                &bad_l,
+            ),
+            (
+                "self.l.transformMap(i, v, v * 2).size() == 3",
+                &good_l,
+                &bad_l,
+            ),
+            (
+                "self.l.transformMap(i, v, v > 1, v).size() == 2",
+                &good_l,
+                &bad_l,
+            ),
+            (
+                "self.l.transformMapEntry(i, v, {v: i}).size() == 3",
+                &good_l,
+                &bad_l,
+            ),
+            (
+                "self.l.transformMapEntry(i, v, v > 1, {v: i}).size() == 2",
+                &good_l,
+                &bad_l,
+            ),
+        ];
+        let both = serde_json::json!({ "m": { "a": 1, "b": 2 }, "l": [1, 2] });
+        let bad_both = serde_json::json!({ "m": { "a": 0 }, "l": [7, 8] });
+        let zero_m = serde_json::json!({ "m": { "a": 0, "b": 2 } });
+        let zero_l = serde_json::json!({ "l": [0] });
+        let chains = [
+            (
+                "self.m.transformMapEntry(k, v, {k: v}).all(k2, v2, v2 > 0)",
+                &good_m,
+                &zero_m,
+            ),
+            (
+                "self.m.transformList(k, v, v * 2).all(x, x > 1)",
+                &good_m,
+                &zero_m,
+            ),
+            (
+                "self.l.transformMap(i, v, v * 2).exists(x, x == 2)",
+                &good_l,
+                &bad_l,
+            ),
+            ("self.l.map(x, x * 2).all(i, v, v > i)", &good_l, &zero_l),
+            (
+                "self.l.all(x, self.m.exists(k, v, v == x))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.m.all(k, v, self.l.exists(x, x == v))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.m.exists(k, v, self.l.existsOne(i, w, w == v))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.l.exists(i, v, v == 1 || self.m.all(k, w, w > 0))",
+                &both,
+                &bad_both,
+            ),
+            (
+                "self.l.transformMapEntry(i, v, {v: i}).all(k, w, w >= 0 && k > 0)",
+                &good_l,
+                &zero_l,
+            ),
+        ];
+        for (rule, good, bad) in cases.into_iter().chain(chains) {
+            let schema = schema(rule);
+            crate::handlers::cel_rules::compile_rule(rule, &schema, true)
+                .unwrap_or_else(|e| panic!("{rule}: rejected at create: {e}"));
+            check_schema(good, schema.clone())
+                .unwrap_or_else(|e| panic!("{rule}: accepted at create but fails on a CR: {e:?}"));
+            let err = check_schema(bad, schema).expect_err(rule);
+            assert!(
+                err.1.message.contains("rule failed"),
+                "{rule}: must fail by the rule, not a runtime error: {}",
+                err.1.message
+            );
+        }
+    }
+
+    #[test]
+    fn transform_map_entry_duplicate_key_error_names_the_key_like_cel_go() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "m": { "type": "object", "maxProperties": 10,
+                                   "additionalProperties": { "type": "integer" } } },
+            "x-kubernetes-validations": [{
+                "rule": "self.m.transformMapEntry(k, v, {'x': v}).size() > 0"
+            }]
+        });
+        let err = check_schema(&serde_json::json!({ "m": { "a": 1, "b": 2 } }), schema)
+            .expect_err("two entries map to the same key");
+        assert!(
+            err.1.message.contains("key 'x' already exists"),
+            "kubectl users read this error: {}",
             err.1.message
         );
     }
