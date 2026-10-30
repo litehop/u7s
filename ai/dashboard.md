@@ -1,45 +1,42 @@
 ---
-updated: 2026-10-25T08:50Z
+updated: 2026-10-30T10:25Z
 ---
-# Dashboard — session 2026-10-25 WRAPPED (main `34d22662`)
-**Stance:** pre-alpha; correctness (Conformance first) > security > perf > features; match upstream; queue merge on green, never `--admin`.
-**Priorities:** bd memory `priorities-2026-10-24-release-after-h6h2v` (release not urgent) → `te4sn` → security/Conformance P2s. TLS deferral lifted: bd memory `tls-deferral-lifted-2026-10-25`.
-**Resume:** `claude --settings .claude/settings.json`; paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. No workers, VMs or VPSes running.
+# Dashboard — session 2026-10-30 WRAPPED (main `5553cf03`)
+**Stance:** pre-alpha, no existing users; Conformance correctness > security > perf > features; match upstream 1.37.1 except secure defaults for weak crypto (never hand-roll it); queue merge on green, never `--admin`.
+**Resume:** `claude --settings .claude/settings.json`; paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. Read `ai/extended-context/` (release-gate, dual-stack, L7). No workers, VMs or GCP VMs running.
 
 ## 🎯 Waiting on you
-- **`vw7jc`** gate FAILs (d) on real e2-micro: mariadb first-init race. Pick 3 robust workload (mayor rec) / 2 gate waits + pre-pull / 1 `pd-balanced`. See `ai/extended-context/cert-rotation-and-release-gate-state.md`.
-- **L7** (epic `s82zr`): adopt Traefik + built-in ACME? Phases 5-8; DNS name + LE email; 80/443 VPC rule. See `ai/extended-context/networking-l7-ingress-state.md`.
-- Stance/priorities not re-confirmed this session.
+- **`yfca9` MariaDB first init on cold GCP disk** — gate still FAILs (d): entrypoint's temp-server wait expires on pd-standard. A config only: lift CPU limit + small-node InnoDB init settings (mayor rec) / B marker-gated init recovery / C both. Blocks `vw7jc` and the `i4bvb` burst A/B.
 
-## 🚦 Queued at wrap
-#2019 this bookkeeping.
+## 📝 Decided 2026-10-30
+- Gate: no pre-pull/sequencing; pd-standard stays; snapshot cuts and publish approval are operator-only.
+- Memory: protect control-plane units (`i4bvb`, #2039 draft); size ~160Mi/~136Mi pending burst A/B.
+- Crypto: aws-lc-rs only, RSA ≥ 2048. L7: Traefik; TLS later via cert-manager. CSR chain kept (ADR).
+- Dual-stack epic `8w6at`: GCP subnet `u7s-test` now IPV4_IPV6 (one-way); beep work in beep tracker.
 
 ## ⏭ First dispatches
-1. `lqu0h` P2 (defaulting/CEL skip map values — security-relevant) · `hkufk` · `jqdf9` · `ddhlo`.
-2. **`te4sn.4`** migration cutover — VM `k3s-migrate-src`; brief in bead notes.
-3. Security P2s: `6i5b7` · `qap3i.55` · `0c8uw` · `qap3i.54` · `xdw6u.17` · `1xpj7.3` · `qm68h` · `qap3i.35`.
-4. `qh7ko` (hygiene never reaps PR-less merged branches; hit twice) · `1tb5u` · `z018t` · `n07ul` · ops `i3n1g` `6t0u2` `pkh20` `vny2h` `0suei` `zy4j1` `yp00d`. Parked `31bz8`. `fgxnm` needs operator.
-
-## ✅ Merged 2026-10-25
-#2018 extended-context (release-gate + L7 state) · #2017 `fvh8w` **P1** CR map data kept by pruning · #2016 `jhtep`+`mqb79` CRD discovery + printer columns · #2015 `n88nk` CEL `has()` cost · #2013 · #2012 · #2011. Also `v0.4.2-snapshot.1`; `s82zr.1`, `g7cts` closed.
+1. `yfca9` once decided → GCP gate run → `i4bvb` A/B with bursts (alternate arms, experiment mode).
+2. Dual-stack: `8w6at.7` manifests · `8w6at.13` worker v6 forwarding · `rv1aw` · #2045 verify on a workers-a pair (not lima-node-5: `0k4i8`).
+3. P2 follow-ons: `jb3ly` PriorityClass parity · `8atzp` CI feature tests · `okr7g` node CSR without openssl.
 
 ## 🔎 Open PRs
+#2039 (draft, `i4bvb`) · #2045 (draft, `8w6at.11`) · #2030 Renovate.
+
+## ✅ Merged 2026-10-30 (25)
+#2050 wrap docs · #2047 `8w6at.6` · #2049 `4qoe5` · #2048 `3h794` · #2046 `vnmcw` · #2044 `0jw45` · #2043 `kbpw7` · #2042 `xpftc` · #2041 `086v6` · #2040 `8w6at.5` · #2038 `luxwl` · #2037 `8w6at.3` · #2036 `8w6at.4` · #2035 `qap3i.55` · #2034 `csud5` · #2033 `4r9zh` · #2032 `uaasp` · #2031 `hkufk` · #2029 `te4sn.4` · #2028 `lrqbx` · #2027 `lqu0h` · #2026 `0c8uw` · #2025 `qm68h` · #2024 `6i5b7`+`1tb5u` · #2023 `02f1s`
+
 <!-- BEGIN AUTO: open-prs -->
-- #2019 (queued)
+#2039 · #2045 · #2030
 <!-- END AUTO: open-prs -->
-## 🌲 Worktrees / hygiene
 <!-- BEGIN AUTO: worktrees -->
-- `temp/review-scratch/wrap-1025` (#2019); reap after merge.
+Two kept for draft PRs (#2039, #2045).
 <!-- END AUTO: worktrees -->
-## 🔁 Cron loops
 <!-- BEGIN AUTO: cron-loops -->
 Stopped at wrap.
 <!-- END AUTO: cron-loops -->
-## Repo state
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-10-25T08:50Z — `main` @ `34d22662`.
+`main` @ `5553cf03`.
 <!-- END AUTO: repo-state -->
-## 📋 Review queue
 <!-- BEGIN AUTO: review-queue -->
 0 pending.
 <!-- END AUTO: review-queue -->
