@@ -144,14 +144,10 @@ pub struct Listing {
 
 impl Source {
     pub fn connect(kubeconfig: &str) -> anyhow::Result<Self> {
-        let creds = politeia::parse_kubeconfig(kubeconfig)?;
-        let connector = politeia::build_tls_connector(&creds)?;
+        // Presents the whole client certificate chain: u7s admin leaves are
+        // signed by an intermediate the apiserver does not trust directly.
         Ok(Self {
-            client: HyperApiClient {
-                server: creds.server,
-                connector: connector.into(),
-                bearer: None,
-            },
+            client: politeia::kubeconfig_client_with_reload(kubeconfig, None)?,
         })
     }
 
@@ -221,19 +217,25 @@ impl Source {
     }
 
     async fn list(&self, t: &ResourceType) -> anyhow::Result<Vec<Value>> {
+        let mut items = self.list_path(&t.base_path()).await?;
+        for item in &mut items {
+            item["apiVersion"] = t.api_version().into();
+            item["kind"] = t.kind.clone().into();
+        }
+        Ok(items)
+    }
+
+    /// Every item under the collection path `base`, paginated.
+    pub(crate) async fn list_path(&self, base: &str) -> anyhow::Result<Vec<Value>> {
         let mut out = vec![];
         let mut cont = String::new();
         loop {
-            let mut path = format!("{}?limit={PAGE}", t.base_path());
+            let mut path = format!("{base}?limit={PAGE}");
             if !cont.is_empty() {
                 path.push_str(&format!("&continue={}", encode(&cont)));
             }
             let mut page = self.get(&path).await?;
-            for mut item in page["items"].take().as_array().cloned().unwrap_or_default() {
-                item["apiVersion"] = t.api_version().into();
-                item["kind"] = t.kind.clone().into();
-                out.push(item);
-            }
+            out.extend(page["items"].take().as_array().cloned().unwrap_or_default());
             cont = page["metadata"]["continue"]
                 .as_str()
                 .unwrap_or_default()
@@ -283,7 +285,9 @@ mod tests {
              contexts:\n- name: c\n  context: {cluster: c, user: u}\n",
         )
         .unwrap();
-        Source::connect(kc.to_str().unwrap()).map(|_| ()).expect(
+        let connected = Source::connect(kc.to_str().unwrap()).map(|_| ());
+        let _ = std::fs::remove_dir_all(&dir);
+        connected.expect(
             "k3s/kubeadm kubeconfigs reference cert files by path; migrate must accept them",
         );
     }
