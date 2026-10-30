@@ -262,7 +262,7 @@ fn kubelet_endpoint_url(
             "invalid path segment '{s}': may not be '.' or '..'"
         )));
     }
-    let mut url = reqwest::Url::parse(&format!("{scheme}://{host}:{port}/"))
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{}/", host_port(host, port)))
         .map_err(|e| Status::internal(format!("invalid kubelet address '{host}': {e}")))?;
     url.path_segments_mut()
         .map_err(|()| Status::internal("kubelet URL cannot carry a path".into()))?
@@ -2335,7 +2335,11 @@ pub async fn resolve_node_proxy_target<S: Store>(
             state,
             kubelet_verify_name(&node, preferred_address(state)).as_deref(),
         )?;
-        let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
+        let kubelet_url = format!(
+            "https://{}/{}",
+            host_port(&node_ip, kp),
+            encode_proxy_tail(path_suffix)?
+        );
         return Ok((kubelet_url, client));
     }
     if scheme_req.is_empty() {
@@ -2347,10 +2351,9 @@ pub async fn resolve_node_proxy_target<S: Store>(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Status::service_unavailable(format!("proxy client unavailable: {e}")))?;
-    let host = if node_ip.contains(':') {
-        format!("[{node_ip}]")
-    } else {
-        node_ip
+    let host = match node_ip.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => format!("[{v6}]"),
+        Err(_) => node_ip,
     };
     let url = format!(
         "{scheme_req}://{host}:{port_req}/{}",
@@ -2556,31 +2559,34 @@ fn validate_proxy_target_ip(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns true iff `ip` is a well-formed IPv4 address contained in the well-formed IPv4
-/// CIDR `cidr`. Any parse failure (malformed CIDR, non-IPv4 `ip`, prefix > 32) returns
-/// false — fail closed, since this only gates the podIP-in-podCIDR SSRF allowlist below.
-fn ipv4_in_cidr(ip: &str, cidr: &str) -> bool {
+/// Returns true iff `ip` is a well-formed address contained in the well-formed CIDR `cidr`
+/// of the same family. Any parse failure (malformed CIDR, family mismatch, prefix beyond the
+/// family width) returns false — fail closed, since this only gates the podIP-in-podCIDR
+/// SSRF allowlist below.
+fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
     let Some((net_str, prefix_str)) = cidr.split_once('/') else {
         return false;
     };
-    let Ok(net) = net_str.parse::<std::net::Ipv4Addr>() else {
+    let (Ok(net), Ok(prefix), Ok(addr)) = (
+        net_str.parse::<std::net::IpAddr>(),
+        prefix_str.parse::<u8>(),
+        ip.parse::<std::net::IpAddr>(),
+    ) else {
         return false;
     };
-    let Ok(prefix) = prefix_str.parse::<u32>() else {
-        return false;
-    };
-    if prefix > 32 {
+    if prefix > if net.is_ipv4() { 32 } else { 128 } {
         return false;
     }
-    let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else {
-        return false;
-    };
-    let mask: u32 = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    (u32::from(addr) & mask) == (u32::from(net) & mask)
+    crate::csr_approver::cidr_contains(net, prefix, addr)
+}
+
+/// `host:port` authority for URLs, Host headers and CONNECT lines; IPv6 literals are
+/// bracketed, DNS names and IPv4 pass through.
+fn host_port(host: &str, port: u16) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => format!("[{v6}]:{port}"),
+        Err(_) => format!("{host}:{port}"),
+    }
 }
 
 /// CIDR-membership allowlist for a pod's `status.podIP`, composed on top of
@@ -2656,12 +2662,21 @@ async fn validate_pod_ip_against_node<S: Store>(
     // out pod IPs independently of it. The CIDR-membership allowlist activates
     // automatically the moment a real per-node podCIDR is assigned; until then this
     // check is a no-op rather than an outage for every real pod's proxy subresource.
-    match node["spec"]["podCIDR"].as_str().filter(|s| !s.is_empty()) {
-        Some(pod_cidr) if ipv4_in_cidr(pod_ip, pod_cidr) => Ok(()),
-        Some(pod_cidr) => Err(format!(
-            "pod IP is not within node \"{node_name}\"'s podCIDR {pod_cidr}"
-        )),
-        None => Ok(()),
+    let pod_cidrs: Vec<&str> = node["spec"]["podCIDRs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain([&node["spec"]["podCIDR"]])
+        .filter_map(|c| c.as_str())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if pod_cidrs.is_empty() || pod_cidrs.iter().any(|c| ip_in_cidr(pod_ip, c)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pod IP is not within node \"{node_name}\"'s podCIDRs {}",
+            pod_cidrs.join(",")
+        ))
     }
 }
 
@@ -2809,6 +2824,10 @@ async fn pod_proxy_via_connect_tunnel(
         let h = parts
             .next()
             .ok_or_else(|| format!("invalid konnectivity addr (no host): {konnectivity_addr}"))?;
+        let h = h
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h);
         (h.to_owned(), p)
     };
 
@@ -2818,7 +2837,7 @@ async fn pod_proxy_via_connect_tunnel(
     let connector = TlsConnector::from(tls_config);
 
     // 3. Open a TCP connection to konnectivity-server.
-    let tcp = TcpStream::connect(format!("{kconn_host}:{kconn_port}"))
+    let tcp = TcpStream::connect((kconn_host.as_str(), kconn_port))
         .await
         .map_err(|e| format!("konnectivity TCP connect: {e}"))?;
 
@@ -2832,7 +2851,8 @@ async fn pod_proxy_via_connect_tunnel(
 
     // 4. Send HTTP CONNECT to ask konnectivity to tunnel to pod_ip:port.
     //    konnectivity-server (proxy-agent v0.35.0) accepts CONNECT only.
-    let connect_req = format!("CONNECT {pod_ip}:{port} HTTP/1.1\r\nHost: {pod_ip}:{port}\r\n\r\n");
+    let authority = host_port(pod_ip, port);
+    let connect_req = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
     tls_stream
         .write_all(connect_req.as_bytes())
         .await
@@ -2903,7 +2923,7 @@ async fn pod_proxy_via_connect_tunnel(
     let hyper_req = hyper::Request::builder()
         .method(method.as_str())
         .uri(&uri)
-        .header("Host", format!("{pod_ip}:{port}"))
+        .header("Host", host_port(pod_ip, port))
         .body(axum::body::Body::from(body_bytes))
         .map_err(|e| format!("build pod request: {e}"))?;
 
@@ -3121,7 +3141,7 @@ async fn pod_proxy_dispatch<S: Store>(
 
     // No konnectivity proxy — direct connection to pod IP.
     let scheme = if is_https { "https" } else { "http" };
-    let target_url = format!("{scheme}://{pod_ip}:{port}/{path_with_query}");
+    let target_url = format!("{scheme}://{}/{path_with_query}", host_port(&pod_ip, port));
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -3487,7 +3507,7 @@ async fn service_proxy_dispatch<S: Store>(
     }
 
     let scheme = if is_https { "https" } else { "http" };
-    let target_url = format!("{scheme}://{ep_ip}:{port}/{path_with_query}");
+    let target_url = format!("{scheme}://{}/{path_with_query}", host_port(&ep_ip, port));
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
@@ -4146,6 +4166,81 @@ mod tests {
                  pod's proxy subresource would ever work",
             );
         assert_eq!(ip, "10.244.0.5");
+    }
+
+    #[tokio::test]
+    async fn pod_proxy_checks_v6_pod_ip_against_every_node_pod_cidr() {
+        let state = make_state();
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "node-v6", "resourceVersion": "1"},
+            "spec": {"podCIDR": "10.244.0.0/24", "podCIDRs": ["10.244.0.0/24", "fd00:244::/64"]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-v6"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let pod = |name: &str, ip: &str| {
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": name, "namespace": "default", "resourceVersion": "1"},
+                "spec": {"nodeName": "node-v6", "containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"podIP": ip}
+            })
+        };
+        for (name, ip, ok) in [
+            ("in6", "fd00:244::5", true),
+            ("out6", "fd00:999::5", false),
+            ("in4", "10.244.0.9", true),
+            ("out4", "10.99.0.9", false),
+        ] {
+            state
+                .store
+                .put(
+                    &crate::keys::object_key("pods", "default", name),
+                    bytes::Bytes::from(pod(name, ip).to_string()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+            let res = resolve_pod_proxy_target(&state, "default", name).await;
+            assert_eq!(
+                res.is_ok(),
+                ok,
+                "podIP {ip} vs podCIDRs [10.244.0.0/24, fd00:244::/64]: a v6 pod must proxy \
+                 inside its v6 range (the old v4-only check rejected every v6 pod) and an \
+                 out-of-range v6 IP must stay blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_in_cidr_is_family_aware_and_fails_closed_on_mismatch() {
+        assert!(ip_in_cidr("fd00::1", "fd00::/64"));
+        assert!(!ip_in_cidr("fd01::1", "fd00::/64"));
+        assert!(!ip_in_cidr("10.0.0.1", "fd00::/64"), "family mismatch");
+        assert!(!ip_in_cidr("fd00::1", "10.0.0.0/8"), "family mismatch");
+        assert!(!ip_in_cidr("fd00::1", "fd00::/129"), "prefix too long");
+        assert!(ip_in_cidr("10.0.0.5", "10.0.0.0/24"));
+    }
+
+    #[test]
+    fn host_port_brackets_only_ipv6_literals() {
+        assert_eq!(host_port("fd00::1", 8080), "[fd00::1]:8080");
+        assert_eq!(host_port("10.0.0.1", 80), "10.0.0.1:80");
+        assert_eq!(host_port("node.example", 443), "node.example:443");
+    }
+
+    #[test]
+    fn kubelet_endpoint_url_accepts_ipv6_node_address() {
+        let url = kubelet_endpoint_url("https", "fd00::7", 10250, &["containerLogs", "a"], None)
+            .expect("an IPv6 InternalIP must produce a parseable kubelet URL");
+        assert_eq!(url, "https://[fd00::7]:10250/containerLogs/a");
     }
 
     /// A non-hostNetwork pod whose node has no spec.podCIDR assigned must still be
