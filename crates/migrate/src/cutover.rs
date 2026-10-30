@@ -377,6 +377,8 @@ pub trait Api {
 pub trait Host {
     type Target: Api;
     fn k3s_data_dir_exists(&self) -> bool;
+    /// Whether the k3s killall script exists and is executable.
+    fn k3s_killall_ready(&self) -> bool;
     fn u7s_installed(&self) -> bool;
     /// Stops and disables k3s, leaving its data in place.
     async fn stop_k3s(&mut self) -> anyhow::Result<()>;
@@ -452,6 +454,12 @@ pub async fn run<S: Api, H: Host>(
         None => {
             if !host.k3s_data_dir_exists() {
                 bail!("k3s data directory not found: is this the k3s host?");
+            }
+            if !host.k3s_killall_ready() {
+                bail!(
+                    "{K3S_KILLALL} is missing or not executable; stopping k3s needs it, so refusing \
+                     to start the cutover (nothing was changed)"
+                );
             }
             if host.u7s_installed() {
                 bail!(
@@ -716,6 +724,12 @@ impl Host for SystemHost {
 
     fn k3s_data_dir_exists(&self) -> bool {
         Path::new(&self.k3s_data_dir).is_dir()
+    }
+
+    fn k3s_killall_ready(&self) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(K3S_KILLALL)
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }
 
     fn u7s_installed(&self) -> bool {

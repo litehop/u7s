@@ -98,6 +98,7 @@ struct FakeHost {
     ready: bool,
     register_driver: bool,
     u7s_present: bool,
+    killall_ready: bool,
     tgt: Rc<FakeApi>,
     install_args: Vec<String>,
     imported_pv_policy: Option<String>,
@@ -115,6 +116,7 @@ impl FakeHost {
             ready: true,
             register_driver: true,
             u7s_present: false,
+            killall_ready: true,
             tgt: tgt.clone(),
             install_args: vec![],
             imported_pv_policy: None,
@@ -127,6 +129,9 @@ impl Host for FakeHost {
     type Target = Rc<FakeApi>;
     fn k3s_data_dir_exists(&self) -> bool {
         self.data_dir.get()
+    }
+    fn k3s_killall_ready(&self) -> bool {
+        self.killall_ready
     }
     fn u7s_installed(&self) -> bool {
         self.u7s_present
@@ -290,6 +295,34 @@ async fn no_pv_is_switched_to_retain_without_confirmation() {
     );
     assert_eq!(host.calls, ["export"]);
     assert_eq!(load_state(&paths).unwrap().unwrap().stage, Stage::Exported);
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn cutover_refuses_before_any_destructive_step_when_killall_is_unusable() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    host.killall_ready = false;
+    let paths = work("no-killall");
+    let err = run(&src, &mut host, &paths, true, &[]).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains(K3S_KILLALL),
+        "the operator must be told which script is missing"
+    );
+    assert!(
+        host.calls.is_empty() && src.patches.borrow().is_empty(),
+        "k3s must not be stopped nor PVs set to Retain when it cannot be cleaned up afterwards"
+    );
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn cutover_proceeds_when_killall_is_ready() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    let paths = work("killall-ok");
+    run(&src, &mut host, &paths, true, &[]).await.unwrap();
+    assert!(host.calls.contains(&"stop_k3s".to_string()));
     cleanup(&paths);
 }
 
@@ -753,7 +786,13 @@ fn work_dir_is_absolute_so_rollback_works_from_any_directory() {
 fn every_cutover_write_goes_through_the_durable_helper() {
     let src = include_str!("../cutover.rs");
     let prod = src.split("#[cfg(test)]").next().unwrap();
-    for banned in ["write_new_private(", "fs::rename(", "fs::write("] {
+    for banned in [
+        "write_new_private(",
+        "fs::rename(",
+        "fs::write(",
+        "File::create(",
+        "OpenOptions",
+    ] {
         assert!(
             !prod.contains(banned),
             "{banned} bypasses fsync-before-rename durability"
