@@ -1863,10 +1863,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn crlf_terminated_block_is_accepted_because_go_pem_decode_accepts_windows_authored_files() {
+        let pem = csr_pem_for("system:node:w1").replace('\n', "\r\n");
+        assert!(pem.contains("\r\n"));
+        parse_csr_pem(pem.as_bytes()).expect("CRLF-encoded CSR must parse like in Go");
+    }
+
     /// Go signs the first block and ignores the rest; a parser that picked another block would
     /// let the guard approve a decoy while KCM signs the claimed control-plane name.
     #[test]
-    fn two_blocks_are_rejected_in_either_order_so_guard_and_signer_cannot_pick_different_ones() {
+    fn loosening_guard_two_blocks_are_rejected_in_either_order_so_guard_and_signer_cannot_pick_different_ones(
+    ) {
         let (decoy, real) = (
             csr_pem_for("system:node:fresh"),
             csr_pem_for("system:node:cp"),
@@ -1877,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn data_around_the_block_is_rejected_because_go_skips_it_silently() {
+    fn loosening_guard_data_around_the_block_is_rejected_because_go_skips_it_silently() {
         let pem = csr_pem_for("system:node:w1");
         for bad in [
             format!("junk\n{pem}"),
@@ -1889,14 +1897,15 @@ mod tests {
     }
 
     #[test]
-    fn wrong_block_type_is_rejected_because_go_requires_certificate_request() {
+    fn loosening_guard_wrong_block_type_is_rejected_because_go_requires_certificate_request() {
         let pem =
             csr_pem_for("system:node:w1").replace("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST");
         parse_csr_pem(pem.as_bytes()).expect_err("block type must be CERTIFICATE REQUEST");
     }
 
     #[test]
-    fn pem_headers_are_rejected_because_go_accepts_them_and_parsers_disagree_on_them() {
+    fn loosening_guard_pem_headers_are_rejected_because_go_accepts_them_and_parsers_disagree_on_them(
+    ) {
         let pem = csr_pem_for("system:node:w1").replacen(
             "-----BEGIN CERTIFICATE REQUEST-----\n",
             "-----BEGIN CERTIFICATE REQUEST-----\nProc-Type: 4,ENCRYPTED\n\n",
