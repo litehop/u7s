@@ -26,8 +26,16 @@ thread_local! {
     pub(crate) static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it.
+/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it. Applies to CRD
+/// rules, which evaluate on a dedicated big-stack thread.
 pub(crate) const MAX_RECURSION_DEPTH: usize = 250;
+
+/// Deepest policy (VAP/MAP/authorization) expression accepted. Policies evaluate on a
+/// 512 KiB request thread under a stack budget; in a release build the worst shape measured
+/// (index chain) evaluates to 187 levels, so 128 leaves ~45% headroom for frames larger
+/// than any measured. Lower than cel-go's 250 on purpose: an accepted-but-unevaluable
+/// policy would deny all matching traffic under `failurePolicy: Fail`.
+pub(crate) const MAX_POLICY_RECURSION_DEPTH: usize = 128;
 
 /// cel-go's default `ExpressionSizeCodePointLimit`; Kubernetes does not override it.
 const MAX_EXPRESSION_CODE_POINTS: usize = 100_000;
@@ -47,7 +55,7 @@ const IN_PLACE_PARSE_MAX_LEN: usize = 100;
 /// parse thread, where a deep drop has the stack to run.
 pub(crate) fn parse_bounded<T: Send>(
     expr: &str,
-    stack_size: usize,
+    (stack_size, max_depth): (usize, usize),
     parse: impl FnOnce() -> Result<T, String> + Send,
     ast: impl FnOnce(&T) -> &IdedExpr + Send,
 ) -> Result<T, String> {
@@ -60,7 +68,7 @@ pub(crate) fn parse_bounded<T: Send>(
     }
     let run = move || {
         let parsed = parse()?;
-        if depth_exceeds(ast(&parsed), MAX_RECURSION_DEPTH) {
+        if depth_exceeds(ast(&parsed), max_depth) {
             return Err(
                 "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded".into(),
             );
@@ -173,10 +181,10 @@ fn parse_with_stack(expr: &str, stack_size: usize) -> Result<IdedExpr, String> {
     PARSE_COUNT.with(|c| c.set(c.get() + 1));
     parse_bounded(
         expr,
-        stack_size,
+        (stack_size, MAX_POLICY_RECURSION_DEPTH),
         || {
             cel::parser::Parser::new()
-                .max_recursion_depth(MAX_RECURSION_DEPTH as u16)
+                .max_recursion_depth(MAX_POLICY_RECURSION_DEPTH as u16)
                 .enable_optional_syntax(true)
                 .enable_ident_escape_syntax(true)
                 .parse(expr)
@@ -195,7 +203,7 @@ pub(crate) fn parse(expr: &str) -> Result<IdedExpr, String> {
 pub(crate) fn compile_program(source: &str) -> Result<cel::Program, String> {
     parse_bounded(
         source,
-        PARSE_STACK_SIZE,
+        (PARSE_STACK_SIZE, MAX_RECURSION_DEPTH),
         || cel::Program::compile(source).map_err(|e| e.to_string()),
         |p| p.expression(),
     )

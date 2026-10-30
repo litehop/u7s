@@ -570,6 +570,16 @@ fn nesting_shapes(n: usize) -> Vec<(&'static str, String)> {
             "map nest",
             format!("{}1{}", "{'a':".repeat(n), "}".repeat(n)),
         ),
+        ("index chain", format!("[[0]]{}", "[0]".repeat(n))),
+        (
+            "nested call args",
+            format!("{}1{}", "size([".repeat(n), "])".repeat(n)),
+        ),
+        (
+            "nested comprehension",
+            format!("{}1{}", "[1].map(x, ".repeat(n), ")".repeat(n)),
+        ),
+        ("membership chain", format!("1{}", " in [1]".repeat(n))),
     ]
 }
 
@@ -598,6 +608,31 @@ fn expression_nesting_past_upstream_limit_is_rejected_with_upstream_message() {
     );
 }
 
+/// Policies evaluate under a stack budget a 250-level expression exceeds in release builds
+/// (call chain 205, index chain 188); accepting them would store a policy that denies all
+/// matching traffic under `failurePolicy: Fail`. The limit is a policy-only divergence from
+/// cel-go's 250, which CRD rules (big-stack evaluation) keep.
+#[test]
+fn policy_expressions_are_rejected_one_level_past_the_policy_limit() {
+    let limit = super::parse::MAX_POLICY_RECURSION_DEPTH;
+    let message = "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded";
+    // a call chain of n calls is n + 1 levels deep: `'x'` is the innermost
+    let at = format!("'x'{}", ".lowerAscii()".repeat(limit - 1));
+    assert!(super::parse::parse(&at).is_ok(), "limit itself must pass");
+    let over = format!("'x'{}", ".lowerAscii()".repeat(limit));
+    assert_eq!(super::parse::parse(&over).expect_err("over"), message);
+    assert_eq!(
+        super::check_syntax(&over, &[]).expect_err("over"),
+        message,
+        "the create-time check must reject what evaluation would refuse"
+    );
+    let crd_deep = format!("'x'{}", ".lowerAscii()".repeat(limit));
+    assert!(
+        super::compile_program(&crd_deep).is_ok(),
+        "CRD rules keep cel-go's 250 limit"
+    );
+}
+
 /// cel-go counts code points, not bytes: a 100k-character rule of 3-byte characters is
 /// within the limit, one more character is not. A byte count would reject legitimate
 /// non-ASCII rules; no count would let a megabyte rule through to the parser.
@@ -620,7 +655,7 @@ fn expression_size_limit_counts_code_points_like_upstream() {
 #[test]
 fn deepest_accepted_expression_evaluates_on_a_production_sized_stack() {
     for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
-        let deepest = (1..=super::parse::MAX_RECURSION_DEPTH)
+        let deepest = (1..=super::parse::MAX_POLICY_RECURSION_DEPTH)
             .rev()
             .map(|n| nesting_shapes(n).swap_remove(i).1)
             .find(|e| super::parse::parse(e).is_ok())
@@ -674,5 +709,37 @@ fn big_stack_threads_never_exceed_the_lane_limit() {
     assert!(
         (1..=super::parse::MAX_PARSE_THREADS).contains(&peak),
         "peak concurrent big-stack threads was {peak}"
+    );
+}
+
+/// A policy stored under failurePolicy Fail denies every matching request if it compiles
+/// but evaluates to "nests too deeply", so the depth the compiler accepts must be one the
+/// evaluator finishes. Frame sizes differ per build profile, so the guarantee is for
+/// release builds, which is what runs.
+#[cfg(not(debug_assertions))]
+#[test]
+fn every_depth_the_compiler_accepts_evaluates_in_release() {
+    let mut failures = Vec::new();
+    for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
+        for n in 1..=super::parse::MAX_POLICY_RECURSION_DEPTH + 1 {
+            let expr = nesting_shapes(n).swap_remove(i).1;
+            if super::parse::parse(&expr).is_err() {
+                continue;
+            }
+            let out = std::thread::Builder::new()
+                .stack_size(4 << 20)
+                .spawn(move || eval(&expr))
+                .unwrap()
+                .join()
+                .unwrap();
+            if out == "error: expression nests too deeply" {
+                failures.push(format!("{shape} n={n}"));
+                break;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "accepted at compile, refused at eval: {failures:?}"
     );
 }
