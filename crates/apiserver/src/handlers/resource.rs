@@ -15044,7 +15044,7 @@ mod tests {
             "apiVersion": "v1",
             "kind": "Service",
             "metadata": { "name": "headless-svc", "namespace": "default" },
-            "spec": { "clusterIP": "None" }
+            "spec": { "clusterIP": "None", "selector": { "app": "x" } }
         });
 
         let _ = create_namespaced_resource(
