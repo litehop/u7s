@@ -2,6 +2,7 @@
 //! Kubernetes API.
 
 pub mod classify;
+pub mod cutover;
 pub mod discover;
 pub mod import;
 pub mod plan;

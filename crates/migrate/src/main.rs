@@ -66,6 +66,59 @@ enum Migrate {
         #[arg(long, default_value = "u7s-migrate-objects.json")]
         objects: String,
     },
+    /// Move this host from k3s to u7s: export, set Retain on the migrated
+    /// PVs (original policies recorded), scale workloads down, wait for
+    /// volumes to detach, stop k3s (its data directory stays), install u7s
+    /// with the source's CIDRs, import, verify, restore the PV policies.
+    /// Resumable: re-run the same command after a failure.
+    ///
+    /// Rollback to k3s (`u7s migrate rollback`) works until you delete a
+    /// migrated PVC on u7s.
+    Cutover {
+        #[command(flatten)]
+        host: HostArgs,
+        /// Allow setting reclaim policy Retain on the source PVs. Without it
+        /// the command exports, changes nothing on the source and stops.
+        #[arg(long)]
+        confirm_retain: bool,
+        /// The u7s install.sh to run.
+        #[arg(long)]
+        install_script: String,
+        /// Arguments for install.sh after `--` (e.g. --tarball PATH). The
+        /// CIDR flags are inherited from the source and rejected here.
+        #[arg(last = true)]
+        install_args: Vec<String>,
+    },
+    /// Undo a cutover: stop u7s, start k3s, restore the source PV reclaim
+    /// policies and workload replicas. Refused once a migrated PVC was
+    /// deleted on u7s.
+    Rollback {
+        #[command(flatten)]
+        host: HostArgs,
+    },
+}
+
+/// Flags shared by `cutover` and `rollback`.
+#[derive(clap::Args)]
+struct HostArgs {
+    /// Source (k3s) kubeconfig.
+    #[arg(long, default_value = "/etc/rancher/k3s/k3s.yaml")]
+    kubeconfig: String,
+    /// Directory holding the cutover state, plan and exported objects
+    /// (Secrets in clear text; files are created 0600).
+    #[arg(long, default_value = "u7s-migrate-cutover")]
+    work_dir: String,
+    /// k3s data directory, which is never removed.
+    #[arg(long, default_value = u7s_migrate::cutover::DEFAULT_K3S_DATA_DIR)]
+    k3s_data_dir: String,
+}
+
+fn system_host(h: &HostArgs, install_script: String) -> u7s_migrate::cutover::SystemHost {
+    u7s_migrate::cutover::SystemHost {
+        source_kubeconfig: h.kubeconfig.clone(),
+        k3s_data_dir: h.k3s_data_dir.clone(),
+        install_script,
+    }
 }
 
 #[tokio::main]
@@ -92,6 +145,23 @@ async fn main() -> anyhow::Result<()> {
             plan,
             objects,
         } => import(&kubeconfig, &plan, &objects).await,
+        Migrate::Cutover {
+            host,
+            confirm_retain,
+            install_script,
+            install_args,
+        } => {
+            let src = u7s_migrate::cutover::Live::connect(&host.kubeconfig)?;
+            let mut h = system_host(&host, install_script);
+            let paths = u7s_migrate::cutover::Paths::new(&host.work_dir);
+            u7s_migrate::cutover::run(&src, &mut h, &paths, confirm_retain, &install_args).await
+        }
+        Migrate::Rollback { host } => {
+            let src = u7s_migrate::cutover::Live::connect(&host.kubeconfig)?;
+            let mut h = system_host(&host, String::new());
+            let paths = u7s_migrate::cutover::Paths::new(&host.work_dir);
+            u7s_migrate::cutover::rollback(&src, &mut h, &paths).await
+        }
     }
 }
 
