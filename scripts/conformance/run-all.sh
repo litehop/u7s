@@ -461,14 +461,14 @@ if [ "$PROFILE" -eq 1 ]; then
   # features enabled; this targeted rebuild overwrites just the apiserver
   # binary in place (same output path, only the feature set changes) so the
   # scheduler binary from the step above is left untouched.
-  cargo build --release -p u7s-apiserver --features dhat --manifest-path "$REPO/Cargo.toml"
+  cargo build --release -p u7s-apiserver --features dhat,rig-test-knobs --manifest-path "$REPO/Cargo.toml"
   DHAT_HEAP_FILE="$WORKDIR/dhat-heap.json"
   export U7S_DHAT_HEAP_FILE="$DHAT_HEAP_FILE"
 fi
 
 if [ -n "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION$PKI_TEST_INTERMEDIATE" ]; then
   banner "PKI test knobs: rebuilding u7s-apiserver with --features pki-test-knobs"
-  cargo build --release -p u7s-apiserver --features pki-test-knobs --manifest-path "$REPO/Cargo.toml"
+  cargo build --release -p u7s-apiserver --features pki-test-knobs,rig-test-knobs --manifest-path "$REPO/Cargo.toml"
   [ -z "$PKI_TEST_LIFETIME" ] || export U7S_PKI_TEST_LIFETIME_SECS="$PKI_TEST_LIFETIME"
   [ -z "$PKI_TEST_SA_ROTATION" ] || export U7S_PKI_TEST_SA_ROTATION_SECS="$PKI_TEST_SA_ROTATION"
   [ -z "$PKI_TEST_INTERMEDIATE" ] || export U7S_PKI_TEST_INTERMEDIATE_LIFETIME_SECS="$PKI_TEST_INTERMEDIATE"

@@ -18,6 +18,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST_DIR="$(cd "$SCRIPT_DIR/../../examples/e2e/wordpress" && pwd)"
+TRAEFIK_DIR="$(cd "$SCRIPT_DIR/../../examples/e2e/traefik" && pwd)"
 NAMESPACE="default"
 KUBECTL_ARGS=()
 SKIP_APPLY=0
@@ -31,8 +32,8 @@ Usage: $(basename "$0") [--kubeconfig PATH] [--skip-apply]
   --skip-apply        Assume examples/e2e/wordpress/ is already applied and
                        Ready; only run the HTTP assertions.
 
-Applies examples/e2e/wordpress/, waits for MariaDB + WordPress to become Ready,
-then asserts: GET / -> 302, GET /wp-admin/install.php -> 200,
+Applies examples/e2e/traefik/ and examples/e2e/wordpress/, waits for MariaDB + WordPress to become Ready,
+then, via Traefik (Host from the Ingress), asserts: GET / -> 302, GET /wp-admin/install.php -> 200,
 POST install.php?step=2 -> body contains "Success!", final GET / renders the
 submitted site title. Exits non-zero on any failed assertion.
 EOF
@@ -82,7 +83,8 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$SKIP_APPLY" -eq 0 ]]; then
-  echo "== applying $MANIFEST_DIR =="
+  echo "== applying $TRAEFIK_DIR and $MANIFEST_DIR =="
+  kc apply -f "$TRAEFIK_DIR"
   kc apply -f "$MANIFEST_DIR"
 fi
 
@@ -94,31 +96,45 @@ echo "== waiting for the pehelypress Deployment to become Available =="
 kc -n "$NAMESPACE" wait --for=condition=Available deployment/pehelypress --timeout=300s \
   || fail "pehelypress Deployment never became Available"
 
-echo "== port-forwarding to svc/pehelypress:80 =="
-kc -n "$NAMESPACE" port-forward svc/pehelypress "$LOCAL_PORT:80" \
+echo "== waiting for the traefik Deployment to become Available =="
+kc -n traefik wait --for=condition=Available deployment/traefik --timeout=300s \
+  || fail "traefik Deployment never became Available"
+
+# WordPress is reached THROUGH Traefik: the port-forward targets the Traefik
+# Service and routing is selected by the Ingress host, sent as a Host header.
+INGRESS_HOST="$(kc -n "$NAMESPACE" get ingress pehelypress -o jsonpath='{.spec.rules[0].host}')"
+[[ -n "$INGRESS_HOST" ]] || fail "ingress/pehelypress has no host rule"
+
+echo "== port-forwarding to svc/traefik:80 (Host: $INGRESS_HOST) =="
+kc -n traefik port-forward svc/traefik "$LOCAL_PORT:80" \
   >/tmp/wordpress-smoke-port-forward.log 2>&1 &
 PF_PID=$!
 
 BASE="http://127.0.0.1:$LOCAL_PORT"
-for _ in $(seq 1 30); do
-  curl -s -o /dev/null "$BASE/" && break
+curl_wp() { curl -H "Host: $INGRESS_HOST" "$@"; }
+# Traefik answers 404 until it has loaded the Ingress, so wait for a WordPress
+# response (200/301/302), not merely a connection.
+ROUTED=0
+for _ in $(seq 1 60); do
+  CODE="$(curl_wp -s -o /dev/null -w '%{http_code}' "$BASE/" || true)"
+  case "$CODE" in 200|301|302) ROUTED=1; break ;; esac
   sleep 1
 done
-curl -s -o /dev/null "$BASE/" || fail "port-forward to svc/pehelypress never came up (see /tmp/wordpress-smoke-port-forward.log)"
+[[ "$ROUTED" -eq 1 ]] || fail "Traefik never routed Host $INGRESS_HOST to WordPress (last status: $CODE; see /tmp/wordpress-smoke-port-forward.log)"
 
 JAR="$(mktemp)"
 
 echo "== GET / (expect 302 to the installer -- fresh, uninstalled WordPress) =="
-STATUS="$(curl -s -o /dev/null -w '%{http_code}' -c "$JAR" "$BASE/")"
+STATUS="$(curl_wp -s -o /dev/null -w '%{http_code}' -c "$JAR" "$BASE/")"
 [[ "$STATUS" == "302" ]] || fail "GET / returned $STATUS, expected 302 (is WordPress already installed? see this script's header comment)"
 
 echo "== GET /wp-admin/install.php (expect 200) =="
-STATUS="$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" -c "$JAR" "$BASE/wp-admin/install.php")"
+STATUS="$(curl_wp -s -o /dev/null -w '%{http_code}' -b "$JAR" -c "$JAR" "$BASE/wp-admin/install.php")"
 [[ "$STATUS" == "200" ]] || fail "GET /wp-admin/install.php returned $STATUS, expected 200"
 
 SITE_TITLE="u7s-e2e-smoke-$(date +%s)"
 echo "== POST /wp-admin/install.php?step=2 (expect body to contain 'Success!') =="
-BODY="$(curl -s -b "$JAR" -c "$JAR" \
+BODY="$(curl_wp -s -b "$JAR" -c "$JAR" \
   --data-urlencode "weblog_title=$SITE_TITLE" \
   --data-urlencode "user_name=admin" \
   --data-urlencode "admin_password=SmokeTestPassw0rd!" \
@@ -137,7 +153,7 @@ echo "== GET / (expect the rendered page to contain the submitted site title) ==
 # steady-state 200s -- retry instead of treating that startup flap as a failure.
 FOUND=0
 for _ in $(seq 1 15); do
-  FINAL_BODY="$(curl -s -b "$JAR" -c "$JAR" "$BASE/")"
+  FINAL_BODY="$(curl_wp -s -b "$JAR" -c "$JAR" "$BASE/")"
   if echo "$FINAL_BODY" | grep -qF "$SITE_TITLE"; then
     FOUND=1
     break

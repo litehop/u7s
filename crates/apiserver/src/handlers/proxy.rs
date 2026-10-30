@@ -2154,31 +2154,90 @@ pub(crate) fn proxied_response(
 // /api/v1/nodes/{name}/proxy/{*path} — forward to kubelet
 // ---------------------------------------------------------------------------
 
-/// Resolve node IP and build the kubelet HTTP URL for node proxy requests.
-///
-/// Separated from the handler for unit-testability: all error paths (404, 502)
-/// are reachable without a real HTTP connection.
-/// Strip a trailing `:port` from a node name as it appears in a proxy URL.
-///
-/// Sonobuoy's dump.go (and kubectl) build node-proxy URLs as
-/// `/api/v1/nodes/<name>:<port>/proxy/...` (e.g. "lima-node:10250").
-/// The node is stored under the bare name without the port suffix.
-/// Node names are DNS-1123 labels (no colons), so a single rsplit_once(':')
-/// on the last colon is safe and sufficient — no full URL parser needed.
-pub fn strip_node_port(node_name: &str) -> &str {
-    node_name
-        .rsplit_once(':')
-        .map(|(bare, _port)| bare)
-        .unwrap_or(node_name)
+/// Parse a node proxy id as upstream `net.SplitSchemeNamePort` does: `name`, `name:port`
+/// or `scheme:name:port` with scheme `http`, `https` or empty. Returns
+/// (scheme, name, port); `None` is upstream's `invalid node request`.
+fn split_node_proxy_id(id: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = id.split(':').collect();
+    let (scheme, name, port) = match parts.as_slice() {
+        [name] => ("", *name, ""),
+        [name, port] => ("", *name, *port),
+        [scheme, name, port] => (*scheme, *name, *port),
+        _ => return None,
+    };
+    (!name.is_empty() && matches!(scheme, "" | "http" | "https")).then_some((scheme, name, port))
 }
 
+/// Go's `net.IP.IsGlobalUnicast`: upstream `isProxyableHostname` rejects a node address
+/// resolving to anything else, so a principal able to write Node status addresses cannot
+/// steer the apiserver at loopback, link-local or unspecified targets.
+fn is_global_unicast(ip: std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
+    };
+    let link_local = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    !(ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || link_local)
+}
+
+/// Whether a node proxy target of `ip` is allowed. Loopback is additionally allowed only
+/// in rig builds, whose node address is a loopback port-forward to the VM kubelet.
+/// Compiled only with the `rig-test-knobs` feature, which no shipped build enables.
+#[cfg(feature = "rig-test-knobs")]
+fn node_proxy_ip_allowed(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || is_global_unicast(ip)
+}
+
+#[cfg(not(feature = "rig-test-knobs"))]
+fn node_proxy_ip_allowed(ip: std::net::IpAddr) -> bool {
+    is_global_unicast(ip)
+}
+
+/// Logged once at startup so a rig build is never mistaken for a shipped one.
+#[cfg(feature = "rig-test-knobs")]
+pub(crate) fn warn_rig_test_knobs() {
+    tracing::warn!("rig-test-knobs: node proxy accepts loopback node addresses");
+}
+
+#[cfg(not(feature = "rig-test-knobs"))]
+pub(crate) fn warn_rig_test_knobs() {}
+
+/// Mirrors upstream `isProxyableHostname`: every resolved address must be allowed.
+fn check_node_proxy_addrs(addrs: &[std::net::IpAddr]) -> Result<(), &'static str> {
+    if addrs.is_empty() {
+        return Err("no addresses for hostname");
+    }
+    if addrs.iter().any(|ip| !node_proxy_ip_allowed(*ip)) {
+        return Err("address not allowed");
+    }
+    Ok(())
+}
+
+async fn ensure_proxyable_hostname(host: &str) -> Result<(), crate::status::StatusError> {
+    let addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host((host, 0))
+        .await
+        .map_err(|e| Status::bad_request(e.to_string()))?
+        .map(|sa| sa.ip())
+        .collect();
+    check_node_proxy_addrs(&addrs).map_err(|e| Status::bad_request(e.to_owned()))
+}
+
+/// Resolve the node address and build the proxy URL for `nodes/<id>/proxy`, mirroring
+/// upstream `ResourceLocation`: the address must be proxyable (400 otherwise), and a
+/// `:port` other than the kubelet's is dialed as requested.
 pub async fn resolve_node_proxy_target<S: Store>(
     state: &AppState<S>,
     node_name: &str,
     path_suffix: &str,
 ) -> Result<(String, reqwest::Client), crate::status::StatusError> {
     validate_path_segment("name", node_name)?;
-    let bare_name = strip_node_port(node_name);
+    let (scheme_req, bare_name, port_req) = split_node_proxy_id(node_name)
+        .ok_or_else(|| Status::bad_request(format!("invalid node request \"{node_name}\"")))?;
     let node_key = cluster_object_key("nodes", bare_name);
     let node_stored = state
         .store
@@ -2203,14 +2262,38 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let client = kubelet_http_client(
-        state,
-        kubelet_verify_name(&node, preferred_address(state)).as_deref(),
-    )?;
+    ensure_proxyable_hostname(&node_ip).await?;
 
     let kp = kubelet_port_for_node(bare_name, &state.node_kubelet_ports, state.kubelet_port);
-    let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
-    Ok((kubelet_url, client))
+    // The kubelet's own port (its real 10250 or the host forward) uses the kubelet
+    // client; any other port is dialed as requested with a plain client.
+    if port_req.is_empty() || port_req == kp.to_string() || port_req == "10250" {
+        let client = kubelet_http_client(
+            state,
+            kubelet_verify_name(&node, preferred_address(state)).as_deref(),
+        )?;
+        let kubelet_url = format!("https://{node_ip}:{kp}/{}", encode_proxy_tail(path_suffix)?);
+        return Ok((kubelet_url, client));
+    }
+    if scheme_req.is_empty() {
+        return Err(Status::service_unavailable(
+            "error trying to reach service: unsupported protocol scheme \"\"".to_owned(),
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Status::service_unavailable(format!("proxy client unavailable: {e}")))?;
+    let host = if node_ip.contains(':') {
+        format!("[{node_ip}]")
+    } else {
+        node_ip
+    };
+    let url = format!(
+        "{scheme_req}://{host}:{port_req}/{}",
+        encode_proxy_tail(path_suffix)?
+    );
+    Ok((url, client))
 }
 
 /// Buffer a proxied request body, capped at `MAX_BODY_BYTES`. Proxy subresources are
@@ -6289,24 +6372,184 @@ mod tests {
         );
     }
 
-    /// strip_node_port must strip the trailing :port from a URL node name.
-    ///
-    /// Sonobuoy's dump.go builds node-proxy URLs as /api/v1/nodes/<name>:<port>/proxy/pods.
-    /// Without stripping, the store lookup uses "lima-node:10250" instead of "lima-node",
-    /// causing every sonobuoy pod-dump to 404 with "Node lima-node:10250 not found".
+    /// The node id must split like upstream `SplitSchemeNamePort`. Sonobuoy's dump.go builds
+    /// /api/v1/nodes/<name>:<port>/proxy/pods; a mis-split looks up "lima-node:10250" in the
+    /// store and 404s every pod-dump.
     #[test]
-    fn strip_node_port_removes_port_suffix() {
+    fn split_node_proxy_id_matches_upstream_split_scheme_name_port() {
+        assert_eq!(split_node_proxy_id("n"), Some(("", "n", "")));
+        assert_eq!(split_node_proxy_id("n:10250"), Some(("", "n", "10250")));
         assert_eq!(
-            super::strip_node_port("lima-node:10250"),
-            "lima-node",
-            "sonobuoy/kubectl node-proxy pod retrieval 404s if :port suffix is not stripped \
-             before the store lookup"
+            split_node_proxy_id("https:n:443"),
+            Some(("https", "n", "443"))
+        );
+        for bad in ["ftp:n:1", "a:b:c:d", ":80", "http::80", ""] {
+            assert_eq!(
+                split_node_proxy_id(bad),
+                None,
+                "{bad:?} must be an invalid node request (400), as upstream"
+            );
+        }
+    }
+
+    fn ips(list: &[&str]) -> Vec<std::net::IpAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    /// Upstream rejects a node whose address resolves to anything but global unicast;
+    /// otherwise anyone able to write Node status addresses aims the apiserver at
+    /// link-local metadata, unspecified or multicast targets.
+    #[test]
+    fn node_proxy_rejects_non_global_unicast_addresses() {
+        for bad in [
+            "169.254.169.254",
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "fe80::1",
+            "::",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert_eq!(
+                check_node_proxy_addrs(&ips(&[bad])),
+                Err("address not allowed"),
+                "{bad} must not be a proxyable node address"
+            );
+        }
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["10.0.0.5", "169.254.169.254"])),
+            Err("address not allowed"),
+            "one non-proxyable address among several must reject the hostname"
         );
         assert_eq!(
-            super::strip_node_port("lima-node"),
-            "lima-node",
-            "bare node names (no port suffix) must pass through unchanged"
+            check_node_proxy_addrs(&[]),
+            Err("no addresses for hostname")
         );
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["10.0.0.5", "2001:db8::1"])),
+            Ok(())
+        );
+    }
+
+    #[cfg(not(feature = "rig-test-knobs"))]
+    #[test]
+    fn node_proxy_rejects_loopback_in_default_build() {
+        for bad in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert_eq!(
+                check_node_proxy_addrs(&ips(&[bad])),
+                Err("address not allowed"),
+                "{bad}: a shipped build must never proxy to loopback"
+            );
+        }
+    }
+
+    #[cfg(feature = "rig-test-knobs")]
+    #[test]
+    fn node_proxy_allows_only_loopback_extra_in_rig_build() {
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["127.0.0.1"])),
+            Ok(()),
+            "the rig's node address is a loopback kubelet port-forward"
+        );
+        assert_eq!(
+            check_node_proxy_addrs(&ips(&["169.254.169.254", "0.0.0.0"])),
+            Err("address not allowed"),
+            "the rig knob must relax loopback only"
+        );
+    }
+
+    async fn seed_node_with_address(state: &AppState, addr: &str) {
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "n", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": addr}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "n"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+    }
+
+    /// End to end through the resolver: a node address that is (or resolves to) a
+    /// non-proxyable address answers 400 "address not allowed" for every spelling of the id.
+    #[tokio::test]
+    async fn node_proxy_resolver_rejects_unproxyable_node_address() {
+        for addr in ["169.254.169.254", "0.0.0.0", "::", "fe80::1"] {
+            let state = make_state();
+            seed_node_with_address(&state, addr).await;
+            for id in ["n", "n:10250", "https:n:8443"] {
+                let err = resolve_node_proxy_target(&state, id, "healthz")
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.0.as_u16(), 400, "{addr} via {id}");
+                assert_eq!(err.1.message, "address not allowed", "{addr} via {id}");
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rig-test-knobs"))]
+    #[tokio::test]
+    async fn node_proxy_resolver_rejects_loopback_and_localhost_in_default_build() {
+        for addr in ["127.0.0.1", "::1", "localhost"] {
+            let state = make_state();
+            seed_node_with_address(&state, addr).await;
+            let err = resolve_node_proxy_target(&state, "n", "healthz")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                (err.0.as_u16(), err.1.message.as_str()),
+                (400, "address not allowed"),
+                "{addr}: a hostname resolving to loopback must be rejected"
+            );
+        }
+    }
+
+    /// `:port` must be honoured: the kubelet's port keeps the kubelet client, any other port
+    /// is dialed as requested with the requested scheme (upstream ResourceLocation).
+    #[tokio::test]
+    async fn node_proxy_honours_port_suffix() {
+        let state = make_state_with_ca().await;
+        state
+            .kubelet_client
+            .set(AppState::<SqliteStore>::build_kubelet_client(
+                state.cluster_ca_ders.get().as_deref().map(|v| v.as_slice()),
+                None,
+            ));
+        seed_node_with_address(&state, "10.0.0.5").await;
+        let kp = state.kubelet_port;
+
+        let (url, _) = resolve_node_proxy_target(&state, "n", "healthz")
+            .await
+            .unwrap();
+        assert_eq!(url, format!("https://10.0.0.5:{kp}/healthz"));
+        let (url, _) = resolve_node_proxy_target(&state, "n:10250", "healthz")
+            .await
+            .unwrap();
+        assert_eq!(url, format!("https://10.0.0.5:{kp}/healthz"));
+
+        let (url, _) = resolve_node_proxy_target(&state, "https:n:8443", "x/y")
+            .await
+            .unwrap();
+        assert_eq!(url, "https://10.0.0.5:8443/x/y", "requested port ignored");
+        let (url, _) = resolve_node_proxy_target(&state, "http:n:9100", "metrics")
+            .await
+            .unwrap();
+        assert_eq!(url, "http://10.0.0.5:9100/metrics");
+
+        let err = resolve_node_proxy_target(&state, "n:9100", "metrics")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 503, "no scheme for a non-kubelet port");
+        let err = resolve_node_proxy_target(&state, "a:b:c:d", "")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 400);
     }
 
     /// node proxy with a :port suffix in the name must resolve the same node as
@@ -6324,7 +6567,7 @@ mod tests {
             "kind": "Node",
             "metadata": {"name": "lima-node", "resourceVersion": "1"},
             "status": {
-                "addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]
+                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]
             }
         });
         state
@@ -9469,6 +9712,7 @@ mod tests {
     /// empty Content-Type even though the kubelet's body was JSON. A protobuf-
     /// preferring client (any typed clientset) then fails with "provided data does
     /// not appear to be a protobuf message" trying to decode that JSON as protobuf.
+    #[cfg(feature = "rig-test-knobs")]
     #[tokio::test]
     async fn node_proxy_forwards_upstream_content_type() {
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
