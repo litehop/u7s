@@ -58,8 +58,13 @@ fi
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
 #   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
 #                                 physical non-loopback interface).
-#   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12).
-#   --cluster-cidr / U7S_CLUSTER_CIDR   Pod CIDR (default 10.244.0.0/16).
+#   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12);
+#                                       or two comma-separated ranges of
+#                                       different IP families (dual-stack,
+#                                       e.g. 10.96.0.0/12,fd00:96::/108).
+#   --cluster-cidr / U7S_CLUSTER_CIDR   Pod CIDR (default 10.244.0.0/16); or two
+#                                       of different families (e.g.
+#                                       10.244.0.0/16,fd00:244::/56).
 #   --cluster-dns  / U7S_CLUSTER_DNS    kube-dns ClusterIP (default: tenth host
 #                                       of the service range). Persisted at
 #                                       first install; a conflicting re-run is
@@ -149,6 +154,9 @@ DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"
 SERVICE_CIDR="${U7S_SERVICE_CIDR:-}"
 POD_CLUSTER_CIDR="${U7S_CLUSTER_CIDR:-}"
 CLUSTER_DNS="${U7S_CLUSTER_DNS:-}"
+# Per-family entries of the two lists, set by validate_network_config.
+SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""
+POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""
 MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"
 TARBALL=""
 TARBALL_URL="$DEFAULT_TARBALL_URL"
@@ -189,6 +197,9 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
+# "a, b" and "a,b" are one dual-stack value: persist and compare one form.
+SERVICE_CIDR="${SERVICE_CIDR//[[:space:]]/}"
+POD_CLUSTER_CIDR="${POD_CLUSTER_CIDR//[[:space:]]/}"
 
 if [ -n "$TARBALL" ] && [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; then
   echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
@@ -472,52 +483,217 @@ int_to_ipv4() {
   echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"
 }
 
-# Parses <cidr> (flag <label>) into CIDR_START/CIDR_END, requiring the
-# canonical network address and a prefix in [min,max].
+# IPv6 address -> 32 lowercase hex digits; fails (no output) on anything else
+# (zone IDs and embedded IPv4 forms are not accepted).
+ip6_to_hex() {
+  local a="$1" left right g out="" i nz
+  local -a L R
+  [[ "$a" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  case "$a" in *:::*) return 1 ;; esac
+  L=(); R=()
+  if [[ "$a" == *::* ]]; then
+    left="${a%%::*}"; right="${a#*::}"
+    case "$right" in *::*) return 1 ;; esac
+    IFS=: read -ra L <<< "$left"
+    IFS=: read -ra R <<< "$right"
+    nz=$(( 8 - ${#L[@]} - ${#R[@]} ))
+    [ "$nz" -ge 1 ] || return 1
+  else
+    IFS=: read -ra L <<< "$a"
+    [ "${#L[@]}" -eq 8 ] || return 1
+    nz=0
+  fi
+  for (( i = 0; i < ${#L[@]}; i++ )); do
+    g="${L[i]}"; [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$(printf '%04x' "$(( 16#$g ))")"
+  done
+  for (( i = 0; i < nz; i++ )); do out="${out}0000"; done
+  for (( i = 0; i < ${#R[@]}; i++ )); do
+    g="${R[i]}"; [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$(printf '%04x' "$(( 16#$g ))")"
+  done
+  echo "$out"
+}
+
+# 32 hex digits -> RFC 5952 text (longest zero run of 2+ groups compressed).
+ip6_hex_to_str() {
+  local h="$1" i s="" best_start=-1 best_len=0 cur_start=-1 cur_len=0
+  local -a G
+  for (( i = 0; i < 8; i++ )); do
+    G[i]="$(printf '%x' "$(( 16#${h:i*4:4} ))")"
+    if [ "${G[i]}" = 0 ]; then
+      [ "$cur_start" -ge 0 ] || { cur_start=$i; cur_len=0; }
+      cur_len=$(( cur_len + 1 ))
+      if [ "$cur_len" -gt "$best_len" ]; then best_start=$cur_start; best_len=$cur_len; fi
+    else
+      cur_start=-1; cur_len=0
+    fi
+  done
+  [ "$best_len" -ge 2 ] || best_start=-1
+  i=0
+  while [ "$i" -lt 8 ]; do
+    if [ "$i" -eq "$best_start" ]; then s+="::"; i=$(( i + best_len )); continue; fi
+    case "$s" in ""|*:) ;; *) s+=: ;; esac
+    s+="${G[i]}"; i=$(( i + 1 ))
+  done
+  echo "$s"
+}
+
+# Keeps the first <bits> bits of the 32-digit hex address, zeroing the rest.
+ip6_mask_hex() {
+  local h="$1" bits="$2" q r out n
+  q=$(( bits / 4 )); r=$(( bits % 4 ))
+  out="${h:0:q}"
+  if [ "$q" -lt 32 ]; then
+    n=$(( 16#${h:q:1} & ((15 << (4 - r)) & 15) ))
+    out+="$(printf '%x' "$n")"
+  fi
+  while [ "${#out}" -lt 32 ]; do out="${out}0"; done
+  echo "${out:0:32}"
+}
+
+# True when two 32-digit hex addresses agree on their first <bits> bits.
+ip6_prefix_equal() {
+  [ "$(ip6_mask_hex "$1" "$3")" = "$(ip6_mask_hex "$2" "$3")" ]
+}
+
+# Adds a small <n> to the low 32 bits.
+ip6_add_hex() {
+  printf '%s%08x\n' "${1:0:24}" "$(( 16#${1:24:8} + $2 ))"
+}
+
+# Parses <cidr> (flag <label>), IPv4 or IPv6 by its address, requiring the
+# canonical network address and a prefix in [min4,max4] / [min6,max6]. Sets
+# CIDR_FAMILY (4|6), CIDR_PREFIX and CIDR_START/CIDR_END (IPv4 integers) or
+# CIDR_HEX (IPv6 network).
 parse_cidr() {
-  local label="$1" cidr="$2" min="$3" max="$4" addr prefix start size
-  case "$cidr" in */*) ;; *) echo "error: $label '$cidr' is not a CIDR (expected a.b.c.d/n)" >&2; return 1 ;; esac
+  local label="$1" cidr="$2" min4="$3" max4="$4" min6="$5" max6="$6" addr prefix start size hex net min max
+  case "$cidr" in */*) ;; *) echo "error: $label '$cidr' is not a CIDR (expected a.b.c.d/n or an IPv6 address/n)" >&2; return 1 ;; esac
   addr="${cidr%/*}"; prefix="${cidr#*/}"
-  if ! start="$(ipv4_to_int "$addr")" || ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]]; then
-    echo "error: $label '$cidr' is not a valid IPv4 CIDR" >&2; return 1
+  if [[ "$addr" == *:* ]]; then
+    CIDR_FAMILY=6; min=$min6; max=$max6
+    if ! hex="$(ip6_to_hex "$addr")" || ! [[ "$prefix" =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+      echo "error: $label '$cidr' is not a valid IPv6 CIDR" >&2; return 1
+    fi
+  else
+    CIDR_FAMILY=4; min=$min4; max=$max4
+    if ! start="$(ipv4_to_int "$addr")" || ! [[ "$prefix" =~ ^(0|[1-9][0-9]?)$ ]]; then
+      echo "error: $label '$cidr' is not a valid IPv4 CIDR" >&2; return 1
+    fi
   fi
   if [ "$prefix" -lt "$min" ] || [ "$prefix" -gt "$max" ]; then
     echo "error: $label '$cidr' has prefix /$prefix; it must be between /$min and /$max" >&2; return 1
   fi
-  size=$(( 1 << (32 - prefix) ))
-  if [ $(( start & (size - 1) )) -ne 0 ]; then
-    echo "error: $label '$cidr' has host bits set; the network address is $(int_to_ipv4 $(( start & ~(size - 1) )))/$prefix" >&2; return 1
+  if [ "$CIDR_FAMILY" = 6 ]; then
+    net="$(ip6_mask_hex "$hex" "$prefix")"
+    if [ "$net" != "$hex" ]; then
+      echo "error: $label '$cidr' has host bits set; the network address is $(ip6_hex_to_str "$net")/$prefix" >&2; return 1
+    fi
+    CIDR_HEX=$net
+  else
+    size=$(( 1 << (32 - prefix) ))
+    if [ $(( start & (size - 1) )) -ne 0 ]; then
+      echo "error: $label '$cidr' has host bits set; the network address is $(int_to_ipv4 $(( start & ~(size - 1) )))/$prefix" >&2; return 1
+    fi
+    CIDR_START=$start
+    CIDR_END=$(( start + size - 1 ))
   fi
-  CIDR_START=$start
-  CIDR_END=$(( start + size - 1 ))
+  CIDR_PREFIX=$prefix
 }
 
-# kubeadm's convention (and the apiserver's default): kube-dns is the tenth host.
+# Parses a --service-cidr / --cluster-cidr value: one CIDR, or two of
+# different IP families (upstream's dual-stack rule), the first being the
+# primary. Sets CIDR_LIST_V4 / CIDR_LIST_V6 to the entry of each family ("" if absent).
+parse_cidr_list() {
+  local label="$1" list="$2" min4="$3" max4="$4" min6="$5" max6="$6" commas e first_family="" idx=0
+  commas="${list//[^,]/}"
+  CIDR_LIST_V4=""; CIDR_LIST_V6=""
+  if [ "${#commas}" -gt 1 ]; then
+    echo "error: $label '$list' must not contain more than two entries" >&2; return 1
+  fi
+  if [ -z "$commas" ]; then
+    parse_cidr "$label" "$list" "$min4" "$max4" "$min6" "$max6" || return 1
+    if [ "$CIDR_FAMILY" = 4 ]; then CIDR_LIST_V4="$list"; else CIDR_LIST_V6="$list"; fi
+    return 0
+  fi
+  for e in "${list%%,*}" "${list#*,}"; do
+    parse_cidr "${label}[$idx]" "$e" "$min4" "$max4" "$min6" "$max6" || return 1
+    if [ "$first_family" = "$CIDR_FAMILY" ]; then
+      echo "error: ${label}[0] and ${label}[1] must be of different IP family" >&2; return 1
+    fi
+    first_family="$CIDR_FAMILY"; idx=1
+    if [ "$CIDR_FAMILY" = 4 ]; then CIDR_LIST_V4="$e"; else CIDR_LIST_V6="$e"; fi
+  done
+}
+
+# True when two CIDRs of the same family share an address.
+cidrs_overlap() {
+  local s e p h
+  parse_cidr range "$1" 0 32 0 128 || return 1
+  s=${CIDR_START:-0}; e=${CIDR_END:-0}; p=$CIDR_PREFIX; h=${CIDR_HEX:-}
+  parse_cidr range "$2" 0 32 0 128 || return 1
+  if [ "$CIDR_FAMILY" = 4 ]; then
+    [ "$s" -le "$CIDR_END" ] && [ "$CIDR_START" -le "$e" ]
+  else
+    [ "$CIDR_PREFIX" -gt "$p" ] || p=$CIDR_PREFIX
+    ip6_prefix_equal "$h" "$CIDR_HEX" "$p"
+  fi
+}
+
+# kubeadm's convention (and the apiserver's default): kube-dns is the tenth
+# host of the first service range, in that range's family.
 default_cluster_dns() {
-  parse_cidr --service-cidr "$1" 12 28 || return 1
-  int_to_ipv4 $(( CIDR_START + 10 ))
+  parse_cidr --service-cidr "${1%%,*}" 1 28 1 124 || return 1
+  if [ "$CIDR_FAMILY" = 4 ]; then
+    int_to_ipv4 $(( CIDR_START + 10 ))
+  else
+    ip6_hex_to_str "$(ip6_add_hex "$CIDR_HEX" 10)"
+  fi
 }
 
 # Fails loud on a combination no consumer can serve. $1=1 on a worker, which
 # runs only kubelet and so only consumes the DNS address (the ranges are the
-# control plane's).
+# control plane's). Sets SERVICE_CIDR_IPV4/_IPV6 and POD_CLUSTER_CIDR_IPV4/_IPV6
+# (the entry of each family, "" if absent) for the manifest placeholders.
 validate_network_config() {
-  local worker="$1" dns svc_start svc_end
-  if ! dns="$(ipv4_to_int "$CLUSTER_DNS")"; then
-    echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 address" >&2; return 1
+  local worker="$1" dns dns_hex dns_family svc
+  if dns="$(ipv4_to_int "$CLUSTER_DNS")"; then
+    dns_family=4
+  elif dns_hex="$(ip6_to_hex "$CLUSTER_DNS")"; then
+    dns_family=6
+  else
+    echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 or IPv6 address" >&2; return 1
   fi
   [ "$worker" -eq 1 ] && return 0
-  # /12 is the largest range upstream accepts; /28 leaves room for the
-  # kubernetes (.1) and kube-dns (.10) VIPs plus allocation.
-  parse_cidr --service-cidr "$SERVICE_CIDR" 12 28 || return 1
-  svc_start=$CIDR_START; svc_end=$CIDR_END
-  # /24 is KCM's per-node mask; the 16-bit gap to the mask is its limit.
-  parse_cidr --cluster-cidr "$POD_CLUSTER_CIDR" 8 24 || return 1
-  if [ "$svc_start" -le "$CIDR_END" ] && [ "$CIDR_START" -le "$svc_end" ]; then
-    echo "error: --service-cidr $SERVICE_CIDR and --cluster-cidr $POD_CLUSTER_CIDR overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  # Upstream 1.37 and the u7s apiserver bound no range size. /28 and /124 leave
+  # room for the kubernetes (first) and kube-dns (tenth) VIPs; /0 would span
+  # the whole address space and always overlap the node and pod networks.
+  parse_cidr_list --service-cidr "$SERVICE_CIDR" 1 28 1 124 || return 1
+  SERVICE_CIDR_IPV4="$CIDR_LIST_V4"; SERVICE_CIDR_IPV6="$CIDR_LIST_V6"
+  # The per-node masks (/24 IPv4, /64 IPv6) are KCM's; its limit is a 16-bit
+  # gap between them and the cluster range.
+  parse_cidr_list --cluster-cidr "$POD_CLUSTER_CIDR" 8 24 48 64 || return 1
+  POD_CLUSTER_CIDR_IPV4="$CIDR_LIST_V4"; POD_CLUSTER_CIDR_IPV6="$CIDR_LIST_V6"
+  if [ -n "$SERVICE_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV4" ] && cidrs_overlap "$SERVICE_CIDR_IPV4" "$POD_CLUSTER_CIDR_IPV4"; then
+    echo "error: --service-cidr $SERVICE_CIDR_IPV4 and --cluster-cidr $POD_CLUSTER_CIDR_IPV4 overlap; Service VIPs and pod IPs would collide" >&2; return 1
   fi
-  if [ "$dns" -le "$svc_start" ] || [ "$dns" -ge "$svc_end" ] || [ "$dns" -eq $(( svc_start + 1 )) ]; then
-    echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $SERVICE_CIDR (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( svc_start + 1 ))) are excluded)" >&2; return 1
+  if [ -n "$SERVICE_CIDR_IPV6" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ] && cidrs_overlap "$SERVICE_CIDR_IPV6" "$POD_CLUSTER_CIDR_IPV6"; then
+    echo "error: --service-cidr $SERVICE_CIDR_IPV6 and --cluster-cidr $POD_CLUSTER_CIDR_IPV6 overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  fi
+  if [ "$dns_family" = 4 ]; then svc="$SERVICE_CIDR_IPV4"; else svc="$SERVICE_CIDR_IPV6"; fi
+  if [ -z "$svc" ]; then
+    echo "error: --cluster-dns $CLUSTER_DNS is an IPv$dns_family address but --service-cidr $SERVICE_CIDR has no IPv$dns_family range" >&2; return 1
+  fi
+  parse_cidr --service-cidr "$svc" 1 28 1 124 || return 1
+  if [ "$dns_family" = 4 ]; then
+    if [ "$dns" -le "$CIDR_START" ] || [ "$dns" -ge "$CIDR_END" ] || [ "$dns" -eq $(( CIDR_START + 1 )) ]; then
+      echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $svc (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( CIDR_START + 1 ))) are excluded)" >&2; return 1
+    fi
+  else
+    # IPv6 has no broadcast address: the all-ones host is allocatable.
+    if ! ip6_prefix_equal "$dns_hex" "$CIDR_HEX" "$CIDR_PREFIX" || [ "$dns_hex" = "$CIDR_HEX" ] || [ "$dns_hex" = "$(ip6_add_hex "$CIDR_HEX" 1)" ]; then
+      echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $svc (network and the kubernetes Service VIP $(ip6_hex_to_str "$(ip6_add_hex "$CIDR_HEX" 1)") are excluded)" >&2; return 1
+    fi
   fi
 }
 
@@ -534,6 +710,10 @@ reconcile_network_flag() {
     effective="$persisted"
   fi
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
+    if [[ "$effective" != *,* && "$given" == *,* ]]; then
+      echo "error: $flag $given requests dual-stack, but this cluster was installed single-stack ($effective, recorded in $CONFIG_FILE). Converting an existing single-stack cluster to dual-stack in place is not supported yet. To get dual-stack now, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh with the dual-stack flags; otherwise re-run without changing $flag." >&2
+      return 1
+    fi
     echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
     return 1
   fi
@@ -543,35 +723,68 @@ reconcile_network_flag() {
 # Fails when $IFACE_IP (arg 1) sits inside either range: the node's own address
 # would be unreachable behind Service/pod routing.
 check_node_ip_outside_ranges() {
-  local ip range
-  ip="$(ipv4_to_int "$1")" || return 0
-  for range in "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"; do
-    parse_cidr range "$range" 0 32 || return 1
-    if [ "$ip" -ge "$CIDR_START" ] && [ "$ip" -le "$CIDR_END" ]; then
+  local ip hex family range inside
+  if ip="$(ipv4_to_int "$1")"; then family=4; elif hex="$(ip6_to_hex "$1")"; then family=6; else return 0; fi
+  for range in ${SERVICE_CIDR//,/ } ${POD_CLUSTER_CIDR//,/ }; do
+    parse_cidr range "$range" 0 32 0 128 || return 1
+    [ "$CIDR_FAMILY" = "$family" ] || continue
+    inside=0
+    if [ "$family" = 4 ]; then
+      if [ "$ip" -ge "$CIDR_START" ] && [ "$ip" -le "$CIDR_END" ]; then inside=1; fi
+    elif ip6_prefix_equal "$hex" "$CIDR_HEX" "$CIDR_PREFIX"; then
+      inside=1
+    fi
+    if [ "$inside" -eq 1 ]; then
       echo "error: node address $1 is inside $range; choose --service-cidr/--cluster-cidr ranges that exclude the host network" >&2; return 1
     fi
   done
 }
 
+# KCM's per-node CIDR mask flags for $POD_CLUSTER_CIDR. Upstream rejects
+# --node-cidr-mask-size with two cluster CIDRs and wants one flag per family
+# (kube-controller-manager app/core.go); defaults are /24 IPv4, /64 IPv6.
+kcm_node_cidr_mask_flags() {
+  case "$POD_CLUSTER_CIDR" in
+    *,*) echo "--node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64" ;;
+    *:*) echo "--node-cidr-mask-size=64" ;;
+    *) echo "--node-cidr-mask-size=24" ;;
+  esac
+}
+
 # Writes the install-time placeholders into the vendored manifests in $1.
+# __POD_CLUSTER_CIDR__ is the primary (first) pod CIDR, so a manifest that
+# predates dual-stack keeps a valid single-family value; the full list and
+# each family are __POD_CLUSTER_CIDRS__, __POD_CLUSTER_CIDR_IPV4__ and
+# __POD_CLUSTER_CIDR_IPV6__ (likewise __SERVICE_CIDRS__, __SERVICE_CIDR_IPV4__,
+# __SERVICE_CIDR_IPV6__); an absent family renders empty. Single-stack IPv4
+# renders __POD_CLUSTER_CIDR__ exactly as before.
 # CoreDNS ships its default VIP literally (the dev rigs apply the file as-is),
 # so its clusterIP line is rewritten and then verified.
 render_vendored_manifests() {
   local dir="$1"
+  local -a cidr_sed=(
+    -e "s#__POD_CLUSTER_CIDR__#${POD_CLUSTER_CIDR%%,*}#g"
+    -e "s#__POD_CLUSTER_CIDRS__#$POD_CLUSTER_CIDR#g"
+    -e "s#__POD_CLUSTER_CIDR_IPV4__#$POD_CLUSTER_CIDR_IPV4#g"
+    -e "s#__POD_CLUSTER_CIDR_IPV6__#$POD_CLUSTER_CIDR_IPV6#g"
+    -e "s#__SERVICE_CIDRS__#$SERVICE_CIDR#g"
+    -e "s#__SERVICE_CIDR_IPV4__#$SERVICE_CIDR_IPV4#g"
+    -e "s#__SERVICE_CIDR_IPV6__#$SERVICE_CIDR_IPV6#g"
+  )
   if [ -f "$dir/flannel.yaml" ]; then
     # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
     # BSD sed, and this redirect-and-replace form works identically on both.
-    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__IFACE__/$IFACE/g" "${cidr_sed[@]}" \
       "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp"
     mv "$dir/flannel.yaml.tmp" "$dir/flannel.yaml"
   fi
   if [ -f "$dir/kube-proxy.yaml" ]; then
-    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" "${cidr_sed[@]}" \
       "$dir/kube-proxy.yaml" > "$dir/kube-proxy.yaml.tmp"
     mv "$dir/kube-proxy.yaml.tmp" "$dir/kube-proxy.yaml"
   fi
   if [ -f "$dir/beep.yaml" ]; then
-    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__IFACE__/$IFACE/g" "${cidr_sed[@]}" \
       "$dir/beep.yaml" > "$dir/beep.yaml.tmp"
     mv "$dir/beep.yaml.tmp" "$dir/beep.yaml"
   fi
@@ -1522,6 +1735,11 @@ cat > /etc/sysctl.d/u7s-br-netfilter.conf <<'SYSCTL_EOF'
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 SYSCTL_EOF
+# IPv6 pod/Service traffic is routed through the node, which the kernel only
+# does with forwarding on; nothing else here sets it.
+if [ -n "$SERVICE_CIDR_IPV6$POD_CLUSTER_CIDR_IPV6" ]; then
+  printf 'net.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/u7s-ipv6-forwarding.conf
+fi
 sysctl --system >/dev/null
 
 # The cri-o package ships a default 10-crio-bridge.conf(list) that gives every
@@ -1787,7 +2005,7 @@ fi
 
 # $POD_CLUSTER_CIDR (resolved and validated above) feeds node-ipam-controller
 # and Flannel's net-conf.json -- one variable so the two can never drift apart.
-POD_NODE_CIDR_MASK_SIZE=24
+KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
 
 # --- Vendored manifests from the tarball -------------------------------------
 #
@@ -1900,7 +2118,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR $KCM_NODE_CIDR_MASK_FLAGS --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
