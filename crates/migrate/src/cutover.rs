@@ -4,7 +4,7 @@
 //! stage is idempotent, so a crash at any point resumes where it stopped or
 //! is rolled back. The source k3s data directory is never removed: nothing
 //! here runs k3s's uninstall script, which `rm -rf`s it (including the
-//! local-path volumes). Source PVs are switched to `Retain` only after the
+//! local-path volumes); only `k3s-killall.sh` is run. Source PVs are switched to `Retain` only after the
 //! operator confirms, with the original policy recorded in the state file
 //! and in an annotation, and put back on whichever cluster ends up serving
 //! them.
@@ -86,6 +86,11 @@ pub struct State {
     /// rollback resumes without needing u7s.
     #[serde(default)]
     pub rolling_back: bool,
+    /// Set once `workloads` holds the live replica counts read just before
+    /// scale-down, so a resumed scale-down never records a count it already
+    /// zeroed.
+    #[serde(default)]
+    pub replicas_recorded: bool,
 }
 
 pub struct Paths {
@@ -94,7 +99,9 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(dir: &str) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: std::path::absolute(dir).unwrap_or_else(|_| dir.into()),
+        }
     }
     pub fn state(&self) -> PathBuf {
         self.dir.join("state.json")
@@ -112,10 +119,11 @@ fn s(p: &Path) -> &str {
 }
 
 fn save(paths: &Paths, st: &State) -> anyhow::Result<()> {
-    let tmp = paths.dir.join("state.json.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    crate::write_new_private(s(&tmp), serde_json::to_string_pretty(st)?.as_bytes())?;
-    std::fs::rename(&tmp, paths.state()).context("recording cutover state")
+    crate::write_durable(
+        s(&paths.state()),
+        serde_json::to_string_pretty(st)?.as_bytes(),
+    )
+    .context("recording cutover state")
 }
 
 fn load_state(paths: &Paths) -> anyhow::Result<Option<State>> {
@@ -431,6 +439,10 @@ pub async fn run<S: Api, H: Host>(
     user_install_args: &[String],
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&paths.dir)?;
+    eprintln!(
+        "cutover work dir: {0} (to undo, run `u7s migrate rollback --work-dir {0}`)",
+        paths.dir.display()
+    );
     let mut st = match load_state(paths)? {
         Some(st) if st.stage == Stage::RolledBack => bail!(
             "this cutover was rolled back; remove {} and start a new one",
@@ -457,6 +469,7 @@ pub async fn run<S: Api, H: Host>(
                 pvs: vec![],
                 workloads: vec![],
                 rolling_back: false,
+                replicas_recorded: false,
             };
             save(paths, &st)?;
             st
@@ -497,14 +510,23 @@ pub async fn run<S: Api, H: Host>(
             set_policy(src, &r.name, "Retain", Some(&r.original_policy)).await?;
         }
         retain_in_export(&mut objs, &st.pvs);
-        let tmp = paths.dir.join("objects.json.new");
-        let _ = std::fs::remove_file(&tmp);
-        crate::write_new_private(s(&tmp), serde_json::to_string(&objs)?.as_bytes())?;
-        std::fs::rename(&tmp, paths.objects())?;
+        crate::write_durable(
+            s(&paths.objects()),
+            serde_json::to_string(&objs)?.as_bytes(),
+        )?;
         step(&mut st, paths, Stage::Retained)?;
     }
 
     if st.stage < Stage::ScaledDown {
+        if !st.replicas_recorded {
+            for w in &mut st.workloads {
+                if let Some(live) = src.get(&w.path()).await? {
+                    w.replicas = live["spec"]["replicas"].as_i64().unwrap_or(1);
+                }
+            }
+            st.replicas_recorded = true;
+            save(paths, &st)?;
+        }
         for w in &st.workloads {
             src.merge_patch(&w.path(), &json!({"spec": {"replicas": 0}}))
                 .await
@@ -603,8 +625,13 @@ pub async fn run<S: Api, H: Host>(
 /// back the source's reclaim policies and replica counts. Refused once the
 /// user has deleted a migrated PVC on u7s.
 pub async fn rollback<S: Api, H: Host>(src: &S, host: &mut H, paths: &Paths) -> anyhow::Result<()> {
-    let mut st = load_state(paths)?.context("no cutover state found; nothing to roll back")?;
-    if st.stage == Stage::PoliciesRestored && !st.rolling_back {
+    let mut st = load_state(paths).context("reading cutover state")?.with_context(|| {
+        format!(
+            "no cutover state in {} (pass the --work-dir the cutover printed); nothing to roll back",
+            paths.dir.display()
+        )
+    })?;
+    if st.stage >= Stage::Verified && !st.rolling_back {
         let unreachable = "cannot check whether u7s data was deleted: start u7s and retry";
         let target = host.target().await.context(unreachable)?;
         let pvs = target
@@ -658,6 +685,19 @@ const U7S_UNITS: [&str; 4] = [
     "u7s-apiserver.service",
 ];
 
+pub const K3S_KILLALL: &str = "/usr/local/bin/k3s-killall.sh";
+
+/// Stopping k3s: the service first, then k3s's own killall script, which
+/// kills the leftover containerd shims, unmounts pod mounts and removes
+/// cni0/flannel.1 and k3s's iptables rules (u7s would otherwise clash with
+/// them on the same CIDRs). It never deletes the data directory.
+pub fn stop_k3s_commands() -> [(&'static str, Vec<&'static str>); 2] {
+    [
+        ("systemctl", vec!["disable", "--now", "k3s"]),
+        (K3S_KILLALL, vec![]),
+    ]
+}
+
 async fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     guard_command(program)?;
     let status = tokio::process::Command::new(program)
@@ -683,7 +723,10 @@ impl Host for SystemHost {
     }
 
     async fn stop_k3s(&mut self) -> anyhow::Result<()> {
-        run_cmd("systemctl", &["disable", "--now", "k3s"]).await
+        for (program, args) in stop_k3s_commands() {
+            run_cmd(program, &args).await?;
+        }
+        Ok(())
     }
 
     async fn start_k3s(&mut self) -> anyhow::Result<()> {

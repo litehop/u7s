@@ -30,6 +30,8 @@ struct FakeApi {
     patches: RefCell<Vec<(String, Value)>>,
     /// VolumeAttachments vanish after this many lists; None = never.
     detach_after: Cell<Option<u32>>,
+    /// A merge_patch on this path fails once.
+    fail_patch_once: RefCell<Option<String>>,
 }
 
 impl FakeApi {
@@ -71,6 +73,10 @@ impl Api for Rc<FakeApi> {
         Ok(self.objs.borrow().get(path).cloned())
     }
     async fn merge_patch(&self, path: &str, patch: &Value) -> anyhow::Result<()> {
+        if self.fail_patch_once.borrow().as_deref() == Some(path) {
+            self.fail_patch_once.take();
+            anyhow::bail!("injected patch failure on {path}");
+        }
         self.patches
             .borrow_mut()
             .push((path.to_string(), patch.clone()));
@@ -95,6 +101,7 @@ struct FakeHost {
     tgt: Rc<FakeApi>,
     install_args: Vec<String>,
     imported_pv_policy: Option<String>,
+    second_pv: bool,
 }
 
 impl FakeHost {
@@ -111,6 +118,7 @@ impl FakeHost {
             tgt: tgt.clone(),
             install_args: vec![],
             imported_pv_policy: None,
+            second_pv: false,
         }
     }
 }
@@ -149,7 +157,10 @@ impl Host for FakeHost {
     }
     async fn export(&mut self, plan_path: &str, objects: &str) -> anyhow::Result<()> {
         self.calls.push("export".into());
-        let objs = source_objects();
+        let mut objs = source_objects();
+        if self.second_pv {
+            objs.extend(second_pv_objects());
+        }
         let (plan, _) = plan::build(&objs, source(), &[], vec![]);
         std::fs::write(plan_path, serde_json::to_string(&plan)?)?;
         crate::write_new_private(objects, serde_json::to_string(&objs)?.as_bytes())
@@ -165,7 +176,8 @@ impl Host for FakeHost {
                 .as_str()
                 .map(Into::into);
             pv["status"] = json!({"phase": "Bound"});
-            self.tgt.put(&pv_path("pv-data"), pv);
+            let name = pv["metadata"]["name"].as_str().unwrap().to_string();
+            self.tgt.put(&pv_path(&name), pv);
         }
         self.tgt.put(
             "/apis/apps/v1/namespaces/app/deployments/db",
@@ -209,6 +221,19 @@ fn source_objects() -> Vec<Value> {
             "spec": {"replicas": 2}}),
         json!({"apiVersion": "storage.k8s.io/v1", "kind": "CSIDriver",
             "metadata": {"name": "csi.example.com", "uid": "u4"}, "spec": {}}),
+    ]
+}
+
+fn second_pv_objects() -> Vec<Value> {
+    vec![
+        json!({"apiVersion": "v1", "kind": "PersistentVolume",
+            "metadata": {"name": "pv-logs", "uid": "u5"},
+            "spec": {"persistentVolumeReclaimPolicy": "Delete", "capacity": {"storage": "1Gi"},
+                     "claimRef": {"namespace": "app", "name": "logs", "uid": "u6"},
+                     "csi": {"driver": "csi.example.com", "volumeHandle": "vol-2"}}}),
+        json!({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "logs", "namespace": "app", "uid": "u6"},
+            "spec": {"volumeName": "pv-logs"}}),
     ]
 }
 
@@ -605,4 +630,133 @@ fn export_copy_of_every_migrated_pv_is_retain_with_the_original_recorded() {
         objs[1]["metadata"]["annotations"].is_null(),
         "only PVs are touched"
     );
+}
+
+const DEPLOY: &str = "/apis/apps/v1/namespaces/app/deployments/db";
+
+#[tokio::test]
+async fn rollback_restores_the_replicas_live_at_scale_down_not_the_stale_export() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    host.fail_import = true;
+    // The export (2 replicas) is taken before an operator scales the app.
+    src.put(DEPLOY, json!({"spec": {"replicas": 5}}));
+    let paths = work("live-replicas");
+    assert!(run(&src, &mut host, &paths, true, &[]).await.is_err());
+    rollback(&src, &mut host, &paths).await.unwrap();
+    assert_eq!(
+        src.at(DEPLOY)["spec"]["replicas"],
+        5,
+        "rollback must bring back what was running, or the app silently shrinks"
+    );
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn resumed_scale_down_keeps_the_replica_counts_it_already_recorded() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    host.fail_stop_once = true;
+    src.put(DEPLOY, json!({"spec": {"replicas": 5}}));
+    let paths = work("replicas-resume");
+    assert!(run(&src, &mut host, &paths, true, &[]).await.is_err());
+    assert_eq!(src.at(DEPLOY)["spec"]["replicas"], 0);
+    let mut st = load_state(&paths).unwrap().unwrap();
+    st.stage = Stage::Retained;
+    save(&paths, &st).unwrap();
+    // The fake target reports 2 ready, so verification times out; only the
+    // recorded state matters here.
+    let _ = run(&src, &mut host, &paths, true, &[]).await;
+    assert_eq!(
+        load_state(&paths).unwrap().unwrap().workloads[0].replicas,
+        5,
+        "re-reading the already-zeroed live value would make rollback restore 0"
+    );
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn rollback_window_is_enforced_after_a_crash_mid_policy_restore() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    let paths = work("rb-window-verified");
+    run(&src, &mut host, &paths, true, &[]).await.unwrap();
+    let mut st = load_state(&paths).unwrap().unwrap();
+    st.stage = Stage::Verified;
+    save(&paths, &st).unwrap();
+    let mut pv = tgt.at(&pv_path("pv-data"));
+    pv["status"]["phase"] = "Released".into();
+    tgt.put(&pv_path("pv-data"), pv);
+    host.calls.clear();
+    let err = rollback(&src, &mut host, &paths).await.unwrap_err();
+    assert!(format!("{err:#}").contains("rollback window closed"));
+    assert!(
+        host.calls.is_empty(),
+        "starting k3s over volumes u7s already restored to Delete and released loses data"
+    );
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn crash_between_the_two_retain_patches_neither_loses_nor_mis_records_policies() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    src.put(
+        &pv_path("pv-logs"),
+        json!({"metadata": {"name": "pv-logs"}, "spec": {"persistentVolumeReclaimPolicy": "Delete"}}),
+    );
+    let mut host = FakeHost::new(&tgt);
+    host.second_pv = true;
+    let paths = work("two-pv-crash");
+    *src.fail_patch_once.borrow_mut() = Some(pv_path("pv-logs"));
+    assert!(run(&src, &mut host, &paths, true, &[]).await.is_err());
+    assert_eq!(
+        policy(&src, &pv_path("pv-data")),
+        ("Retain".into(), Some("Delete".into())),
+        "first PV is already Retain with its original in the annotation"
+    );
+    assert_eq!(policy(&src, &pv_path("pv-logs")).0, "Delete");
+    host.fail_import = true;
+    assert!(run(&src, &mut host, &paths, true, &[]).await.is_err());
+    let st = load_state(&paths).unwrap().unwrap();
+    assert!(
+        st.pvs.iter().all(|r| r.original_policy == "Delete") && st.pvs.len() == 2,
+        "a resumed run recorded Retain as an original: {:?}",
+        st.pvs
+    );
+    rollback(&src, &mut host, &paths).await.unwrap();
+    for pv in ["pv-data", "pv-logs"] {
+        assert_eq!(
+            policy(&src, &pv_path(pv)),
+            ("Delete".into(), None),
+            "{pv} must get its original policy back on rollback"
+        );
+    }
+    cleanup(&paths);
+}
+
+#[test]
+fn k3s_is_stopped_then_killed_with_its_own_killall_and_never_uninstalled() {
+    let cmds = stop_k3s_commands();
+    assert_eq!(cmds[0].0, "systemctl");
+    assert_eq!(cmds[1].0, K3S_KILLALL);
+    for (p, _) in &cmds {
+        assert!(guard_command(p).is_ok(), "{p} must pass the data-dir guard");
+    }
+}
+
+#[test]
+fn work_dir_is_absolute_so_rollback_works_from_any_directory() {
+    assert!(Paths::new("u7s-migrate-cutover").dir.is_absolute());
+}
+
+#[test]
+fn every_cutover_write_goes_through_the_durable_helper() {
+    let src = include_str!("../cutover.rs");
+    let prod = src.split("#[cfg(test)]").next().unwrap();
+    for banned in ["write_new_private(", "fs::rename(", "fs::write("] {
+        assert!(
+            !prod.contains(banned),
+            "{banned} bypasses fsync-before-rename durability"
+        );
+    }
 }
