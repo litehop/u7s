@@ -2181,6 +2181,90 @@ assert_true "--mint-join-token prints --cluster-dns for a non-default cluster so
 assert_false "no hardcoded 10.96.0.10 / 10.244.0.0/16 assignment is left outside the defaults block" \
   grep -nE '^\s*(POD_CLUSTER_CIDR|CLUSTER_DNS)="?10\.' "$INSTALL"
 
+# ---------------------------------------------------------------------------
+# wait_for_cluster_ready: install must not exit 0 while the node or a
+# kube-system workload it shipped is still pulling images, or the user's first
+# apply competes with those pulls on a small disk. Extracted from install.sh
+# and run against a fake kubectl; sleep is stubbed.
+# ---------------------------------------------------------------------------
+RDY_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK" "$RDY_WORK"' EXIT
+mkdir -p "$RDY_WORK/bin"
+cat > "$RDY_WORK/bin/kubectl" <<'FAKE'
+#!/usr/bin/env bash
+# FAKE_STATE counts kube-proxy rollout-status calls; kube-proxy rolls out only
+# after FAKE_READY_AFTER calls (never, if "never").
+args="$*"
+case "$args" in
+  *"get node"*) echo "${FAKE_NODE_READY:-True}" ;;
+  *"rollout status"*)
+    # Real kubectl without --watch=false blocks (--timeout=0 means forever) and
+    # with it exits 0 even when the rollout is unfinished; mimic both.
+    case "$args" in *"--watch=false"*) ;; *) echo "fake kubectl: would block forever" >&2; exit 99 ;; esac
+    if [[ "$args" == *"daemonset/kube-proxy"* ]]; then
+      n=$(( $(cat "$FAKE_STATE" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_STATE"
+      if [ "${FAKE_READY_AFTER:-0}" = never ] || [ "$n" -le "${FAKE_READY_AFTER:-0}" ]; then
+        echo 'Waiting for daemon set "kube-proxy" rollout to finish: 0 of 1 updated pods are available...'; exit 0
+      fi
+    fi
+    echo 'rollout successfully rolled out' ;;
+  *) exit 1 ;;
+esac
+FAKE
+chmod +x "$RDY_WORK/bin/kubectl"
+{
+  echo 'set -uo pipefail'
+  echo 'STATE_DIR=/nonexistent; NODE_NAME=n1'
+  echo 'sleep() { echo "$1" >> "$FAKE_STATE.sleeps"; }'
+  grep -E '^(READY_POLL_SECONDS|READY_PROGRESS_EVERY)=' "$INSTALL"
+  awk '$0 == "wait_for_cluster_ready() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
+  echo 'CLUSTER_WORKLOADS="kube-system/deployment/coredns kube-system/daemonset/kube-proxy"'
+  echo 'wait_for_cluster_ready'
+} > "$RDY_WORK/scenario.sh"
+rdy_run() {
+  rm -f "$RDY_WORK/state" "$RDY_WORK/state.sleeps"
+  RDY_STATUS=0
+  RDY_OUT="$(PATH="$RDY_WORK/bin:$PATH" FAKE_STATE="$RDY_WORK/state" "$@" bash "$RDY_WORK/scenario.sh" 2>&1)" || RDY_STATUS=$?
+}
+assert "the wait scenario was extracted with the real function (if this fails the wait tests below test nothing)" \
+  "$(grep -q 'rollout status' "$RDY_WORK/scenario.sh" && grep -q '^READY_POLL_SECONDS=' "$RDY_WORK/scenario.sh" && echo 1 || echo 0)"
+
+rdy_run env FAKE_READY_AFTER=3 U7S_READY_TIMEOUT_SECONDS=600
+assert "install keeps polling while a workload is not rolled out and returns 0 only once it is, so a user's first apply never races our image pulls" \
+  "$([ "$RDY_STATUS" -eq 0 ] && [ "$(cat "$RDY_WORK/state")" -eq 4 ] && printf '%s' "$RDY_OUT" | grep -qF 'still waiting' && printf '%s' "$RDY_OUT" | grep -qF 'kube-system/daemonset/kube-proxy' && echo 1 || echo 0)"
+
+rdy_run env FAKE_READY_AFTER=never U7S_READY_TIMEOUT_SECONDS=20
+assert "a workload that never rolls out fails the install non-zero, naming only it with a describe hint -- no silent success" \
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'not Ready after 20s: kube-system/daemonset/kube-proxy' && printf '%s' "$RDY_OUT" | grep -qF 'describe daemonset/kube-proxy' && ! printf '%s' "$RDY_OUT" | grep -qF 'describe deployment/coredns' && echo 1 || echo 0)"
+assert "the timeout is bounded by the configured seconds (20s at 5s polls = 4 sleeps), not unbounded" \
+  "$([ "$(wc -l < "$RDY_WORK/state.sleeps")" -eq 4 ] && echo 1 || echo 0)"
+
+rdy_run env FAKE_NODE_READY=False FAKE_READY_AFTER=0 U7S_READY_TIMEOUT_SECONDS=10
+assert "a node that is not Ready fails the install even when every workload reports rolled out" \
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'not Ready after 10s: node/n1' && printf '%s' "$RDY_OUT" | grep -qF 'describe node n1' && echo 1 || echo 0)"
+
+rdy_run env U7S_READY_TIMEOUT_SECONDS=abc
+assert "a malformed U7S_READY_TIMEOUT_SECONDS is rejected rather than silently treated as 0" \
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'must be a whole number' && echo 1 || echo 0)"
+
+# Structural: the workload list is what the vendored manifests actually ship,
+# and only the control-plane path waits (a worker's node identity cannot read
+# workloads; its own Ready+serving-cert wait is wait_for_joined_node).
+wl_line="$(grep -F 'CLUSTER_WORKLOADS="kube-system' "$INSTALL")"
+wl_ok=1
+for spec in "coredns.yaml Deployment coredns" "kube-proxy.yaml DaemonSet kube-proxy" "beep.yaml DaemonSet servicelb-controller" "flannel.yaml DaemonSet kube-flannel-ds"; do
+  read -r f k n <<< "$spec"
+  awk -v k="$k" '$0=="kind: " k {s=1} s && /^  name: / {print $2; exit}' "$ROOT_DIR/manifests/$f" | grep -qx "$n" || wl_ok=0
+  printf '%s' "$wl_line" | grep -qF "/$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]')/$n" || wl_ok=0
+done
+assert "CLUSTER_WORKLOADS lists exactly the Deployment/DaemonSets the vendored manifests define (a new or renamed workload must be waited on)" "$wl_ok"
+assert "no vendored manifest defines a Deployment/DaemonSet/StatefulSet beyond the four waited on" \
+  "$([ "$(grep -hE '^kind: (Deployment|DaemonSet|StatefulSet)$' "$ROOT_DIR"/manifests/*.yaml | wc -l)" -eq 4 ] && echo 1 || echo 0)"
+assert "the control-plane install waits after labelling the node, as its last step before reporting success" \
+  "$(awk '/^label_control_plane_node \|\| exit 1$/ {l=NR} /^wait_for_cluster_ready \|\| exit 1$/ {w=NR} /^echo "u7s bootstrap complete/ {b=NR} END {print (l && w>l && b>w) ? 1 : 0}' "$INSTALL")"
+assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
+  "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then

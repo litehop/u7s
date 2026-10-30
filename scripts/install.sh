@@ -72,6 +72,10 @@ fi
 #                                 the apiserver's well-known auto-applied
 #                                 folder -- docs/decisions/
 #                                 well-known-manifest-folder.md).
+#   U7S_READY_TIMEOUT_SECONDS     How long the control-plane install waits for
+#                                 the node and the vendored kube-system
+#                                 workloads to be Ready before failing
+#                                 (default 1200).
 #
 # The default and --join modes need a tarball, from --tarball <path>,
 # --tarball-url <url>, or DEFAULT_TARBALL_URL below. It must contain the
@@ -1018,6 +1022,58 @@ label_control_plane_node() {
   return 1
 }
 
+# Control-plane success condition: the node is Ready and every workload this
+# script itself ships (CLUSTER_WORKLOADS, "<ns>/<kind>/<name>" entries) is
+# rolled out, so a user's first apply does not compete with our own image
+# pulls. Default timeout is 20 min: a fresh 10 GB pd-standard e2-micro measured
+# 4-10 min to pull and start everything; 2x headroom. U7S_READY_TIMEOUT_SECONDS
+# overrides it. Returns non-zero naming each unready item on timeout.
+CLUSTER_WORKLOADS=""
+READY_POLL_SECONDS=5
+READY_PROGRESS_EVERY=6
+wait_for_cluster_ready() {
+  local timeout="${U7S_READY_TIMEOUT_SECONDS:-1200}"
+  case "$timeout" in
+    ''|*[!0-9]*) echo "error: U7S_READY_TIMEOUT_SECONDS must be a whole number of seconds, got '$timeout'" >&2; return 1 ;;
+  esac
+  local kc=(kubectl --kubeconfig="$STATE_DIR/kubeconfig" --request-timeout=10s)
+  local polls=$(( (timeout + READY_POLL_SECONDS - 1) / READY_POLL_SECONDS )) i w ns kind name
+  local pending=""
+  echo "Waiting up to ${timeout}s for node $NODE_NAME and ${CLUSTER_WORKLOADS:-no vendored workloads} to be Ready..."
+  for i in $(seq 0 "$polls"); do
+    pending=""
+    if [ "$("${kc[@]}" get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)" != "True" ]; then
+      pending="node/$NODE_NAME"
+    fi
+    for w in $CLUSTER_WORKLOADS; do
+      IFS=/ read -r ns kind name <<< "$w"
+      # --watch=false exits 0 even when unfinished (--timeout=0 would block
+      # forever), so success is the "successfully rolled out" line.
+      if ! "${kc[@]}" -n "$ns" rollout status "$kind/$name" --watch=false 2>&1 | grep -q 'successfully rolled out'; then
+        pending="${pending:+$pending }$w"
+      fi
+    done
+    if [ -z "$pending" ]; then
+      echo "Node $NODE_NAME and all vendored workloads are Ready."
+      return 0
+    fi
+    [ "$i" -eq "$polls" ] && break
+    if [ $(( i % READY_PROGRESS_EVERY )) -eq 0 ]; then
+      echo "  still waiting ($(( i * READY_POLL_SECONDS ))s/${timeout}s): $pending"
+    fi
+    sleep "$READY_POLL_SECONDS"
+  done
+  echo "error: not Ready after ${timeout}s: $pending" >&2
+  for w in $pending; do
+    case "$w" in
+      node/*) echo "  check: kubectl --kubeconfig=$STATE_DIR/kubeconfig describe node $NODE_NAME; journalctl -u kubelet" >&2 ;;
+      *) IFS=/ read -r ns kind name <<< "$w"
+         echo "  check: kubectl --kubeconfig=$STATE_DIR/kubeconfig -n $ns describe $kind/$name; kubectl --kubeconfig=$STATE_DIR/kubeconfig -n $ns get pods -o wide; df -h /var/lib (image pulls need disk)" >&2 ;;
+    esac
+  done
+  return 1
+}
+
 # Success condition of a join, checked as the new node identity after kubelet
 # started: the Node is Ready and the kubelet's own kubelet-serving CSR
 # (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
@@ -1723,6 +1779,10 @@ if [ "$WORKER_MODE" -eq 0 ]; then
     install -d -m 0755 "$MANIFEST_OUTPUT_DIR"
     cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"
     render_vendored_manifests "$MANIFEST_OUTPUT_DIR" || exit 1
+    # Only the well-known folder is auto-applied; a custom dir is GitOps-managed.
+    if [ "$MANIFEST_OUTPUT_DIR" = "/etc/u7s/manifests" ]; then
+      CLUSTER_WORKLOADS="kube-system/deployment/coredns kube-system/daemonset/kube-proxy kube-system/daemonset/servicelb-controller kube-flannel/daemonset/kube-flannel-ds"
+    fi
   fi
 fi
 
@@ -1920,6 +1980,7 @@ if [ "$EXISTING_INSTALL" -eq 1 ]; then
   verify_cp_identity_preserved "$CP_IDENTITY_BEFORE" || exit 1
 fi
 label_control_plane_node || exit 1
+wait_for_cluster_ready || exit 1
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"
