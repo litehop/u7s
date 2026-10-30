@@ -1118,9 +1118,22 @@ fn find_schema_node<'a>(
         if let Some(items) = node.get("items") {
             node = items;
         }
-        node = node.get("properties")?.get(segment)?;
+        node = node
+            .get("properties")
+            .and_then(|p| p.get(segment))
+            .or_else(|| additional_properties_schema(node))?;
     }
     Some(node)
+}
+
+/// The value schema of a structural map (`additionalProperties` given as a schema object).
+/// `additionalProperties: true/false` carries no schema, so there is nothing to default or
+/// validate beneath it. The single child-lookup step shared by every CR schema walker, so a
+/// map's values are visited consistently.
+pub(crate) fn additional_properties_schema(
+    schema: &serde_json::Value,
+) -> Option<&serde_json::Value> {
+    schema.get("additionalProperties").filter(|v| v.is_object())
 }
 
 fn has_delete_directive(arr: &serde_json::Value) -> bool {
@@ -4451,5 +4464,45 @@ mod tests {
         let patch = json!({"s": {"$patch": "bogus"}});
         let err = strategic_merge_patch(&mut target, &patch).unwrap_err();
         assert!(matches!(err, PatchError::InvalidDirective(_)), "{err:?}");
+    }
+
+    #[test]
+    fn find_schema_node_resolves_map_values_via_additional_properties() {
+        let list = json!({"type": "array", "x-kubernetes-list-type": "map"});
+        let schema = json!({"type": "object", "properties": {"m": {
+            "type": "object",
+            "additionalProperties": {"type": "object", "properties": {"l": list}}
+        }}});
+        assert_eq!(
+            find_schema_node(&schema, "m.anykey.l"),
+            Some(&list),
+            "a list under a map value must resolve its declared merge strategy, else a \
+             strategic merge patch replaces the list wholesale"
+        );
+        for ap in [json!(true), json!(false)] {
+            let s = json!({"type": "object", "properties": {"m": {"additionalProperties": ap}}});
+            assert_eq!(find_schema_node(&s, "m.k"), None, "no schema under bool");
+        }
+    }
+
+    #[test]
+    fn smp_for_cr_merges_list_under_map_value_by_declared_key() {
+        let schema = json!({"type": "object", "properties": {"m": {
+            "type": "object",
+            "additionalProperties": {"type": "object", "properties": {"l": {
+                "type": "array",
+                "x-kubernetes-list-type": "map",
+                "x-kubernetes-list-map-keys": ["name"],
+                "items": {"type": "object", "properties": {"name": {"type": "string"}}}
+            }}}
+        }}});
+        let mut target = json!({"m": {"k": {"l": [{"name": "a"}]}}});
+        let patch = json!({"m": {"k": {"l": [{"name": "b"}]}}});
+        strategic_merge_patch_for_cr(&mut target, &patch, Some(&schema)).unwrap();
+        assert_eq!(
+            target["m"]["k"]["l"].as_array().unwrap().len(),
+            2,
+            "list-type=map under an additionalProperties value must merge by key"
+        );
     }
 }
