@@ -27,12 +27,11 @@ dual node IPs to the Lima harness, not install.sh. kube-proxy runs
   firewall `u7s-test-allow-internal-v6` (source = subnet /64).
 - #2040 (`.5`): IPv6 papercuts: `::1`/v6 SANs, `kubernetes` EndpointSlice
   family, CSR service-CIDR guard, v6-safe pod/kubelet proxy.
-- #2047 (`.6`, OPEN, in review as of 2026-10-30): install.sh dual
-  `--service-cidr`/`--cluster-cidr`, per-family KCM `-ipv4`/`-ipv6` mask flags,
-  IPv6 forwarding sysctl on the control plane.
 
 ## Remaining, in dependency order
 
+0. `.6` (#2047): install.sh dual `--service-cidr`/`--cluster-cidr`, per-family
+   KCM `-ipv4`/`-ipv6` mask flags, IPv6 forwarding sysctl on the control plane.
 1. `.7` manifests: flannel `EnableIPv6`, kube-proxy dual clusterCIDR and
    bracketed server URL, CoreDNS family, beep `--pod-cidr`. Needs `.6` and
    `rv1aw`.
@@ -52,9 +51,9 @@ dual node IPs to the Lima harness, not install.sh. kube-proxy runs
    (dual `--node-ip`, v6 forwarding on workers). install.sh never sets
    `net.ipv4.ip_forward`; it flips on at first pod sandbox (unverified: likely
    the CNI bridge plugin).
-7. `.11` Lima dual-stack rig, PR #2045 DRAFT: unverified VM-to-VM (only a
+7. `.11` Lima dual-stack rig, PR #2045: unverified VM-to-VM (only a
    single-VM smoke ran; NDP not measured). Verify on a same-network pair
-   (`user-v2-workers-a`), then un-draft.
+   (`user-v2-workers-a`), before merge.
 8. `.2` verify on GCP: node addresses, pod and Service families, AAAA/A, beep
    LoadBalancer reachable from outside over both families, upstream
    `[Feature:IPv6DualStack]` subset. Delete all VMs.

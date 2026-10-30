@@ -9,7 +9,8 @@ Main is NOT release-ready: the release-authoritative GCP e2-micro gate fails
 criterion (d) because MariaDB's first init does not survive a cold pd-standard
 disk (`mayor-vw7jc`). Fix choice is waiting on an operator decision
 (`mayor-yfca9`). Cert rotation, uppercase-hostname install and advisory bumps
-are done; the Lima burst gate (50 pods, 3/3, 1 GiB) passed on 2026-10-21.
+shipped earlier; the Lima burst gate measured 50 pods, 3/3, on a 1 GiB VM on
+2026-10-21 (`mayor-f2gfd`; ran with a local lowercase VM name, see `zl285`).
 
 ## Root-cause chain (`vw7jc`)
 
@@ -28,7 +29,7 @@ are done; the Lima burst gate (50 pods, 3/3, 1 GiB) passed on 2026-10-21.
    MiB, 0 OOM. Lima thrash numbers do not transfer to GCP.
 4. MariaDB: the old liveness (initialDelay 120 s, timeout 1 s) killed init
    mid-run, and readiness `mariadb-admin ping` hid broken root auth. Probes are
-   fixed in #2046 (`mayor-vnmcw`: startupProbe, `healthcheck.sh`). (d) still
+   changed by #2046 (`mayor-vnmcw`: startupProbe, `healthcheck.sh`). (d) still
    fails: the first container exits ~3 min in with `[Entrypoint]: Unable to
    start server.` (the entrypoint's own 30 s temp-server wait on the cold disk,
    CPU-throttled at the 375m limit); the restart skips init and root auth stays
@@ -40,9 +41,9 @@ recovery (initContainer wipes a datadir that never finished init; excluded
 earlier); C both. Verify on GCP through the gate (example manifests come from
 the checkout even with `--release`, no snapshot needed).
 
-## Memory protection (`mayor-i4bvb`, PR #2039 DRAFT)
+## Memory protection (`mayor-i4bvb`, PR #2039)
 
-Option A was approved (`mayor-8bhlt`): systemd MemoryLow on u7s-apiserver,
+Option A (decision recorded in `mayor-i4bvb`): systemd MemoryLow on u7s-apiserver,
 scheduler, kcm, kubelet and crio plus kubelet systemReserved/kubeReserved with
 `enforceNodeAllocatable=pods`; zram by default was not chosen (u7s configures
 no swap). Lima: refaults 64.4M -> 25.7M, reads 269.6 -> 110.2 GB, MemAvailable
@@ -76,7 +77,7 @@ system.slice idle 150-187 MiB), kubeReserved ~136Mi (kubelet+crio idle
 ## Cert rotation and other checks
 
 Control-plane kubelet runs as `system:node:<name>` with rotating certs (#1932);
-uppercase-hostname install fixed (#1935, `zl285`; live checks need an uppercase
+uppercase-hostname install (#1935, `zl285`; live checks need an uppercase
 hostname); advisories bumped (#1938). Non-gating: `xdw6u.8` (two-tier CA),
 `.9` (root succession; worker `ca.pem` goes stale after succession).
 `pki-rotation-e2e` is ADVISORY (removed from required checks 2026-10-24,
