@@ -2102,8 +2102,13 @@ net_bad "an octet above 255 is refused -- bash arithmetic would otherwise silent
   'SERVICE_CIDR=10.300.0.0/16; resolve' "not a valid IPv4 CIDR"
 net_bad "a CIDR with host bits set is refused, since components disagree on which network it names" \
   'SERVICE_CIDR=10.43.1.0/16; resolve' "host bits set"
-net_bad "a service range wider than /12 is refused, as upstream's apiserver refuses it" \
-  'SERVICE_CIDR=10.0.0.0/8; resolve' "must be between /12 and /28"
+net_run "$RESOLVE"'SERVICE_CIDR=10.0.0.0/8; POD_CLUSTER_CIDR=172.16.0.0/16; resolve && echo ok'
+assert "an IPv4 service range wider than /12 is accepted: upstream 1.37 and the u7s apiserver bound no range size, so refusing it would block valid clusters" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_bad "a /0 service range is refused: it spans the whole address space and always overlaps the node and pod networks" \
+  'SERVICE_CIDR=0.0.0.0/0; resolve' "must be between /1 and /28"
+net_bad "a /29 IPv4 service range is refused: kube-dns is the tenth host" \
+  'SERVICE_CIDR=10.96.0.0/29; resolve' "must be between /1 and /28"
 net_bad "overlapping service and pod ranges are refused: a Service VIP would equal a pod IP" \
   'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.43.128.0/17; resolve' "overlap"
 net_bad "a pod range narrower than the /24 per-node mask is refused instead of leaving KCM unable to allocate a node CIDR" \
@@ -2222,8 +2227,11 @@ net_bad "more than two ranges are refused: upstream's limit is one per family" \
   'SERVICE_CIDR=10.96.0.0/12,fd00:96::/108,fd00:97::/108; resolve' "must not contain more than two entries"
 net_bad "an empty second entry is refused instead of being read as single-stack" \
   'SERVICE_CIDR=10.96.0.0/12,; resolve' "not a CIDR"
-net_bad "an IPv6 service range wider than /108 is refused, as upstream's apiserver refuses it" \
-  'SERVICE_CIDR=10.96.0.0/12,fd00:96::/64; resolve' "must be between /108 and /124"
+net_run "$RESOLVE"'SERVICE_CIDR=10.96.0.0/12,fd00:96::/64; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve && echo ok'
+assert "an IPv6 service range wider than /108 is accepted: upstream 1.37 and the u7s apiserver bound no range size" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_bad "an IPv6 service range narrower than /124 is refused: kube-dns is the tenth host" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:96::/125; resolve' "must be between /1 and /124"
 net_bad "an IPv6 pod range wider than the 16-bit gap to the /64 node mask is refused" \
   'POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/40; resolve' "must be between /48 and /64"
 net_bad "an IPv6 pod range narrower than the /64 node mask is refused" \
@@ -2274,7 +2282,9 @@ net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108;
 assert "a bare re-run keeps the persisted dual-stack lists instead of reverting to the single-stack defaults" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56" ] && echo 1 || echo 0)"
 net_bad "turning a single-stack install dual-stack is refused: existing Services and node podCIDRs hold only the old family" \
-  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "conflicts with the value in effect since install time"
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "installed single-stack (10.96.0.0/12"
+net_bad "the single-to-dual refusal says upgrading in place is unsupported and how to proceed, so the operator is not left with a generic conflict message" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "not supported yet. To get dual-stack now, start over"
 net_bad "swapping the family order of a persisted dual-stack list is refused: the primary family determines the kubernetes Service VIP" \
   'EXISTING_INSTALL=1; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve' "--cluster-cidr"
 

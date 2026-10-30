@@ -643,7 +643,7 @@ cidrs_overlap() {
 # kubeadm's convention (and the apiserver's default): kube-dns is the tenth
 # host of the first service range, in that range's family.
 default_cluster_dns() {
-  parse_cidr --service-cidr "${1%%,*}" 12 28 108 124 || return 1
+  parse_cidr --service-cidr "${1%%,*}" 1 28 1 124 || return 1
   if [ "$CIDR_FAMILY" = 4 ]; then
     int_to_ipv4 $(( CIDR_START + 10 ))
   else
@@ -665,10 +665,10 @@ validate_network_config() {
     echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 or IPv6 address" >&2; return 1
   fi
   [ "$worker" -eq 1 ] && return 0
-  # /12 is the largest IPv4 range and /108 the largest IPv6 range upstream
-  # accepts; /28 and /124 leave room for the kubernetes (first) and kube-dns
-  # (tenth) VIPs plus allocation.
-  parse_cidr_list --service-cidr "$SERVICE_CIDR" 12 28 108 124 || return 1
+  # Upstream 1.37 and the u7s apiserver bound no range size. /28 and /124 leave
+  # room for the kubernetes (first) and kube-dns (tenth) VIPs; /0 would span
+  # the whole address space and always overlap the node and pod networks.
+  parse_cidr_list --service-cidr "$SERVICE_CIDR" 1 28 1 124 || return 1
   SERVICE_CIDR_IPV4="$CIDR_LIST_V4"; SERVICE_CIDR_IPV6="$CIDR_LIST_V6"
   # The per-node masks (/24 IPv4, /64 IPv6) are KCM's; its limit is a 16-bit
   # gap between them and the cluster range.
@@ -684,7 +684,7 @@ validate_network_config() {
   if [ -z "$svc" ]; then
     echo "error: --cluster-dns $CLUSTER_DNS is an IPv$dns_family address but --service-cidr $SERVICE_CIDR has no IPv$dns_family range" >&2; return 1
   fi
-  parse_cidr --service-cidr "$svc" 12 28 108 124 || return 1
+  parse_cidr --service-cidr "$svc" 1 28 1 124 || return 1
   if [ "$dns_family" = 4 ]; then
     if [ "$dns" -le "$CIDR_START" ] || [ "$dns" -ge "$CIDR_END" ] || [ "$dns" -eq $(( CIDR_START + 1 )) ]; then
       echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $svc (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( CIDR_START + 1 ))) are excluded)" >&2; return 1
@@ -710,6 +710,10 @@ reconcile_network_flag() {
     effective="$persisted"
   fi
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
+    if [[ "$effective" != *,* && "$given" == *,* ]]; then
+      echo "error: $flag $given requests dual-stack, but this cluster was installed single-stack ($effective, recorded in $CONFIG_FILE). Converting an existing single-stack cluster to dual-stack in place is not supported yet. To get dual-stack now, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh with the dual-stack flags; otherwise re-run without changing $flag." >&2
+      return 1
+    fi
     echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
     return 1
   fi
