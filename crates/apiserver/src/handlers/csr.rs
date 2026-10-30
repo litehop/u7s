@@ -922,7 +922,8 @@ pub(crate) fn guard_csr_status_write<S: Store>(
 /// appended. kube-controller-manager signs with a single-certificate file and returns the bare
 /// leaf, but clients pin only the root, so a leaf alone cannot be verified. The API allows
 /// intermediates after the leaf. None when no known intermediate signed the leaf (e.g. it is
-/// root-signed) or the chain is already there.
+/// root-signed) or the chain is already there. Deliberately diverges from upstream, which
+/// returns the leaf only.
 pub(crate) fn append_signing_chain(
     certificate_b64: &str,
     intermediates: &[Vec<u8>],
