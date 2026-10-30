@@ -27,12 +27,17 @@ gcp_require_config() {
     || gcp_die "gcloud configuration '$CLOUDSDK_ACTIVE_CONFIG_NAME' has no project; see docs/dev-setup.md (GCP test VPSes)"
 }
 
+# gcp_vps_create NAME ZONE [STACK_TYPE]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6.
 gcp_vps_create() {
+  local stack="${3:-IPV4_ONLY}"
+  case "$stack" in IPV4_ONLY|IPV4_IPV6) ;; *) gcp_die "unsupported stack type: $stack" ;; esac
+  local v6=()
+  [ "$stack" = IPV4_IPV6 ] && v6=(--ipv6-network-tier=PREMIUM)
   gcloud compute instances create "$1" --zone="$2" \
     --machine-type=e2-micro \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
     --boot-disk-size=10GB --boot-disk-type=pd-standard \
-    --network="$GCP_NETWORK" --subnet="$GCP_NETWORK" \
+    --network="$GCP_NETWORK" --subnet="$GCP_NETWORK" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
     --labels="$GCP_LABEL" \
     --provisioning-model=SPOT --instance-termination-action=STOP --max-run-duration=16h
 }

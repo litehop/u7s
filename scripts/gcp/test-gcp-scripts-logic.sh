@@ -31,6 +31,7 @@ case "$*" in
   "config get-value account") echo "${CLOUDSDK_CORE_ACCOUNT:-${STUB_ACCOUNT-acct@example.com}}"; exit 0 ;;
   "config get-value compute/zone") echo "${CLOUDSDK_COMPUTE_ZONE:-${STUB_ZONE-us-west1-b}}"; exit 0 ;;
   "services list "*) echo "${STUB_SERVICES:-}"; exit 0 ;;
+  "compute networks subnets describe "*) case "$*" in *externalIpv6Prefix*) echo "${STUB_V6_PREFIX-2600:1900:4000:1::/64}" ;; *) echo "${STUB_STACK-IPV4_IPV6}" ;; esac; exit 0 ;;
   "compute instances list "*) echo "${STUB_INSTANCES:-}"; exit 0 ;;
   "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; *" ${STUB_NOTFOUND:-<none>} "*) echo "ERROR: (gcloud.compute.instances.describe) The resource was not found" >&2; exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
   "compute operations list "*) [ "${STUB_OPS_FAIL:-0}" = 1 ] && { echo "ERROR: denied on proj" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
@@ -95,7 +96,7 @@ assert "setup.sh has no mutating gcloud call except via mutate()" \
 
 # idempotent: everything exists -> nothing to do, in both modes
 export STUB_SERVICES=$'compute.googleapis.com\niap.googleapis.com'
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
 run "$SETUP" --dry-run
 assert "a fully set-up project yields no planned changes (setup must be re-runnable)" "$(hasnt 'WOULD RUN' "$OUT")"
 run "$SETUP"
@@ -115,10 +116,33 @@ export STUB_EXISTING="u7s-test-allow-iap-ssh"
 run "$SETUP" --dry-run
 assert "a name that merely contains another resource's name does not count as existing" \
   "$(has 'networks create u7s-test --subnet-mode=custom' "$OUT")"
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
 STUB_LIST_FAIL=1 run "$SETUP" --dry-run
 assert "a failing gcloud list (e.g. permission denied) aborts instead of reading as 'not found'" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'WOULD RUN' "$OUT")"
+
+# --- dual-stack subnet and IPv6 firewall
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
+STUB_STACK=IPV4_ONLY run "$SETUP" --dry-run
+assert "an IPV4_ONLY subnet is updated in place to external dual-stack (dual-stack VMs cannot get IPv6 otherwise) and not recreated" \
+  "$(has 'WOULD RUN: gcloud compute networks subnets update u7s-test --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")$(hasnt 'subnets create' "$OUT")"
+STUB_STACK=IPV4_IPV6 run "$SETUP" --dry-run
+assert "an already dual-stack subnet is left alone (setup must be re-runnable)" "$(hasnt 'subnets update' "$OUT")"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal"
+run "$SETUP" --dry-run
+assert "the IPv6 internal rule mirrors the IPv4 one (allow all, source restricted to the subnet's own range) and never opens ::/0" \
+  "$(has 'WOULD RUN: gcloud compute firewall-rules create u7s-test-allow-internal-v6 --network=u7s-test --direction=INGRESS --allow=all --source-ranges=<subnet-external-ipv6-prefix>' "$OUT")$(hasnt '::/0' "$OUT")$(hasnt '0.0.0.0/0' "$OUT")"
+assert "there is no IPv6 ssh rule (IAP is IPv4-only, so ssh stays IAP-only)" "$(hasnt 'iap-ssh-v6' "$OUT")"
+run "$SETUP"
+assert "real mode feeds the subnet's actual external IPv6 /64 into the IPv6 rule" \
+  "$(has 'firewall-rules create u7s-test-allow-internal-v6 --network=u7s-test --direction=INGRESS --allow=all --source-ranges=2600:1900:4000:1::/64' "$LOG")"
+STUB_V6_PREFIX= run "$SETUP"
+assert "real mode aborts rather than creating an IPv6 rule with an empty source range" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'internal-v6' "$LOG")"
+unset STUB_EXISTING
+run "$SETUP" --dry-run
+assert "a missing subnet is created dual-stack from the start" \
+  "$(has '--range=10.80.0.0/24 --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")"
 
 # real mode executes what dry-run would print
 export STUB_SERVICES="compute.googleapis.com"
@@ -155,6 +179,16 @@ STUB_ZONE= run "$VPS" up t1
 assert "up without a configured zone fails instead of prompting or guessing" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances create' "$LOG")"
 assert "up adds no firewall rules (ingress stays limited to the IAP and intra-subnet rules from setup)" "$(hasnt 'firewall' "$LOG")"
+
+assert "up defaults to IPV4_ONLY with no IPv6 flags (existing gate/e2e VMs must not change when the subnet is dual-stack)" \
+  "$(has '--stack-type=IPV4_ONLY' "$create")$(hasnt 'IPV6' "$(sed 's/IPV4_ONLY//' <<<"$create")")$(hasnt 'ipv6-network-tier' "$create")"
+run "$VPS" up --stack-type IPV4_IPV6 t2
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "up --stack-type IPV4_IPV6 requests a dual-stack NIC with external IPv6 (premium tier) while staying Spot on the same subnet" \
+  "$(has 'instances create t2' "$create")$(has '--stack-type=IPV4_IPV6' "$create")$(has '--ipv6-network-tier=PREMIUM' "$create")$(has '--provisioning-model=SPOT' "$create")$(has '--subnet=u7s-test' "$create")"
+run "$VPS" up --stack-type IPV6_ONLY t3
+assert "an unsupported stack type is rejected before any instance is created" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances create' "$LOG")"
 
 # --- ssh / scp go through IAP
 run "$VPS" ssh t1 -- free -m
