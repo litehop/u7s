@@ -8,7 +8,7 @@
 #   - kubectl runs on the Mac against 127.0.0.1:<port>
 #
 # Quick start:
-#   1. cargo build --release -p u7s-apiserver
+#   1. cargo build --release -p u7s-apiserver --features rig-test-knobs
 #      scripts/u7s-start.sh       # starts server, prints export KUBECONFIG=...
 #
 #   2. export KUBECONFIG=./temp/u7s/kubeconfig

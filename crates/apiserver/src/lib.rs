@@ -212,6 +212,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // Raise the FD limit before opening the DB, generating TLS certs, or
     // binding the listener socket below — see raise_fd_limit's doc comment.
     raise_fd_limit();
+    handlers::proxy::warn_rig_test_knobs();
 
     // 3. Compute advertised server address early — needed for endpoint seeding below.
     // Identical logic to step 8; kept here so seed_services gets the right IP before TLS init.
