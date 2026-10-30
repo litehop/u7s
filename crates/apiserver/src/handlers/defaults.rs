@@ -1116,6 +1116,48 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if group == "resource.k8s.io" && plural == "devicetaintrules" {
         super::device_taint_rule::validate_device_taint_rule(obj)?;
     }
+    if group == "scheduling.k8s.io" && plural == "priorityclasses" {
+        validate_priority_class(obj)?;
+    }
+    Ok(())
+}
+
+const HIGHEST_USER_DEFINABLE_PRIORITY: i64 = 1_000_000_000;
+
+/// Upstream `ValidatePriorityClass`: `system-` names are reserved for the two built-in
+/// classes (exact value, not globalDefault); every other class is capped at one billion so
+/// user classes can never outrank system-critical pods.
+fn validate_priority_class(obj: &serde_json::Value) -> Result<(), String> {
+    let name = obj["metadata"]["name"].as_str().unwrap_or_default();
+    let value = obj["value"].as_i64().unwrap_or(0);
+    if name.starts_with("system-") {
+        let expected = match name {
+            "system-node-critical" => super::pods::SYSTEM_NODE_CRITICAL_VALUE,
+            "system-cluster-critical" => super::pods::SYSTEM_CLUSTER_CRITICAL_VALUE,
+            _ => {
+                return Err(format!(
+                    "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                     reserved for system use only. error: {name} is not a known system priority class"
+                ))
+            }
+        };
+        if value != i64::from(expected) {
+            return Err(format!(
+                "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                 reserved for system use only. error: value of {name} PriorityClass must be {expected}"
+            ));
+        }
+        if obj["globalDefault"].as_bool() == Some(true) {
+            return Err(format!(
+                "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                 reserved for system use only. error: globalDefault of {name} PriorityClass must be false"
+            ));
+        }
+    } else if value > HIGHEST_USER_DEFINABLE_PRIORITY {
+        return Err(format!(
+            "value: Forbidden: maximum allowed value of a user defined priority is {HIGHEST_USER_DEFINABLE_PRIORITY}"
+        ));
+    }
     Ok(())
 }
 
@@ -1735,6 +1777,30 @@ fn default_exact_device_request_counts(requests: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tenant who could mint `system-*` or >1e9 classes could outrank kube-system pods and
+    /// preempt them; only the two exact built-ins may use the reserved range.
+    #[test]
+    fn priority_class_reserved_names_and_values_follow_upstream() {
+        let pc = |name: &str, value: i64, gd: bool| serde_json::json!({"metadata": {"name": name}, "value": value, "globalDefault": gd});
+        let check = |o| validate_resource("scheduling.k8s.io", "priorityclasses", &o);
+        assert!(check(pc("system-node-critical", 2_000_001_000, false)).is_ok());
+        assert!(check(pc("system-cluster-critical", 2_000_000_000, false)).is_ok());
+        assert!(
+            check(pc("system-mine", 5, false)).is_err(),
+            "unknown system- name"
+        );
+        assert!(
+            check(pc("system-node-critical", 5, false)).is_err(),
+            "wrong value"
+        );
+        assert!(check(pc("system-node-critical", 2_000_001_000, true)).is_err());
+        assert!(
+            check(pc("mine", 1_000_000_001, false)).is_err(),
+            "above user max"
+        );
+        assert!(check(pc("mine", 1_000_000_000, false)).is_ok());
+    }
 
     /// Adding an externalIP is denied, but keeping or removing stored ones is allowed so a
     /// Service that predates the plugin stays editable (upstream isSubset semantics).

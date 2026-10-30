@@ -94,6 +94,7 @@ spec:
         k8s-app: kube-proxy
     spec:
       serviceAccountName: kube-proxy
+      priorityClassName: system-node-critical
       hostNetwork: true
       tolerations:
       - operator: Exists
@@ -104,6 +105,11 @@ spec:
         - /usr/local/bin/kube-proxy
         - --config=/var/lib/kube-proxy/config.conf
         - --hostname-override=$(NODE_NAME)
+        # Memory request from the measured ~23 MB PSS steady state, rounded up.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
         securityContext:
           privileged: true
         env:

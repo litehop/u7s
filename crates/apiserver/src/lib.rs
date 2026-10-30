@@ -1537,8 +1537,7 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
 }
 
 /// Seed the two built-in PriorityClasses so `kubectl get priorityclass` lists them, as
-/// upstream's bootstrap hook does. Pod admission resolves these names to fixed values
-/// regardless of what is stored.
+/// upstream's bootstrap hook does. Pod admission resolves them from the store.
 async fn seed_priorityclasses(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;

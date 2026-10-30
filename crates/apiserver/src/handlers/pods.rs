@@ -5534,10 +5534,7 @@ pub(crate) fn apply_runtime_class_scheduling(
     Ok(())
 }
 
-/// The two built-in Kubernetes PriorityClasses that are always resolvable, even
-/// when no PriorityClass object has been created for them. Upstream's
-/// PriorityClass admission plugin (plugin/pkg/admission/priority) special-cases
-/// these two names regardless of what's in the PriorityClass store.
+/// Values of the two bootstrapped system PriorityClasses (upstream `SystemPriorityClasses`).
 pub const SYSTEM_CLUSTER_CRITICAL_VALUE: i32 = 2_000_000_000;
 pub const SYSTEM_NODE_CRITICAL_VALUE: i32 = 2_000_001_000;
 
@@ -5613,8 +5610,7 @@ fn pick_global_default(classes: &[serde_json::Value]) -> Option<&serde_json::Val
 
 /// Pure core of priority admission.
 ///
-/// `named_class` is the stored PriorityClass for `spec.priorityClassName` (ignored for
-/// the two built-in names, which resolve to fixed values). `default_class` is the
+/// `named_class` is the stored PriorityClass for `spec.priorityClassName`. `default_class` is the
 /// `globalDefault` class, consulted only when the pod names no class.
 ///
 /// Mutates `spec.priorityClassName` (to the default class's name), `spec.priority` and
@@ -5636,16 +5632,6 @@ pub(crate) fn resolve_pod_priority(
             .to_owned()
     };
     let (class_name, value, policy): (Option<String>, i32, String) = match requested.as_deref() {
-        Some("system-cluster-critical") => (
-            requested.clone(),
-            SYSTEM_CLUSTER_CRITICAL_VALUE,
-            "PreemptLowerPriority".to_owned(),
-        ),
-        Some("system-node-critical") => (
-            requested.clone(),
-            SYSTEM_NODE_CRITICAL_VALUE,
-            "PreemptLowerPriority".to_owned(),
-        ),
         Some(name) => match named_class {
             Some(pc) => (
                 requested.clone(),
@@ -9896,43 +9882,24 @@ mod priority_class_tests {
         );
     }
 
-    /// system-cluster-critical must resolve to its fixed value even when no
-    /// PriorityClass object exists for it in the store.
-    ///
-    /// Real Kubernetes clusters bootstrap this PriorityClass automatically; u7s
-    /// does not seed it as a stored object, so control-plane-critical pods that
-    /// reference it by name must not be rejected just because the store lookup
-    /// misses.
+    /// System classes resolve through the stored (bootstrapped) object like any other class, as
+    /// upstream's admission does; a deleted bootstrap class must fail pod creation rather than
+    /// silently grant critical priority.
     #[test]
-    fn resolves_system_cluster_critical_without_a_stored_object() {
-        let mut pod = serde_json::json!({
-            "spec": { "priorityClassName": "system-cluster-critical" }
-        });
-
-        resolve_pod_priority(&mut pod, None, None)
-            .expect("system-cluster-critical must always resolve, stored or not");
-
-        assert_eq!(
-            pod["spec"]["priority"], SYSTEM_CLUSTER_CRITICAL_VALUE,
-            "system-cluster-critical must resolve to its well-known value 2000000000"
-        );
-    }
-
-    /// system-node-critical must resolve to its fixed value even when no
-    /// PriorityClass object exists for it in the store.
-    #[test]
-    fn resolves_system_node_critical_without_a_stored_object() {
+    fn system_node_critical_resolves_from_stored_object_and_errors_without_one() {
+        let stored = serde_json::json!({"value": SYSTEM_NODE_CRITICAL_VALUE});
         let mut pod = serde_json::json!({
             "spec": { "priorityClassName": "system-node-critical" }
         });
+        resolve_pod_priority(&mut pod, Some(&stored), None).expect("stored class resolves");
+        assert_eq!(pod["spec"]["priority"], SYSTEM_NODE_CRITICAL_VALUE);
 
-        resolve_pod_priority(&mut pod, None, None)
-            .expect("system-node-critical must always resolve, stored or not");
-
-        assert_eq!(
-            pod["spec"]["priority"], SYSTEM_NODE_CRITICAL_VALUE,
-            "system-node-critical must resolve to its well-known value 2000001000"
-        );
+        let mut pod = serde_json::json!({
+            "spec": { "priorityClassName": "system-node-critical" }
+        });
+        let err = resolve_pod_priority(&mut pod, None, None)
+            .expect_err("a missing system class must not be special-cased");
+        assert!(err.contains("system-node-critical"), "{err}");
     }
 
     /// A pod with no class and no globalDefault gets priority 0, so the scheduler
@@ -9996,7 +9963,7 @@ mod priority_class_tests {
                 serde_json::json!({
                     "priorityClassName": "system-cluster-critical", "priority": 2147483647
                 }),
-                None,
+                Some(serde_json::json!({"value": SYSTEM_CLUSTER_CRITICAL_VALUE})),
             ),
         ] {
             let mut pod = serde_json::json!({ "spec": spec });
@@ -12226,17 +12193,12 @@ mod handler_tests {
         );
     }
 
-    /// system-cluster-critical must resolve to its well-known priority even though
-    /// u7s does not seed it as a stored PriorityClass object.
-    ///
-    /// Real clusters bootstrap this PriorityClass automatically; control-plane
-    /// pods that reference it by name (e.g. via a static manifest) must not be
-    /// rejected just because u7s has no stored object under that name.
+    /// A system class resolves from its bootstrapped object like any other class: pod
+    /// creation is rejected while it is absent and gets the class value once present.
     #[tokio::test]
-    async fn create_pod_resolves_system_cluster_critical_without_seeded_object() {
+    async fn create_pod_resolves_system_cluster_critical_from_seeded_object() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
-        // Deliberately do NOT seed a PriorityClass named "system-cluster-critical".
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
@@ -12253,20 +12215,39 @@ mod handler_tests {
             }
         });
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/namespaces/default/pods")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(json_body(&pod))
-            .unwrap();
+        let post_pod = || {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/pods")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json_body(&pod))
+                .unwrap()
+        };
 
-        let resp = app.oneshot(req).await.unwrap();
+        let resp = app.clone().oneshot(post_pod()).await.unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::CREATED,
-            "system-cluster-critical must resolve and succeed even without a \
-             seeded PriorityClass object"
+            StatusCode::FORBIDDEN,
+            "an unbootstrapped system class must not be special-cased"
         );
+
+        let pc = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": {"name": "system-cluster-critical"},
+            "value": 2_000_000_000
+        });
+        store
+            .put(
+                "/registry/scheduling.k8s.io/priorityclasses/system-cluster-critical",
+                Bytes::from(serde_json::to_vec(&pc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed PriorityClass");
+
+        let resp = app.oneshot(post_pod()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
 
         let stored = store
             .get("/registry/pods/default/critical-pod")
