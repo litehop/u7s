@@ -1123,6 +1123,9 @@ fn collect_cel_programs(
             collect_cel_programs(sub_schema, out);
         }
     }
+    if let Some(values_schema) = crate::patch::additional_properties_schema(schema) {
+        collect_cel_programs(values_schema, out);
+    }
     if let Some(items_schema) = schema.get("items") {
         collect_cel_programs(items_schema, out);
     }
@@ -1264,7 +1267,33 @@ fn collect_cel_rule_errors(
                 }
             }
         }
-    } else if let Some(items_schema) = schema.get("items") {
+    }
+    // Upstream validates every map value against `additionalProperties` and reports it at
+    // `path[key]`.
+    if let (Some(values_schema), Some(map)) = (
+        crate::patch::additional_properties_schema(schema),
+        obj.as_object(),
+    ) {
+        let props = schema.get("properties").and_then(|p| p.as_object());
+        for (key, child) in map {
+            if props.is_some_and(|p| p.contains_key(key)) {
+                continue;
+            }
+            let child_old = old_node.and_then(|o| o.get(key));
+            if !collect_cel_rule_errors(
+                values_schema,
+                child,
+                child_old,
+                &format!("{field_path}[{key}]"),
+                programs,
+                run,
+                errors,
+            ) {
+                return false;
+            }
+        }
+    }
+    if let Some(items_schema) = schema.get("items") {
         if let Some(arr) = obj.as_array() {
             for (i, item) in arr.iter().enumerate() {
                 let item_old = old_node.and_then(|o| o.as_array()).and_then(|a| a.get(i));
@@ -2442,17 +2471,27 @@ fn json_value_as_display_string(v: &serde_json::Value) -> String {
 /// on every read (a default added to the schema after an object was created must still show
 /// up on GET/LIST against the *current* schema, since it was never persisted for that object).
 pub(crate) fn apply_crd_schema_defaults(schema: &serde_json::Value, obj: &mut serde_json::Value) {
-    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let values_schema = crate::patch::additional_properties_schema(schema);
+    if props.is_some() || values_schema.is_some() {
         let Some(map) = obj.as_object_mut() else {
             return;
         };
-        for (key, sub_schema) in props {
+        for (key, sub_schema) in props.into_iter().flatten() {
             match map.get_mut(key) {
                 Some(existing) => apply_crd_schema_defaults(sub_schema, existing),
                 None => {
                     if let Some(default) = sub_schema.get("default") {
                         map.insert(key.clone(), default.clone());
                     }
+                }
+            }
+        }
+        // Map values: defaults apply inside each existing value; a map never invents keys.
+        if let Some(values_schema) = values_schema {
+            for (key, value) in map.iter_mut() {
+                if !props.is_some_and(|p| p.contains_key(key)) {
+                    apply_crd_schema_defaults(values_schema, value);
                 }
             }
         }
@@ -28727,5 +28766,140 @@ mod tests {
             result.is_ok(),
             "validating before the webhook rejects objects the webhook would have fixed"
         );
+    }
+
+    fn map_of_objects_schema(ap: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "properties": { "m": { "type": "object", "additionalProperties": ap } }
+            }}
+        })
+    }
+
+    #[test]
+    fn cel_rule_on_map_value_rejects_invalid_value_else_validation_is_bypassed() {
+        let schema = map_of_objects_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "x-kubernetes-validations": [{"rule": "self.n > 0", "message": "n must be positive"}]
+        }));
+        let err = check_schema(
+            &serde_json::json!({"spec": {"m": {"a": {"n": 1}, "b": {"n": -1}}}}),
+            schema.clone(),
+        )
+        .expect_err("a map value violating its CEL rule must be rejected");
+        assert!(
+            err.1.message.contains("spec.m[b]"),
+            "upstream reports map values at path[key]; got {}",
+            err.1.message
+        );
+        assert!(
+            check_schema(&serde_json::json!({"spec": {"m": {"a": {"n": 1}}}}), schema).is_ok(),
+            "valid map values must still pass"
+        );
+    }
+
+    #[test]
+    fn cel_rule_on_array_of_maps_and_nested_maps_is_enforced() {
+        let value = serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "x-kubernetes-validations": [{"rule": "self.n > 0"}]
+        });
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "l": {
+                "type": "array",
+                "items": { "type": "object", "additionalProperties": {
+                    "type": "object", "additionalProperties": value } }
+            }}
+        });
+        assert!(
+            check_schema(&serde_json::json!({"l": [{"x": {"y": {"n": -1}}}]}), schema).is_err(),
+            "a rule under array-of-map-of-map must fire, else nested maps bypass validation"
+        );
+    }
+
+    #[test]
+    fn cel_rule_under_additional_properties_bool_has_no_schema_to_enforce() {
+        assert!(
+            check_schema(
+                &serde_json::json!({"spec": {"m": {"a": {"n": -1}}}}),
+                map_of_objects_schema(serde_json::json!(true))
+            )
+            .is_ok(),
+            "additionalProperties: true has no value schema, so no rules apply"
+        );
+        assert!(
+            check_schema(
+                &serde_json::json!({"spec": {"m": {}}}),
+                map_of_objects_schema(serde_json::json!(false))
+            )
+            .is_ok(),
+            "additionalProperties: false with an empty map must validate"
+        );
+    }
+
+    #[test]
+    fn collect_cel_programs_visits_additional_properties_values() {
+        let schema = map_of_objects_schema(serde_json::json!({
+            "type": "object",
+            "x-kubernetes-validations": [{"rule": "self.n > 41"}]
+        }));
+        let mut out = std::collections::HashMap::new();
+        collect_cel_programs(&schema, &mut out);
+        assert!(
+            out.contains_key("self.n > 41"),
+            "map-value rules must be prewarmed or every write recompiles them"
+        );
+        let mut none = std::collections::HashMap::new();
+        collect_cel_programs(&map_of_objects_schema(serde_json::json!(true)), &mut none);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn defaults_apply_inside_map_values_but_never_invent_keys() {
+        let schema = map_of_objects_schema(serde_json::json!({
+            "type": "object",
+            "properties": { "color": { "type": "string", "default": "red" } }
+        }));
+        let mut obj = serde_json::json!({"spec": {"m": {"a": {}, "b": {"color": "blue"}}}});
+        apply_crd_schema_defaults(&schema, &mut obj);
+        assert_eq!(
+            obj["spec"]["m"],
+            serde_json::json!({"a": {"color": "red"}, "b": {"color": "blue"}}),
+            "values inside map fields must get defaults, without overriding set fields"
+        );
+
+        let mut empty = serde_json::json!({"spec": {"m": {}}});
+        apply_crd_schema_defaults(&schema, &mut empty);
+        assert_eq!(
+            empty["spec"]["m"],
+            serde_json::json!({}),
+            "no keys invented"
+        );
+
+        for ap in [serde_json::json!(true), serde_json::json!(false)] {
+            let mut o = serde_json::json!({"spec": {"m": {"a": {}}}});
+            apply_crd_schema_defaults(&map_of_objects_schema(ap), &mut o);
+            assert_eq!(o["spec"]["m"], serde_json::json!({"a": {}}));
+        }
+    }
+
+    #[test]
+    fn defaults_apply_through_array_of_maps_and_nested_maps() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "l": { "type": "array", "items": {
+                "type": "object", "additionalProperties": {
+                    "type": "object", "additionalProperties": {
+                        "type": "object",
+                        "properties": { "p": { "type": "integer", "default": 7 } } } } } } }
+        });
+        let mut obj = serde_json::json!({"l": [{"x": {"y": {}}}]});
+        apply_crd_schema_defaults(&schema, &mut obj);
+        assert_eq!(obj["l"][0]["x"]["y"]["p"], 7);
     }
 }
