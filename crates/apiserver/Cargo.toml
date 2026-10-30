@@ -70,6 +70,7 @@ libc            = "0.2"
 [features]
 dhat = ["dep:dhat"]
 pki-test-knobs = []
+rig-test-knobs = []
 
 [build-dependencies]
 u7s-proto-generated      = { path = "../proto-generated" }
