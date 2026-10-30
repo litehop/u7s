@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Notify, Semaphore};
 use u7s_store::{ListOptions, SqliteStore, Store};
@@ -18,58 +18,169 @@ use crate::types::{ResourceKey, ResourceMeta};
 /// The UNIQUE constraint on `objects.key` in SQLite makes allocation race-safe.
 pub const SERVICE_IP_PREFIX: &str = "/registry/service-ips/";
 
-/// Holds the CIDR parameters for clusterIP allocation.
+/// IP family of a Service range or ClusterIP, spelled as the API's `ipFamilies` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IpFamily {
+    V4,
+    V6,
+}
+
+impl IpFamily {
+    pub fn of(ip: &IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(_) => IpFamily::V4,
+            IpAddr::V6(_) => IpFamily::V6,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IpFamily::V4 => "IPv4",
+            IpFamily::V6 => "IPv6",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "IPv4" => Some(IpFamily::V4),
+            "IPv6" => Some(IpFamily::V6),
+            _ => None,
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            IpFamily::V4 => IpFamily::V6,
+            IpFamily::V6 => IpFamily::V4,
+        }
+    }
+}
+
+/// Holds the CIDR parameters for clusterIP allocation of one IP family.
 ///
-/// Correctness comes from the store's UNIQUE key constraint (CAS).
-/// The `hint` is a best-effort offset to avoid scanning from offset 1 every time.
+/// Correctness comes from the store's UNIQUE key constraint (CAS): each allocated address is
+/// one sentinel key, so memory and time scale with the number of allocated addresses, never
+/// with the size of the range.
 pub struct ServiceIpAllocator {
-    /// Base address of the service CIDR (e.g. 10.96.0.0).
-    pub base: Ipv4Addr,
-    /// Number of IPs in the range (2^(32-prefix)).
-    pub size: u32,
-    /// Next candidate offset (hint only — correctness does not depend on this).
-    pub hint: AtomicU32,
+    /// Network address of the service CIDR (e.g. 10.96.0.0 or fd00:96::).
+    pub base: IpAddr,
+    /// Number of addresses in the range (2^host bits).
+    pub size: u128,
 }
 
 impl ServiceIpAllocator {
-    /// Parse a CIDR string like "10.96.0.0/12" into a `ServiceIpAllocator`.
+    /// Parse a CIDR string like "10.96.0.0/12" or "fd00:96::/108" into a `ServiceIpAllocator`.
     pub fn from_cidr(cidr: &str) -> Result<Self, String> {
         let (addr_str, prefix_str) = cidr
             .split_once('/')
             .ok_or_else(|| format!("invalid CIDR (no '/'): {cidr}"))?;
-        let addr: Ipv4Addr = addr_str
+        let addr: IpAddr = addr_str
             .parse()
             .map_err(|e| format!("invalid CIDR address: {e}"))?;
         let prefix: u32 = prefix_str
             .parse()
             .map_err(|e| format!("invalid prefix length: {e}"))?;
-        if prefix > 30 {
-            return Err(format!("prefix length {prefix} too large (max 30)"));
+        let bits: u32 = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix > bits - 2 {
+            return Err(format!(
+                "prefix length {prefix} too large (max {})",
+                bits - 2
+            ));
         }
-        let size = 1u32.checked_shl(32 - prefix).unwrap_or(u32::MAX);
-        // Mask to the network address.
-        let base_u32 = u32::from(addr) & !(size - 1);
-        Ok(ServiceIpAllocator {
-            base: Ipv4Addr::from(base_u32),
-            size,
-            hint: AtomicU32::new(2), // start at offset 2 (.2), skip .0 and .1
-        })
+        let host_bits = bits - prefix;
+        let size = 1u128 << host_bits;
+        let base = match addr {
+            IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) & !((size - 1) as u32))),
+            IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) & !(size - 1))),
+        };
+        Ok(ServiceIpAllocator { base, size })
     }
 
-    /// Return the IPv4 address at host offset `n` within the range (offset 1 is the
+    pub fn family(&self) -> IpFamily {
+        IpFamily::of(&self.base)
+    }
+
+    pub fn prefix_len(&self) -> u32 {
+        let bits = if self.base.is_ipv4() { 32 } else { 128 };
+        bits - self.size.trailing_zeros()
+    }
+
+    /// The address at `offset` from the network address. `offset` must be below `size`.
+    pub fn ip_at(&self, offset: u128) -> IpAddr {
+        match self.base {
+            IpAddr::V4(b) => IpAddr::V4(Ipv4Addr::from(u32::from(b) + offset as u32)),
+            IpAddr::V6(b) => IpAddr::V6(Ipv6Addr::from(u128::from(b) + offset)),
+        }
+    }
+
+    /// Offset of `ip` from the network address, if it lies inside the range.
+    pub fn offset_of(&self, ip: &IpAddr) -> Option<u128> {
+        let off: u128 = match (self.base, ip) {
+            (IpAddr::V4(b), IpAddr::V4(a)) => u32::from(*a).checked_sub(u32::from(b))?.into(),
+            (IpAddr::V6(b), IpAddr::V6(a)) => u128::from(*a).checked_sub(u128::from(b))?,
+            _ => return None,
+        };
+        Some(off).filter(|o| *o < self.size)
+    }
+
+    /// Highest allocatable offset. IPv4 reserves the broadcast address; IPv6 has none and
+    /// uses the all-ones address (upstream `ipallocator.NewIPAllocator`).
+    pub fn last_offset(&self) -> u128 {
+        if self.base.is_ipv4() {
+            self.size - 2
+        } else {
+            self.size - 1
+        }
+    }
+
+    /// True if `ip` is an allocatable host of the range: not the network address and, for
+    /// IPv4, not the broadcast address.
+    pub fn contains_host(&self, ip: &IpAddr) -> bool {
+        self.offset_of(ip)
+            .is_some_and(|o| (1..=self.last_offset()).contains(&o))
+    }
+
+    /// Return the address at host offset `n` within the range (offset 1 is the
     /// first usable host, matching kubeadm's convention of reserving `.1` for the
     /// kubernetes Service and `.10` for kube-dns). Errs if the range is too small to
     /// contain that many hosts, so a misconfigured `--service-cluster-ip-range` fails
     /// loudly at startup instead of silently seeding a wrong bootstrap ClusterIP.
-    pub fn nth_host(&self, n: u32) -> Result<Ipv4Addr, String> {
-        if n == 0 || n >= self.size {
+    pub fn nth_host(&self, n: u32) -> Result<IpAddr, String> {
+        let n = u128::from(n);
+        if n == 0 || n > self.last_offset() {
             return Err(format!(
                 "offset {n} does not fit in range starting at {} (size {})",
                 self.base, self.size
             ));
         }
-        Ok(Ipv4Addr::from(u32::from(self.base) + n))
+        Ok(self.ip_at(n))
     }
+}
+
+/// Parse `--service-cluster-ip-range`: one CIDR, or two of different families with the
+/// first as the primary family. Mirrors upstream's `ValidateServiceClusterIPRange`
+/// (cmd/kube-apiserver/app/options/validation.go).
+pub fn parse_service_cluster_ip_ranges(
+    spec: &str,
+) -> Result<(ServiceIpAllocator, Option<ServiceIpAllocator>), String> {
+    let entries: Vec<&str> = spec.split(',').map(str::trim).collect();
+    if entries.len() > 2 {
+        return Err("--service-cluster-ip-range must not contain more than two entries".into());
+    }
+    let primary = ServiceIpAllocator::from_cidr(entries[0])
+        .map_err(|e| format!("--service-cluster-ip-range[0]: {e}"))?;
+    let Some(second) = entries.get(1) else {
+        return Ok((primary, None));
+    };
+    let secondary = ServiceIpAllocator::from_cidr(second)
+        .map_err(|e| format!("--service-cluster-ip-range[1]: {e}"))?;
+    if primary.family() == secondary.family() {
+        return Err(
+            "--service-cluster-ip-range[0] and --service-cluster-ip-range[1] must be of different IP family"
+                .into(),
+        );
+    }
+    Ok((primary, Some(secondary)))
 }
 
 /// Maximum number of concurrent watch streams allowed per authenticated user.
@@ -952,6 +1063,9 @@ pub struct AppState<S = SqliteStore> {
     pub node_kubelet_ports: HashMap<String, u16>,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
+    /// Allocator of the secondary IP family on a dual-stack cluster. Not part of
+    /// `AppStateConfig`: `run()` sets it directly after construction.
+    pub secondary_service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
     /// Generated fresh at server startup; tokens from a previous run are rejected (410).
     pub continue_token_key: Arc<[u8; 32]>,
@@ -1080,6 +1194,7 @@ impl<S> Clone for AppState<S> {
             kubelet_port: self.kubelet_port,
             node_kubelet_ports: self.node_kubelet_ports.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
+            secondary_service_ip_allocator: self.secondary_service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             proxy_client_identity_pem: self.proxy_client_identity_pem.clone(),
@@ -1347,6 +1462,7 @@ impl<S: Store> AppState<S> {
             // today's global-port-only behavior via kubelet_port_for_node's fallback.
             node_kubelet_ports: HashMap::new(),
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
+            secondary_service_ip_allocator: None,
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
             // Not part of AppStateConfig: see the field's own doc — run() sets this
@@ -1475,46 +1591,34 @@ impl<S: Store> AppState<S> {
         tracing::info!("node graph init: populated from store");
     }
 
-    /// Scan `/registry/service-ips/` at startup to seed the hint past already-allocated IPs.
-    ///
-    /// This avoids always starting iteration from offset 2 after a restart, which would
-    /// cause unnecessary CAS conflicts on the first few allocations. Correctness is
-    /// guaranteed by CAS — this is a performance hint only.
-    pub async fn init_service_ip_hint(&self) {
-        let alloc = match &self.service_ip_allocator {
-            Some(a) => a.clone(),
-            None => return,
-        };
-        let resp = match self
-            .store
-            .list(SERVICE_IP_PREFIX, ListOptions::default())
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("service-ip hint init: list failed: {e}");
-                return;
-            }
-        };
-        let base_u32 = u32::from(alloc.base);
-        let mut max_offset: u32 = 1; // start hint at 2 (offset 2 = .2)
-        for obj in &resp.items {
-            if let Some(ip_str) = obj.key.strip_prefix(SERVICE_IP_PREFIX) {
-                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                    let ip_u32 = u32::from(ip);
-                    if ip_u32 > base_u32 {
-                        let offset = ip_u32 - base_u32;
-                        if offset > max_offset && offset < alloc.size {
-                            max_offset = offset;
-                        }
-                    }
-                }
-            }
+    /// Configured Service IP allocators, primary family first.
+    pub fn service_ip_allocators(&self) -> Vec<Arc<ServiceIpAllocator>> {
+        self.service_ip_allocator
+            .iter()
+            .chain(self.secondary_service_ip_allocator.iter())
+            .cloned()
+            .collect()
+    }
+
+    pub fn service_ip_allocator_for(&self, family: IpFamily) -> Option<Arc<ServiceIpAllocator>> {
+        self.service_ip_allocators()
+            .into_iter()
+            .find(|a| a.family() == family)
+    }
+
+    /// Families Services may use, primary first. An unconfigured range (allocation
+    /// disabled) still accepts IPv4 Services, as it always has.
+    pub fn service_ip_families(&self) -> Vec<IpFamily> {
+        let fams: Vec<IpFamily> = self
+            .service_ip_allocators()
+            .iter()
+            .map(|a| a.family())
+            .collect();
+        if fams.is_empty() {
+            vec![IpFamily::V4]
+        } else {
+            fams
         }
-        // Set hint to one past the highest allocated offset.
-        let next = (max_offset + 1).min(alloc.size - 1);
-        alloc.hint.store(next, Ordering::Relaxed);
-        tracing::info!("service-ip hint initialized to offset {next}");
     }
 
     /// Refresh the admission config cache for the given plural resource type.
@@ -1714,59 +1818,61 @@ impl<S: Store> AppState<S> {
         tracing::info!("flowcontrol cache: initialized from store");
     }
 
-    /// Attempt to allocate the next available clusterIP from the service CIDR.
+    /// Attempt to allocate an available clusterIP of `family` from the service CIDR.
     ///
     /// Returns `Ok(Some(ip))` on success, `Ok(None)` when allocation is disabled
-    /// (no CIDR configured), or `Err` when the CIDR is exhausted.
+    /// (no CIDR configured), or `Err` (500, upstream's `ErrFull` text) when the CIDR is
+    /// exhausted.
+    ///
+    /// Probing starts at a random offset and walks forward, so with `n` addresses held it
+    /// finishes within `n + reserved + 1` store writes whatever the size of the range;
+    /// exhaustion is only reported after every offset was tried, which a large range can
+    /// never reach.
     ///
     /// **Reservation rules (matching Kubernetes upstream):**
     /// - offset 0 (network address) — always skipped
     /// - offset 1 (conventionally `.1`) — reserved for the `kubernetes` Service;
     ///   skip unless `is_kubernetes_service` is true
-    /// - last IP (broadcast) — always skipped
+    /// - last IP (IPv4 broadcast) — always skipped
     ///
     /// **Concurrency safety:** uses `store.put(key, b"1", Some(0))` (create-only CAS).
     /// Two concurrent allocations racing for the same IP will have one succeed and one
     /// retry with the next candidate.
     pub async fn allocate_service_ip(
         &self,
+        family: IpFamily,
+        service_name: &str,
         is_kubernetes_service: bool,
-    ) -> Result<Option<Ipv4Addr>, crate::status::StatusError> {
+    ) -> Result<Option<IpAddr>, crate::status::StatusError> {
         use crate::status::Status;
 
-        let alloc = match &self.service_ip_allocator {
-            Some(a) => a.clone(),
-            None => return Ok(None),
+        let Some(alloc) = self.service_ip_allocator_for(family) else {
+            return Ok(None);
         };
+        let last_offset = alloc.last_offset();
 
-        let base_u32 = u32::from(alloc.base);
-        // broadcast offset = size - 1
-        let broadcast_offset = alloc.size - 1;
-
-        // We try at most `size` candidates before giving up.
-        let start = alloc.hint.load(Ordering::Relaxed);
-        let mut tried = 0u32;
-        let mut offset = start;
+        let mut offset = uuid::Uuid::new_v4().as_u128() % alloc.size;
+        let mut tried = 0u128;
 
         loop {
             if tried >= alloc.size {
-                return Err(Status::service_unavailable(
-                    "service CIDR exhausted: no available clusterIP".to_string(),
-                ));
-            }
-
-            // Wrap offset within [0, size).
-            if offset >= alloc.size {
-                offset = 0;
+                let cause = format!(
+                    "failed to allocate a serviceIP for Service {service_name:?}: range is full"
+                );
+                let mut err = Status::internal(format!("Internal error occurred: {cause}"));
+                err.1.details = Some(Box::new(serde_json::json!({
+                    "causes": [{"message": cause}]
+                })));
+                return Err(err);
             }
 
             // Skip reserved offsets.
             let skip = offset == 0                          // network address
                 || (offset == 1 && !is_kubernetes_service) // kubernetes Service reservation
-                || offset == broadcast_offset; // broadcast
+                || offset > last_offset; // IPv4 broadcast
 
             if !skip {
-                let candidate = Ipv4Addr::from(base_u32 + offset);
+                let candidate = alloc.ip_at(offset);
                 let sentinel_key = format!("{}{}", SERVICE_IP_PREFIX, candidate);
                 match self
                     .store
@@ -1777,13 +1883,7 @@ impl<S: Store> AppState<S> {
                     )
                     .await
                 {
-                    Ok(_) => {
-                        // Advance hint to one past the allocated offset.
-                        alloc
-                            .hint
-                            .store((offset + 1) % alloc.size, Ordering::Relaxed);
-                        return Ok(Some(candidate));
-                    }
+                    Ok(_) => return Ok(Some(candidate)),
                     Err(u7s_store::StoreError::AlreadyExists { .. }) => {
                         // IP taken — try next.
                     }
@@ -2736,12 +2836,12 @@ mod tests {
         // Use a /29 (8 IPs: .0 network, .1 reserved, .2-.6 usable, .7 broadcast)
         let state = make_state_with_cidr("10.0.0.0/29");
         let ip1 = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("allocation must not error")
             .expect("allocation must return Some");
         let ip2 = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("allocation must not error")
             .expect("allocation must return Some");
@@ -2759,7 +2859,7 @@ mod tests {
         // /30: 4 IPs — .0 network, .1 reserved, .2 only usable, .3 broadcast
         let state = make_state_with_cidr("10.0.0.0/30");
         let ip = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("first allocation must succeed")
             .expect("must return Some");
@@ -2767,7 +2867,7 @@ mod tests {
         state.release_service_ip(&ip.to_string()).await;
         // Must be re-allocatable (only one usable IP in /30).
         let ip2 = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("second allocation must succeed")
             .expect("must return Some");
@@ -2787,14 +2887,20 @@ mod tests {
         let state = make_state_with_cidr("10.0.0.0/30");
         // Allocate the only usable IP.
         state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("first allocation must succeed");
         // Second allocation must fail.
-        let result = state.allocate_service_ip(false).await;
-        assert!(
-            result.is_err(),
-            "exhausted CIDR must return Err — callers must surface a 503, not loop forever"
+        let result = state.allocate_service_ip(IpFamily::V4, "svc", false).await;
+        let err = result.expect_err("exhausted CIDR must return Err, not loop forever");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "upstream answers a full range with 500 InternalError; clients retry on it"
+        );
+        assert_eq!(
+            err.1.message,
+            "Internal error occurred: failed to allocate a serviceIP for Service \"svc\": range is full"
         );
     }
 
@@ -2811,7 +2917,7 @@ mod tests {
 
         // Normal service must NOT get .1.
         let ip = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("allocation must succeed")
             .expect("must return Some");
@@ -2823,37 +2929,44 @@ mod tests {
 
         // kubernetes service explicitly IS allowed to get .1.
         // Reset the state so .1 is free.
+        // Only .1-.6 are allocatable and a /29 holds six: the kubernetes Service must be
+        // able to reach .1, which no other Service may take.
         let state2 = make_state_with_cidr("10.0.0.0/29");
+        let mut got = HashSet::new();
+        for _ in 0..5 {
+            got.insert(
+                state2
+                    .allocate_service_ip(IpFamily::V4, "svc", false)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(!got.contains(&"10.0.0.1".parse().unwrap()));
         let k8s_ip = state2
-            .allocate_service_ip(true) // is_kubernetes_service = true
+            .allocate_service_ip(IpFamily::V4, "kubernetes", true)
             .await
-            .expect("allocation must succeed")
+            .expect("the kubernetes Service must still get the reserved address")
             .expect("must return Some");
-        assert_eq!(
-            k8s_ip,
-            "10.0.0.2".parse::<Ipv4Addr>().unwrap(),
-            "kubernetes service starts at offset 2 since hint starts at 2 — \
-             .1 is still skippable when hint starts past it; \
-             the important property is .1 is not reserved for kubernetes, it can get any IP"
-        );
+        assert_eq!(k8s_ip, "10.0.0.1".parse::<Ipv4Addr>().unwrap());
     }
 
     /// Offset .10 (kube-dns) must never be handed to an ordinary dynamic Service.
     ///
     /// kube-dns's Service gets its fixed clusterIP written directly to the store,
     /// bypassing `allocate_service_ip`. If `seed_services` didn't also write the
-    /// allocator's own sentinel key for that IP, the allocator's hint (which starts
-    /// at offset 2 and advances by 1 per call) would walk straight over it: the 9th
-    /// dynamic allocation would collide with kube-dns's VIP, so kube-proxy ends up
-    /// programming two Services onto one VIP and cluster DNS breaks unpredictably.
+    /// allocator's own sentinel key for that IP, the allocator would eventually hand it
+    /// out: kube-proxy ends up programming two Services onto one VIP and cluster DNS
+    /// breaks unpredictably. A /28 makes that certain: filling every free host must
+    /// skip .10.
     #[tokio::test]
     async fn dot_ten_reserved_for_kube_dns() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
-        crate::seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+        crate::seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/28", None)
             .await
             .expect("seed_services must not fail");
 
-        let alloc = ServiceIpAllocator::from_cidr("10.96.0.0/12").expect("valid CIDR");
+        let alloc = ServiceIpAllocator::from_cidr("10.96.0.0/28").expect("valid CIDR");
         let state = AppState::new_with_config(AppStateConfig {
             store: Arc::new(store),
             sa_keys: None,
@@ -2870,12 +2983,10 @@ mod tests {
 
         let kube_dns_ip: Ipv4Addr = "10.96.0.10".parse().unwrap();
 
-        // hint starts at offset 2 and .1 is skipped for non-kubernetes services, so
-        // 12 sequential allocations would walk offsets 2..=13 absent the sentinel —
-        // covering offset 10.
+        // Hosts .1-.14; .1 (kubernetes) and .10 (kube-dns) are held: 12 remain.
         for _ in 0..12 {
             let ip = state
-                .allocate_service_ip(false)
+                .allocate_service_ip(IpFamily::V4, "svc", false)
                 .await
                 .expect("allocation must succeed")
                 .expect("must return Some");
@@ -2900,6 +3011,180 @@ mod tests {
         assert!(
             ServiceIpAllocator::from_cidr("999.0.0.0/24").is_err(),
             "from_cidr must reject invalid IP address"
+        );
+    }
+
+    /// Upstream 1.37 enforces no range-size bound (MultiCIDRServiceAllocator is GA), so a
+    /// /8 IPv4 or /64 IPv6 range must work. Allocation state is one store row per held IP:
+    /// 200 allocations leave exactly 200 rows, so memory and time never scale with the
+    /// range, and every address lies inside its range.
+    #[tokio::test]
+    async fn huge_ranges_allocate_in_time_proportional_to_held_addresses() {
+        let st = make_dual_state("10.0.0.0/8", "fd00:1:2:3::/64");
+        let started = std::time::Instant::now();
+        let mut held = HashSet::new();
+        for _ in 0..100 {
+            for family in [IpFamily::V4, IpFamily::V6] {
+                let ip = st
+                    .allocate_service_ip(family, "svc", false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let alloc = st.service_ip_allocator_for(family).unwrap();
+                assert!(alloc.contains_host(&ip), "{ip} escaped its range");
+                assert!(held.insert(ip), "{ip} was handed out twice");
+            }
+        }
+        let rows = st
+            .store
+            .list(SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .unwrap()
+            .items
+            .len();
+        assert_eq!(rows, 200, "state must be one row per held address");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "allocation walked the range instead of probing: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Operators with a /8 or /64 service range (valid upstream) must be able to start.
+    #[test]
+    fn from_cidr_accepts_ranges_of_any_size_the_family_can_hold() {
+        let v4 = ServiceIpAllocator::from_cidr("10.0.0.0/8").unwrap();
+        assert_eq!((v4.size, v4.prefix_len()), (1 << 24, 8));
+        let v6 = ServiceIpAllocator::from_cidr("fd00::/64").unwrap();
+        assert_eq!((v6.size, v6.prefix_len()), (1 << 64, 64));
+    }
+
+    /// `--service-cluster-ip-range` takes one CIDR or two of different families, the
+    /// first being the primary; the upstream error texts must be preserved so operators
+    /// recognise them.
+    #[test]
+    fn parse_ranges_accepts_one_or_two_families_and_rejects_the_rest() {
+        let (p, s) = parse_service_cluster_ip_ranges("10.96.0.0/12").unwrap();
+        assert_eq!((p.family(), s.is_none()), (IpFamily::V4, true));
+        let (p, s) = parse_service_cluster_ip_ranges("fd00:96::/108,10.96.0.0/12").unwrap();
+        assert_eq!(
+            (p.family(), s.unwrap().family()),
+            (IpFamily::V6, IpFamily::V4),
+            "order defines the primary family"
+        );
+        assert_eq!(
+            parse_service_cluster_ip_ranges("10.96.0.0/12,10.97.0.0/16").err().unwrap(),
+            "--service-cluster-ip-range[0] and --service-cluster-ip-range[1] must be of different IP family"
+        );
+        assert_eq!(
+            parse_service_cluster_ip_ranges("10.96.0.0/12,fd00::/108,fd01::/108")
+                .err()
+                .unwrap(),
+            "--service-cluster-ip-range must not contain more than two entries"
+        );
+        assert!(parse_service_cluster_ip_ranges("10.96.0.0/12,fd00::/64").is_ok());
+    }
+
+    /// IPv4 reserves its broadcast address, IPv6 has none and its all-ones address is
+    /// allocatable (upstream `ipallocator.NewIPAllocator`); both reserve the network address.
+    #[test]
+    fn host_range_reserves_network_and_only_v4_broadcast() {
+        let v4 = ServiceIpAllocator::from_cidr("10.0.0.0/29").unwrap();
+        let v6 = ServiceIpAllocator::from_cidr("fd00::/125").unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(!v4.contains_host(&ip("10.0.0.0")) && v4.contains_host(&ip("10.0.0.6")));
+        assert!(
+            !v4.contains_host(&ip("10.0.0.7")),
+            "IPv4 broadcast is not a host"
+        );
+        assert!(!v6.contains_host(&ip("fd00::")) && v6.contains_host(&ip("fd00::7")));
+        assert!(!v6.contains_host(&ip("fd00::8")) && !v6.contains_host(&ip("10.0.0.3")));
+    }
+
+    fn make_dual_state(v4: &str, v6: &str) -> AppState<SqliteStore> {
+        let mut st = make_state_with_cidr(v4);
+        st.secondary_service_ip_allocator = Some(Arc::new(
+            ServiceIpAllocator::from_cidr(v6).expect("valid CIDR"),
+        ));
+        st
+    }
+
+    /// Exhausting one family must fail only that family: a dual-stack cluster whose IPv6
+    /// pool is full still has to serve IPv4 Services.
+    #[tokio::test]
+    async fn exhausting_one_family_does_not_touch_the_other() {
+        // fd00::/126 holds ::1 (kubernetes) .. ::3; ::1 is reserved, leaving two.
+        let st = make_dual_state("10.0.0.0/24", "fd00::/126");
+        let mut got = HashSet::new();
+        for _ in 0..2 {
+            let ip = st
+                .allocate_service_ip(IpFamily::V6, "svc", false)
+                .await
+                .unwrap()
+                .unwrap();
+            got.insert(ip.to_string());
+        }
+        assert_eq!(
+            got,
+            HashSet::from(["fd00::2".to_string(), "fd00::3".to_string()]),
+            "IPv6 all-ones address is allocatable"
+        );
+        let err = st
+            .allocate_service_ip(IpFamily::V6, "svc", false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let v4 = st
+            .allocate_service_ip(IpFamily::V4, "svc", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(st
+            .service_ip_allocator_for(IpFamily::V4)
+            .unwrap()
+            .contains_host(&v4));
+    }
+
+    /// Held addresses live only in the store, so a restarted apiserver must never re-issue
+    /// them, and an IPv4 sentinel must not occupy an IPv6 slot.
+    #[tokio::test]
+    async fn addresses_held_in_the_store_survive_restart_per_family() {
+        let st = make_dual_state("10.0.0.0/29", "fd00::/126");
+        for key in ["fd00::2", "10.0.0.3"] {
+            st.store
+                .put(
+                    &format!("{SERVICE_IP_PREFIX}{key}"),
+                    bytes::Bytes::from_static(b"{}"),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+        let v6 = st
+            .allocate_service_ip(IpFamily::V6, "svc", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(v6.to_string(), "fd00::3", "::2 is held, ::1 is reserved");
+        assert!(st
+            .allocate_service_ip(IpFamily::V6, "svc", false)
+            .await
+            .is_err());
+        let mut v4 = HashSet::new();
+        for _ in 0..4 {
+            v4.insert(
+                st.allocate_service_ip(IpFamily::V4, "svc", false)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            v4,
+            ["10.0.0.2", "10.0.0.4", "10.0.0.5", "10.0.0.6"]
+                .map(String::from)
+                .into()
         );
     }
 
@@ -2963,7 +3248,7 @@ mod tests {
             "https://localhost:6443".into(),
         );
         let result = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(IpFamily::V4, "svc", false)
             .await
             .expect("disabled allocation must not error");
         assert!(
