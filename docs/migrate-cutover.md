@@ -35,6 +35,17 @@ resumes where it stopped when re-run; `rollback` undoes it.
    and volumes to be ready.
 8. Put the original reclaim policies back on the u7s PVs.
 
+## Pre-flight
+
+Before the export, a fresh cutover checks everything local that a later
+step needs: the k3s data directory, an executable `k3s-killall.sh`, a
+readable `--install-script` (not an uninstall script) and, if given, a
+readable local `--tarball PATH`. Any failure aborts with nothing changed.
+Not pre-checked, because they only fail at runtime: network downloads
+(`--tarball-url`, the default URL, signatures and checksums), unit start and
+the checks inside `install.sh`. If one of those fails mid-cutover, re-run
+the command (it resumes) or run `u7s migrate rollback`.
+
 ## Rollback window
 
 `u7s migrate rollback` stops u7s, starts k3s, and restores the source PVs'

@@ -377,8 +377,9 @@ pub trait Api {
 pub trait Host {
     type Target: Api;
     fn k3s_data_dir_exists(&self) -> bool;
-    /// Whether the k3s killall script exists and is executable.
-    fn k3s_killall_ready(&self) -> bool;
+    /// Verifies every local file a later step needs (k3s-killall.sh, the
+    /// install script and a local `--tarball`) before anything is changed.
+    fn preflight(&self, install_args: &[String]) -> anyhow::Result<()>;
     fn u7s_installed(&self) -> bool;
     /// Stops and disables k3s, leaving its data in place.
     async fn stop_k3s(&mut self) -> anyhow::Result<()>;
@@ -455,12 +456,8 @@ pub async fn run<S: Api, H: Host>(
             if !host.k3s_data_dir_exists() {
                 bail!("k3s data directory not found: is this the k3s host?");
             }
-            if !host.k3s_killall_ready() {
-                bail!(
-                    "{K3S_KILLALL} is missing or not executable; stopping k3s needs it, so refusing \
-                     to start the cutover (nothing was changed)"
-                );
-            }
+            host.preflight(user_install_args)
+                .context("pre-flight failed, nothing was changed")?;
             if host.u7s_installed() {
                 bail!(
                     "u7s is already installed on this host ({U7S_KUBECONFIG} exists), so the import \
@@ -706,6 +703,40 @@ pub fn stop_k3s_commands() -> [(&'static str, Vec<&'static str>); 2] {
     ]
 }
 
+/// `path` must be a regular file with an execute bit.
+pub fn check_executable(path: &str, what: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let m = std::fs::metadata(path).with_context(|| format!("{what}: cannot stat {path}"))?;
+    if !m.is_file() || m.permissions().mode() & 0o111 == 0 {
+        bail!("{what}: {path} is not an executable regular file");
+    }
+    Ok(())
+}
+
+/// `path` must be a regular file this process can open for reading.
+pub fn check_readable_file(path: &str, what: &str) -> anyhow::Result<()> {
+    let m = std::fs::metadata(path).with_context(|| format!("{what}: cannot stat {path}"))?;
+    if !m.is_file() {
+        bail!("{what}: {path} is not a regular file");
+    }
+    std::fs::File::open(path).with_context(|| format!("{what}: cannot read {path}"))?;
+    Ok(())
+}
+
+/// The install script and a local `--tarball PATH` are run/read only after
+/// k3s has been stopped; a bad one then leaves the host without a cluster.
+pub fn check_install_inputs(install_script: &str, install_args: &[String]) -> anyhow::Result<()> {
+    guard_command(install_script)?;
+    check_readable_file(install_script, "--install-script")?;
+    if let Some(i) = install_args.iter().position(|a| a == "--tarball") {
+        let path = install_args
+            .get(i + 1)
+            .context("--tarball needs a path argument")?;
+        check_readable_file(path, "--tarball")?;
+    }
+    Ok(())
+}
+
 async fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     guard_command(program)?;
     let status = tokio::process::Command::new(program)
@@ -726,10 +757,9 @@ impl Host for SystemHost {
         Path::new(&self.k3s_data_dir).is_dir()
     }
 
-    fn k3s_killall_ready(&self) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(K3S_KILLALL)
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    fn preflight(&self, install_args: &[String]) -> anyhow::Result<()> {
+        check_executable(K3S_KILLALL, "k3s-killall.sh (needed to stop k3s)")?;
+        check_install_inputs(&self.install_script, install_args)
     }
 
     fn u7s_installed(&self) -> bool {

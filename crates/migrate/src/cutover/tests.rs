@@ -99,6 +99,7 @@ struct FakeHost {
     register_driver: bool,
     u7s_present: bool,
     killall_ready: bool,
+    install_script: String,
     tgt: Rc<FakeApi>,
     install_args: Vec<String>,
     imported_pv_policy: Option<String>,
@@ -117,6 +118,7 @@ impl FakeHost {
             register_driver: true,
             u7s_present: false,
             killall_ready: true,
+            install_script: std::env::current_exe().unwrap().to_str().unwrap().into(),
             tgt: tgt.clone(),
             install_args: vec![],
             imported_pv_policy: None,
@@ -130,8 +132,11 @@ impl Host for FakeHost {
     fn k3s_data_dir_exists(&self) -> bool {
         self.data_dir.get()
     }
-    fn k3s_killall_ready(&self) -> bool {
-        self.killall_ready
+    fn preflight(&self, install_args: &[String]) -> anyhow::Result<()> {
+        if !self.killall_ready {
+            bail!("{K3S_KILLALL} is missing");
+        }
+        check_install_inputs(&self.install_script, install_args)
     }
     fn u7s_installed(&self) -> bool {
         self.u7s_present
@@ -798,4 +803,174 @@ fn every_cutover_write_goes_through_the_durable_helper() {
             "{banned} bypasses fsync-before-rename durability"
         );
     }
+}
+
+fn tmp_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("u7s-pre-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+async fn assert_refused_untouched(
+    tag: &str,
+    install_script: Option<&str>,
+    args: &[String],
+    must_name: &str,
+) {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    if let Some(s) = install_script {
+        host.install_script = s.into();
+    }
+    let paths = work(tag);
+    let err = run(&src, &mut host, &paths, true, args).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains(must_name),
+        "the operator must be told what to fix: {err:#}"
+    );
+    assert!(
+        host.calls.is_empty() && src.patches.borrow().is_empty(),
+        "nothing may be exported, patched or stopped when a later step cannot run"
+    );
+    assert!(
+        !paths.state().exists(),
+        "no state means a fixed re-run starts fresh"
+    );
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn cutover_refuses_a_missing_install_script_before_any_destructive_step() {
+    assert_refused_untouched(
+        "no-script",
+        Some("/nonexistent/install.sh"),
+        &[],
+        "--install-script",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cutover_refuses_an_install_script_that_is_a_directory() {
+    let d = tmp_dir("script-dir");
+    assert_refused_untouched(
+        "script-dir",
+        Some(d.to_str().unwrap()),
+        &[],
+        "--install-script",
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test]
+async fn cutover_refuses_an_uninstall_install_script_before_any_destructive_step() {
+    let d = tmp_dir("script-uninstall");
+    let f = d.join("k3s-uninstall.sh");
+    std::fs::write(&f, "#!/bin/sh\n").unwrap();
+    assert_refused_untouched(
+        "script-uninstall",
+        Some(f.to_str().unwrap()),
+        &[],
+        "uninstall",
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test]
+async fn cutover_refuses_a_missing_local_tarball_before_any_destructive_step() {
+    let args = [
+        "--tarball".to_string(),
+        "/nonexistent/u7s.tar.gz".to_string(),
+    ];
+    assert_refused_untouched("no-tarball", None, &args, "--tarball").await;
+}
+
+#[tokio::test]
+async fn cutover_does_not_pre_check_a_tarball_url() {
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    let paths = work("tarball-url");
+    let args = [
+        "--tarball-url".to_string(),
+        "https://example.invalid/u7s.tgz".to_string(),
+    ];
+    run(&src, &mut host, &paths, true, &args).await.unwrap();
+    cleanup(&paths);
+}
+
+#[tokio::test]
+async fn cutover_proceeds_when_script_and_tarball_are_ready() {
+    let d = tmp_dir("all-ready");
+    let tar = d.join("u7s.tar.gz");
+    std::fs::write(&tar, "x").unwrap();
+    let (src, tgt) = (source_api(), Rc::new(FakeApi::default()));
+    let mut host = FakeHost::new(&tgt);
+    let paths = work("all-ready");
+    let args = ["--tarball".to_string(), tar.to_str().unwrap().to_string()];
+    run(&src, &mut host, &paths, true, &args).await.unwrap();
+    assert!(host.calls.contains(&"stop_k3s".to_string()));
+    cleanup(&paths);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn check_executable_needs_an_existing_regular_file_with_an_exec_bit() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp_dir("exec");
+    let f = d.join("killall.sh");
+    let p = f.to_str().unwrap();
+    assert!(check_executable(p, "x").is_err(), "missing file");
+    std::fs::write(&f, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        check_executable(p, "x").is_err(),
+        "a non-executable killall would fail only after k3s was stopped"
+    );
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(check_executable(p, "x").is_ok());
+    assert!(
+        check_executable(d.to_str().unwrap(), "x").is_err(),
+        "directory"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn check_readable_file_rejects_missing_directory_and_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tmp_dir("readable");
+    let f = d.join("u7s.tar.gz");
+    let p = f.to_str().unwrap();
+    assert!(check_readable_file(p, "--tarball").is_err(), "missing");
+    std::fs::write(&f, "x").unwrap();
+    assert!(check_readable_file(p, "--tarball").is_ok());
+    assert!(
+        check_readable_file(d.to_str().unwrap(), "--tarball").is_err(),
+        "directory"
+    );
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let root = std::fs::File::open(&f).is_ok();
+    assert!(
+        root || check_readable_file(p, "--tarball").is_err(),
+        "an unreadable tarball would fail only after k3s was stopped"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn install_inputs_check_script_and_local_tarball() {
+    let d = tmp_dir("sys-pre");
+    let script = d.join("install.sh");
+    std::fs::write(&script, "#!/bin/sh\n").unwrap();
+    let ok = script.to_str().unwrap();
+    assert!(check_install_inputs(ok, &[]).is_ok());
+    assert!(check_install_inputs("/nonexistent/install.sh", &[]).is_err());
+    let missing = ["--tarball".to_string(), "/nonexistent/t.tgz".to_string()];
+    assert!(check_install_inputs(ok, &missing).is_err());
+    let dangling = ["--tarball".to_string()];
+    assert!(check_install_inputs(ok, &dangling).is_err());
+    let _ = std::fs::remove_dir_all(&d);
 }
