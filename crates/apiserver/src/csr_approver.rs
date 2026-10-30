@@ -133,7 +133,7 @@ pub(crate) struct IpContext {
     /// Every IP any OTHER Node reports in any address field.
     pub other_node_ips: BTreeSet<IpAddr>,
     /// Service CIDR base and size, one per configured family.
-    pub service_cidrs: Vec<(IpAddr, u32)>,
+    pub service_cidrs: Vec<(IpAddr, u128)>,
     /// The apiserver's own advertise and listen addresses.
     pub apiserver_ips: Vec<IpAddr>,
     /// Every Node's `spec.podCIDRs`/`spec.podCIDR` as (node name, base, prefix length). The
@@ -189,7 +189,7 @@ impl IpContext {
                 (IpAddr::V6(a), IpAddr::V6(b)) => u128::from(a).checked_sub(u128::from(*b)),
                 _ => None,
             };
-            if off.is_some_and(|o| o < u128::from(*size)) {
+            if off.is_some_and(|o| o < *size) {
                 return Err(format!("IP SAN {ip} is inside the service CIDR"));
             }
         }

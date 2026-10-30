@@ -1077,7 +1077,7 @@ async fn deleting_a_dual_stack_service_releases_both_addresses() {
     }
 }
 
-/// An exhausted IPv6 pool is a 503 for IPv6 allocations only, and a dual-stack create that
+/// An exhausted IPv6 pool is a 500 for IPv6 allocations only, and a dual-stack create that
 /// fails on the second family must give the first family's address back.
 #[tokio::test]
 async fn exhausting_ipv6_fails_only_ipv6_and_leaks_no_ipv4_address() {
@@ -1087,8 +1087,8 @@ async fn exhausting_ipv6_fails_only_ipv6_and_leaks_no_ipv4_address() {
         create(&st, n, v6_only.clone(), false).await.unwrap();
     }
     match create(&st, "c", v6_only, false).await {
-        Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {}
-        other => panic!("exhausted IPv6 pool must answer 503, got {other:?}"),
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => {}
+        other => panic!("exhausted IPv6 pool must answer 500, got {other:?}"),
     }
     let before = held_ips(&st).await;
     match create(
@@ -1099,8 +1099,8 @@ async fn exhausting_ipv6_fails_only_ipv6_and_leaks_no_ipv4_address() {
     )
     .await
     {
-        Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {}
-        other => panic!("dual-stack create needing the full pool must answer 503, got {other:?}"),
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => {}
+        other => panic!("dual-stack create needing the full pool must answer 500, got {other:?}"),
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(

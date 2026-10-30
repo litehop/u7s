@@ -529,9 +529,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // init_node_graph's doc for why this must happen before the listener accepts traffic.
     state.init_node_graph().await;
 
-    // 10b. Seed service IP hint from already-allocated sentinels in the store.
-    state.init_service_ip_hint().await;
-
     // 10c-pre. Populate admission config cache from persisted objects before serving.
     // This ensures the first admission check after startup reads from cache, not the store.
     state.init_admission_cache().await;
@@ -2845,8 +2842,8 @@ async fn seed_services(
     // kube-system/kube-dns itself is applied later, from the vendored CoreDNS bundle (see
     // bootstrap_apply.rs), so the whole CoreDNS install lives in one manifest. Its clusterIP
     // is still reserved here in the allocator's own sentinel keyspace ahead of that apply.
-    // Without this, allocate_service_ip (hint starts at offset 2, +1 per call) has no
-    // idea offset 10 is taken and will hand it to the 9th ordinary dynamic Service,
+    // Without this, allocate_service_ip (random start, linear probing) has no
+    // idea offset 10 is taken and may hand it to an ordinary dynamic Service,
     // colliding with kube-dns's VIP.
     // default/kubernetes' VIP is reserved the same way (upstream's kubernetesservice
     // controller does this every boot), so no tenant Service can claim the apiserver's
@@ -4128,10 +4125,45 @@ async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::R
         .await
     {
         Ok(_) => tracing::info!("seeded ServiceCIDR: kubernetes"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+            upgrade_default_servicecidr_to_dual_stack(store, &key, &cidrs).await?;
+        }
         Err(e) => return Err(anyhow::anyhow!("seed ServiceCIDR kubernetes: {e}")),
     }
 
+    Ok(())
+}
+
+/// Mirrors upstream's default-ServiceCIDR controller: an existing single-CIDR `kubernetes`
+/// ServiceCIDR gains the secondary family when the flags now name two CIDRs and the primary
+/// is unchanged. Every other mismatch leaves the object as it is.
+async fn upgrade_default_servicecidr_to_dual_stack(
+    store: &SqliteStore,
+    key: &str,
+    cidrs: &[&str],
+) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let Some(existing) = store
+        .get(key)
+        .await
+        .map_err(|e| anyhow::anyhow!("get ServiceCIDR kubernetes: {e}"))?
+    else {
+        return Ok(());
+    };
+    let mut obj: serde_json::Value = serde_json::from_slice(&existing.value)
+        .map_err(|e| anyhow::anyhow!("parse ServiceCIDR kubernetes: {e}"))?;
+    let current = obj["spec"]["cidrs"].as_array().cloned().unwrap_or_default();
+    if cidrs.len() != 2 || current.len() != 1 || current[0].as_str() != Some(cidrs[0]) {
+        return Ok(());
+    }
+    tracing::info!("updating default ServiceCIDR from single-stack to dual-stack");
+    obj["spec"]["cidrs"] = serde_json::json!(cidrs);
+    store
+        .put(key, Bytes::from(obj.to_string()), Some(existing.revision))
+        .await
+        .map_err(|e| anyhow::anyhow!("upgrade ServiceCIDR kubernetes to dual stack: {e}"))?;
     Ok(())
 }
 
@@ -8765,6 +8797,57 @@ mod tests {
         assert!(
             obj.is_none(),
             "ServiceCIDR 'kubernetes' must not be created when service CIDR is empty"
+        );
+    }
+
+    async fn default_servicecidr_cidrs(store: &SqliteStore) -> Vec<String> {
+        let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+        let obj = store.get(&key).await.unwrap().expect("ServiceCIDR exists");
+        let v: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
+        v["spec"]["cidrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Restarting a single-stack cluster with a dual-stack range must add the secondary CIDR
+    /// to the default ServiceCIDR; otherwise IPv6 ClusterIPs are allocated outside any
+    /// ServiceCIDR the rest of the cluster can see.
+    #[tokio::test]
+    async fn seed_servicecidrs_upgrades_single_stack_to_dual_stack() {
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        seed_servicecidrs(&store, "10.96.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        assert_eq!(
+            default_servicecidr_cidrs(&store).await,
+            ["10.96.0.0/12", "fd00:96::/108"]
+        );
+    }
+
+    /// Upstream only upgrades when the primary CIDR is unchanged; any other mismatch is left
+    /// alone, so a changed range never silently rewrites the existing object.
+    #[tokio::test]
+    async fn seed_servicecidrs_leaves_other_mismatches_untouched() {
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        seed_servicecidrs(&store, "10.200.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        assert_eq!(default_servicecidr_cidrs(&store).await, ["10.96.0.0/12"]);
+
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        assert_eq!(
+            default_servicecidr_cidrs(&store).await,
+            ["10.96.0.0/12", "fd00:96::/108"],
+            "dual to single is not a supported upgrade"
         );
     }
 

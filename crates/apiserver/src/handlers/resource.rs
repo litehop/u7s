@@ -5224,7 +5224,7 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     let mut auto = crate::service_alloc::AutoClusterIp::new(state.store.clone());
     for (idx, family) in crate::service_ip_families::unallocated_slots(&body["spec"]) {
         if let Some(ip) = state
-            .allocate_service_ip(family, is_kubernetes_service)
+            .allocate_service_ip(family, name, is_kubernetes_service)
             .await?
         {
             auto.push(ip);
@@ -15110,7 +15110,6 @@ mod tests {
     async fn create_service_rejects_require_dual_stack_policy() {
         use axum::extract::{Path, State};
         use axum::response::IntoResponse;
-        use std::net::Ipv4Addr;
 
         // Small CIDR so the first-allocatable address (offset 2) is deterministic.
         let state = make_state_with_cidr_for_resource_tests("10.0.0.0/29");
@@ -15158,7 +15157,7 @@ mod tests {
             "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
         });
         let resp = create_namespaced_resource(
-            State(state),
+            State(state.clone()),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
             test_user(),
@@ -15174,12 +15173,20 @@ mod tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let cluster_ip = v["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+        let held = state
+            .store
+            .list(crate::state::SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .unwrap()
+            .items;
         assert_eq!(
-            cluster_ip,
-            Ipv4Addr::new(10, 0, 0, 2).to_string(),
-            "the rejected RequireDualStack create must not have leaked the first \
-             allocatable IP (10.0.0.2) from the pool — got {cluster_ip}"
+            held.len(),
+            1,
+            "the rejected RequireDualStack create must not have leaked an IP from the \
+             pool; held: {:?}, plain Service got {cluster_ip}",
+            held.iter().map(|o| &o.key).collect::<Vec<_>>()
         );
+        assert!(held[0].key.ends_with(&cluster_ip));
     }
 
     /// Creating a Service with an explicit ipFamilies entry the cluster cannot
@@ -15437,12 +15444,12 @@ mod tests {
 
         // Verify the CIDR can be fully allocated again (two IPs available).
         let ip1 = state
-            .allocate_service_ip(crate::state::IpFamily::V4, false)
+            .allocate_service_ip(crate::state::IpFamily::V4, "svc", false)
             .await
             .expect("allocation must not error")
             .expect("allocation must return Some after sentinels released");
         let ip2 = state
-            .allocate_service_ip(crate::state::IpFamily::V4, false)
+            .allocate_service_ip(crate::state::IpFamily::V4, "svc", false)
             .await
             .expect("allocation must not error")
             .expect("second allocation must return Some after sentinels released");
