@@ -14,7 +14,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Path, Query, State,
+        FromRequestParts, Path, State,
     },
     response::Response,
 };
@@ -52,6 +52,44 @@ fn outbound_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketCo
 // ---------------------------------------------------------------------------
 // /log — query parameters forwarded to the kubelet
 // ---------------------------------------------------------------------------
+
+/// Query extractor with upstream's url.Values semantics: a repeated scalar
+/// parameter resolves to its first value (apimachinery `Convert_Slice_string_To_*`
+/// take `in[0]`) instead of failing the whole request the way serde_urlencoded's
+/// duplicate-field check does. `command` is multi-valued and forwarded from the
+/// raw query, so it is never collapsed here.
+pub struct FirstValueQuery<T>(pub T);
+
+fn first_value_pairs(raw: &str) -> Result<String, serde_urlencoded::de::Error> {
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw)?;
+    let mut seen = std::collections::HashSet::new();
+    let first: Vec<(String, String)> = pairs
+        .into_iter()
+        .filter(|(k, _)| k == "command" || seen.insert(k.clone()))
+        .collect();
+    Ok(serde_urlencoded::to_string(&first).expect("string pairs always serialise"))
+}
+
+impl<T, S> FromRequestParts<S> for FirstValueQuery<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = crate::status::StatusError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bad = |e: serde_urlencoded::de::Error| {
+            Status::bad_request(format!("invalid query string: {e}"))
+        };
+        let deduped = first_value_pairs(parts.uri.query().unwrap_or("")).map_err(bad)?;
+        serde_urlencoded::from_str(&deduped)
+            .map(FirstValueQuery)
+            .map_err(bad)
+    }
+}
 
 #[derive(Deserialize)]
 pub struct LogQuery {
@@ -399,7 +437,7 @@ async fn stream_log_over_websocket(
 pub async fn pod_log<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<LogQuery>,
+    FirstValueQuery(query): FirstValueQuery<LogQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
     let (kubelet_url, verify_name) = resolve_log_target(&state, &raw_ns, &pod_name, &query).await?;
@@ -646,7 +684,7 @@ pub async fn resolve_attach_target<S: Store>(
 pub async fn pod_attach<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<AttachQuery>,
+    FirstValueQuery(query): FirstValueQuery<AttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, crate::status::StatusError> {
     let target = resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
@@ -682,7 +720,7 @@ pub async fn pod_attach<S: Store>(
 pub async fn pod_attach_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<AttachQuery>,
+    FirstValueQuery(query): FirstValueQuery<AttachQuery>,
 ) -> Result<Response, crate::status::StatusError> {
     resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
     Err(crate::status::StatusError(
@@ -1125,32 +1163,24 @@ pub async fn resolve_exec_target<S: Store>(
     //   Also normalizes boolean values: true→1. Reconstructs the query for kubelet.
     //   command= is multi-valued (?command=ls&command=-la) and is preserved as-is.
     let mut params: Vec<String> = Vec::new();
-    let mut stdin_set = false;
-    let mut stdout_set = false;
-    let mut stderr_set = false;
-    let mut tty_set = false;
+    let mut stdin_set: Option<bool> = None;
+    let mut stdout_set: Option<bool> = None;
+    let mut stderr_set: Option<bool> = None;
+    let mut tty_set: Option<bool> = None;
     for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "stdin" => {
-                if v == "true" || v == "1" {
-                    stdin_set = true;
-                }
+                let _ = stdin_set.get_or_insert(v == "true" || v == "1");
             }
             "stdout" => {
-                if v == "true" || v == "1" {
-                    stdout_set = true;
-                }
+                let _ = stdout_set.get_or_insert(v == "true" || v == "1");
             }
             "stderr" => {
-                if v == "true" || v == "1" {
-                    stderr_set = true;
-                }
+                let _ = stderr_set.get_or_insert(v == "true" || v == "1");
             }
             "tty" => {
-                if v == "true" || v == "1" {
-                    tty_set = true;
-                }
+                let _ = tty_set.get_or_insert(v == "true" || v == "1");
             }
             "command" | "container" => {
                 // command is multi-valued; container is already in the URL path.
@@ -1168,16 +1198,16 @@ pub async fn resolve_exec_target<S: Store>(
     // Kubelet uses different param names than kubectl on the exec endpoint:
     // kubectl: stdin/stdout/stderr  →  kubelet: input/output/error
     // (k8s.io/api/core/types.go ExecStdinParam="input", ExecStdoutParam="output", ExecStderrParam="error")
-    if stdin_set {
+    if stdin_set == Some(true) {
         params.push("input=1".to_owned());
     }
-    if stdout_set {
+    if stdout_set == Some(true) {
         params.push("output=1".to_owned());
     }
-    if stderr_set {
+    if stderr_set == Some(true) {
         params.push("error=1".to_owned());
     }
-    if tty_set {
+    if tty_set == Some(true) {
         params.push("tty=1".to_owned());
     }
     let qs = params.join("&");
@@ -1236,7 +1266,7 @@ pub async fn resolve_exec_target<S: Store>(
 pub async fn pod_exec<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<ExecQuery>,
+    FirstValueQuery(query): FirstValueQuery<ExecQuery>,
     uri: axum::http::Uri,
     ws: WebSocketUpgrade,
 ) -> Result<Response, crate::status::StatusError> {
@@ -1281,7 +1311,7 @@ pub async fn pod_exec<S: Store>(
 pub async fn pod_exec_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<ExecQuery>,
+    FirstValueQuery(query): FirstValueQuery<ExecQuery>,
     uri: axum::http::Uri,
 ) -> Result<Response, crate::status::StatusError> {
     let raw_query = uri.query().unwrap_or("").to_owned();
@@ -1814,7 +1844,7 @@ fn parse_https_url(url: &str) -> anyhow::Result<(String, u16, String)> {
 pub async fn pod_portforward<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
-    Query(query): Query<PortforwardQuery>,
+    FirstValueQuery(query): FirstValueQuery<PortforwardQuery>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
     let params = validate_portforward(&state, &raw_ns, &pod_name, query.ports.as_deref()).await?;
@@ -3442,6 +3472,64 @@ pub async fn service_proxy_root<S: Store>(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    async fn first_value<T: serde::de::DeserializeOwned>(
+        uri: &str,
+    ) -> Result<T, crate::status::StatusError> {
+        let (mut parts, _) = Request::builder().uri(uri).body(()).unwrap().into_parts();
+        FirstValueQuery::<T>::from_request_parts(&mut parts, &())
+            .await
+            .map(|q| q.0)
+    }
+
+    /// sonobuoy's exec request carries `container=` twice; rejecting it with 400
+    /// breaks `sonobuoy retrieve`.
+    #[tokio::test]
+    async fn repeated_identical_container_param_is_accepted() {
+        let q: ExecQuery = first_value("/exec?container=a&container=a&command=ls")
+            .await
+            .unwrap_or_else(|_| panic!("duplicate container= must not be rejected"));
+        assert_eq!(q.container.as_deref(), Some("a"));
+    }
+
+    /// Upstream's string conversion takes `in[0]`: with differing values the
+    /// first one wins, not the last and not an error.
+    #[tokio::test]
+    async fn repeated_differing_container_param_first_value_wins() {
+        let q: ExecQuery = first_value("/exec?container=a&container=b")
+            .await
+            .unwrap_or_else(|_| panic!("duplicate container= must not be rejected"));
+        assert_eq!(q.container.as_deref(), Some("a"));
+    }
+
+    /// Attach and log share the extractor; repeated bool/int scalars must also
+    /// resolve to the first value.
+    #[tokio::test]
+    async fn attach_and_log_queries_tolerate_repeated_scalars() {
+        let a: AttachQuery = first_value("/attach?container=x&stdin=true&stdin=false&container=y")
+            .await
+            .unwrap_or_else(|_| panic!("attach must tolerate repeats"));
+        assert_eq!(a.container.as_deref(), Some("x"));
+        assert_eq!(a.stdin.as_deref(), Some("true"));
+        let l: LogQuery = first_value("/log?tailLines=5&tailLines=9&follow=true&follow=false")
+            .await
+            .unwrap_or_else(|_| panic!("log must tolerate repeats"));
+        assert_eq!(l.tail_lines, Some(5));
+        assert_eq!(l.follow, Some(true));
+        let p: PortforwardQuery = first_value("/pf?ports=80&ports=81")
+            .await
+            .unwrap_or_else(|_| panic!("portforward must tolerate repeats"));
+        assert_eq!(p.ports.as_deref(), Some("80"));
+    }
+
+    /// `command` is repeated by design and must survive dedup in order, since it
+    /// is the argv of the exec'd process.
+    #[test]
+    fn command_param_survives_dedup_in_order() {
+        let s = first_value_pairs("command=ls&container=a&command=-la&container=b&command=%2Ftmp")
+            .unwrap();
+        assert_eq!(s, "command=ls&container=a&command=-la&command=%2Ftmp");
+    }
 
     use axum::{
         http::{Request, StatusCode},
