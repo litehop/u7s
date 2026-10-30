@@ -570,6 +570,16 @@ fn nesting_shapes(n: usize) -> Vec<(&'static str, String)> {
             "map nest",
             format!("{}1{}", "{'a':".repeat(n), "}".repeat(n)),
         ),
+        ("index chain", format!("[[0]]{}", "[0]".repeat(n))),
+        (
+            "nested call args",
+            format!("{}1{}", "size([".repeat(n), "])".repeat(n)),
+        ),
+        (
+            "nested comprehension",
+            format!("{}1{}", "[1].map(x, ".repeat(n), ")".repeat(n)),
+        ),
+        ("membership chain", format!("1{}", " in [1]".repeat(n))),
     ]
 }
 
@@ -598,6 +608,31 @@ fn expression_nesting_past_upstream_limit_is_rejected_with_upstream_message() {
     );
 }
 
+/// Policies evaluate under a stack budget a 250-level expression exceeds in release builds
+/// (call chain 205, index chain 188); accepting them would store a policy that denies all
+/// matching traffic under `failurePolicy: Fail`. The limit is a policy-only divergence from
+/// cel-go's 250, which CRD rules (big-stack evaluation) keep.
+#[test]
+fn policy_expressions_are_rejected_one_level_past_the_policy_limit() {
+    let limit = super::parse::MAX_POLICY_RECURSION_DEPTH;
+    let message = "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded";
+    // a call chain of n calls is n + 1 levels deep: `'x'` is the innermost
+    let at = format!("'x'{}", ".lowerAscii()".repeat(limit - 1));
+    assert!(super::parse::parse(&at).is_ok(), "limit itself must pass");
+    let over = format!("'x'{}", ".lowerAscii()".repeat(limit));
+    assert_eq!(super::parse::parse(&over).expect_err("over"), message);
+    assert_eq!(
+        super::check_syntax(&over, &[]).expect_err("over"),
+        message,
+        "the create-time check must reject what evaluation would refuse"
+    );
+    let crd_deep = format!("'x'{}", ".lowerAscii()".repeat(limit));
+    assert!(
+        super::compile_program(&crd_deep).is_ok(),
+        "CRD rules keep cel-go's 250 limit"
+    );
+}
+
 /// cel-go counts code points, not bytes: a 100k-character rule of 3-byte characters is
 /// within the limit, one more character is not. A byte count would reject legitimate
 /// non-ASCII rules; no count would let a megabyte rule through to the parser.
@@ -620,7 +655,7 @@ fn expression_size_limit_counts_code_points_like_upstream() {
 #[test]
 fn deepest_accepted_expression_evaluates_on_a_production_sized_stack() {
     for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
-        let deepest = (1..=super::parse::MAX_RECURSION_DEPTH)
+        let deepest = (1..=super::parse::MAX_POLICY_RECURSION_DEPTH)
             .rev()
             .map(|n| nesting_shapes(n).swap_remove(i).1)
             .find(|e| super::parse::parse(e).is_ok())
@@ -647,5 +682,84 @@ fn maps_built_by_expressions_round_trip_to_json() {
     assert_eq!(
         v.to_json().unwrap(),
         json!({"a": 1, "b": [1.5, "x"], "c": "aGk=", "d": "1970-01-01T00:00:00Z", "e": null})
+    );
+}
+
+/// Every long rule gets a thread that reserves 256 MiB of address space; a burst of
+/// creates must queue for a few lanes rather than reserve a thread's worth each.
+#[test]
+fn big_stack_threads_never_exceed_the_lane_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let live = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..(super::parse::MAX_PARSE_THREADS * 4) {
+            s.spawn(|| {
+                super::parse::on_big_stack(1 << 20, "test", || {
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    live.fetch_sub(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            });
+        }
+    });
+    let peak = peak.load(Ordering::SeqCst);
+    assert!(
+        (1..=super::parse::MAX_PARSE_THREADS).contains(&peak),
+        "peak concurrent big-stack threads was {peak}"
+    );
+}
+
+/// Handlers call the lane gate from async code: with every lane busy, a waiting request
+/// must not park the runtime worker, or one burst of long rules stalls every unrelated
+/// request scheduled on that worker. One worker makes a parked wait observable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn waiting_for_a_busy_lane_does_not_block_the_runtime() {
+    static LANES: super::parse::Lanes = super::parse::Lanes::new(1);
+    let held = LANES.acquire();
+    let waiter = tokio::spawn(async {
+        let _lane = LANES.acquire();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move { tx.send(()).unwrap() });
+    // The test thread is not a worker, so a std wait here is safe while the worker is parked.
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a cheap task starved while another waited for a lane");
+    drop(held);
+    waiter.await.unwrap();
+}
+
+/// A policy stored under failurePolicy Fail denies every matching request if it compiles
+/// but evaluates to "nests too deeply", so the depth the compiler accepts must be one the
+/// evaluator finishes. Frame sizes differ per build profile, so the guarantee is for
+/// release builds, which is what runs.
+#[cfg(not(debug_assertions))]
+#[test]
+fn every_depth_the_compiler_accepts_evaluates_in_release() {
+    let mut failures = Vec::new();
+    for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
+        for n in 1..=super::parse::MAX_POLICY_RECURSION_DEPTH + 1 {
+            let expr = nesting_shapes(n).swap_remove(i).1;
+            if super::parse::parse(&expr).is_err() {
+                continue;
+            }
+            let out = std::thread::Builder::new()
+                .stack_size(4 << 20)
+                .spawn(move || eval(&expr))
+                .unwrap()
+                .join()
+                .unwrap();
+            if out == "error: expression nests too deeply" {
+                failures.push(format!("{shape} n={n}"));
+                break;
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "accepted at compile, refused at eval: {failures:?}"
     );
 }

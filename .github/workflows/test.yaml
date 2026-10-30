@@ -125,3 +125,30 @@ jobs:
 
       - name: Coverage
         run: cargo llvm-cov --locked --workspace --summary-only --fail-under-lines 90
+
+  # Optimised frames are what production runs, so the depth limits' guarantee
+  # (accepted at create => evaluates at runtime) is only checkable here. Fat LTO with one
+  # codegen unit takes over 15 minutes cold on a runner, so the profile is relaxed to
+  # opt-level 3 without LTO; the limits keep 45% headroom over measured fat-LTO depths.
+  # Not a required check.
+  release-invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      # save-if: only main writes the shared cache; branches restore it read-only.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Depth invariants (release)
+        run: >-
+          cargo test --locked --release
+          --config 'profile.release.lto="off"' --config profile.release.codegen-units=16
+          -p u7s-apiserver -- evaluates_in_release every_crd_shape

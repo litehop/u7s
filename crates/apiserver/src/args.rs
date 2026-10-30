@@ -64,9 +64,11 @@ pub struct Args {
     #[arg(long)]
     pub(crate) advertise_address: Option<String>,
 
-    /// CIDR range from which clusterIPs are auto-allocated for Services.
-    /// Must be a valid IPv4 CIDR with prefix length <= 30 (e.g. "10.96.0.0/12").
-    /// Matches kubeadm's default. Set to empty string to disable auto-allocation.
+    /// CIDR range(s) from which clusterIPs are auto-allocated for Services: one CIDR, or two
+    /// comma-separated CIDRs of different IP families (e.g. "10.96.0.0/12,fd00:96::/108");
+    /// the first is the primary family. Ranges are at most 2^20 addresses (IPv4 /12, IPv6
+    /// /108), as upstream. Matches kubeadm's default. Set to empty string to disable
+    /// auto-allocation.
     #[arg(long, default_value = "10.96.0.0/12")]
     pub(crate) service_cluster_ip_range: String,
 

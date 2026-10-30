@@ -8,13 +8,13 @@
 //! the write succeeds.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde_json::Value;
 use u7s_store::{CreateNamespacedError, ListOptions, Store, StoreError};
 
-use crate::state::{AppState, SERVICE_IP_PREFIX};
+use crate::state::{AppState, IpFamily, SERVICE_IP_PREFIX};
 use crate::status::{Status, StatusError};
 
 /// Sentinel key prefix for reserved node ports. Format: /registry/service-nodeports/<port>
@@ -76,18 +76,30 @@ impl<S: Store> Drop for ServiceAllocTxn<S> {
     }
 }
 
-/// A clusterIP taken from the pool before the Service is admitted. Dropping it frees the
-/// address, so a rejection between allocation and `begin` cannot leak it.
+/// The clusterIPs (one per family) taken from the pools before the Service is admitted.
+/// Dropping it frees them, so a rejection between allocation and `begin` — or a failure
+/// allocating the second family — cannot leak an address.
 pub(crate) struct AutoClusterIp<S: Store> {
-    ip: Ipv4Addr,
+    ips: BTreeSet<String>,
     txn: ServiceAllocTxn<S>,
 }
 
 impl<S: Store> AutoClusterIp<S> {
-    pub(crate) fn new(store: Arc<S>, ip: Ipv4Addr) -> Self {
-        let mut txn = ServiceAllocTxn::new(store);
-        txn.created.push(ip_key(&ip.to_string()));
-        Self { ip, txn }
+    pub(crate) fn new(store: Arc<S>) -> Self {
+        Self {
+            ips: BTreeSet::new(),
+            txn: ServiceAllocTxn::new(store),
+        }
+    }
+
+    pub(crate) fn push(&mut self, ip: IpAddr) {
+        let ip = ip.to_string();
+        self.txn.created.push(ip_key(&ip));
+        self.ips.insert(ip);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ips.is_empty()
     }
 }
 
@@ -298,16 +310,16 @@ pub(crate) async fn begin<S: Store>(
     auto_ip: Option<AutoClusterIp<S>>,
     dry_run: bool,
 ) -> Result<ServiceAllocTxn<S>, StatusError> {
-    let (txn, auto_ip) = match auto_ip {
-        Some(a) => (a.txn, Some(a.ip)),
-        None => (ServiceAllocTxn::new(state.store.clone()), None),
+    let (txn, auto_ips) = match auto_ip {
+        Some(a) => (a.txn, a.ips),
+        None => (ServiceAllocTxn::new(state.store.clone()), BTreeSet::new()),
     };
     let mut r = Reserver {
         state,
         dry_run,
         txn,
     };
-    r.txn.stale = reserve_all(&mut r, ns, name, old_spec, body, auto_ip).await?;
+    r.txn.stale = reserve_all(&mut r, ns, name, old_spec, body, auto_ips).await?;
     Ok(r.txn)
 }
 
@@ -317,7 +329,7 @@ async fn reserve_all<S: Store>(
     name: &str,
     old_spec: Option<&Value>,
     body: &mut Value,
-    auto_ip: Option<Ipv4Addr>,
+    auto_ips: BTreeSet<String>,
 ) -> Result<Vec<String>, StatusError> {
     let null = Value::Null;
     let old_spec = old_spec.unwrap_or(&null);
@@ -325,10 +337,9 @@ async fn reserve_all<S: Store>(
     let spec = &mut body["spec"];
     let mut stale = Vec::new();
 
-    if let Some(alloc) = r.state.service_ip_allocator.clone() {
+    if let Some(primary) = r.state.service_ip_allocator.clone() {
         let new_ips = spec_ips(spec);
         let old_ips = spec_ips(old_spec);
-        let auto = auto_ip.map(|ip| ip.to_string());
         let listed = format!(
             "[{}]",
             new_ips
@@ -339,13 +350,13 @@ async fn reserve_all<S: Store>(
         );
         for ip in new_ips
             .iter()
-            .filter(|ip| !old_ips.contains(*ip) && Some(*ip) != auto.as_ref())
+            .filter(|ip| !old_ips.contains(*ip) && !auto_ips.contains(*ip))
         {
-            let in_range = ip.parse::<Ipv4Addr>().ok().filter(|a| {
-                let off = u32::from(*a).wrapping_sub(u32::from(alloc.base));
-                off >= 1 && off <= alloc.size - 2
-            });
-            if in_range.is_none() {
+            let parsed = ip.parse::<IpAddr>().ok();
+            let alloc = parsed
+                .and_then(|a| r.state.service_ip_allocator_for(IpFamily::of(&a)))
+                .unwrap_or_else(|| primary.clone());
+            if !parsed.is_some_and(|a| alloc.contains_host(&a)) {
                 return Err(invalid(
                     name,
                     "spec.clusterIPs",
@@ -353,7 +364,7 @@ async fn reserve_all<S: Store>(
                     &format!(
                         "failed to allocate IP {ip}: the provided IP ({ip}) is not in the valid range. The range of valid IPs is {}/{}",
                         alloc.base,
-                        32 - alloc.size.trailing_zeros()
+                        alloc.prefix_len()
                     ),
                 ));
             }

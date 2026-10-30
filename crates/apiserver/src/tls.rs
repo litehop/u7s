@@ -574,7 +574,7 @@ fn build_server_sans(
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
-        SanType::IpAddress(std::net::IpAddr::V4(kubernetes_ip)),
+        SanType::IpAddress(kubernetes_ip),
         SanType::DnsName("kubernetes".try_into()?),
         SanType::DnsName("kubernetes.default".try_into()?),
         SanType::DnsName("kubernetes.default.svc".try_into()?),
