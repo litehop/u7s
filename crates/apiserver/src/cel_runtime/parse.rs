@@ -210,10 +210,21 @@ fn check(expr: &str, ast: &IdedExpr, roots: &[&str]) -> Result<(), String> {
         )),
         None => Ok(()),
     };
+    walk_deep(expr, "checker", walk)?
+}
+
+/// Runs a walk that recurses once per AST level of `expr`: a short expression cannot nest
+/// deeply enough to matter and runs in place, a long one runs on the parse stack so a
+/// request thread's 512 KiB cannot overflow.
+pub(crate) fn walk_deep<T: Send>(
+    expr: &str,
+    what: &str,
+    work: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
     if expr.len() <= IN_PLACE_PARSE_MAX_LEN {
-        return walk();
+        return Ok(work());
     }
-    on_big_stack(PARSE_STACK_SIZE, "checker", walk)?
+    on_big_stack(PARSE_STACK_SIZE, what, work)
 }
 
 /// Compile-step analogue: parse errors must stay distinct from eval errors, since the

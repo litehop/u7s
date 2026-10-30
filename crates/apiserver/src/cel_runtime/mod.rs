@@ -25,9 +25,9 @@ pub(crate) use authzlib::{
     Principal as AuthzPrincipal, RequestResource,
 };
 pub(crate) use interp::{Env, Evaluator};
-pub(crate) use parse::{check_syntax, compile_program};
+pub(crate) use parse::{check_syntax, compile_program, walk_deep};
 #[cfg(test)]
-pub(crate) use parse::{check_syntax_with_stack, PARSE_COUNT};
+pub(crate) use parse::{check_syntax_with_stack, MAX_RECURSION_DEPTH, PARSE_COUNT};
 pub(crate) use value::Value;
 
 /// Stack for a dedicated thread that runs a CRD rule's evaluation or cost replay, which
