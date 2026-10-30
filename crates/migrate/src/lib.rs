@@ -2,6 +2,7 @@
 //! Kubernetes API.
 
 pub mod classify;
+pub mod cutover;
 pub mod discover;
 pub mod import;
 pub mod plan;
@@ -22,7 +23,33 @@ pub fn write_new_private(path: &str, data: &[u8]) -> anyhow::Result<()> {
         .with_context(|| {
             format!("creating {path} (it must not exist; remove or rename the old file first)")
         })?;
-    f.write_all(data).with_context(|| format!("writing {path}"))
+    f.write_all(data)
+        .with_context(|| format!("writing {path}"))?;
+    f.sync_all().with_context(|| format!("syncing {path}"))?;
+    sync_parent(path)
+}
+
+fn sync_parent(path: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let parent = match std::path::Path::new(path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(parent)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing directory {}", parent.display()))
+}
+
+/// Replaces `path` with `data` so that a crash or power loss leaves either the
+/// old or the new complete content: the sibling temp file is synced before the
+/// rename and the directory entry is synced after it. The file is owner-only.
+pub fn write_durable(path: &str, data: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let tmp = format!("{path}.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    write_new_private(&tmp, data)?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {path}"))?;
+    sync_parent(path)
 }
 
 /// Fails if `path` exists (a dangling symlink counts), so a doomed export is
@@ -48,12 +75,10 @@ pub fn write_export(
     if let Some((path, data)) = objects {
         write_new_private(path, data)?;
     }
-    let tmp = format!("{plan_path}.tmp");
-    let res = std::fs::write(&tmp, plan_json)
-        .and_then(|()| std::fs::rename(&tmp, plan_path))
+    let res = write_durable(plan_path, plan_json.as_bytes())
         .with_context(|| format!("writing {plan_path}"));
     if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{plan_path}.tmp"));
         if let Some((path, _)) = objects {
             let _ = std::fs::remove_file(path);
         }
@@ -63,7 +88,7 @@ pub fn write_export(
 
 #[cfg(test)]
 mod tests {
-    use super::{refuse_existing, write_export, write_new_private};
+    use super::{refuse_existing, write_durable, write_export, write_new_private};
     use std::os::unix::fs::{symlink, PermissionsExt};
 
     fn dir(tag: &str) -> std::path::PathBuf {
@@ -80,6 +105,22 @@ mod tests {
         write_new_private(p.to_str().unwrap(), b"[]").unwrap();
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "group/world must not read exported Secrets");
+    }
+
+    #[test]
+    fn durable_write_replaces_whole_file_owner_only_and_leaves_no_temp() {
+        let d = dir("durable");
+        let p = d.join("state.json");
+        std::fs::write(&p, b"old").unwrap();
+        std::fs::write(d.join("state.json.tmp"), b"stale half-write").unwrap();
+        write_durable(p.to_str().unwrap(), b"new-complete").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"new-complete");
+        assert!(
+            !d.join("state.json.tmp").exists(),
+            "a leftover temp file means the rename did not publish the synced content"
+        );
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "state and objects hold Secrets");
     }
 
     #[test]
