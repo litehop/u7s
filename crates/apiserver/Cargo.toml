@@ -54,6 +54,7 @@ yaml-rust2      = "0.13"
 prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
+num-bigint      = "0.4"
 u7s-sentinel    = { path = "../sentinel" }
 u7s-version     = { path = "../version" }
 u7s-proto-generated = { path = "../proto-generated" }

@@ -3448,6 +3448,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "libc",
+ "num-bigint",
  "prometheus",
  "prost",
  "prost-types",
