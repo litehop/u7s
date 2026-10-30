@@ -18,6 +18,7 @@
 #                                  [--k8s-version <ver>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #                                  [--embedded-scheduler <true|false>]
+#                                  [--service-cidr <cidr>[,<cidr>]]
 #
 #   --embedded-scheduler  Passthrough to u7s-apiserver's own --embedded-scheduler flag:
 #                run u7s-scheduler as a supervised task inside the
@@ -235,6 +236,7 @@ SAMPLE_INTERVAL=""
 PROCS=""
 K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
+SERVICE_CIDR=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -265,6 +267,7 @@ while [[ $# -gt 0 ]]; do
     --procs) PROCS="$2"; shift 2 ;;
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
+    --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -437,6 +440,8 @@ _K8S_VERSION_ARG=""
 [ -n "$K8S_VERSION" ] && _K8S_VERSION_ARG="--k8s-version $K8S_VERSION"
 _EMBEDDED_SCHEDULER_ARG=""
 [ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
+_SERVICE_CIDR_ARG=""
+[ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
@@ -484,11 +489,11 @@ if [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ]; then
   # here at all -- main.rs's own default of 10 applies.
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG}
+  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG}
 else
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG}
+  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG}
 fi
 
 # KUBECONFIG is now set (either from the running instance or newly started).

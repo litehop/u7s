@@ -17,19 +17,26 @@ use crate::state::{AppState, AppStateConfig, ServiceIpAllocator};
 const RANGE: &str = "10.96.0.0/24";
 
 fn state() -> AppState<SqliteStore> {
-    AppState::new_with_config(AppStateConfig {
+    state_with(RANGE)
+}
+
+fn state_with(ranges: &str) -> AppState<SqliteStore> {
+    let (primary, secondary) = crate::state::parse_service_cluster_ip_ranges(ranges).unwrap();
+    let mut st = AppState::new_with_config(AppStateConfig {
         store: std::sync::Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
         sa_keys: None,
         token_map: std::collections::HashMap::new(),
         server_address: "https://localhost:6443".into(),
         cluster_ca_ders: None,
-        service_ip_allocator: Some(ServiceIpAllocator::from_cidr(RANGE).unwrap()),
+        service_ip_allocator: Some(primary),
         kubelet_client_identity_pem: None,
         kubelet_preferred_address: None,
         kubelet_port: 10250,
         continue_token_key: None,
         konnectivity_proxy_addr: None,
-    })
+    });
+    st.secondary_service_ip_allocator = secondary.map(std::sync::Arc::new);
+    st
 }
 
 fn user() -> Extension<crate::auth::UserInfo> {
@@ -883,5 +890,504 @@ async fn client_disconnect_during_create_keeps_reservations_of_the_persisted_ser
     assert!(
         cancelled_after_persist > 0,
         "never cancelled a create after its write landed; the test did not exercise the window"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dual-stack: one allocator per family behind the shared create/PUT/PATCH path.
+// ---------------------------------------------------------------------------
+
+const DUAL: &str = "10.96.0.0/24,fd00:96::/120";
+
+fn cluster_ips(v: &Value) -> Vec<String> {
+    v["spec"]["clusterIPs"]
+        .as_array()
+        .map(|a| a.iter().map(|s| s.as_str().unwrap().to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn is_v6(ip: &str) -> bool {
+    ip.contains(':')
+}
+
+#[tokio::test]
+async fn require_dual_stack_create_gets_one_cluster_ip_per_family_primary_first() {
+    let st = state_with(DUAL);
+    let (code, v) = create(
+        &st,
+        "d",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, StatusCode::CREATED);
+    let ips = cluster_ips(&v);
+    assert_eq!(
+        ips.len(),
+        2,
+        "RequireDualStack must yield two clusterIPs: {v}"
+    );
+    assert!(
+        !is_v6(&ips[0]) && is_v6(&ips[1]),
+        "v4 primary first: {ips:?}"
+    );
+    assert_eq!(v["spec"]["clusterIP"], ips[0].as_str());
+    assert_eq!(v["spec"]["ipFamilies"], json!(["IPv4", "IPv6"]));
+    for ip in &ips {
+        assert!(held(&st, &ip_key(ip)).await, "{ip} must be reserved");
+    }
+    let stored = get(&st, "d").await;
+    assert_eq!(cluster_ips(&stored), ips, "the persisted object keeps both");
+}
+
+#[tokio::test]
+async fn prefer_dual_stack_and_ipv6_single_stack_allocate_from_the_right_pool() {
+    let st = state_with(DUAL);
+    let (_, p) = create(
+        &st,
+        "p",
+        json!({"ipFamilyPolicy": "PreferDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cluster_ips(&p).len(), 2);
+
+    let (_, s6) = create(
+        &st,
+        "s6",
+        json!({"ipFamilies": ["IPv6"], "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    let ips = cluster_ips(&s6);
+    assert_eq!(
+        ips.len(),
+        1,
+        "SingleStack IPv6 must hold exactly one IP: {s6}"
+    );
+    assert!(
+        ips[0].starts_with("fd00:96::"),
+        "an IPv6-only Service must come from the IPv6 range, got {ips:?}"
+    );
+    assert_eq!(s6["spec"]["ipFamilyPolicy"], "SingleStack");
+    assert_eq!(s6["spec"]["clusterIP"], ips[0].as_str());
+}
+
+#[tokio::test]
+async fn unconfigured_service_stays_single_stack_on_the_primary_family() {
+    for (ranges, v6) in [(DUAL, false), ("fd00:96::/120,10.96.0.0/24", true)] {
+        let st = state_with(ranges);
+        let (_, v) = create(&st, "x", json!({"ports": [{"port": 80}]}), false)
+            .await
+            .unwrap();
+        let ips = cluster_ips(&v);
+        assert_eq!(
+            ips.len(),
+            1,
+            "a plain Service must not become dual-stack: {v}"
+        );
+        assert_eq!(
+            is_v6(&ips[0]),
+            v6,
+            "primary family follows range order: {ips:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn require_dual_stack_is_rejected_on_a_single_stack_cluster_without_leaking_an_ip() {
+    let st = state();
+    assert_422(
+        create(
+            &st,
+            "d",
+            json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+            false,
+        )
+        .await,
+        "spec.ipFamilyPolicy: Invalid value: \"RequireDualStack\": this cluster is not configured for dual-stack services",
+    );
+    assert!(
+        held_ips(&st).await.is_empty(),
+        "a rejected create must not take an IP"
+    );
+}
+
+#[tokio::test]
+async fn explicit_cluster_ips_per_family_are_reserved_and_validated_against_their_own_range() {
+    let st = state_with(DUAL);
+    let spec = json!({
+        "ipFamilyPolicy": "RequireDualStack",
+        "clusterIPs": ["fd00:96::40", "10.96.0.40"],
+        "ports": [{"port": 80}],
+    });
+    let (_, v) = create(&st, "a", spec.clone(), false).await.unwrap();
+    assert_eq!(
+        v["spec"]["ipFamilies"],
+        json!(["IPv6", "IPv4"]),
+        "user order defines family order"
+    );
+    assert_eq!(cluster_ips(&v), ["fd00:96::40", "10.96.0.40"]);
+    assert!(held(&st, &ip_key("fd00:96::40")).await);
+
+    assert_422(
+        create(&st, "b", spec, false).await,
+        "provided IP is already allocated",
+    );
+    assert_422(
+        create(
+            &st,
+            "c",
+            json!({"clusterIP": "fd00:97::5", "ports": [{"port": 80}]}),
+            false,
+        )
+        .await,
+        "The range of valid IPs is fd00:96::/120",
+    );
+    assert_422(
+        create(
+            &st,
+            "e",
+            json!({"ipFamilyPolicy": "RequireDualStack", "clusterIPs": ["10.96.0.41", "10.96.0.42"], "ports": [{"port": 80}]}),
+            false,
+        )
+        .await,
+        "may specify no more than one IP for each IP family",
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_dual_stack_service_releases_both_addresses() {
+    let st = state_with(DUAL);
+    let (_, v) = create(
+        &st,
+        "d",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    let ips = cluster_ips(&v);
+    delete(&st, "d").await;
+    for ip in &ips {
+        assert!(!held(&st, &ip_key(ip)).await, "{ip} leaked after delete");
+    }
+}
+
+/// An exhausted IPv6 pool is a 500 for IPv6 allocations only, and a dual-stack create that
+/// fails on the second family must give the first family's address back.
+#[tokio::test]
+async fn exhausting_ipv6_fails_only_ipv6_and_leaks_no_ipv4_address() {
+    let st = state_with("10.96.0.0/24,fd00:96::/126");
+    let v6_only = json!({"ipFamilies": ["IPv6"], "ports": [{"port": 80}]});
+    for n in ["a", "b"] {
+        create(&st, n, v6_only.clone(), false).await.unwrap();
+    }
+    match create(&st, "c", v6_only, false).await {
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => {}
+        other => panic!("exhausted IPv6 pool must answer 500, got {other:?}"),
+    }
+    let before = held_ips(&st).await;
+    match create(
+        &st,
+        "dual",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    {
+        Err((StatusCode::INTERNAL_SERVER_ERROR, _)) => {}
+        other => panic!("dual-stack create needing the full pool must answer 500, got {other:?}"),
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        held_ips(&st).await,
+        before,
+        "the IPv4 half of a failed dual create leaked"
+    );
+    let (code, v) = create(&st, "v4", json!({"ports": [{"port": 80}]}), false)
+        .await
+        .expect("IPv4 must stay allocatable while IPv6 is full");
+    assert_eq!(code, StatusCode::CREATED);
+    assert!(!is_v6(&cluster_ips(&v)[0]));
+}
+
+async fn upgrade_then_downgrade(patch_kind: &str) {
+    let st = state_with(DUAL);
+    let (_, v) = create(&st, "u", json!({"ports": [{"port": 80}]}), false)
+        .await
+        .unwrap();
+    let primary = cluster_ips(&v)[0].clone();
+
+    for (policy, want_len) in [("RequireDualStack", 2), ("SingleStack", 1)] {
+        let r = match patch_kind {
+            "put" => {
+                let mut body = get(&st, "u").await;
+                body["spec"]["ipFamilyPolicy"] = json!(policy);
+                put(&st, body, false).await
+            }
+            "merge" => {
+                patch(
+                    &st,
+                    "u",
+                    "application/merge-patch+json",
+                    json!({"spec": {"ipFamilyPolicy": policy}}),
+                )
+                .await
+            }
+            "strategic" => {
+                patch(
+                    &st,
+                    "u",
+                    "application/strategic-merge-patch+json",
+                    json!({"spec": {"ipFamilyPolicy": policy}}),
+                )
+                .await
+            }
+            "json" => {
+                patch(
+                    &st,
+                    "u",
+                    "application/json-patch+json",
+                    json!([{"op": "add", "path": "/spec/ipFamilyPolicy", "value": policy}]),
+                )
+                .await
+            }
+            _ => unreachable!(),
+        };
+        let (_, after) = r.unwrap_or_else(|e| panic!("{patch_kind} {policy}: {e:?}"));
+        let ips = cluster_ips(&after);
+        assert_eq!(ips.len(), want_len, "{patch_kind} -> {policy}: {after}");
+        assert_eq!(
+            ips[0], primary,
+            "{patch_kind}: the primary clusterIP must never move"
+        );
+        if want_len == 2 {
+            assert!(is_v6(&ips[1]) && held(&st, &ip_key(&ips[1])).await);
+            assert_eq!(after["spec"]["ipFamilies"], json!(["IPv4", "IPv6"]));
+        } else {
+            assert_eq!(after["spec"]["ipFamilies"], json!(["IPv4"]));
+        }
+    }
+    let stored = get(&st, "u").await;
+    assert_eq!(cluster_ips(&stored), [primary.as_str()]);
+    assert_eq!(
+        held_ips(&st).await,
+        vec![ip_key(&primary)],
+        "{patch_kind}: downgrading must release the secondary address"
+    );
+}
+
+#[tokio::test]
+async fn put_upgrade_and_downgrade_allocate_and_release_the_secondary() {
+    upgrade_then_downgrade("put").await;
+}
+
+#[tokio::test]
+async fn merge_patch_upgrade_and_downgrade_allocate_and_release_the_secondary() {
+    upgrade_then_downgrade("merge").await;
+}
+
+#[tokio::test]
+async fn strategic_patch_upgrade_and_downgrade_allocate_and_release_the_secondary() {
+    upgrade_then_downgrade("strategic").await;
+}
+
+#[tokio::test]
+async fn json_patch_upgrade_and_downgrade_allocate_and_release_the_secondary() {
+    upgrade_then_downgrade("json").await;
+}
+
+/// `kubectl apply --server-side` creates and then updates through the apply branch of the
+/// patch handler, which must resolve families and allocate exactly like POST and PUT.
+#[tokio::test]
+async fn server_side_apply_create_and_upgrade_allocate_per_family() {
+    let st = state_with(DUAL);
+    let applied = |policy: &str| {
+        svc(
+            "ssa",
+            json!({"ipFamilyPolicy": policy, "ports": [{"port": 80}]}),
+        )
+    };
+    let (_, v) = patch(
+        &st,
+        "ssa",
+        "application/apply-patch+yaml",
+        applied("PreferDualStack"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cluster_ips(&v).len(),
+        2,
+        "apply-create must allocate both: {v}"
+    );
+
+    let (_, one) = patch(
+        &st,
+        "ssa2",
+        "application/apply-patch+yaml",
+        svc(
+            "ssa2",
+            json!({"ipFamilyPolicy": "SingleStack", "ports": [{"port": 80}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cluster_ips(&one).len(), 1);
+    let (_, up) = patch(
+        &st,
+        "ssa2",
+        "application/apply-patch+yaml",
+        svc(
+            "ssa2",
+            json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    let ips = cluster_ips(&up);
+    assert_eq!(
+        ips.len(),
+        2,
+        "apply-update to RequireDualStack must allocate the secondary: {up}"
+    );
+    assert_eq!(ips[0], cluster_ips(&one)[0]);
+}
+
+#[tokio::test]
+async fn primary_cluster_ip_cannot_change_and_secondary_release_needs_single_stack() {
+    let st = state_with(DUAL);
+    let (_, v) = create(
+        &st,
+        "i",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    let ips = cluster_ips(&v);
+
+    let mut moved = get(&st, "i").await;
+    moved["spec"]["clusterIPs"] = json!(["10.96.0.99", ips[1]]);
+    moved["spec"]["clusterIP"] = json!("10.96.0.99");
+    assert_422(put(&st, moved, false).await, "may not change once set");
+    assert_422(
+        patch(
+            &st,
+            "i",
+            "application/merge-patch+json",
+            json!({"spec": {"clusterIPs": ["10.96.0.99", ips[1]], "clusterIP": "10.96.0.99"}}),
+        )
+        .await,
+        "may not change once set",
+    );
+
+    assert_422(
+        patch(
+            &st,
+            "i",
+            "application/merge-patch+json",
+            json!({"spec": {"clusterIPs": [ips[0]]}}),
+        )
+        .await,
+        "must be 'SingleStack' to release the secondary cluster IP",
+    );
+    assert!(
+        held(&st, &ip_key(&ips[1])).await,
+        "a rejected downgrade must not release the IP"
+    );
+}
+
+/// kubectl replace sends only what the user wrote; leaving out the allocated addresses
+/// must keep them rather than allocate fresh ones that then trip the immutability check.
+#[tokio::test]
+async fn put_without_cluster_ips_keeps_both_allocated_addresses() {
+    let st = state_with(DUAL);
+    let (_, v) = create(
+        &st,
+        "k",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    let ips = cluster_ips(&v);
+    let mut body = svc(
+        "k",
+        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 8080}]}),
+    );
+    body["metadata"]["resourceVersion"] = v["metadata"]["resourceVersion"].clone();
+    let (_, after) = put(&st, body, false).await.unwrap();
+    assert_eq!(cluster_ips(&after), ips);
+    assert_eq!(held_ips(&st).await.len(), 2);
+}
+
+#[tokio::test]
+async fn kubernetes_service_stays_single_stack_on_the_primary_family_and_cidr_lists_both() {
+    let st = state_with(DUAL);
+    crate::seed_services(&st.store, "127.0.0.1", 6443, DUAL, None)
+        .await
+        .unwrap();
+    crate::seed_servicecidrs(&st.store, DUAL).await.unwrap();
+    let k = get(&st, "kubernetes").await;
+    assert_eq!(k["spec"]["clusterIPs"], json!(["10.96.0.1"]));
+    assert_eq!(k["spec"]["ipFamilies"], json!(["IPv4"]));
+    assert_eq!(k["spec"]["ipFamilyPolicy"], "SingleStack");
+    assert!(held(&st, &ip_key("10.96.0.1")).await);
+
+    let cidr = st
+        .store
+        .get("/registry/networking.k8s.io/servicecidrs/kubernetes")
+        .await
+        .unwrap()
+        .expect("ServiceCIDR must be seeded");
+    let cidr: Value = serde_json::from_slice(&cidr.value).unwrap();
+    assert_eq!(
+        cidr["spec"]["cidrs"],
+        json!(["10.96.0.0/24", "fd00:96::/120"]),
+        "the default ServiceCIDR must list every configured range"
+    );
+
+    let v6_range = "fd00:96::/120,10.96.0.0/24";
+    let v6 = state_with(v6_range);
+    crate::seed_services(&v6.store, "127.0.0.1", 6443, v6_range, None)
+        .await
+        .unwrap();
+    let k = get(&v6, "kubernetes").await;
+    assert_eq!(k["spec"]["clusterIPs"], json!(["fd00:96::1"]));
+    assert_eq!(k["spec"]["ipFamilies"], json!(["IPv6"]));
+}
+
+#[tokio::test]
+async fn repair_reserves_ipv6_cluster_ips_under_their_canonical_key() {
+    let st = state_with(DUAL);
+    store_without_sentinels(
+        &st,
+        "default",
+        "old",
+        json!({
+            "clusterIP": "10.96.0.2", "clusterIPs": ["10.96.0.2", "fd00:96::2"],
+            "ipFamilies": ["IPv4", "IPv6"], "ipFamilyPolicy": "RequireDualStack",
+        }),
+    )
+    .await;
+    super::repair(&*st.store).await.unwrap();
+    assert!(held(&st, &ip_key("fd00:96::2")).await);
+    let (_, v) = create(
+        &st,
+        "new",
+        json!({"ipFamilies": ["IPv6"], "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        cluster_ips(&v)[0],
+        "fd00:96::2",
+        "after a restart, auto-allocation must skip the IPv6 address an existing Service holds"
     );
 }

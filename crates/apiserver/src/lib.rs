@@ -51,6 +51,7 @@ pub(crate) mod sa_keys;
 mod sa_sig_cache;
 mod serve;
 mod service_alloc;
+mod service_ip_families;
 mod service_resolver;
 mod state;
 mod status;
@@ -351,29 +352,29 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     };
     tracing::info!("advertised server address: {server_address}");
 
-    // 9. Build service IP allocator from the configured CIDR.
-    let service_ip_allocator = if args.service_cluster_ip_range.is_empty() {
-        tracing::info!(
-            "service clusterIP auto-allocation disabled (empty --service-cluster-ip-range)"
-        );
-        None
-    } else {
-        match state::ServiceIpAllocator::from_cidr(&args.service_cluster_ip_range) {
-            Ok(alloc) => {
-                tracing::info!(
-                    "service clusterIP auto-allocation enabled: {}",
-                    args.service_cluster_ip_range
-                );
-                Some(alloc)
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
+    // 9. Build the per-family service IP allocators from the configured CIDR(s).
+    let (service_ip_allocator, secondary_service_ip_allocator) =
+        if args.service_cluster_ip_range.is_empty() {
+            tracing::info!(
+                "service clusterIP auto-allocation disabled (empty --service-cluster-ip-range)"
+            );
+            (None, None)
+        } else {
+            let (primary, secondary) = state::parse_service_cluster_ip_ranges(
+                &args.service_cluster_ip_range,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
                     "invalid --service-cluster-ip-range '{}': {e}",
                     args.service_cluster_ip_range
-                ));
-            }
-        }
-    };
+                )
+            })?;
+            tracing::info!(
+                "service clusterIP auto-allocation enabled: {}",
+                args.service_cluster_ip_range
+            );
+            (Some(primary), secondary)
+        };
 
     // 10. Build app state (shared with the auth layer).
     // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
@@ -398,6 +399,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         continue_token_key: None, // fresh random key generated at startup
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
     });
+    state.secondary_service_ip_allocator = secondary_service_ip_allocator.map(Arc::new);
     state.deny_service_external_ips = args.deny_service_external_ips;
     state.local_node_name = args.local_node_name.clone();
     // Not part of AppStateConfig: see the field's own doc — mirrors node_kubelet_ports below.
@@ -526,9 +528,6 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // 10a2. Populate the node-authorization graph from persisted pods before serving — see
     // init_node_graph's doc for why this must happen before the listener accepts traffic.
     state.init_node_graph().await;
-
-    // 10b. Seed service IP hint from already-allocated sentinels in the store.
-    state.init_service_ip_hint().await;
 
     // 10c-pre. Populate admission config cache from persisted objects before serving.
     // This ensures the first admission check after startup reads from cache, not the store.
@@ -2726,60 +2725,64 @@ fn parse_advertise_address(addr: &str) -> (String, u16) {
     }
 }
 
-/// Derive the ClusterIPs for the two well-known bootstrap Services from the configured
-/// `--service-cluster-ip-range`: `default/kubernetes` gets the first host (kubeadm's
-/// `.1` convention), `kube-system/kube-dns` gets the tenth host (kubeadm's `.10`
-/// convention). Both must land inside the configured range — a Service outside its
-/// ServiceCIDR fails the startup coherence check, and kube-proxy/kubelet would program
-/// rules for an IP the range doesn't actually own.
-///
-/// An empty range only disables *user* Service clusterIP auto-allocation (see
-/// `--service-cluster-ip-range`'s doc comment in args.rs); the two bootstrap Services
-/// still need concrete IPs, so fall back to the historical default range in that case.
-fn bootstrap_service_ips(
+/// Split `--service-cluster-ip-range` into its allocators, falling back to the historical
+/// default range when empty: the two bootstrap Services still need concrete IPs even
+/// when user Service auto-allocation is disabled.
+fn service_range_allocators(
     service_cluster_ip_range: &str,
-) -> anyhow::Result<(std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+) -> anyhow::Result<Vec<state::ServiceIpAllocator>> {
     let range = if service_cluster_ip_range.is_empty() {
         "10.96.0.0/12"
     } else {
         service_cluster_ip_range
     };
-    let allocator = state::ServiceIpAllocator::from_cidr(range)
+    let (primary, secondary) = state::parse_service_cluster_ip_ranges(range)
         .map_err(|e| anyhow::anyhow!("invalid --service-cluster-ip-range '{range}': {e}"))?;
-    let kubernetes_ip = allocator.nth_host(1).map_err(|e| {
+    Ok([Some(primary), secondary].into_iter().flatten().collect())
+}
+
+/// Derive the ClusterIPs for the two well-known bootstrap Services from the primary
+/// family of `--service-cluster-ip-range`: `default/kubernetes` gets the first host
+/// (kubeadm's `.1` convention), `kube-system/kube-dns` gets the tenth host (kubeadm's
+/// `.10` convention). Both must land inside the configured range — a Service outside its
+/// ServiceCIDR fails the startup coherence check, and kube-proxy/kubelet would program
+/// rules for an IP the range doesn't actually own. `default/kubernetes` stays single-stack
+/// on the primary family, as upstream's `kubernetes.default` Service does.
+fn bootstrap_service_ips(
+    service_cluster_ip_range: &str,
+) -> anyhow::Result<(std::net::IpAddr, std::net::IpAddr)> {
+    let allocators = service_range_allocators(service_cluster_ip_range)?;
+    let primary = &allocators[0];
+    let kubernetes_ip = primary.nth_host(1).map_err(|e| {
         anyhow::anyhow!(
-            "--service-cluster-ip-range '{range}' too small for kubernetes Service: {e}"
+            "--service-cluster-ip-range '{service_cluster_ip_range}' too small for kubernetes Service: {e}"
         )
     })?;
-    let kube_dns_ip = allocator.nth_host(10).map_err(|e| {
-        anyhow::anyhow!("--service-cluster-ip-range '{range}' too small for kube-dns Service: {e}")
+    let kube_dns_ip = primary.nth_host(10).map_err(|e| {
+        anyhow::anyhow!(
+            "--service-cluster-ip-range '{service_cluster_ip_range}' too small for kube-dns Service: {e}"
+        )
     })?;
     Ok((kubernetes_ip, kube_dns_ip))
 }
 
-/// Parse `--kube-dns-cluster-ip` and require it to be an allocatable host of the range that
-/// does not collide with the `kubernetes` Service. An IP outside the range would sit outside
-/// the ServiceCIDR and fail the startup coherence check; the network/broadcast addresses are
-/// never allocatable.
+/// Parse `--kube-dns-cluster-ip` and require it to be an allocatable host of one of the
+/// configured ranges that does not collide with the `kubernetes` Service. An IP outside the
+/// ranges would sit outside the ServiceCIDR and fail the startup coherence check; the
+/// network/broadcast addresses are never allocatable. The kube-dns Service is single-stack,
+/// so a dual-stack cluster may place it in either family.
 fn validate_kube_dns_ip(
     service_cluster_ip_range: &str,
-    kubernetes_ip: std::net::Ipv4Addr,
+    kubernetes_ip: std::net::IpAddr,
     raw: &str,
-) -> anyhow::Result<std::net::Ipv4Addr> {
-    let ip: std::net::Ipv4Addr = raw
+) -> anyhow::Result<std::net::IpAddr> {
+    let ip: std::net::IpAddr = raw
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --kube-dns-cluster-ip '{raw}': {e}"))?;
-    let range = if service_cluster_ip_range.is_empty() {
-        "10.96.0.0/12"
-    } else {
-        service_cluster_ip_range
-    };
-    let alloc = state::ServiceIpAllocator::from_cidr(range)
-        .map_err(|e| anyhow::anyhow!("invalid --service-cluster-ip-range '{range}': {e}"))?;
-    let offset = u32::from(ip).wrapping_sub(u32::from(alloc.base));
-    if offset == 0 || offset >= alloc.size - 1 {
+    let allocators = service_range_allocators(service_cluster_ip_range)?;
+    if !allocators.iter().any(|a| a.contains_host(&ip)) {
         anyhow::bail!(
-            "--kube-dns-cluster-ip {ip} is not an allocatable host of --service-cluster-ip-range {range}"
+            "--kube-dns-cluster-ip {ip} is not an allocatable host of --service-cluster-ip-range {service_cluster_ip_range}"
         );
     }
     if ip == kubernetes_ip {
@@ -2819,6 +2822,9 @@ async fn seed_services(
         },
         "spec": {
             "clusterIP": kubernetes_cluster_ip.to_string(),
+            "clusterIPs": [kubernetes_cluster_ip.to_string()],
+            "ipFamilies": [state::IpFamily::of(&kubernetes_cluster_ip).as_str()],
+            "ipFamilyPolicy": "SingleStack",
             "ports": [{ "name": "https", "port": 443, "targetPort": 6443, "protocol": "TCP" }],
             "sessionAffinity": "None",
             "type": "ClusterIP"
@@ -2836,8 +2842,8 @@ async fn seed_services(
     // kube-system/kube-dns itself is applied later, from the vendored CoreDNS bundle (see
     // bootstrap_apply.rs), so the whole CoreDNS install lives in one manifest. Its clusterIP
     // is still reserved here in the allocator's own sentinel keyspace ahead of that apply.
-    // Without this, allocate_service_ip (hint starts at offset 2, +1 per call) has no
-    // idea offset 10 is taken and will hand it to the 9th ordinary dynamic Service,
+    // Without this, allocate_service_ip (random start, linear probing) has no
+    // idea offset 10 is taken and may hand it to an ordinary dynamic Service,
     // colliding with kube-dns's VIP.
     // default/kubernetes' VIP is reserved the same way (upstream's kubernetesservice
     // controller does this every boot), so no tenant Service can claim the apiserver's
@@ -4091,6 +4097,7 @@ async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::R
         return Ok(());
     }
 
+    let cidrs: Vec<&str> = service_cidr.split(',').map(str::trim).collect();
     let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
     let body = serde_json::json!({
         "apiVersion": "networking.k8s.io/v1",
@@ -4101,7 +4108,7 @@ async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::R
             "creationTimestamp": "2024-01-01T00:00:00Z"
         },
         "spec": {
-            "cidrs": [service_cidr]
+            "cidrs": cidrs
         },
         "status": {
             "conditions": [{
@@ -4118,10 +4125,45 @@ async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::R
         .await
     {
         Ok(_) => tracing::info!("seeded ServiceCIDR: kubernetes"),
-        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+            upgrade_default_servicecidr_to_dual_stack(store, &key, &cidrs).await?;
+        }
         Err(e) => return Err(anyhow::anyhow!("seed ServiceCIDR kubernetes: {e}")),
     }
 
+    Ok(())
+}
+
+/// Mirrors upstream's default-ServiceCIDR controller: an existing single-CIDR `kubernetes`
+/// ServiceCIDR gains the secondary family when the flags now name two CIDRs and the primary
+/// is unchanged. Every other mismatch leaves the object as it is.
+async fn upgrade_default_servicecidr_to_dual_stack(
+    store: &SqliteStore,
+    key: &str,
+    cidrs: &[&str],
+) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let Some(existing) = store
+        .get(key)
+        .await
+        .map_err(|e| anyhow::anyhow!("get ServiceCIDR kubernetes: {e}"))?
+    else {
+        return Ok(());
+    };
+    let mut obj: serde_json::Value = serde_json::from_slice(&existing.value)
+        .map_err(|e| anyhow::anyhow!("parse ServiceCIDR kubernetes: {e}"))?;
+    let current = obj["spec"]["cidrs"].as_array().cloned().unwrap_or_default();
+    if cidrs.len() != 2 || current.len() != 1 || current[0].as_str() != Some(cidrs[0]) {
+        return Ok(());
+    }
+    tracing::info!("updating default ServiceCIDR from single-stack to dual-stack");
+    obj["spec"]["cidrs"] = serde_json::json!(cidrs);
+    store
+        .put(key, Bytes::from(obj.to_string()), Some(existing.revision))
+        .await
+        .map_err(|e| anyhow::anyhow!("upgrade ServiceCIDR kubernetes to dual stack: {e}"))?;
     Ok(())
 }
 
@@ -7467,7 +7509,7 @@ mod tests {
     /// instead of seeding a Service the ServiceCIDR does not own.
     #[test]
     fn kube_dns_override_must_be_an_allocatable_host_distinct_from_kubernetes() {
-        let k8s: std::net::Ipv4Addr = "10.43.0.1".parse().unwrap();
+        let k8s: std::net::IpAddr = "10.43.0.1".parse().unwrap();
         assert_eq!(
             validate_kube_dns_ip("10.43.0.0/16", k8s, "10.43.0.53")
                 .unwrap()
@@ -7486,6 +7528,31 @@ mod tests {
                 "{bad} must be rejected as a kube-dns ClusterIP for 10.43.0.0/16"
             );
         }
+    }
+
+    /// On a dual-stack range the `kubernetes` Service must land on the primary (first)
+    /// family: kubelet-injected KUBERNETES_SERVICE_HOST and the apiserver cert SAN follow
+    /// it, so a secondary-family pick would break every in-cluster client. kube-dns may
+    /// sit in either family, so an operator override in the secondary range is accepted.
+    #[test]
+    fn dual_stack_bootstrap_ips_follow_the_primary_family_and_dns_may_use_either() {
+        let (k8s, dns) = bootstrap_service_ips("10.96.0.0/12,fd00:96::/108").unwrap();
+        assert_eq!(
+            (k8s.to_string(), dns.to_string()),
+            ("10.96.0.1".into(), "10.96.0.10".into())
+        );
+        let (k8s, dns) = bootstrap_service_ips("fd00:96::/108,10.96.0.0/12").unwrap();
+        assert_eq!(
+            (k8s.to_string(), dns.to_string()),
+            ("fd00:96::1".into(), "fd00:96::a".into()),
+            "an IPv6-primary cluster must bootstrap the kubernetes Service on IPv6"
+        );
+        let k8s: std::net::IpAddr = "10.96.0.1".parse().unwrap();
+        assert!(validate_kube_dns_ip("10.96.0.0/12,fd00:96::/108", k8s, "fd00:96::53").is_ok());
+        assert!(
+            validate_kube_dns_ip("10.96.0.0/12,fd00:96::/108", k8s, "fd00:97::53").is_err(),
+            "an IPv6 address outside every configured range must be rejected"
+        );
     }
 
     /// bootstrap_service_ips must derive both bootstrap ClusterIPs from whatever range
@@ -8730,6 +8797,57 @@ mod tests {
         assert!(
             obj.is_none(),
             "ServiceCIDR 'kubernetes' must not be created when service CIDR is empty"
+        );
+    }
+
+    async fn default_servicecidr_cidrs(store: &SqliteStore) -> Vec<String> {
+        let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+        let obj = store.get(&key).await.unwrap().expect("ServiceCIDR exists");
+        let v: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
+        v["spec"]["cidrs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Restarting a single-stack cluster with a dual-stack range must add the secondary CIDR
+    /// to the default ServiceCIDR; otherwise IPv6 ClusterIPs are allocated outside any
+    /// ServiceCIDR the rest of the cluster can see.
+    #[tokio::test]
+    async fn seed_servicecidrs_upgrades_single_stack_to_dual_stack() {
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        seed_servicecidrs(&store, "10.96.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        assert_eq!(
+            default_servicecidr_cidrs(&store).await,
+            ["10.96.0.0/12", "fd00:96::/108"]
+        );
+    }
+
+    /// Upstream only upgrades when the primary CIDR is unchanged; any other mismatch is left
+    /// alone, so a changed range never silently rewrites the existing object.
+    #[tokio::test]
+    async fn seed_servicecidrs_leaves_other_mismatches_untouched() {
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        seed_servicecidrs(&store, "10.200.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        assert_eq!(default_servicecidr_cidrs(&store).await, ["10.96.0.0/12"]);
+
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12,fd00:96::/108")
+            .await
+            .unwrap();
+        seed_servicecidrs(&store, "10.96.0.0/12").await.unwrap();
+        assert_eq!(
+            default_servicecidr_cidrs(&store).await,
+            ["10.96.0.0/12", "fd00:96::/108"],
+            "dual to single is not a supported upgrade"
         );
     }
 
