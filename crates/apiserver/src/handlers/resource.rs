@@ -1568,12 +1568,11 @@ pub(crate) async fn do_patch<S: Store>(
                 super::defaults::deny_service_external_ips(None, &obj.body["spec"])
                     .map_err(Status::forbidden)?;
             }
-            super::defaults::validate_service_ip_family_fields(&obj.body)
-                .map_err(Status::unprocessable_entity)?;
             auto_cluster_ip = maybe_allocate_cluster_ip(
                 state,
                 ns.unwrap_or_default(),
                 name,
+                None,
                 &mut obj.body,
                 dry_run,
             )
@@ -2085,9 +2084,9 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // Capture the Service spec before patch: validate_service_cluster_ip_immutable
-        // (below, after the patch is applied) needs the stored clusterIP/type to reject a
-        // patch that repoints an already-allocated clusterIP onto a different address.
+        // Capture the Service spec before patch: maybe_allocate_cluster_ip (below, after the
+        // patch is applied) needs the stored clusterIPs/ipFamilies/type to resolve the new
+        // families and to reject a patch that repoints an allocated clusterIP.
         let svc_spec_before_patch = if group.is_empty() && plural == "services" {
             Some(current.body["spec"].clone())
         } else {
@@ -2232,11 +2231,6 @@ pub(crate) async fn do_patch<S: Store>(
             .map_err(Status::forbidden)?;
         }
 
-        if let Some(ref old_spec) = svc_spec_before_patch {
-            validate_service_cluster_ip_immutable(old_spec, &current.body["spec"])
-                .map_err(Status::unprocessable_entity)?;
-        }
-
         if let Some((ref old_size, ref sc_name)) = pvc_before_patch {
             reject_disallowed_pvc_resize(
                 state,
@@ -2272,12 +2266,11 @@ pub(crate) async fn do_patch<S: Store>(
                 )
                 .map_err(Status::forbidden)?;
             }
-            super::defaults::validate_service_ip_family_fields(&current.body)
-                .map_err(Status::unprocessable_entity)?;
             auto_cluster_ip = maybe_allocate_cluster_ip(
                 state,
                 ns.unwrap_or_default(),
                 name,
+                svc_spec_before_patch.as_ref(),
                 &mut current.body,
                 dry_run,
             )
@@ -2763,39 +2756,6 @@ fn validate_workload_spec_immutable(
         "statefulsets" => validate_statefulset_spec_immutable(old_spec, new_spec),
         _ => Ok(()),
     }
-}
-
-/// Reject a client-driven change to `spec.clusterIP` once a Service already has one
-/// allocated. Mirrors upstream's `validateUpgradeDowngradeClusterIPs`
-/// (pkg/apis/core/validation/validation.go, release-1.36): a Service's clusterIP is the
-/// exact address every in-cluster DNS record and proxy rule for that Service points to,
-/// and it's the allocator's only bookkeeping key for "this VIP is taken" — a caller with
-/// only `patch`/`update` rights on Services could otherwise repoint an existing Service's
-/// clusterIP onto an address already handed to a *different* Service, silently hijacking
-/// whatever traffic still resolves to that VIP. `maybe_allocate_cluster_ip` only ever
-/// *fills in* an empty clusterIP; nothing previously stopped a client from overwriting an
-/// already-set one.
-///
-/// Exempted, matching upstream's own "bail out for ExternalName" branch in
-/// `validateUpgradeDowngradeClusterIPs`: a transition to or from `ExternalName` on either
-/// side. ExternalName Services carry no clusterIP at all — `default_service_spec` forces
-/// the field blank whenever the (new) type is ExternalName — so there is no VIP to
-/// protect while either the stored or incoming type is ExternalName.
-fn validate_service_cluster_ip_immutable(
-    old_spec: &serde_json::Value,
-    new_spec: &serde_json::Value,
-) -> Result<(), String> {
-    let old_type = old_spec["type"].as_str().unwrap_or("ClusterIP");
-    let new_type = new_spec["type"].as_str().unwrap_or("ClusterIP");
-    if old_type == "ExternalName" || new_type == "ExternalName" {
-        return Ok(());
-    }
-    let old_ip = old_spec["clusterIP"].as_str().unwrap_or("");
-    let new_ip = new_spec["clusterIP"].as_str().unwrap_or("");
-    if old_ip == new_ip {
-        return Ok(());
-    }
-    Err("spec.clusterIP: Forbidden: field is immutable once set".into())
 }
 
 /// StatefulSet spec fields upstream leaves mutable on update (`ValidateStatefulSetUpdate`,
@@ -3466,7 +3426,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     stamp_metadata(&mut obj);
 
     // Auto-allocate clusterIP for Services that don't specify one.
-    // Must run before apply_defaults so the allocated IP feeds into ipFamilies/clusterIPs.
+    // Must run before apply_defaults so the allocated IPs feed into ipFamilies/clusterIPs.
     // The ip-family check runs first, on the raw client body, so a Service the cluster
     // cannot satisfy (e.g. ipFamilyPolicy: RequireDualStack) is rejected before an IP is
     // ever taken from the pool — rejecting after allocation would leak it.
@@ -3476,11 +3436,15 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             super::defaults::deny_service_external_ips(None, &obj.body["spec"])
                 .map_err(Status::forbidden)?;
         }
-        super::defaults::validate_service_ip_family_fields(&obj.body)
-            .map_err(Status::unprocessable_entity)?;
-        auto_cluster_ip =
-            maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body, create_query.is_dry_run())
-                .await?;
+        auto_cluster_ip = maybe_allocate_cluster_ip(
+            &state,
+            &ns,
+            &name,
+            None,
+            &mut obj.body,
+            create_query.is_dry_run(),
+        )
+        .await?;
     }
 
     let api_version = if group.is_empty() {
@@ -4094,9 +4058,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             None
         };
         // Captured pre-`apply_defaults` for the same reason as pvc_spec_before_replace above:
-        // validate_service_cluster_ip_immutable, called after apply_defaults runs on the
-        // incoming body, needs the stored spec's already-defaulted clusterIP/type to compare
-        // against.
+        // maybe_allocate_cluster_ip needs the stored spec's already-defaulted
+        // clusterIPs/ipFamilies/type to resolve and compare against.
         let svc_spec_before_replace = if is_service {
             parsed.as_ref().map(|v| v["spec"].clone())
         } else {
@@ -4212,10 +4175,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // handles initial allocation; the update path must also allocate when the type
     // changes, because ExternalName services are created without a clusterIP and the
     // stored object carries no IP to preserve.
-    // maybe_allocate_cluster_ip is a no-op when clusterIP is already set or when
-    // the type is (still) ExternalName, so calling it unconditionally is safe.
-    // The ip-family check runs first, on the raw client body, for the same
-    // leak-avoidance reason as the create path above.
+    // maybe_allocate_cluster_ip also validates the family fields before taking any
+    // address, for the same leak-avoidance reason as the create path above.
     let mut auto_cluster_ip = None;
     if group.is_empty() && plural == "services" {
         if state.deny_service_external_ips {
@@ -4225,12 +4186,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
-        super::defaults::validate_service_ip_family_fields(&obj.body)
-            .map_err(Status::unprocessable_entity)?;
         auto_cluster_ip = maybe_allocate_cluster_ip(
             &state,
             &ns,
             &name,
+            svc_spec_before_replace.as_ref(),
             &mut obj.body,
             replace_query.is_dry_run(),
         )
@@ -4266,16 +4226,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // check above.
     if let Some(ref old_spec) = spec_before_replace {
         validate_workload_spec_immutable(&group, &plural, old_spec, &obj.body["spec"])
-            .map_err(Status::unprocessable_entity)?;
-    }
-
-    // A PUT may not repoint an already-allocated spec.clusterIP onto a different address
-    // (except across an ExternalName type transition) — see
-    // validate_service_cluster_ip_immutable. Same apply_defaults-then-compare ordering as
-    // the PVC check above; runs after maybe_allocate_cluster_ip too, since that call only
-    // fills in an empty clusterIP and never changes an already-set one.
-    if let Some(ref old_spec) = svc_spec_before_replace {
-        validate_service_cluster_ip_immutable(old_spec, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
     }
 
@@ -5225,55 +5175,63 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
 // Private helpers (duplicated from generic to avoid pub exposure)
 // ---------------------------------------------------------------------------
 
-/// Allocate a clusterIP for a Service if none is already set.
+/// Resolve a Service write's `ipFamilyPolicy`/`ipFamilies`/`clusterIPs` and allocate one
+/// clusterIP per family that still lacks one — the single point every Service create, PUT,
+/// PATCH and apply goes through (upstream: `initIPFamilyFields` + `allocClusterIPs`).
 ///
-/// Called on Service CREATE and UPDATE (PUT).  On create, an explicit clusterIP in the
-/// body is respected; without one an address is auto-allocated.  On update the call is
-/// a no-op for services that already have a clusterIP, but it allocates one when the
-/// service type transitions from ExternalName (which stores no clusterIP) to a
-/// cluster-routed type (ClusterIP, NodePort, LoadBalancer).
-/// Keeps `apply_defaults` pure (no async side effects).
-///
-/// Sets `spec.clusterIP` in `body` when allocation succeeds.
-/// If `spec.clusterIP` is already set (non-empty string), does nothing.
-/// ExternalName services are skipped entirely — they must not have a ClusterIP.
+/// `old_spec` is the stored spec on update, `None` on create. An explicit clusterIP is
+/// kept (and reserved later by `service_alloc::begin`); an update that drops the secondary
+/// family frees it there too, because `begin` releases whatever the old spec held and the
+/// new one does not. ExternalName Services are skipped entirely — they have no ClusterIP.
 ///
 /// `dry_run`: `allocate_service_ip` reserves the IP via a real create-only store write
 /// (it doubles as the allocator's distributed lock) — there is no side-effect-free way to
-/// compute a candidate address. Under `dryRun=All` this must be skipped entirely rather
-/// than calling it and leaking a permanently-reserved sentinel for an object that is never
-/// actually created; the dry-run response is left with `spec.clusterIP` unset instead.
+/// compute a candidate address. Under `dryRun=All` the families are still resolved but no
+/// address is allocated, rather than leaking a permanently-reserved sentinel for an object
+/// that is never created.
+///
+/// Runs before `apply_defaults` and before any allocation, so a rejected write never takes
+/// an address from the pool.
 async fn maybe_allocate_cluster_ip<S: Store>(
     state: &AppState<S>,
     ns: &str,
     name: &str,
+    old_spec: Option<&serde_json::Value>,
     body: &mut serde_json::Value,
     dry_run: bool,
 ) -> Result<Option<crate::service_alloc::AutoClusterIp<S>>, crate::status::StatusError> {
-    // ExternalName services must not have a ClusterIP; skip allocation entirely.
-    let svc_type = body["spec"]["type"].as_str().unwrap_or("");
-    if svc_type == "ExternalName" {
+    if body["spec"]["type"].as_str() == Some("ExternalName") {
         return Ok(None);
     }
 
-    // Only auto-allocate when clusterIP is absent or empty.
-    let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
-    if !existing.is_empty() {
-        return Ok(None);
+    crate::service_ip_families::init_ip_family_fields(
+        &state.service_ip_families(),
+        old_spec,
+        &mut body["spec"],
+        name,
+    )?;
+    if let Some(old) = old_spec {
+        crate::service_ip_families::validate_ip_fields_update(old, &body["spec"], name)?;
     }
 
-    if dry_run {
+    if dry_run || state.service_ip_allocators().is_empty() {
         return Ok(None);
     }
 
     // Detect the special `default/kubernetes` Service which reserves .1.
     let is_kubernetes_service = ns == "default" && name == "kubernetes";
 
-    let ip = state.allocate_service_ip(is_kubernetes_service).await?;
-    if let Some(ip) = ip {
-        body["spec"]["clusterIP"] = serde_json::Value::String(ip.to_string());
+    let mut auto = crate::service_alloc::AutoClusterIp::new(state.store.clone());
+    for (idx, family) in crate::service_ip_families::unallocated_slots(&body["spec"]) {
+        if let Some(ip) = state
+            .allocate_service_ip(family, is_kubernetes_service)
+            .await?
+        {
+            auto.push(ip);
+            crate::service_ip_families::set_cluster_ip(&mut body["spec"], idx, &ip.to_string());
+        }
     }
-    Ok(ip.map(|ip| crate::service_alloc::AutoClusterIp::new(state.store.clone(), ip)))
+    Ok((!auto.is_empty()).then_some(auto))
 }
 
 pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
@@ -15070,13 +15028,12 @@ mod tests {
         );
     }
 
-    /// A headless Service (clusterIP="None") must get ipFamilies defaulted but no clusterIPs.
-    ///
-    /// "None" is a sentinel that kube uses for headless Services; it must not appear
-    /// in clusterIPs.  KCM reads IPFamilies[0] even for headless Services, so
-    /// the field must be present.
+    /// A headless Service (clusterIP="None") must get ipFamilies defaulted and
+    /// clusterIPs=["None"], as kube-apiserver stores it: the update-time immutability and
+    /// upgrade rules key off that exact shape. KCM reads IPFamilies[0] even for headless
+    /// Services, so the field must be present.
     #[tokio::test]
-    async fn headless_service_get_has_ip_family_but_no_cluster_ips() {
+    async fn headless_service_get_has_ip_family_and_none_cluster_ips() {
         use axum::body::to_bytes;
         use axum::extract::{Path, State};
         use axum::response::IntoResponse;
@@ -15124,23 +15081,21 @@ mod tests {
             serde_json::json!(["IPv4"]),
             "headless Service must have ipFamilies=[IPv4]"
         );
-        assert!(
-            v["spec"]["clusterIPs"].is_null(),
-            "headless Service must not have clusterIPs set"
+        assert_eq!(
+            v["spec"]["clusterIPs"],
+            serde_json::json!(["None"]),
+            "headless Service must carry clusterIPs=[\"None\"]"
         );
     }
 
     // ---------------------------------------------------------------------------
     // Service dual-stack ipFamilyPolicy/ipFamilies validation regression tests
     //
-    // u7s's ServiceIpAllocator only ever allocates from a single IPv4 CIDR — there
-    // is no second allocator for any other family. Before this fix, a Service
-    // claiming ipFamilyPolicy: RequireDualStack (or explicitly listing a
-    // non-IPv4 family) was accepted and echoed back verbatim while only ever
-    // getting one IPv4 ClusterIP allocated, silently breaking dual-stack routing
-    // for any consumer (kube-proxy, DNS) that trusts the advertised policy. If
-    // validate_service_ip_family_fields is removed or its call sites dropped,
-    // these tests fail.
+    // On a cluster with only an IPv4 range there is no second allocator, so a Service
+    // claiming ipFamilyPolicy: RequireDualStack (or explicitly listing IPv6) must be
+    // rejected instead of being echoed back while only ever getting one IPv4 ClusterIP,
+    // which silently breaks dual-stack routing for kube-proxy and DNS. If
+    // maybe_allocate_cluster_ip stops resolving families, these tests fail.
     // ---------------------------------------------------------------------------
 
     /// Creating a Service with ipFamilyPolicy: RequireDualStack on a cluster that
@@ -15482,12 +15437,12 @@ mod tests {
 
         // Verify the CIDR can be fully allocated again (two IPs available).
         let ip1 = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(crate::state::IpFamily::V4, false)
             .await
             .expect("allocation must not error")
             .expect("allocation must return Some after sentinels released");
         let ip2 = state
-            .allocate_service_ip(false)
+            .allocate_service_ip(crate::state::IpFamily::V4, false)
             .await
             .expect("allocation must not error")
             .expect("second allocation must return Some after sentinels released");

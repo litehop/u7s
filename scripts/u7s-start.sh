@@ -23,8 +23,11 @@
 #                        [--node-kubelet-port <name>=<N>]
 #                        [--konnectivity-server-port <N>]
 #                        [--embedded-scheduler <true|false>]
+#                        [--service-cidr <cidr>[,<cidr>]]
 #
-#   --reset       Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
+#   --service-cidr  Passthrough to --service-cluster-ip-range (default 10.96.0.0/12);
+#                 two comma-separated CIDRs of different families make a dual-stack range.
+#   --reset      Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
 #                 to be re-joined via scripts/conformance/lima-start.sh after this).
 #   --background  Start backgrounded (logs to ./temp/u7s/apiserver.log). Kills
 #                 any existing apiserver on the port and starts the new binary.
@@ -91,6 +94,7 @@ _KUBELET_PORT_OVERRIDE=""
 _NODE_KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _EMBEDDED_SCHEDULER_OVERRIDE=""
+_SERVICE_CIDR_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
@@ -104,9 +108,11 @@ while [[ $# -gt 0 ]]; do
     --node-kubelet-port) _NODE_KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --embedded-scheduler) _EMBEDDED_SCHEDULER_OVERRIDE="$2"; shift 2 ;;
+    --service-cidr) _SERVICE_CIDR_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+SERVICE_CIDR="${_SERVICE_CIDR_OVERRIDE:-10.96.0.0/12}"
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 NODE_KUBELET_PORT_ARG=""
@@ -332,7 +338,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --kubelet-preferred-address "$HOST_IP" \
     --kubelet-port "$KUBELET_PORT" \
     $NODE_KUBELET_PORT_ARG \
-    --service-cluster-ip-range "10.96.0.0/12" \
+    --service-cluster-ip-range "$SERVICE_CIDR" \
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -355,7 +361,7 @@ else
     --kubelet-preferred-address "$HOST_IP" \
     --kubelet-port "$KUBELET_PORT" \
     $NODE_KUBELET_PORT_ARG \
-    --service-cluster-ip-range "10.96.0.0/12" \
+    --service-cluster-ip-range "$SERVICE_CIDR" \
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -479,7 +485,7 @@ EXTEOF
       --kubelet-preferred-address "$HOST_IP" \
       --kubelet-port "$KUBELET_PORT" \
       $NODE_KUBELET_PORT_ARG \
-      --service-cluster-ip-range "10.96.0.0/12" \
+      --service-cluster-ip-range "$SERVICE_CIDR" \
       --manifest-dir "$MANIFEST_DIR" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \

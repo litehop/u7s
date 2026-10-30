@@ -132,8 +132,8 @@ pub(crate) fn evaluate(
 pub(crate) struct IpContext {
     /// Every IP any OTHER Node reports in any address field.
     pub other_node_ips: BTreeSet<IpAddr>,
-    /// Service CIDR base and size (IPv4 only, as the allocator is).
-    pub service_cidr: Option<(std::net::Ipv4Addr, u32)>,
+    /// Service CIDR base and size, one per configured family.
+    pub service_cidrs: Vec<(IpAddr, u32)>,
     /// The apiserver's own advertise and listen addresses.
     pub apiserver_ips: Vec<IpAddr>,
     /// Every Node's `spec.podCIDRs`/`spec.podCIDR` as (node name, base, prefix length). The
@@ -181,9 +181,15 @@ impl IpContext {
                 "IP SAN {ip} is loopback, unspecified, link-local or multicast"
             ));
         }
-        if let (IpAddr::V4(v4), Some((base, size))) = (ip, self.service_cidr) {
-            let off = u32::from(v4).wrapping_sub(u32::from(base));
-            if u32::from(v4) >= u32::from(base) && off < size {
+        for (base, size) in &self.service_cidrs {
+            let off = match (ip, base) {
+                (IpAddr::V4(a), IpAddr::V4(b)) => {
+                    u32::from(a).checked_sub(u32::from(*b)).map(u128::from)
+                }
+                (IpAddr::V6(a), IpAddr::V6(b)) => u128::from(a).checked_sub(u128::from(*b)),
+                _ => None,
+            };
+            if off.is_some_and(|o| o < u128::from(*size)) {
                 return Err(format!("IP SAN {ip} is inside the service CIDR"));
             }
         }
@@ -331,10 +337,11 @@ pub(crate) async fn approve_kubelet_serving_csrs<S: Store>(
         };
         let mut node = None;
         let mut ctx = IpContext {
-            service_cidr: state
-                .service_ip_allocator
-                .as_ref()
-                .map(|a| (a.base, a.size)),
+            service_cidrs: state
+                .service_ip_allocators()
+                .iter()
+                .map(|a| (a.base, a.size))
+                .collect(),
             apiserver_ips: forbidden_apiserver_ips(apiserver_ips, node_name, local_node_name)
                 .to_vec(),
             ..Default::default()
@@ -853,7 +860,7 @@ mod tests {
     #[test]
     fn ips_that_name_the_cluster_rather_than_a_node_are_refused_even_when_the_node_claims_them() {
         let ctx = IpContext {
-            service_cidr: Some(("10.96.0.0".parse().unwrap(), 1 << 20)),
+            service_cidrs: vec![("10.96.0.0".parse().unwrap(), 1 << 20)],
             apiserver_ips: vec!["192.168.5.1".parse().unwrap()],
             ..Default::default()
         };
