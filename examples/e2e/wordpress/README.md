@@ -28,6 +28,22 @@ Creates the `csi-hostpath-sc` StorageClass, a MariaDB StatefulSet+Secret+ConfigM
 Service, and a WordPress+nginx+php-fpm Deployment+Secret+ConfigMaps+Service, all in
 the `default` namespace.
 
+## Ingress (Traefik, cleartext HTTP)
+
+WordPress is exposed through Traefik, not `kubectl port-forward` to the pod.
+`ingress.yaml` routes host `wordpress.u7s.test` (not in DNS) to the `pehelypress`
+Service; the controller lives in `examples/e2e/traefik/` (Traefik v3.7.16, its own
+`traefik` namespace, `traefik` IngressClass, ~64 MiB request / 128 MiB limit).
+
+```
+kubectl apply -f examples/e2e/traefik/
+kubectl apply -f examples/e2e/wordpress/
+curl -H 'Host: wordpress.u7s.test' http://<node-ip>:30080/
+```
+
+Traefik's Service is `NodePort` 30080: `type=LoadBalancer` needs beep, which the
+conformance rig does not run. HTTP only; TLS is out of scope here.
+
 ## Smoke test
 
 ```
