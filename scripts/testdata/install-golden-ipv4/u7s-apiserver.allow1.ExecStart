@@ -1,0 +1,1 @@
+ExecStart=/usr/local/bin/u7s-apiserver --listen 192.168.1.5:6443 --advertise-address https://192.168.1.5:6443 --local-node-name n1 --service-cluster-ip-range 10.96.0.0/12 --kube-dns-cluster-ip 10.96.0.10 --embedded-scheduler true
