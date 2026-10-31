@@ -1592,6 +1592,7 @@ case "\$1" in
           '[{id:\$id,status:\$st,notes:\$notes,issue_type:\$type}]' ;;
   children) n=\$(cat "$BEAD_DB/\$2.children" 2>/dev/null || echo 0)
             jq -nc --argjson n "\$n" '[range(\$n) | {status:"open"}] + [{status:"closed"}]' ;;
+  list) cat "$BEAD_DB/inprogress.json" 2>/dev/null || echo '[]' ;;
   close) [ -f "$BEAD_DB/FAIL" ] && exit 1
          printf '%s\n' "\$*" >> "$BEAD_CLOSE_LOG"; printf closed > "$BEAD_DB/\$2" ;;
   *) exit 1 ;;
@@ -1669,6 +1670,81 @@ assert "only the bead whose note says this PR completed it closes; other-PR-numb
   "$([ "$(cat "$BEAD_CLOSE_LOG")" = "close ${B}ok01 --reason merged in #51 (6666666666)" ] && echo 1 || echo 0)"
 assert "...and skipping them is quiet: exit 0 with no gate exception (an epic close attempt used to raise bead-close-failed)" \
   "$([ "$TICK_RC" -eq 0 ] && [ "$(jq '.gate_exceptions | length' "$TICK_STATE")" = "0" ] && echo 1 || echo 0)"
+
+# Worker PR titles usually carry no bead ID, so the PR's bead is found only
+# through its in_progress "PR #N opened" note. Title-only discovery left every
+# such bead in_progress after merge. The first PR's bead having open children
+# must not stop the later PRs' beads from closing, and each skip says why.
+setup_bead_stubs notefind \
+  "[{\"number\":61,\"title\":\"fix(x): has parent (${B}par61)\",\"mergeCommit\":{\"oid\":\"7777777777\"}},{\"number\":62,\"title\":\"fix(y): no id in title\",\"mergeCommit\":{\"oid\":\"8888888888\"}},{\"number\":63,\"title\":\"fix(z): also no id\",\"mergeCommit\":{\"oid\":\"9999999999\"}},{\"number\":64,\"title\":\"chore: nothing\",\"mergeCommit\":{\"oid\":\"0000000000\"}}]" \
+  ${B}par61=in_progress ${B}par61.children=1 "${B}par61.notes=PR #61 opened: u" \
+  ${B}note62=in_progress "${B}note62.notes=PR #62 opened: https://x/62" \
+  ${B}note63=in_progress "${B}note63.notes=PR #63 opened: https://x/63" \
+  "inprogress.json=[{\"id\":\"${B}par61\",\"notes\":\"PR #61 opened: u\"},{\"id\":\"${B}note62\",\"notes\":\"PR #62 opened: https://x/62\"},{\"id\":\"${B}note63\",\"notes\":\"PR #63 opened: https://x/63\"}]"
+bead_tick
+assert "beads with no ID in the PR title close via their 'PR #N opened' note, even after an earlier PR's bead was skipped for open children" \
+  "$([ "$(sort "$BEAD_CLOSE_LOG")" = "$(printf 'close %snote62 --reason merged in #62 (8888888888)\nclose %snote63 --reason merged in #63 (9999999999)' "$B" "$B")" ] && echo 1 || echo 0)"
+assert "a skipped bead logs 'bead <id> not closed: <reason>'" \
+  "$(printf '%s' "$TICK_OUT" | grep -q "mayor-tick: bead ${B}par61 not closed: has open children" && echo 1 || echo 0)"
+assert "a merged PR with no discoverable bead logs a reason line instead of staying silent" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #64 has no bead to close' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 25. The review gate enqueues (bare `gh pr merge N`) a CLEAN PR whose latest
+#     reviewer review is LGTM, and every PR it declines logs why -- a silent
+#     skip left CLEAN+APPROVED PRs un-enqueued with nothing in the log.
+# ---------------------------------------------------------------------------
+
+STUB_GATE_BIN="$WORKDIR/stub-gate-bin"
+mkdir -p "$STUB_GATE_BIN"
+cat > "$STUB_GATE_BIN/gh" <<'GHEOF'
+#!/usr/bin/env bash
+lgtm='[{"author":{"login":"litehop-reviewer"},"state":"APPROVED","body":"## critical-reviewer findings -- PR -- x\n\n**Verdict**: LGTM\n","submittedAt":"2026-01-01T00:00:00Z"}]'
+chg='[{"author":{"login":"litehop-reviewer"},"state":"APPROVED","body":"## critical-reviewer findings -- PR -- x\n\n**Verdict**: LGTM\n","submittedAt":"2026-01-01T00:00:00Z"},{"author":{"login":"litehop-reviewer"},"state":"CHANGES_REQUESTED","body":"## critical-reviewer findings -- PR -- x (round 2)\n\n**Verdict**: needs-changes\n","submittedAt":"2026-01-01T01:00:00Z"}]'
+prs='[
+ {"number":71,"url":"u/71","headRefName":"worker/agent-a71","mergeStateStatus":"CLEAN","isDraft":false,"statusCheckRollup":[{"status":"COMPLETED","conclusion":"SUCCESS"}]},
+ {"number":72,"url":"u/72","headRefName":"worker/agent-a72","mergeStateStatus":"CLEAN","isDraft":false,"statusCheckRollup":[]},
+ {"number":73,"url":"u/73","headRefName":"worker/agent-a73","mergeStateStatus":"BLOCKED","isDraft":false,"statusCheckRollup":[]},
+ {"number":74,"url":"u/74","headRefName":"worker/agent-a74","mergeStateStatus":"UNKNOWN","isDraft":false,"statusCheckRollup":[]},
+ {"number":75,"url":"u/75","headRefName":"worker/agent-a75","mergeStateStatus":"CLEAN","isDraft":false,"statusCheckRollup":[{"status":"IN_PROGRESS","conclusion":null}]}
+]'
+if [[ " $* " == *" pr view "* ]]; then
+  n=$3
+  if [[ " $* " == *" mergeStateStatus "* ]]; then
+    [ "$n" = 74 ] && base='{"mergeStateStatus":"CLEAN"}' || base='{"mergeStateStatus":"UNKNOWN"}'
+  elif [[ " $* " == *" commits "* ]]; then
+    base='{"commits":[]}'
+  else
+    case "$n" in
+      71|74) base="{\"reviews\":$lgtm}" ;;
+      72) base="{\"reviews\":$chg}" ;;
+      *) base='{"reviews":[]}' ;;
+    esac
+  fi
+elif [[ " $* " == *" --state open "* ]]; then
+  base="$prs"
+else
+  base='[]'
+fi
+jq_filter=""; prev=""
+for a in "$@"; do [ "$prev" = "--jq" ] && jq_filter="$a"; prev="$a"; done
+if [ -n "$jq_filter" ]; then printf '%s' "$base" | jq -r "$jq_filter"; else printf '%s' "$base"; fi
+GHEOF
+cp "$STUB_GATE_BIN/gh" "$STUB_GATE_BIN/bd"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_GATE_BIN/bd"
+chmod +x "$STUB_GATE_BIN/gh" "$STUB_GATE_BIN/bd"
+
+run_full_tick "$STUB_GATE_BIN"
+assert "a CLEAN PR whose latest reviewer review is LGTM gets a bare 'gh pr merge 71' (no flags)" \
+  "$(printf '%s\n' "$TICK_OUT" | grep -qx '\[dry-run\] would run: gh pr merge 71' && echo 1 || echo 0)"
+assert "a PR UNKNOWN in the list but CLEAN on re-query (lazy mergeability) is enqueued too" \
+  "$(printf '%s\n' "$TICK_OUT" | grep -qx '\[dry-run\] would run: gh pr merge 74' && echo 1 || echo 0)"
+assert "a PR whose latest review is CHANGES_REQUESTED/needs-changes is not merged and logs why" \
+  "$(! printf '%s\n' "$TICK_OUT" | grep -q 'gh pr merge 72' && printf '%s' "$TICK_OUT" | grep -q "mayor-tick: PR #72 not enqueued: latest critical-reviewer verdict is 'needs-changes'" && echo 1 || echo 0)"
+assert "a non-CLEAN PR logs its merge state instead of vanishing from the log" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #73 not enqueued: mergeStateStatus is BLOCKED' && echo 1 || echo 0)"
+assert "a PR with pending checks logs the pending count" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #75 not enqueued: 1 check(s) still pending' && echo 1 || echo 0)"
 
 CLUSTER_TITLE="tooling(mayor): full bead IDs in cluster titles (${B}aa001, ${B}bb002, ${B}cc003)"
 assert "a Shape 2 cluster title lists every full bead ID, so extract_bead_ids returns all three and the tick can close them on merge" \
