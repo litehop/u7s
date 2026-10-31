@@ -1,0 +1,24 @@
+name: Cache prime
+
+# Pushes to main do not re-run Test: the merge queue already tested the identical SHA. Only
+# main may write rust-cache entries (PR and queue refs read main's), and those keys change only
+# with the lockfile, manifests, toolchain, or a job added to test.yaml, so the cache-writing
+# jobs re-run on main only for those changes. The e2e-focus build (which also covers the PKI
+# build's cache key) still runs on every main push.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - rust-toolchain.toml
+      - .github/workflows/test.yaml
+      - .github/workflows/cache-prime.yaml
+  workflow_dispatch:
+
+jobs:
+  prime:
+    uses: ./.github/workflows/test.yaml
+    permissions:
+      contents: read
