@@ -2790,6 +2790,67 @@ fn validate_kube_dns_ip(
     Ok(ip)
 }
 
+/// A reservation that already exists is a re-seed only when `ns/name` holds it: the sentinel
+/// is owned by it, or is plain and that Service's stored spec lists `ip`. Anything else is
+/// another Service sitting on an address the bootstrap Service needs.
+async fn check_seed_sentinel_holder(
+    store: &SqliteStore,
+    key: &str,
+    ip: std::net::IpAddr,
+    ns: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    use u7s_store::Store;
+
+    let Some(existing) = store.get(key).await? else {
+        return Ok(());
+    };
+    let owner = serde_json::from_slice::<serde_json::Value>(&existing.value)
+        .ok()
+        .and_then(|v| v["owner"].as_str().map(str::to_string));
+    if owner.as_deref() == Some(&format!("{ns}/{name}")) {
+        return Ok(());
+    }
+    if owner.is_none() {
+        let svc_key = keys::object_key("services", ns, name);
+        if let Some(svc) = store.get(&svc_key).await? {
+            let spec_has_ip = serde_json::from_slice::<serde_json::Value>(&svc.value)
+                .ok()
+                .and_then(|v| {
+                    v["spec"]["clusterIPs"]
+                        .as_array()
+                        .map(|a| a.iter().any(|i| i.as_str() == Some(&ip.to_string())))
+                })
+                .unwrap_or(false);
+            if spec_has_ip {
+                return Ok(());
+            }
+        }
+    }
+    let mut holder = owner;
+    if holder.is_none() {
+        let list = store
+            .list("/registry/services/", u7s_store::ListOptions::default())
+            .await?;
+        holder = list.items.into_iter().find_map(|o| {
+            let v = serde_json::from_slice::<serde_json::Value>(&o.value).ok()?;
+            v["spec"]["clusterIPs"]
+                .as_array()?
+                .iter()
+                .any(|i| i.as_str() == Some(&ip.to_string()))
+                .then(|| {
+                    format!(
+                        "{}/{}",
+                        v["metadata"]["namespace"].as_str().unwrap_or_default(),
+                        v["metadata"]["name"].as_str().unwrap_or_default()
+                    )
+                })
+        });
+    }
+    let holder = holder.unwrap_or_else(|| "an unrecorded Service".to_string());
+    anyhow::bail!("clusterIP {ip} needed by {ns}/{name} is already allocated to {holder}")
+}
+
 async fn seed_services(
     store: &SqliteStore,
     apiserver_ip: &str,
@@ -2869,7 +2930,10 @@ async fn seed_services(
             .put(&key, service_alloc::owned_ip_sentinel(ns, name), Some(0))
             .await
         {
-            Ok(_) | Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Ok(_) => {}
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+                check_seed_sentinel_holder(store, &key, ip, ns, name).await?;
+            }
             Err(e) => return Err(anyhow::anyhow!("seed {ns}/{name} clusterIP sentinel: {e}")),
         }
     }
@@ -7812,6 +7876,90 @@ mod tests {
             axum::http::StatusCode::CREATED,
             "CoreDNS with both VIPs must apply after the IPv6 pool was exhausted"
         );
+    }
+
+    /// Seeding over an address another Service already holds must fail startup naming the
+    /// holder; silently skipping would leave CoreDNS's apply failing "already allocated"
+    /// with no pointer to the cause. Re-seeding over its own reservation must stay quiet.
+    #[tokio::test]
+    async fn seed_fails_loudly_when_kube_dns_ip_is_held_by_another_service() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        const RANGE: &str = "10.96.0.0/24,fd00:96::/124";
+        for held in ["fd00:96::a", "10.96.0.10"] {
+            let store = make_store();
+            seed_namespaces(&store).await.expect("namespaces");
+            let svc = serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": { "name": "squatter", "namespace": "default" },
+                "spec": { "clusterIP": held, "clusterIPs": [held] }
+            });
+            store
+                .put(
+                    &keys::object_key("services", "default", "squatter"),
+                    Bytes::from(svc.to_string()),
+                    Some(0),
+                )
+                .await
+                .expect("service");
+            store
+                .put(
+                    &format!("{}{held}", state::SERVICE_IP_PREFIX),
+                    Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                    Some(0),
+                )
+                .await
+                .expect("sentinel");
+            let err = seed_services(&store, "127.0.0.1", 6443, RANGE, None)
+                .await
+                .expect_err("seed must refuse a held kube-dns VIP")
+                .to_string();
+            assert!(
+                err.contains(held) && err.contains("default/squatter"),
+                "error must name the IP and its holder: {err}"
+            );
+        }
+
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        for _ in 0..2 {
+            seed_services(&store, "127.0.0.1", 6443, RANGE, None)
+                .await
+                .expect("re-seeding its own reservations is idempotent");
+        }
+    }
+
+    /// With --kube-dns-cluster-ip in the IPv6 family, the IPv4 tenth host is the one the
+    /// dual-stack CoreDNS Service additionally requests, so that one is reserved.
+    #[tokio::test]
+    async fn dual_stack_seed_reservation_follows_kube_dns_override_family() {
+        use u7s_store::ListOptions;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        seed_services(
+            &store,
+            "127.0.0.1",
+            6443,
+            "10.96.0.0/24,fd00:96::/124",
+            Some("fd00:96::5"),
+        )
+        .await
+        .expect("seed");
+        let mut keys: Vec<String> = store
+            .list(state::SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|o| {
+                o.key
+                    .trim_start_matches(state::SERVICE_IP_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["10.96.0.1", "10.96.0.10", "fd00:96::5"]);
     }
 
     /// A single-stack cluster has no second family, so seeding reserves exactly the
