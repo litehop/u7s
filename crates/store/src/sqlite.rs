@@ -1181,7 +1181,35 @@ const WRITE_CACHE_SIZE_KIB: i64 = -2000;
 /// fall through to the OS page cache.
 const READ_CACHE_SIZE_KIB: i64 = -4000;
 
+/// Make the database and its sidecars owner-only; they hold every Secret in plaintext.
+/// SQLite creates `-wal`/`-shm`/`-journal` lazily with the main file's mode, so the main file
+/// is created 0600 up front (no umask window) and any pre-existing file is chmodded, covering
+/// databases and sidecars left at 0644 by earlier versions.
+fn restrict_db_files(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if path == ":memory:" {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        match std::fs::set_permissions(
+            format!("{path}{suffix}"),
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn open_conn(path: &str, cache_size_kib: i64) -> Result<Connection> {
+    restrict_db_files(path)?;
     let conn = Connection::open(path)?;
     conn.execute_batch(&format!(
         "
@@ -2972,6 +3000,44 @@ mod tests {
             .await
             .expect("put");
         (store, db_path_str)
+    }
+
+    /// A local user who can read state.db, -wal or -shm reads every Secret in the cluster.
+    /// Starts from a database and sidecars left at 0644 by an earlier run, then a fresh one.
+    #[tokio::test]
+    async fn db_and_wal_shm_are_owner_only_so_local_users_cannot_read_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &str| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let (store, path) = file_store_with_one_object("db-mode-fresh").await;
+        for suffix in ["", "-wal", "-shm"] {
+            assert_eq!(mode(&format!("{path}{suffix}")), 0o600, "fresh {suffix}");
+        }
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let p = format!("{path}{suffix}");
+            if std::fs::metadata(&p).is_ok() {
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let store = SqliteStore::new(&path).expect("reopen");
+        store
+            .put("/registry/configmaps/a/y", Bytes::from_static(b"{}"), None)
+            .await
+            .expect("put");
+        for suffix in ["", "-wal", "-shm"] {
+            let p = format!("{path}{suffix}");
+            if std::fs::metadata(&p).is_ok() {
+                assert_eq!(
+                    mode(&p),
+                    0o600,
+                    "pre-existing 0644 {suffix} must be tightened"
+                );
+            }
+        }
+        assert_eq!(mode(&path), 0o600);
+        drop(store);
+        remove_db(&path);
     }
 
     fn remove_db(path: &str) {
