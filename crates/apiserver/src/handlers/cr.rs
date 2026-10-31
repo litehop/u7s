@@ -5909,10 +5909,6 @@ pub async fn put_cr_status<S: Store>(
         &group,
         &version,
     );
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current));
-    }
-
     let incoming_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
@@ -5927,6 +5923,10 @@ pub async fn put_cr_status<S: Store>(
             &name,
         )?;
     }
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current));
+    }
+
     let converted = match &cr_ctx {
         Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
         None => None,
