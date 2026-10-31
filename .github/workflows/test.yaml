@@ -152,7 +152,7 @@ jobs:
       # save-if: only main writes the shared cache; branches restore it read-only.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/worker/agent-a14348dcb74896895' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Only the node-proxy tests are feature-sensitive; the rest of the suite already runs
       # in test-coverage. Clippy with the features runs in the lint job.
