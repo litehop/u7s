@@ -11965,9 +11965,15 @@ mod tests {
         check_schema_inner(obj, schema, None, budgets)
     }
 
+    /// Each context gets its own kind, hence its own key in the process-wide CEL eval gate:
+    /// with one shared key, more than `MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD` tests
+    /// evaluating at once on parallel test threads trip the per-CRD cap and fail with a
+    /// spurious "too many rules exceeding their time budget" rejection.
     fn test_ctx(schema: serde_json::Value) -> CrContext {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         CrContext {
-            kind: "Test".into(),
+            kind: format!("Test{n}"),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12003,6 +12009,18 @@ mod tests {
         // calls with different schemas would return the wrong compiled schema.
         let cache = crate::state::CrSchemaCache::new();
         validate_cr_schema_with_budgets(obj, &ctx, &cache, old_object, budgets)
+    }
+
+    // Tests sharing one gate key exceed the per-CRD eval cap when run in parallel and fail
+    // spuriously, so every test context must map to a distinct key.
+    #[test]
+    fn test_contexts_do_not_share_a_cel_gate_key() {
+        let schema = serde_json::json!({});
+        assert_ne!(
+            test_ctx(schema.clone()).kind,
+            test_ctx(schema).kind,
+            "a shared CRD key lets parallel tests starve each other of per-CRD CEL slots"
+        );
     }
 
     // type:object with valid object passes.
