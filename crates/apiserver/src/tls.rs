@@ -37,6 +37,8 @@ fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` applies only on creation; tighten a pre-existing file before writing secrets.
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -3090,6 +3092,33 @@ mod tests {
         assert_eq!(
             actual, expected,
             "write_private_key must write the exact bytes provided"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// A key or kubeconfig left at 0644 by an earlier install or a stale `.tmp` is rewritten on
+    /// every start; if the mode were kept, a local user could read cluster-admin credentials.
+    #[test]
+    fn private_writers_tighten_preexisting_world_readable_files_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = test_temp_dir("key-preexisting-mode");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777; // lgtm[rust/path-injection]
+
+        let key = dir.join("sa.key");
+        std::fs::write(&key, b"old").unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap(); // lgtm[rust/path-injection]
+        write_private_key(&key, b"new").unwrap();
+        assert_eq!(mode(&key), 0o600, "existing 0644 key must become 0600");
+
+        let kc = dir.join("admin.kubeconfig");
+        let stale_tmp = dir.join("admin.kubeconfig.tmp");
+        std::fs::write(&stale_tmp, b"old").unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&stale_tmp, std::fs::Permissions::from_mode(0o666)).unwrap(); // lgtm[rust/path-injection]
+        replace_file(&kc.to_string_lossy(), b"secret", true).unwrap();
+        assert_eq!(
+            mode(&kc),
+            0o600,
+            "kubeconfig via stale 0666 .tmp must be 0600"
         );
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
