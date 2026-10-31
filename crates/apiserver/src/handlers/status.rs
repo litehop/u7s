@@ -1295,7 +1295,7 @@ mod tests {
             "status": { "ready": false }
         });
         let key = "/registry/storage.k8s.io/csinodes/dry-run-node";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
@@ -1318,7 +1318,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "dry-run-node", "resourceVersion": "1" },
+            "metadata": { "name": "dry-run-node", "resourceVersion": stored_rv.to_string() },
             "status": { "ready": true }
         });
         let result = put_resource_status(
@@ -1888,7 +1888,7 @@ mod tests {
             "status": { "phase": "Active" }
         });
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
@@ -1911,7 +1911,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease", "resourceVersion": stored_rv.to_string() },
             "status": { "phase": "Expired" }
         });
         let result = put_namespaced_resource_status(

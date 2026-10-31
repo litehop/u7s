@@ -16974,6 +16974,169 @@ mod tests {
         );
     }
 
+    /// Every status PUT site must run the resourceVersion requirement before its dry-run
+    /// return: upstream's dry-run storage path still validates the update, so `kubectl
+    /// --dry-run=server` must not approve a status write the real request rejects (422). With
+    /// the stored RV it is 200 and persists nothing.
+    #[tokio::test]
+    async fn status_put_dry_run_requires_resource_version_at_every_status_site() {
+        use crate::handlers::{crd, status};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+        create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("w"),
+        )
+        .await
+        .expect("seed CR");
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+            "metadata": { "name": "n" }, "spec": { "drivers": [] }
+        });
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": { "name": "l", "namespace": "kube-node-lease" }, "spec": {}
+        });
+        for (key, v) in [
+            ("/registry/storage.k8s.io/csinodes/n", &csinode),
+            (
+                "/registry/coordination.k8s.io/leases/kube-node-lease/l",
+                &lease,
+            ),
+        ] {
+            state
+                .store
+                .put(key, Bytes::from(v.to_string()), None)
+                .await
+                .unwrap();
+        }
+        let crd_obj = {
+            let resp = crd::get_crd(State(state.clone()), Path("widgets.example.io".into()))
+                .await
+                .expect("get crd");
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+        let cr_obj = serde_json::json!({
+            "apiVersion": "example.io/v1", "kind": "Widget",
+            "metadata": { "name": "w" }, "spec": { "color": "blue" },
+            "status": { "x": 1 }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let sites: [(&str, &str, serde_json::Value); 4] = [
+            (
+                "put_resource_status",
+                "/registry/storage.k8s.io/csinodes/n",
+                csinode.clone(),
+            ),
+            (
+                "put_namespaced_resource_status_guarded",
+                "/registry/coordination.k8s.io/leases/kube-node-lease/l",
+                lease.clone(),
+            ),
+            (
+                "put_crd_status",
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io",
+                crd_obj,
+            ),
+            ("put_cr_status", "/registry/cr/example.io/widgets/w", cr_obj),
+        ];
+        for (site, key, obj) in sites {
+            let before = state.store.get(key).await.unwrap().unwrap().revision;
+            for stated in [false, true] {
+                let mut body = obj.clone();
+                body["metadata"]["resourceVersion"] = if stated {
+                    before.to_string().into()
+                } else {
+                    serde_json::Value::Null
+                };
+                let body = Bytes::from(body.to_string());
+                let (st, h) = (State(state.clone()), headers.clone());
+                let result = match site {
+                    "put_resource_status" => status::put_resource_status(
+                        st,
+                        Path((
+                            "storage.k8s.io".into(),
+                            "v1".into(),
+                            "csinodes".into(),
+                            "n".into(),
+                        )),
+                        Extension(crate::auth::UserInfo::default()),
+                        h,
+                        body,
+                    )
+                    .await
+                    .map(|r| r.into_response()),
+                    "put_namespaced_resource_status_guarded" => {
+                        status::put_namespaced_resource_status_guarded(
+                            st,
+                            Path((
+                                "coordination.k8s.io".into(),
+                                "v1".into(),
+                                "kube-node-lease".into(),
+                                "leases".into(),
+                                "l".into(),
+                            )),
+                            None,
+                            h,
+                            body,
+                            None,
+                        )
+                        .await
+                    }
+                    "put_crd_status" => {
+                        crd::put_crd_status(st, Path("widgets.example.io".into()), None, h, body)
+                            .await
+                            .map(|r| r.into_response())
+                    }
+                    _ => super::put_cr_status(
+                        st,
+                        Extension(crate::auth::UserInfo::default()),
+                        Path((
+                            "example.io".into(),
+                            "v1".into(),
+                            "widgets".into(),
+                            "w".into(),
+                        )),
+                        h,
+                        body,
+                    )
+                    .await
+                    .map(|r| r.into_response()),
+                };
+                if stated {
+                    let resp =
+                        result.unwrap_or_else(|e| panic!("{site}: stated RV must pass: {e:?}"));
+                    assert_eq!(resp.status(), StatusCode::OK, "{site}");
+                } else {
+                    let err = result.err().unwrap_or_else(|| {
+                        panic!("{site}: dryRun without resourceVersion must be rejected")
+                    });
+                    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "{site}");
+                }
+                let after = state.store.get(key).await.unwrap().unwrap().revision;
+                assert_eq!(before, after, "{site}: dryRun must persist nothing");
+            }
+        }
+    }
+
     // Regression: mirrors VolumeSnapshotContent's real lifecycle — csi-snapshotter PATCHes
     // .status.snapshotHandle via /status, then a later spec-only Update (PUT to the main
     // endpoint, e.g. flipping deletionPolicy to Retain) must not wipe that status. Before
