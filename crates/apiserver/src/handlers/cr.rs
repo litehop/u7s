@@ -5008,6 +5008,15 @@ pub async fn patch_cr<S: Store>(
     // handles kubelet SSA bodies that happen to be JSON, CR SSA bodies from the conformance
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
+        crate::handlers::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            None,
+            &name,
+        )?;
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
@@ -5311,6 +5320,15 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
+        crate::handlers::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            Some(&ns),
+            &name,
+        )?;
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
@@ -20733,6 +20751,116 @@ mod tests {
                 .contains("being terminated"),
             "error message must say namespace is being terminated"
         );
+    }
+
+    /// SSA apply-create of a CR (cluster and namespaced) must also authorize `create`, as
+    /// upstream does; patch alone must not mint objects.
+    #[tokio::test]
+    async fn ssa_create_of_a_cr_requires_the_create_verb_because_patch_alone_must_not_create() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let cluster_state = make_state();
+        install_cluster_crd(&cluster_state).await;
+        let user = |state: &AppState, verbs: &[&str]| {
+            let name = verbs.join("-");
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{name}"),
+                &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": verbs}]}),
+            );
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"),
+                &serde_json::json!({
+                    "subjects": [{"kind": "User", "name": name}],
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name}
+                }),
+            );
+            axum::extract::Extension(crate::auth::UserInfo {
+                username: name,
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            })
+        };
+        let apply_headers = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+            );
+            h
+        };
+        let widget = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": {"name": "w1"}
+            })
+            .to_string(),
+        );
+        let ns_path = || {
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+                "new-app".to_string(),
+            ))
+        };
+        let cluster_path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w1".to_string(),
+            ))
+        };
+
+        let patcher = user(&state, &["patch", "update"]);
+        let err = patch_cr_namespaced(
+            State(state.clone()),
+            ns_path(),
+            patcher,
+            apply_headers(),
+            app_body("new-app", "argocd"),
+        )
+        .await
+        .err()
+        .expect("namespaced CR apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let key = cr_store_key("argoproj.io", "applications", Some("argocd"), "new-app");
+        assert!(state.store.get(&key).await.unwrap().is_none());
+        let creator = user(&state, &["patch", "create"]);
+        assert!(patch_cr_namespaced(
+            State(state.clone()),
+            ns_path(),
+            creator,
+            apply_headers(),
+            app_body("new-app", "argocd"),
+        )
+        .await
+        .is_ok());
+
+        let patcher = user(&cluster_state, &["patch", "update"]);
+        let err = patch_cr(
+            State(cluster_state.clone()),
+            cluster_path(),
+            patcher,
+            apply_headers(),
+            widget.clone(),
+        )
+        .await
+        .err()
+        .expect("cluster CR apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let creator = user(&cluster_state, &["patch", "create"]);
+        assert!(patch_cr(
+            State(cluster_state.clone()),
+            cluster_path(),
+            creator,
+            apply_headers(),
+            widget,
+        )
+        .await
+        .is_ok());
     }
 
     /// patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) had no

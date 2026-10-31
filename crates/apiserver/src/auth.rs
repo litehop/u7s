@@ -1992,7 +1992,6 @@ mod tests {
                 #[cfg(test)]
                 namespaced: true,
                 has_status_subresource: false,
-                create_or_update: false,
             },
         );
         Arc::new(registry)
