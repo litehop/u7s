@@ -3432,6 +3432,12 @@ pub async fn replace_cr<S: Store>(
     // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
     // permanent 422 validation failure instead of the retryable 409 that tells client-go's
     // Update-on-conflict loop to re-GET and resubmit.
+    super::resource::require_cr_resourceversion_on_update(
+        &group,
+        &plural,
+        expected_revision,
+        &name,
+    )?;
     if let Some(expected) = expected_revision {
         if expected != stored.revision {
             return Err(store_err_cr(
@@ -4483,6 +4489,12 @@ pub async fn replace_cr_namespaced<S: Store>(
     // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
     // permanent 422 validation failure instead of the retryable 409 that tells client-go's
     // Update-on-conflict loop to re-GET and resubmit.
+    super::resource::require_cr_resourceversion_on_update(
+        &group,
+        &plural,
+        expected_revision,
+        &name,
+    )?;
     if let Some(expected) = expected_revision {
         if expected != stored.revision {
             return Err(store_err_cr(
@@ -5784,6 +5796,16 @@ pub async fn put_cr_status<S: Store>(
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
+    if cr_ctx.is_some() {
+        super::resource::require_cr_resourceversion_on_update(&group, &plural, expected_rv, &name)?;
+    } else {
+        super::resource::require_builtin_resourceversion_on_update(
+            &group,
+            &plural,
+            expected_rv,
+            &name,
+        )?;
+    }
     let converted = match &cr_ctx {
         Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
         None => None,
@@ -6624,6 +6646,111 @@ mod tests {
     use u7s_store::SqliteStore;
 
     use crate::handlers::test_support::make_state;
+
+    // Custom resources never allow unconditional update, so a client PUT must carry the
+    // resourceVersion it read. These shims stand in for such a client: they stamp the stored
+    // resourceVersion onto bodies that omit one, and shadow the handlers of the same name.
+    // Tests of the missing-resourceVersion rejection call `super::` directly.
+    async fn with_stored_rv<S: Store>(state: &AppState<S>, key: &str, body: Bytes) -> Bytes {
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        let absent = v["metadata"]["resourceVersion"]
+            .as_str()
+            .is_none_or(str::is_empty);
+        if absent {
+            let builtin_key = key.replacen("/registry/cr/", "/registry/", 1);
+            for key in [key, builtin_key.as_str()] {
+                if let Some(stored) = state.store.get(key).await.unwrap() {
+                    v["metadata"]["resourceVersion"] = stored.revision.to_string().into();
+                    break;
+                }
+            }
+        }
+        Bytes::from(v.to_string())
+    }
+
+    async fn replace_cr<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, plural, name)): Path<(String, String, String, String)>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(&state, &cr_store_key(&group, &plural, None, &name), body).await;
+        super::replace_cr(
+            State(state),
+            Path((group, version, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn replace_cr_namespaced<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(
+            &state,
+            &cr_store_key(&group, &plural, Some(&ns), &name),
+            body,
+        )
+        .await;
+        super::replace_cr_namespaced(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn put_cr_status<S: Store>(
+        State(state): State<AppState<S>>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        Path((group, version, plural, name)): Path<(String, String, String, String)>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(&state, &cr_store_key(&group, &plural, None, &name), body).await;
+        super::put_cr_status(
+            State(state),
+            user,
+            Path((group, version, plural, name)),
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn put_namespaced_resource_status<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+        user: Option<axum::Extension<crate::auth::UserInfo>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(
+            &state,
+            &cr_store_key(&group, &plural, Some(&ns), &name),
+            body,
+        )
+        .await;
+        crate::handlers::status::put_namespaced_resource_status(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
 
     fn no_watch_query() -> super::super::generic::CollectionQuery {
         super::super::generic::CollectionQuery {
@@ -9992,7 +10119,7 @@ mod tests {
             "metadata": { "name": "g", "namespace": "default" },
             "status": { "ready": true }
         });
-        let resp = crate::handlers::status::put_namespaced_resource_status(
+        let resp = put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
             None,
@@ -10231,7 +10358,7 @@ mod tests {
         let state = seed_gizmo_with_subresources(&base_url).await;
         let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
 
-        let result = crate::handlers::status::put_namespaced_resource_status(
+        let result = put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v9", "default", "g"),
             None,
@@ -10322,7 +10449,7 @@ mod tests {
             start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
         let state = seed_gizmo_with_subresources(&base_url).await;
 
-        crate::handlers::status::put_namespaced_resource_status(
+        put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v1", "default", "g"),
             None,
@@ -10378,7 +10505,7 @@ mod tests {
         let state = seed_gizmo_with_subresources(&base_url).await;
         let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
 
-        let result = crate::handlers::status::put_namespaced_resource_status(
+        let result = put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
             None,
@@ -11472,7 +11599,7 @@ mod tests {
             .to_string(),
         );
         assert!(
-            crate::handlers::status::put_namespaced_resource_status(
+            put_namespaced_resource_status(
                 State(state.clone()),
                 Path((
                     group.clone(),
@@ -11684,7 +11811,7 @@ mod tests {
         );
 
         assert!(
-            super::super::status::put_namespaced_resource_status(
+            put_namespaced_resource_status(
                 State(state.clone()),
                 Path((
                     group.clone(),
@@ -12556,12 +12683,23 @@ mod tests {
             "sanity check: spec.color must be optional under the original schema"
         );
 
+        let mut replacement: serde_json::Value =
+            serde_json::from_slice(&crd_with_schema(true)).unwrap();
+        replacement["metadata"]["resourceVersion"] = state
+            .store
+            .get("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io")
+            .await
+            .unwrap()
+            .expect("stored CRD")
+            .revision
+            .to_string()
+            .into();
         crd::replace_crd(
             State(state.clone()),
             Path("widgets.example.io".to_string()),
             test_user(),
             HeaderMap::new(),
-            crd_with_schema(true),
+            Bytes::from(replacement.to_string()),
         )
         .await
         .expect("replace_crd must succeed");
@@ -24158,12 +24296,10 @@ mod tests {
         );
     }
 
-    /// put_cr_status with an absent resourceVersion in the body succeeds unconditionally.
-    ///
-    /// Upstream k8s allows omitting resourceVersion in a subresource PUT, treating it as
-    /// an unconditional write.  The fix must not break this.
+    /// put_cr_status with an absent resourceVersion is 422: upstream's custom resource
+    /// strategy does not allow unconditional update.
     #[tokio::test]
-    async fn put_cr_status_absent_rv_is_unconditional_write() {
+    async fn put_cr_status_absent_rv_is_422_because_custom_resources_forbid_unconditional_update() {
         let state = make_state();
         install_cluster_crd_with_status_subresource(&state).await;
 
@@ -24199,7 +24335,7 @@ mod tests {
             })
             .to_string(),
         );
-        let result = put_cr_status(
+        let result = super::put_cr_status(
             State(state.clone()),
             axum::Extension(crate::auth::UserInfo::default()),
             Path((
@@ -24212,10 +24348,11 @@ mod tests {
             put_body,
         )
         .await;
-        assert!(
-            result.is_ok(),
-            "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
-             single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
+        assert_eq!(
+            result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+            "custom resources forbid unconditional update, so a status PUT without a \
+             resourceVersion must be 422 instead of silently overwriting concurrent writers"
         );
     }
 

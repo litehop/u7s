@@ -178,9 +178,18 @@ mod tests {
         serde_json::from_slice(&stored.value).unwrap()
     }
 
+    /// PUT updates of this kind are 422 without the stored resourceVersion.
+    async fn stored_rv(state: &AppState) -> String {
+        let key = crate::keys::group_object_key(GROUP, PLURAL, None, "m");
+        use u7s_store::Store as _;
+        let stored = state.store.get(&key).await.unwrap().expect("stored");
+        stored.revision.to_string()
+    }
+
     /// One spec-changing write over `mode`; returns status and message.
     async fn retarget(state: &AppState, mode: &str) -> (StatusCode, String) {
-        let target = full("", "bar");
+        let mut target = full("", "bar");
+        target["metadata"]["resourceVersion"] = stored_rv(state).await.into();
         let partial =
             serde_json::to_vec(&json!({"spec": {"resource": {"resource": "bar"}}})).unwrap();
         let json_patch = serde_json::to_vec(&json!([
@@ -281,6 +290,7 @@ mod tests {
     async fn status_write(state: &AppState, mode: &str, status: Value) -> (StatusCode, String) {
         let result = if mode == "put" {
             let mut body = full("", "foo");
+            body["metadata"]["resourceVersion"] = stored_rv(state).await.into();
             body["status"] = status;
             super::super::status::put_resource_status(
                 State(state.clone()),
