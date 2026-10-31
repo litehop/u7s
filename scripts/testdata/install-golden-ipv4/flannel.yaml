@@ -10,11 +10,13 @@
 #   eth0              install.sh's own resolved --iface value for this node. Varies per
 #                           host: this project's own Lima fleet has observed non-uniform
 #                           physical interface naming across otherwise-identical VMs.
-#   10.244.0.0/16    matches kube-controller-manager's own --cluster-cidr
-#                           (install.sh's $POD_CLUSTER_CIDR), so node-ipam-controller's
+#   10.244.0.0/16 the IPv4 entry of kube-controller-manager's own --cluster-cidr
+#                           (install.sh's $POD_CLUSTER_CIDR; the IPv6Network line takes the IPv6
+#                           entry on a dual-stack install), so node-ipam-controller's
 #                           allocated Node.spec.podCIDR ranges and flanneld's own subnet can
 #                           never drift apart (they agree today: 10.244.0.0/16 is also
-#                           flannel's and this project's own default).
+#                           flannel's and this project's own default). Single-stack installs
+#                           drop the EnableIPv6/IPv6Network line.
 #
 # Departures from upstream:
 #   - flanneld gets both --iface and --iface-regex, matching install.sh's own $IFACE
@@ -24,7 +26,8 @@
 #     VPN-mesh interface (e.g. a WireGuard/Tailscale link for cluster traffic across clouds,
 #     docs/decisions/flannel-for-cni.md) gets an exact --iface match on every node instead of
 #     falling through to the regex.
-#   - net-conf.json's Network is templated, not upstream's hardcoded literal.
+#   - net-conf.json's Network (and, dual-stack, IPv6Network) is templated, not upstream's
+#     hardcoded literal.
 apiVersion: v1
 kind: Namespace
 metadata:
