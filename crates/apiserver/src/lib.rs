@@ -2790,65 +2790,53 @@ fn validate_kube_dns_ip(
     Ok(ip)
 }
 
-/// A reservation that already exists is a re-seed only when `ns/name` holds it: the sentinel
-/// is owned by it, or is plain and that Service's stored spec lists `ip`. Anything else is
-/// another Service sitting on an address the bootstrap Service needs.
+/// A bootstrap VIP whose sentinel already exists is a re-seed unless a different Service's
+/// spec lists the address, which would break `ns/name`: that fails startup naming the
+/// holder. Returns true for an orphan: a sentinel not owned by `ns/name` that no Service
+/// lists (`repair` releases it), which the caller only warns about. Specs are read through
+/// `spec_ips` so legacy `clusterIP`-only Services count.
 async fn check_seed_sentinel_holder(
     store: &SqliteStore,
     key: &str,
     ip: std::net::IpAddr,
     ns: &str,
     name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     use u7s_store::Store;
 
-    let Some(existing) = store.get(key).await? else {
-        return Ok(());
-    };
-    let owner = serde_json::from_slice::<serde_json::Value>(&existing.value)
-        .ok()
-        .and_then(|v| v["owner"].as_str().map(str::to_string));
-    if owner.as_deref() == Some(&format!("{ns}/{name}")) {
-        return Ok(());
-    }
-    if owner.is_none() {
-        let svc_key = keys::object_key("services", ns, name);
-        if let Some(svc) = store.get(&svc_key).await? {
-            let spec_has_ip = serde_json::from_slice::<serde_json::Value>(&svc.value)
-                .ok()
-                .and_then(|v| {
-                    v["spec"]["clusterIPs"]
-                        .as_array()
-                        .map(|a| a.iter().any(|i| i.as_str() == Some(&ip.to_string())))
-                })
-                .unwrap_or(false);
-            if spec_has_ip {
-                return Ok(());
-            }
+    let ip = ip.to_string();
+    let list = store
+        .list("/registry/services/", u7s_store::ListOptions::default())
+        .await?;
+    let mut held_by_self = false;
+    for o in list.items {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.value) else {
+            continue;
+        };
+        if !service_alloc::spec_ips(&v["spec"]).contains(&ip) {
+            continue;
         }
+        let (h_ns, h_name) = (
+            v["metadata"]["namespace"].as_str().unwrap_or_default(),
+            v["metadata"]["name"].as_str().unwrap_or_default(),
+        );
+        if (h_ns, h_name) != (ns, name) {
+            anyhow::bail!(
+                "clusterIP {ip} needed by {ns}/{name} is already allocated to {h_ns}/{h_name}"
+            );
+        }
+        held_by_self = true;
     }
-    let mut holder = owner;
-    if holder.is_none() {
-        let list = store
-            .list("/registry/services/", u7s_store::ListOptions::default())
-            .await?;
-        holder = list.items.into_iter().find_map(|o| {
-            let v = serde_json::from_slice::<serde_json::Value>(&o.value).ok()?;
-            v["spec"]["clusterIPs"]
-                .as_array()?
-                .iter()
-                .any(|i| i.as_str() == Some(&ip.to_string()))
-                .then(|| {
-                    format!(
-                        "{}/{}",
-                        v["metadata"]["namespace"].as_str().unwrap_or_default(),
-                        v["metadata"]["name"].as_str().unwrap_or_default()
-                    )
-                })
-        });
-    }
-    let holder = holder.unwrap_or_else(|| "an unrecorded Service".to_string());
-    anyhow::bail!("clusterIP {ip} needed by {ns}/{name} is already allocated to {holder}")
+    let owned_by_self = match store.get(key).await? {
+        Some(s) => {
+            serde_json::from_slice::<serde_json::Value>(&s.value)
+                .ok()
+                .and_then(|v| v["owner"].as_str().map(str::to_string))
+                == Some(format!("{ns}/{name}"))
+        }
+        None => true,
+    };
+    Ok(!held_by_self && !owned_by_self)
 }
 
 async fn seed_services(
@@ -2932,7 +2920,12 @@ async fn seed_services(
         {
             Ok(_) => {}
             Err(u7s_store::StoreError::AlreadyExists { .. }) => {
-                check_seed_sentinel_holder(store, &key, ip, ns, name).await?;
+                if check_seed_sentinel_holder(store, &key, ip, ns, name).await? {
+                    tracing::warn!(
+                        "clusterIP {ip} for {ns}/{name} is already reserved but no Service lists it; \
+                         continuing, the reservation is an orphan"
+                    );
+                }
             }
             Err(e) => return Err(anyhow::anyhow!("seed {ns}/{name} clusterIP sentinel: {e}")),
         }
@@ -7928,6 +7921,82 @@ mod tests {
                 .await
                 .expect("re-seeding its own reservations is idempotent");
         }
+    }
+
+    /// Databases from before clusterIPs/owned sentinels hold a plain sentinel and a Service
+    /// with only `spec.clusterIP`; refusing to boot on them would brick an upgrade.
+    #[tokio::test]
+    async fn seed_accepts_legacy_clusterip_only_service_with_plain_sentinel() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        let svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "kubernetes", "namespace": "default" },
+            "spec": { "clusterIP": "10.96.0.1" }
+        });
+        store
+            .put(
+                &keys::object_key("services", "default", "kubernetes"),
+                Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("service");
+        store
+            .put(
+                &format!("{}10.96.0.1", state::SERVICE_IP_PREFIX),
+                Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                Some(0),
+            )
+            .await
+            .expect("sentinel");
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("legacy-shaped DB must boot");
+    }
+
+    /// An orphan plain sentinel (no Service lists it) is released by `repair`, so seeding
+    /// continues but must say so.
+    #[tokio::test]
+    async fn seed_warns_and_continues_on_orphan_sentinel() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        let key = format!("{}10.96.0.10", state::SERVICE_IP_PREFIX);
+        store
+            .put(
+                &key,
+                Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                Some(0),
+            )
+            .await
+            .expect("sentinel");
+        let ip = "10.96.0.10".parse().unwrap();
+        assert!(
+            check_seed_sentinel_holder(&store, &key, ip, "kube-system", "kube-dns")
+                .await
+                .expect("an orphan must not be an error"),
+            "an unlisted plain sentinel is reported as an orphan so seeding warns"
+        );
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("an orphan sentinel must not block boot");
+        let own = format!("{}10.96.0.1", state::SERVICE_IP_PREFIX);
+        assert!(
+            !check_seed_sentinel_holder(
+                &store,
+                &own,
+                "10.96.0.1".parse().unwrap(),
+                "default",
+                "kubernetes"
+            )
+            .await
+            .unwrap(),
+            "a sentinel owned by the bootstrap Service is a plain re-seed, not an orphan"
+        );
     }
 
     /// With --kube-dns-cluster-ip in the IPv6 family, the IPv4 tenth host is the one the
