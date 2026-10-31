@@ -12011,16 +12011,36 @@ mod tests {
         validate_cr_schema_with_budgets(obj, &ctx, &cache, old_object, budgets)
     }
 
-    // Tests sharing one gate key exceed the per-CRD eval cap when run in parallel and fail
-    // spuriously, so every test context must map to a distinct key.
+    // A CEL test must not depend on what other parallel tests hold in the per-CRD eval gate:
+    // with every context on one shared key, six overlapping evaluations made unrelated tests
+    // fail with a spurious "too many rules" rejection.
     #[test]
-    fn test_contexts_do_not_share_a_cel_gate_key() {
-        let schema = serde_json::json!({});
-        assert_ne!(
-            test_ctx(schema.clone()).kind,
-            test_ctx(schema).kind,
-            "a shared CRD key lets parallel tests starve each other of per-CRD CEL slots"
-        );
+    fn test_ctx_cel_evaluation_is_unaffected_by_stuck_permits_on_another_test_ctx_key() {
+        let first = test_ctx(serde_json::json!({}));
+        let first_key = format!("{}/{}", first.schema_cache_key.0, first.kind);
+        let mut stuck = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let timed_out = run_within_budget(
+                std::time::Duration::from_millis(10),
+                (&CEL_EVAL_THREAD_GATE, &first_key),
+                move || {
+                    let _ = held.recv();
+                },
+            );
+            assert!(matches!(timed_out, Err(CelEvalOverBudget::TimedOut)));
+            stuck.push(release);
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "x": {
+                "type": "integer",
+                "x-kubernetes-validations": [{ "rule": "self >= 0" }]
+            } }
+        });
+        check_schema(&serde_json::json!({ "x": 1 }), schema)
+            .expect("a fresh test context must not share the gate key of another test's context");
+        drop(stuck);
     }
 
     // type:object with valid object passes.
@@ -12139,7 +12159,7 @@ mod tests {
             "properties": { "spec": { "type": "object" } }
         });
         let ctx = CrContext {
-            kind: "Test".into(),
+            kind: "CacheReuseTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12192,7 +12212,7 @@ mod tests {
             ]
         });
         let ctx = CrContext {
-            kind: "Test".into(),
+            kind: "CacheCelTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12262,7 +12282,7 @@ mod tests {
             "properties": { "spec": { "type": "object" } }
         });
         let make_ctx = |rv: &str| CrContext {
-            kind: "Test".into(),
+            kind: "CacheRebuildTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema.clone())),
