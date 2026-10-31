@@ -15947,7 +15947,9 @@ mod tests {
             caller.join().unwrap();
         }
         wait_until("evaluation threads to exit", || GATE.live.load(SeqCst) == 0);
-        assert!(GATE.live_per_key.lock().unwrap().is_empty());
+        wait_until("per-CRD live counts to drain", || {
+            GATE.live_per_key.lock().unwrap().is_empty()
+        });
     }
 
     // Before this fix, validate_cel_rules only recursed via `properties`/`items`, so a
