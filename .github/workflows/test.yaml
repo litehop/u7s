@@ -7,7 +7,11 @@ on:
       # push and merge_group both fire on the same queue ref and race in
       # the shared concurrency group, cancelling the merge_group run.
       - 'gh-readonly-queue/**'
+      # The queue already tested this exact SHA; cache-prime.yaml re-runs these jobs on main
+      # only when a rust-cache key can change.
+      - main
   merge_group:
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,10 +61,6 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: rustup toolchain install
-      # save-if: only main writes the shared cache; branches restore it read-only.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format check
         run: cargo fmt --check
@@ -82,33 +82,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Some discovered test-*-logic.sh invoke cargo (e.g.
-      # test-release-tarball-licenses.sh, scripts/conformance/test-dhat-depth-
-      # logic.sh, test-profile-flag-logic.sh) -- needs cargo on PATH.
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install
-      # save-if: only main writes the shared cache; branches restore it read-only.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
+      # No scripts here compile anything, so no Rust toolchain or cache. Scripts run in
+      # parallel (see scripts/run-script-tests.sh); each must use its own mktemp -d.
       - name: Run scripts/**/test-*-logic.sh + test-critical-reviewer-hook.sh + test-install-checksum.sh + test-release-tarball-licenses.sh + test-add-node-warning.sh
-        run: |
-          tests_file="$(mktemp)"
-          find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' -o -name 'test-install-checksum.sh' -o -name 'test-release-tarball-licenses.sh' -o -name 'test-add-node-warning.sh' \) | sort > "$tests_file"
-          count=$(wc -l < "$tests_file")
-          if [ "$count" -eq 0 ]; then
-            echo "no scripts/**/test-*-logic.sh regression scripts found — discovery is broken" >&2
-            exit 1
-          fi
-          echo "found $count regression-guard scripts"
-          fail=0
-          while IFS= read -r t; do
-            echo "--- $t ---"
-            bash "$t" || fail=1
-          done < "$tests_file"
-          rm -f "$tests_file"
-          exit "$fail"
+        run: scripts/run-script-tests.sh
 
   # runs the whole suite _and_ checks coverage too
   test-coverage:

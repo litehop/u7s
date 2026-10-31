@@ -51,8 +51,8 @@ call() {  # runs the real script's __call entry point, capturing stdout
   bash "$SCRIPT" __call "$@"
 }
 
-file_mtime() {  # portable GNU/BSD stat, matches the idiom used elsewhere in scripts/
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+file_mtime() {  # GNU first: GNU `stat -f` reports filesystem state, which shifts under parallel tests
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
 # Builds an isolated single-worktree scratch git repo (one worktree, no

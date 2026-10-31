@@ -22,8 +22,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SUPERVISOR="$SCRIPT_DIR/kcm-supervisor.sh"
-CRASH_LOG="/tmp/kcm-crashes.log"
-CRASH_MARKER="/tmp/kcm-crashed.marker"
+STATE_DIR="$(mktemp -d)"
+export KCM_CRASH_LOG="$STATE_DIR/kcm-crashes.log"
+export KCM_CRASH_MARKER="$STATE_DIR/kcm-crashed.marker"
+CRASH_LOG="$KCM_CRASH_LOG"
+CRASH_MARKER="$KCM_CRASH_MARKER"
 
 # Stand-in for the real kcm binary: a real, independently-schedulable process
 # (not just a string) that stays up until the test kills it. Using the real
@@ -45,7 +48,9 @@ if [ -z "$SLEEP_BIN" ]; then
   echo "FAIL: 'sleep' binary not found on PATH -- required as this test's kube-controller-manager stand-in" >&2
   exit 1
 fi
-FAKE_PATTERN="${SLEEP_BIN} 300"
+# Per-run sleep argument: pkill -f on a shared " 300" would kill other tests running in parallel.
+SLEEP_ARG="300.$$"
+FAKE_PATTERN="${SLEEP_BIN} ${SLEEP_ARG}"
 
 PASS=0
 FAIL=0
@@ -57,6 +62,7 @@ cleanup() {
     [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
   done
   pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
+  rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
 
@@ -123,7 +129,7 @@ assert_in_range() {
 start_supervisor() {
   local kcmlog="$1" redirect_to="$2"
   shift 2
-  env "$@" bash "$SUPERVISOR" "$SLEEP_BIN" "$kcmlog" 300 > "$redirect_to" 2>&1 &
+  env "$@" bash "$SUPERVISOR" "$SLEEP_BIN" "$kcmlog" "$SLEEP_ARG" > "$redirect_to" 2>&1 &
   echo $!
 }
 

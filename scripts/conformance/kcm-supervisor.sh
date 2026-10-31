@@ -21,8 +21,8 @@ KCM_BINARY="$1"
 KCM_LOG="$2"
 shift 2
 
-CRASH_LOG="/tmp/kcm-crashes.log"
-CRASH_MARKER="/tmp/kcm-crashed.marker"
+CRASH_LOG="${KCM_CRASH_LOG:-/tmp/kcm-crashes.log}"
+CRASH_MARKER="${KCM_CRASH_MARKER:-/tmp/kcm-crashed.marker}"
 BACKOFF_BASE="${KCM_BACKOFF_BASE_SECS:-10}"
 BACKOFF_MAX="${KCM_BACKOFF_MAX_SECS:-160}"
 STABLE_UPTIME="${KCM_STABLE_UPTIME_SECS:-60}"
