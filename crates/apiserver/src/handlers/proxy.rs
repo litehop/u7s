@@ -2394,8 +2394,19 @@ pub async fn node_proxy<S: Store>(
 
     let body_bytes = read_proxy_request_body(req.into_body()).await?;
 
+    forward_to_kubelet(&client, method, &kubelet_url, body_bytes).await
+}
+
+/// Send the already address-checked request to the kubelet and relay its status,
+/// filtered headers and streamed body.
+async fn forward_to_kubelet(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    kubelet_url: &str,
+    body_bytes: bytes::Bytes,
+) -> Result<Response, crate::status::StatusError> {
     let kubelet_resp = client
-        .request(method, &kubelet_url)
+        .request(method, kubelet_url)
         .body(body_bytes)
         .send()
         .await
@@ -10323,33 +10334,18 @@ mod tests {
     /// empty Content-Type even though the kubelet's body was JSON. A protobuf-
     /// preferring client (any typed clientset) then fails with "provided data does
     /// not appear to be a protobuf message" trying to decode that JSON as protobuf.
-    #[cfg(feature = "rig-test-knobs")]
+    ///
+    /// Drives `forward_to_kubelet` (everything node_proxy does after the address check)
+    /// against a plain-HTTP loopback fake, so the loopback guard stays untouched.
     #[tokio::test]
     async fn node_proxy_forwards_upstream_content_type() {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use rustls::ServerConfig;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
-        use tokio_rustls::TlsAcceptor;
-
-        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
-        let cert_der = cert.cert.der().to_vec();
-        let key_der = cert.signing_key.serialize_der();
-
-        let server_cert = CertificateDer::from(cert_der.clone());
-        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
-        let server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![server_cert], server_key)
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let kubelet_port = listener.local_addr().unwrap().port();
-
+        let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
             let mut buf = [0u8; 512];
             let _ = stream.read(&mut buf).await;
             stream
@@ -10360,48 +10356,16 @@ mod tests {
                 .unwrap();
         });
 
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
-        let node = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Node",
-            "metadata": {"name": "mynode", "resourceVersion": "1"},
-            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
-        });
-        store
-            .put(
-                &crate::keys::cluster_object_key("nodes", "mynode"),
-                bytes::Bytes::from(node.to_string()),
-                Some(0),
-            )
-            .await
-            .expect("seed node");
+        let resp = forward_to_kubelet(
+            &reqwest::Client::new(),
+            reqwest::Method::GET,
+            &format!("http://127.0.0.1:{port}/pods"),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap();
 
-        let state = AppState::new_with_config(crate::state::AppStateConfig {
-            store,
-            sa_keys: None,
-            token_map: std::collections::HashMap::new(),
-            server_address: "https://localhost:6443".into(),
-            cluster_ca_ders: Some(vec![cert_der]),
-            service_ip_allocator: None,
-            kubelet_client_identity_pem: None,
-            kubelet_preferred_address: None,
-            kubelet_port,
-            continue_token_key: None,
-            konnectivity_proxy_addr: None,
-        });
-
-        let mut router = make_router(state);
-        let req = axum::http::Request::builder()
-            .uri("/api/v1/nodes/mynode/proxy/pods")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = router.call(req).await.unwrap();
-
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "the mock kubelet must be reachable over TLS with the generated CA"
-        );
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
                 .get(axum::http::header::CONTENT_TYPE)

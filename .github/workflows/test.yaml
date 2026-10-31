@@ -126,6 +126,36 @@ jobs:
       - name: Coverage
         run: cargo llvm-cov --locked --workspace --summary-only --fail-under-lines 90
 
+  # The test-only cfg paths (rig loopback allowance, shortened PKI lifetimes) never compile in
+  # the default-feature jobs above. Separate job so it runs parallel to test-coverage and adds
+  # no wall-clock to the merge queue; the cost is that it is not a required check unless the
+  # ruleset adds it.
+  feature-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install
+      # save-if: only main writes the shared cache; branches restore it read-only.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy (test-knob features)
+        run: >-
+          cargo clippy --locked -p u7s-apiserver --tests --no-deps
+          --features rig-test-knobs,pki-test-knobs -- -D warnings
+
+      - name: Tests (test-knob features)
+        run: >-
+          cargo test --locked -p u7s-apiserver
+          --features rig-test-knobs,pki-test-knobs
+
   # Optimised frames are what production runs, so the depth limits' guarantee
   # (accepted at create => evaluates at runtime) is only checkable here. Fat LTO with one
   # codegen unit takes over 15 minutes cold on a runner, so the profile is relaxed to
