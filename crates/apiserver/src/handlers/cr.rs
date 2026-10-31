@@ -1580,6 +1580,12 @@ const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
 /// ordinary request concurrency never reaches it.
 const MAX_LIVE_CEL_EVAL_THREADS: usize = 200;
 
+/// How many of `MAX_LIVE_CEL_EVAL_THREADS` one CRD may hold. A burst of stuck writes to one
+/// CRD is only charged as abandoned after the eval budget elapses, so this share is what
+/// stops that burst from pinning the whole ceiling meanwhile. Far above the overlap of
+/// ordinary writes to one CRD.
+const MAX_LIVE_CEL_EVAL_THREADS_PER_CRD: usize = 64;
+
 /// Two independent limits on CEL evaluation threads, rejecting outright once either is
 /// reached. A plain struct (rather than bare static counters) so the behavior can be
 /// exercised in a test with its own small caps — the real, process-wide gate below is
@@ -1587,7 +1593,9 @@ const MAX_LIVE_CEL_EVAL_THREADS: usize = 200;
 /// spuriously reject unrelated evaluations.
 ///
 /// - `live`: every evaluation thread, reserved before spawn and released when the thread
-///   exits, so the total thread count is bounded by construction.
+///   exits, so the total thread count is bounded by construction. Each key (a CRD) may
+///   hold at most `live_per_key_cap` of them, so a burst of stuck writes to one CRD, which
+///   is only charged as abandoned after the eval budget, cannot pin the whole ceiling.
 /// - abandoned (`in_flight`, `per_key`): threads whose caller timed out and left them
 ///   running, charged on abandonment. At most `cap` overall and `per_key_cap` per key (a
 ///   CRD) may run, so one CRD with stuck evaluations cannot use up the `live` ceiling for
@@ -1595,6 +1603,8 @@ const MAX_LIVE_CEL_EVAL_THREADS: usize = 200;
 struct ConcurrencyGate {
     live: std::sync::atomic::AtomicUsize,
     live_cap: usize,
+    live_per_key_cap: usize,
+    live_per_key: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
     in_flight: std::sync::atomic::AtomicUsize,
     cap: usize,
     per_key_cap: usize,
@@ -1609,13 +1619,20 @@ impl ConcurrencyGate {
 
     #[cfg(test)]
     const fn with_per_key_cap(cap: usize, per_key_cap: usize) -> Self {
-        Self::with_caps(usize::MAX, cap, per_key_cap)
+        Self::with_caps(usize::MAX, usize::MAX, cap, per_key_cap)
     }
 
-    const fn with_caps(live_cap: usize, cap: usize, per_key_cap: usize) -> Self {
+    const fn with_caps(
+        live_cap: usize,
+        live_per_key_cap: usize,
+        cap: usize,
+        per_key_cap: usize,
+    ) -> Self {
         Self {
             live: std::sync::atomic::AtomicUsize::new(0),
             live_cap,
+            live_per_key_cap,
+            live_per_key: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             cap,
             per_key_cap,
@@ -1623,20 +1640,41 @@ impl ConcurrencyGate {
         }
     }
 
-    /// Reserves one of the `live_cap` thread slots; the caller must `release_live` it when
-    /// the thread exits (or was never spawned).
-    fn try_reserve_live(&self) -> bool {
+    /// Reserves one of the `live_cap` thread slots, and one of `key`'s `live_per_key_cap`
+    /// share of them; the caller must `release_live(key)` when the thread exits (or was
+    /// never spawned). On `false` nothing is held.
+    fn try_reserve_live(&self, key: &str) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
+        {
+            let mut held = self.live_per_key.lock().unwrap_or_else(|e| e.into_inner());
+            let count = held.entry(key.to_string()).or_insert(0);
+            if *count >= self.live_per_key_cap {
+                return false;
+            }
+            *count += 1;
+        }
         if self.live.fetch_add(1, SeqCst) >= self.live_cap {
             self.live.fetch_sub(1, SeqCst);
+            Self::decrement(&self.live_per_key, key);
             false
         } else {
             true
         }
     }
 
-    fn release_live(&self) {
+    fn release_live(&self, key: &str) {
         self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Self::decrement(&self.live_per_key, key);
+    }
+
+    fn decrement(map: &std::sync::Mutex<std::collections::BTreeMap<String, usize>>, key: &str) {
+        let mut held = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = held.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(key);
+            }
+        }
     }
 
     /// Reserves an abandoned-thread slot for `key` and returns `true`, or returns `false`
@@ -1685,13 +1723,7 @@ impl ConcurrencyGate {
     }
 
     fn release_key(&self, key: &str) {
-        let mut held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = held.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                held.remove(key);
-            }
-        }
+        Self::decrement(&self.per_key, key);
     }
 }
 
@@ -1706,6 +1738,7 @@ const MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD: usize = 6;
 /// The process-wide gate every `execute_cel_with_budget` call reserves a slot from.
 static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_caps(
     MAX_LIVE_CEL_EVAL_THREADS,
+    MAX_LIVE_CEL_EVAL_THREADS_PER_CRD,
     MAX_CONCURRENT_CEL_EVAL_THREADS,
     MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
 );
@@ -1747,7 +1780,7 @@ struct GateGuard<'a>(
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::SeqCst;
-        self.0.release_live();
+        self.0.release_live(&self.1);
         if self
             .2
             .compare_exchange(EVAL_RUNNING, EVAL_FINISHED, SeqCst, SeqCst)
@@ -1800,7 +1833,7 @@ fn run_within_budget<T: Send + 'static>(
     (gate, crd): (&'static ConcurrencyGate, &str),
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, CelEvalOverBudget> {
-    if !gate.has_room(crd) || !gate.try_reserve_live() {
+    if !gate.has_room(crd) || !gate.try_reserve_live(crd) {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
@@ -1818,7 +1851,7 @@ fn run_within_budget<T: Send + 'static>(
             let _ = tx.send(work());
         });
     if spawned.is_err() {
-        gate.release_live();
+        gate.release_live(crd);
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
     rx.recv_timeout(budget).map_err(|_| {
@@ -15725,8 +15758,8 @@ mod tests {
     // sites to actually fire.
     #[test]
     fn gate_guard_releases_slot_even_when_guarded_scope_panics() {
-        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(1, 1, 1);
-        assert!(GATE.try_reserve_live());
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(1, 1, 1, 1);
+        assert!(GATE.try_reserve_live(""));
         let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
         abandon_eval(&GATE, "", &state);
         assert!(
@@ -15746,7 +15779,7 @@ mod tests {
              unwind path this test is checking"
         );
         assert!(
-            GATE.has_room("") && GATE.try_reserve_live(),
+            GATE.has_room("") && GATE.try_reserve_live(""),
             "a slot leaked across a panic inside the guarded region -- GateGuard's Drop \
              must release during unwinding, not only on normal return, or a handful of \
              panicking CEL rules permanently wedges the process-wide gate and blocks every \
@@ -15769,10 +15802,10 @@ mod tests {
     #[test]
     fn eval_finishing_and_caller_abandoning_in_either_order_release_exactly_once() {
         use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
-        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8);
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8, 8);
 
         let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
-        assert!(GATE.try_reserve_live());
+        assert!(GATE.try_reserve_live("k"));
         drop(GateGuard(&GATE, "k".into(), state.clone()));
         abandon_eval(&GATE, "k", &state);
         assert_eq!(GATE.in_flight.load(SeqCst), 0, "finish then abandon");
@@ -15780,7 +15813,7 @@ mod tests {
         assert!(GATE.per_key.lock().unwrap().is_empty());
 
         let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
-        assert!(GATE.try_reserve_live());
+        assert!(GATE.try_reserve_live("k"));
         abandon_eval(&GATE, "k", &state);
         assert_eq!(
             GATE.in_flight.load(SeqCst),
@@ -15799,7 +15832,7 @@ mod tests {
     #[test]
     fn eval_thread_panic_is_reported_as_timeout_and_leaves_the_gate_empty() {
         use std::sync::atomic::Ordering::SeqCst;
-        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8);
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8, 8);
         let result =
             run_within_budget::<()>(std::time::Duration::from_secs(30), (&GATE, "k"), || {
                 panic!("simulated cel panic")
@@ -15818,7 +15851,7 @@ mod tests {
     fn evaluation_thread_ceiling_refuses_the_extra_write_immediately_and_recovers() {
         use std::sync::atomic::Ordering::SeqCst;
         const CEILING: usize = 3;
-        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(CEILING, 100, 100);
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(CEILING, CEILING, 100, 100);
         let (release, held) = std::sync::mpsc::channel::<()>();
         let held = Arc::new(std::sync::Mutex::new(held));
         let callers: Vec<_> = (0..CEILING)
@@ -15859,6 +15892,62 @@ mod tests {
             run_within_budget(std::time::Duration::from_secs(30), (&GATE, "x"), || ()).is_ok(),
             "writes must be accepted again once the threads exit"
         );
+    }
+
+    /// A burst of simultaneous stuck writes to one CRD is not yet charged as abandoned (that
+    /// happens only after the eval budget), so its live share is what keeps it from taking
+    /// every thread slot and rejecting other CRDs' writes.
+    #[test]
+    fn burst_of_stuck_writes_to_one_crd_cannot_take_other_crds_thread_slots() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const SHARE: usize = 2;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(10, SHARE, 100, 100);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let callers: Vec<_> = (0..SHARE)
+            .map(|_| {
+                let held = Arc::clone(&held);
+                std::thread::spawn(move || {
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, "a.example.com/A"),
+                        move || {
+                            let _ = held.lock().unwrap().recv();
+                        },
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        wait_until("CRD A's evaluation threads to be live", || {
+            GATE.live.load(SeqCst) == SHARE
+        });
+
+        let a_extra = run_within_budget(
+            std::time::Duration::from_secs(30),
+            (&GATE, "a.example.com/A"),
+            || (),
+        );
+        assert!(
+            matches!(a_extra, Err(CelEvalOverBudget::TooManyInFlight)),
+            "CRD A is past its live share"
+        );
+        assert!(
+            run_within_budget(
+                std::time::Duration::from_secs(30),
+                (&GATE, "b.example.com/B"),
+                || ()
+            )
+            .is_ok(),
+            "CRD A's stuck writes must not reject CRD B's"
+        );
+
+        drop(release);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        wait_until("evaluation threads to exit", || GATE.live.load(SeqCst) == 0);
+        assert!(GATE.live_per_key.lock().unwrap().is_empty());
     }
 
     // Before this fix, validate_cel_rules only recursed via `properties`/`items`, so a
