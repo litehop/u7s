@@ -13,8 +13,12 @@ on:
       - Cargo.lock
       - '**/Cargo.toml'
       - rust-toolchain.toml
+      - .cargo/config.toml
       - .github/workflows/test.yaml
       - .github/workflows/cache-prime.yaml
+  # Caches idle for 7 days are evicted; re-prime weekly so PR runs are never cold.
+  schedule:
+    - cron: '17 3 * * 1'
   workflow_dispatch:
 
 jobs:
