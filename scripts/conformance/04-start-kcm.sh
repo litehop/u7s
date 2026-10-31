@@ -56,6 +56,7 @@ limactl shell "$VM_NAME" bash -c \
 # of silently blacking out the control plane for the rest of an unattended
 # run. See kcm-supervisor.sh for the backoff/circuit-breaker logic.
 limactl copy "$REPO/scripts/conformance/kcm-supervisor.sh" "${VM_NAME}:/tmp/kcm-supervisor.sh"
+limactl copy "$REPO/scripts/conformance/fetch-cached-binary.sh" "${VM_NAME}:/tmp/fetch-cached-binary.sh"
 
 # Run setup foreground (download, cert conversion, kubeconfig rewrite),
 # then background only the final binary launch.
@@ -120,14 +121,8 @@ for f in "\$WORKDIR/kcm-kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/intermediate-c
   fi
 done
 
-if [ ! -f "\$KCM_BINARY" ]; then
-  mkdir -p "\$CACHE_DIR"
-  URL="https://dl.k8s.io/release/v\${K8S_VERSION}/bin/linux/\${ARCH}/kube-controller-manager"
-  echo "Downloading kube-controller-manager v\${K8S_VERSION} (linux/\${ARCH}) ..."
-  curl -fsSL "\$URL" -o "\$KCM_BINARY"
-  chmod +x "\$KCM_BINARY"
-  echo "Cached at \$KCM_BINARY"
-fi
+mkdir -p "\$CACHE_DIR"
+bash /tmp/fetch-cached-binary.sh "https://dl.k8s.io/release/v\${K8S_VERSION}/bin/linux/\${ARCH}/kube-controller-manager" "\$KCM_BINARY"
 
 TMPDIR_KCM="\$(mktemp -d)"
 
