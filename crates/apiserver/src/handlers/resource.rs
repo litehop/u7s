@@ -710,42 +710,101 @@ fn allows_create_on_update(group: &str, plural: &str) -> bool {
     )
 }
 
-/// Upstream `AllowUnconditionalUpdate()` per create-on-update kind (release-1.37 `pkg/registry`
-/// strategy.go): true for services, endpoints, events, limitranges and the four RBAC kinds;
-/// false for leases, leasecandidates and runtimeclasses.
+/// Upstream `AllowUnconditionalUpdate()` for every served kind (release-1.37 `strategy.go` of
+/// each registry; status strategies inherit). Exactly the served kinds whose strategy returns
+/// false are listed; every other built-in (core, apps, batch, autoscaling, networking, rbac,
+/// storage.k8s.io classes, scheduling.k8s.io priorityclasses, flowcontrol, ...) is true.
+/// Custom resources, CRDs and APIServices are false too (see `require_resourceversion_on_update`).
 fn allows_unconditional_update(group: &str, plural: &str) -> bool {
-    matches!(
+    !matches!(
         (group, plural),
-        ("", "services" | "endpoints" | "events" | "limitranges")
-            | ("events.k8s.io", "events")
+        (
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations"
+                | "mutatingwebhookconfigurations"
+                | "validatingadmissionpolicies"
+                | "validatingadmissionpolicybindings"
+                | "mutatingadmissionpolicies"
+                | "mutatingadmissionpolicybindings"
+        ) | ("apiextensions.k8s.io", "customresourcedefinitions")
+            | ("apiregistration.k8s.io", "apiservices")
             | (
-                RBAC_GROUP,
-                "roles" | "rolebindings" | "clusterroles" | "clusterrolebindings"
+                "certificates.k8s.io",
+                "clustertrustbundles" | "podcertificaterequests"
             )
+            | ("coordination.k8s.io", "leases" | "leasecandidates")
+            | ("node.k8s.io", "runtimeclasses")
+            | ("policy", "poddisruptionbudgets")
+            | ("resource.k8s.io", "devicetaintrules")
+            | (
+                "storage.k8s.io",
+                "csidrivers" | "csinodes" | "csistoragecapacities" | "volumeattachments"
+            )
+            | ("storagemigration.k8s.io", "storageversionmigrations")
     )
 }
 
-/// Precondition for the update a PUT-create degrades to when it loses a create race.
-/// Upstream `GuaranteedUpdate` retries the closure against the now-existing object: an empty
-/// resourceVersion updates unconditionally only if the kind `AllowUnconditionalUpdate()`s,
-/// otherwise it is 422 "must be specified for an update"; a stated resourceVersion is compared
-/// by the store and conflicts (409) on mismatch.
-fn lost_create_race_precondition(
+/// Upstream generic store `Update`: a PUT to an existing object with no resourceVersion is
+/// 422 unless the kind's strategy `AllowUnconditionalUpdate()`s. `unconditional_update` is
+/// false for every custom resource.
+pub(crate) fn require_resourceversion_on_update(
     unconditional_update: bool,
     expected_revision: Option<u64>,
     qualified_resource: &str,
     name: &str,
-) -> Result<Option<u64>, crate::status::StatusError> {
+) -> Result<(), crate::status::StatusError> {
     if expected_revision.is_none() && !unconditional_update {
         return Err(Status::unprocessable_entity(format!(
             "{qualified_resource} \"{name}\" is invalid: metadata.resourceVersion: Invalid value: 0x0: must be \
              specified for an update"
         )));
     }
-    Ok(expected_revision)
+    Ok(())
+}
+
+/// `require_resourceversion_on_update` for a built-in kind.
+pub(crate) fn require_builtin_resourceversion_on_update(
+    group: &str,
+    plural: &str,
+    expected_revision: Option<u64>,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    require_resourceversion_on_update(
+        allows_unconditional_update(group, plural),
+        expected_revision,
+        &qualified_resource(group, plural),
+        name,
+    )
+}
+
+/// `require_resourceversion_on_update` for a custom resource (upstream
+/// `customResourceStrategy.AllowUnconditionalUpdate()` is false).
+pub(crate) fn require_cr_resourceversion_on_update(
+    group: &str,
+    plural: &str,
+    expected_revision: Option<u64>,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    require_resourceversion_on_update(
+        false,
+        expected_revision,
+        &qualified_resource(group, plural),
+        name,
+    )
+}
+
+fn qualified_resource(group: &str, plural: &str) -> String {
+    if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{plural}.{group}")
+    }
 }
 
 /// Persist a PUT-create that found the object already created by a concurrent writer.
+/// Upstream `GuaranteedUpdate` retries the closure against the now-existing object, so the
+/// update rules apply: see `require_resourceversion_on_update`; a stated resourceVersion is
+/// compared by the store and conflicts (409) on mismatch.
 async fn update_after_lost_create_race<S: Store>(
     state: &AppState<S>,
     key: &str,
@@ -753,20 +812,10 @@ async fn update_after_lost_create_race<S: Store>(
     expected_revision: Option<u64>,
     (group, plural, name, kind): (&str, &str, &str, &str),
 ) -> Result<u64, crate::status::StatusError> {
-    let qualified = if group.is_empty() {
-        plural.to_string()
-    } else {
-        format!("{plural}.{group}")
-    };
-    let precondition = lost_create_race_precondition(
-        allows_unconditional_update(group, plural),
-        expected_revision,
-        &qualified,
-        name,
-    )?;
+    require_builtin_resourceversion_on_update(group, plural, expected_revision, name)?;
     state
         .store
-        .put(key, body, precondition)
+        .put(key, body, expected_revision)
         .await
         .map_err(|e| store_err(e, group, plural, name, kind))
 }
@@ -840,6 +889,9 @@ fn check_replace_resource_version_precondition(
     kind: &str,
 ) -> Result<(), crate::status::StatusError> {
     let Some(expected) = expected_revision else {
+        if parsed.is_some() {
+            require_builtin_resourceversion_on_update(group, resource, None, name)?;
+        }
         return Ok(());
     };
     let current = parsed
@@ -5999,7 +6051,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "argoproj.io/v1alpha1",
             "kind": "Application",
-            "metadata": { "name": name, "namespace": ns },
+            "metadata": { "name": name, "namespace": ns, "resourceVersion": store.get(&cr_key).await.unwrap().unwrap().revision.to_string() },
             "status": { "health": { "status": "Healthy" }, "sync": { "status": "Synced" } }
         });
         let body_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
@@ -8322,41 +8374,78 @@ mod tests {
         );
     }
 
-    /// A PUT-create that loses a create race continues as an update (upstream GuaranteedUpdate
-    /// retry): an empty resourceVersion overwrites only if the kind allows unconditional
-    /// update, otherwise it is 422; a stated one is CAS-compared.
+    /// Every served kind whose upstream `AllowUnconditionalUpdate()` is false must reject an
+    /// update with no resourceVersion (422) — otherwise a client that forgot to send one
+    /// silently clobbers a concurrent writer — while true kinds keep accepting it.
     #[test]
-    fn lost_create_race_precondition_follows_allow_unconditional_update() {
-        for (g, p, want) in [
-            ("", "services", true),
-            ("", "endpoints", true),
-            ("", "events", true),
-            ("events.k8s.io", "events", true),
-            ("", "limitranges", true),
-            (RBAC_GROUP, "roles", true),
-            (RBAC_GROUP, "rolebindings", true),
-            (RBAC_GROUP, "clusterroles", true),
-            (RBAC_GROUP, "clusterrolebindings", true),
-            ("coordination.k8s.io", "leases", false),
-            ("coordination.k8s.io", "leasecandidates", false),
-            ("node.k8s.io", "runtimeclasses", false),
-        ] {
-            assert_eq!(allows_unconditional_update(g, p), want, "{g}/{p}");
+    fn allow_unconditional_update_matches_upstream_strategies() {
+        let adm = "admissionregistration.k8s.io";
+        let false_kinds = [
+            (adm, "validatingwebhookconfigurations"),
+            (adm, "mutatingwebhookconfigurations"),
+            (adm, "validatingadmissionpolicies"),
+            (adm, "validatingadmissionpolicybindings"),
+            (adm, "mutatingadmissionpolicies"),
+            (adm, "mutatingadmissionpolicybindings"),
+            ("apiextensions.k8s.io", "customresourcedefinitions"),
+            ("apiregistration.k8s.io", "apiservices"),
+            ("certificates.k8s.io", "clustertrustbundles"),
+            ("certificates.k8s.io", "podcertificaterequests"),
+            ("coordination.k8s.io", "leases"),
+            ("coordination.k8s.io", "leasecandidates"),
+            ("node.k8s.io", "runtimeclasses"),
+            ("policy", "poddisruptionbudgets"),
+            ("resource.k8s.io", "devicetaintrules"),
+            ("storage.k8s.io", "csidrivers"),
+            ("storage.k8s.io", "csinodes"),
+            ("storage.k8s.io", "csistoragecapacities"),
+            ("storage.k8s.io", "volumeattachments"),
+            ("storagemigration.k8s.io", "storageversionmigrations"),
+        ];
+        for (g, p) in false_kinds {
+            let err = require_builtin_resourceversion_on_update(g, p, None, "x")
+                .expect_err(&format!("{g}/{p} must require a resourceVersion"));
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{g}/{p}"
+            );
+            assert!(
+                err.1.message.starts_with(p)
+                    && err
+                        .1
+                        .message
+                        .ends_with("metadata.resourceVersion: Invalid value: 0x0: must be specified for an update"),
+                "{}",
+                err.1.message
+            );
+            require_builtin_resourceversion_on_update(g, p, Some(7), "x")
+                .expect("a stated resourceVersion is always accepted here");
         }
-        assert_eq!(
-            lost_create_race_precondition(true, None, "services", "s").unwrap(),
-            None,
-            "AllowUnconditionalUpdate kinds overwrite the race winner"
-        );
-        let err = lost_create_race_precondition(false, None, "leases.coordination.k8s.io", "f")
-            .expect_err("kinds without AllowUnconditionalUpdate must not clobber the winner");
-        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(err.1.message.contains("must be specified for an update"));
-        assert_eq!(
-            lost_create_race_precondition(false, Some(7), "leases.coordination.k8s.io", "f")
-                .unwrap(),
-            Some(7)
-        );
+        let true_kinds = [
+            ("", "configmaps"),
+            ("", "secrets"),
+            ("", "services"),
+            ("", "endpoints"),
+            ("", "events"),
+            ("", "pods"),
+            ("", "nodes"),
+            ("", "namespaces"),
+            ("", "persistentvolumes"),
+            ("apps", "deployments"),
+            ("batch", "jobs"),
+            (RBAC_GROUP, "roles"),
+            (RBAC_GROUP, "clusterrolebindings"),
+            ("storage.k8s.io", "storageclasses"),
+            ("scheduling.k8s.io", "priorityclasses"),
+            ("certificates.k8s.io", "certificatesigningrequests"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("flowcontrol.apiserver.k8s.io", "flowschemas"),
+        ];
+        for (g, p) in true_kinds {
+            require_builtin_resourceversion_on_update(g, p, None, "x")
+                .unwrap_or_else(|_| panic!("{g}/{p} allows unconditional update upstream"));
+        }
     }
 
     /// PUT-create (empty resourceVersion) of `plural`/`name` that loses a create race to a
@@ -12937,6 +13026,7 @@ mod tests {
             "metadata": {
                 "name": "put-gc-node",
                 "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "drivers": [] }
@@ -13025,6 +13115,7 @@ mod tests {
             "kind": "CSINode",
             "metadata": {
                 "name": "proto-gc-node",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "drivers": [] }
@@ -13108,6 +13199,7 @@ mod tests {
                 "name": "put-gc-lease",
                 "namespace": "default",
                 "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "holderIdentity": "test-holder" }
@@ -13191,6 +13283,7 @@ mod tests {
             "metadata": {
                 "name": "proto-gc-lease",
                 "namespace": "default",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "holderIdentity": "test-holder" }
@@ -13271,6 +13364,16 @@ mod tests {
         metadata: serde_json::Value,
     ) {
         use axum::extract::{Path, State};
+        let mut metadata = metadata;
+        let stored = state
+            .store
+            .get(&format!(
+                "/registry/coordination.k8s.io/leases/default/{name}"
+            ))
+            .await
+            .unwrap()
+            .expect("lease seeded before PUT");
+        metadata["resourceVersion"] = stored.revision.to_string().into();
         let body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
             "metadata": metadata, "spec": {"holderIdentity": "h"}
@@ -13320,6 +13423,141 @@ mod tests {
         )
         .await
         .expect("PATCH must succeed (the server ignores the client's deletion fields)");
+    }
+
+    /// PUT of an existing object without a resourceVersion: 422 for a kind whose strategy
+    /// forbids unconditional update (a blind overwrite would clobber concurrent writers, e.g.
+    /// two leader-election candidates), 200 for one that allows it; a stated resourceVersion
+    /// always works. Covers both the namespaced and the cluster-scoped handler.
+    #[tokio::test]
+    async fn put_without_resource_version_is_422_only_for_kinds_forbidding_unconditional_update() {
+        use axum::extract::{Path, Query, State};
+        let (store, state) = deletion_guard_state().await;
+        seed_lease(&store, "l", serde_json::json!({})).await;
+        let lease = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "metadata": {"name": "l", "namespace": "default"},
+                "spec": {"holderIdentity": "other"}
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_lease = |body| {
+            replace_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "leases".into(),
+                    "l".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        let err = put_lease(lease(None))
+            .await
+            .err()
+            .expect("a Lease PUT without resourceVersion must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.1.message.contains("must be specified for an update"),
+            "{}",
+            err.1.message
+        );
+        let rv = store
+            .get("/registry/coordination.k8s.io/leases/default/l")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string();
+        put_lease(lease(Some(&rv)))
+            .await
+            .expect("a Lease PUT with the stored resourceVersion must succeed");
+
+        let cm = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "c", "namespace": "default"}, "data": {"k": "v"}
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_cm = |body| {
+            replace_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    String::new(),
+                    "v1".into(),
+                    "default".into(),
+                    "configmaps".into(),
+                    "c".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        store
+            .put(
+                &group_object_key("", "configmaps", Some("default"), "c"),
+                cm(None),
+                None,
+            )
+            .await
+            .unwrap();
+        put_cm(cm(None))
+            .await
+            .expect("ConfigMap allows unconditional update, as upstream");
+
+        let rc = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+                "metadata": {"name": "rc"}, "handler": "h"
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_rc = |body| {
+            replace_resource(
+                State(state.clone()),
+                Path((
+                    "node.k8s.io".into(),
+                    "v1".into(),
+                    "runtimeclasses".into(),
+                    "rc".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        store
+            .put(
+                &group_object_key("node.k8s.io", "runtimeclasses", None, "rc"),
+                rc(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = put_rc(rc(None))
+            .await
+            .err()
+            .expect("a RuntimeClass PUT without resourceVersion must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// A caller holding only `update` must not be able to hard-delete a finalizer-free object
@@ -20976,7 +21214,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "apiVersion": "coordination.k8s.io/v1",
                     "kind": "Lease",
-                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease" },
+                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease", "resourceVersion": state.store.get("/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-node").await.unwrap().unwrap().revision.to_string() },
                     "spec": { "holderIdentity": "new-holder", "leaseDurationSeconds": 40 }
                 }))
                 .unwrap(),

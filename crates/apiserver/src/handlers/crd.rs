@@ -980,6 +980,7 @@ pub async fn replace_crd<S: Store>(
     } else {
         crd.metadata.resource_version.parse::<u64>().ok()
     };
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
 
     // Admission webhook pipeline (mutating then validating).
     {
@@ -1910,6 +1911,7 @@ pub async fn put_crd_status<S: Store>(
     }
 
     let expected_rv = parse_resource_version(incoming.resource_version())?;
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -2266,13 +2268,27 @@ mod tests {
         );
 
         let replace = |versions: serde_json::Value, generation: Option<i64>| {
-            replace_crd(
-                State(state.clone()),
-                Path(name.to_string()),
-                test_user(),
-                HeaderMap::new(),
-                crd_with_versions(name, versions, generation),
-            )
+            let state = state.clone();
+            async move {
+                let rv = state
+                    .store
+                    .get(&store_key(name))
+                    .await
+                    .unwrap()
+                    .expect("stored CRD")
+                    .revision;
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(&crd_with_versions(name, versions, generation)).unwrap();
+                body["metadata"]["resourceVersion"] = rv.to_string().into();
+                replace_crd(
+                    State(state),
+                    Path(name.to_string()),
+                    test_user(),
+                    HeaderMap::new(),
+                    Bytes::from(body.to_string()),
+                )
+                .await
+            }
         };
         assert!(replace(two.clone(), None).await.is_ok());
         assert_eq!(
@@ -4232,9 +4248,16 @@ mod tests {
             .await
             .expect("create must succeed");
 
+        let rv = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("stored CRD")
+            .revision;
         let put_body = Bytes::from(
             serde_json::json!({
-                "metadata": { "name": name },
+                "metadata": { "name": name, "resourceVersion": rv.to_string() },
                 "status": null
             })
             .to_string(),
@@ -6369,6 +6392,15 @@ mod ratchet_tests {
             serde_json::from_slice(&minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"))
                 .unwrap();
         body["metadata"]["finalizers"] = serde_json::json!([CLEANUP_FINALIZER]);
+        body["metadata"]["resourceVersion"] = state
+            .store
+            .get(&store_key(FIN_CRD))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string()
+            .into();
         replace_crd(
             State(state.clone()),
             Path(FIN_CRD.to_string()),

@@ -275,6 +275,12 @@ mod cases {
             serde_json::from_slice(&stored.value).unwrap()
         }
 
+        /// The stored object's resourceVersion, which a PUT of a custom resource must carry.
+        pub(crate) async fn stored_rv(&self, key: &str) -> Value {
+            let stored = self.store.get(key).await.unwrap().unwrap();
+            json!(stored.revision.to_string())
+        }
+
         pub(crate) async fn stored_pod(&self, name: &str) -> Value {
             self.stored(&format!("/registry/pods/default/{name}")).await
         }
@@ -1519,6 +1525,12 @@ mod cases {
                 ("merge-PATCH", MERGE, patch_body),
             ] {
                 let method = if verb == "PUT" { "PUT" } else { "PATCH" };
+                let mut body = body;
+                if verb == "PUT" && what == "custom resource" {
+                    body["metadata"]["resourceVersion"] = c
+                        .stored_rv("/registry/cr/example.com/widgets/default/w")
+                        .await;
+                }
                 let (status, resp) = c.call(method, &uri, ct, body).await;
                 assert_eq!(status, StatusCode::OK, "{what} {verb}: {resp}");
                 let stored = if what == "pod" {
@@ -1612,7 +1624,9 @@ mod cases {
                 &format!("{widgets}/w/status"),
                 "application/json",
                 json!({"apiVersion": "example.com/v2", "kind": "Widget",
-                    "metadata": {"name": "w"}, "status": {"replicas": 2}}),
+                    "metadata": {"name": "w", "resourceVersion":
+                        c.stored_rv("/registry/cr/example.com/widgets/default/w").await},
+                    "status": {"replicas": 2}}),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{resp}");
@@ -2034,13 +2048,12 @@ mod cases {
                                 c.call("POST", &base, "application/json", body).await
                             }
                             ("widgets", "UPDATE") => {
-                                c.call(
-                                    "PUT",
-                                    &format!("{base}/w"),
-                                    "application/json",
-                                    widget_at(request_version, spec),
-                                )
-                                .await
+                                let mut body = widget_at(request_version, spec);
+                                body["metadata"]["resourceVersion"] = c
+                                    .stored_rv("/registry/cr/example.com/widgets/default/w")
+                                    .await;
+                                c.call("PUT", &format!("{base}/w"), "application/json", body)
+                                    .await
                             }
                             ("widgets", "DELETE") => {
                                 c.call(
@@ -2057,7 +2070,10 @@ mod cases {
                                     &format!("{base}/w/status"),
                                     "application/json",
                                     json!({"apiVersion": format!("example.com/{request_version}"),
-                                        "kind": "Widget", "metadata": {"name": "w"},
+                                        "kind": "Widget",
+                                        "metadata": {"name": "w", "resourceVersion": c
+                                            .stored_rv("/registry/cr/example.com/widgets/default/w")
+                                            .await},
                                         "status": {"replicas": 2}}),
                                 )
                                 .await
