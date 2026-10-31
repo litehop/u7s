@@ -1565,12 +1565,13 @@ pub(crate) fn json_to_cel_value(
 /// Callers receive it through `CelBudgets` so tests can inject their own.
 const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Caps how many `execute_cel_with_budget` threads may be alive at once. Each thread
-/// that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than joined, so
-/// without a cap a flood of concurrent writes carrying a pathological CEL rule could
-/// still exhaust host threads/CPU even though each individual request keeps returning
-/// in ~`CEL_RULE_EVAL_BUDGET`. A legitimate cluster should essentially never hit this —
-/// it only bounds a sustained attempt to spawn many over-budget evaluations at once.
+/// Caps how many abandoned `execute_cel_with_budget` threads may be alive at once. Each
+/// thread that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than
+/// joined, so without a cap a flood of concurrent writes carrying a pathological CEL rule
+/// could still exhaust host threads/CPU even though each individual request keeps
+/// returning in ~`CEL_RULE_EVAL_BUDGET`. Evaluations still within budget are not counted,
+/// so a legitimate cluster never hits this — it only bounds a sustained attempt to spawn
+/// many over-budget evaluations at once.
 const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
 
 /// Bounds how many owners may hold a slot at once, rejecting new acquisitions outright
@@ -1604,6 +1605,7 @@ impl ConcurrencyGate {
         }
     }
 
+    #[cfg(test)]
     /// Reserves a slot for `key` and returns `true`, or returns `false` if either cap has
     /// already been reached. On `false` no slot is held, so the caller must not call
     /// `release`.
@@ -1624,6 +1626,22 @@ impl ConcurrencyGate {
         } else {
             true
         }
+    }
+
+    /// Whether `try_acquire(key)` would succeed right now, without taking a slot.
+    fn has_room(&self, key: &str) -> bool {
+        let held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
+        held.get(key).copied().unwrap_or(0) < self.per_key_cap
+            && self.in_flight.load(std::sync::atomic::Ordering::SeqCst) < self.cap
+    }
+
+    /// Takes a slot for `key` regardless of the caps: the thread it accounts for already
+    /// exists, so refusing the count would only hide it.
+    fn charge(&self, key: &str) {
+        let mut held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
+        *held.entry(key.to_string()).or_insert(0) += 1;
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn release(&self, key: &str) {
@@ -1657,20 +1675,35 @@ static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_per_key_cap
     MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
 );
 
-/// Releases a `ConcurrencyGate` slot on `Drop`, so the slot is freed whether the guarded
-/// scope returns normally or unwinds from a panic. `execute_cel_with_budget`'s spawned
-/// thread runs an untrusted, CRD-author-supplied CEL rule via `cel::Program::execute`,
-/// which has reachable `panic!` sites in the `cel` crate's evaluator (e.g. cel 0.14.3
-/// `objects.rs:1546`, `:1467`). A manually-placed `gate.release()` call *after*
-/// `execute()` would be skipped by such a panic, permanently leaking the slot -- enough
-/// leaked panics wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL
-/// validation, the exact DoS this file exists to prevent, just triggered by malformed
-/// input instead of slow input.
-struct GateGuard<'a>(&'a ConcurrencyGate, String);
+/// Where an evaluation thread stands with its caller. Only an `ABANDONED` thread (the
+/// caller timed out and left it running) holds a gate slot, so evaluations within budget
+/// never count against the cap, however many overlap.
+const EVAL_RUNNING: u8 = 0;
+const EVAL_FINISHED: u8 = 1;
+const EVAL_ABANDONED: u8 = 2;
+
+/// On `Drop` (thread return or panic unwind), releases the slot of an abandoned evaluation
+/// thread. `execute_cel_with_budget`'s spawned thread runs an untrusted, CRD-author-supplied
+/// CEL rule via `cel::Program::execute`, which has reachable `panic!` sites in the `cel`
+/// crate's evaluator (e.g. cel 0.14.3 `objects.rs:1546`, `:1467`); a manually-placed
+/// `gate.release()` after `execute()` would be skipped by such a panic and leak the slot,
+/// wedging `CEL_EVAL_THREAD_GATE` for every future CR write.
+struct GateGuard<'a>(
+    &'a ConcurrencyGate,
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicU8>,
+);
 
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
-        self.0.release(&self.1);
+        use std::sync::atomic::Ordering::SeqCst;
+        if self
+            .2
+            .compare_exchange(EVAL_RUNNING, EVAL_FINISHED, SeqCst, SeqCst)
+            .is_err()
+        {
+            self.0.release(&self.1);
+        }
     }
 }
 
@@ -1716,27 +1749,38 @@ fn run_within_budget<T: Send + 'static>(
     (gate, crd): (&'static ConcurrencyGate, &str),
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, CelEvalOverBudget> {
-    if !gate.try_acquire(crd) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !gate.has_room(crd) {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
     // The interpreter and cost replay recurse once per level of the rule's AST, which
     // compilation bounds at cel-go's 250 levels; the default 2 MiB thread stack is not
     // sized for that, so size it explicitly.
     let guard_key = crd.to_string();
+    let thread_state = std::sync::Arc::clone(&state);
     let spawned = std::thread::Builder::new()
         .stack_size(crate::cel_runtime::EVAL_STACK_SIZE)
         .spawn(move || {
-            let _guard = GateGuard(gate, guard_key);
+            let _guard = GateGuard(gate, guard_key, thread_state);
             let _ = tx.send(work());
         });
     if spawned.is_err() {
-        gate.release(crd);
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
-    rx.recv_timeout(budget)
-        .map_err(|_| CelEvalOverBudget::TimedOut)
+    rx.recv_timeout(budget).map_err(|_| {
+        // Charge before flipping the state so the thread's release can never precede it.
+        gate.charge(crd);
+        if state
+            .compare_exchange(EVAL_RUNNING, EVAL_ABANDONED, SeqCst, SeqCst)
+            .is_err()
+        {
+            gate.release(crd);
+        }
+        CelEvalOverBudget::TimedOut
+    })
 }
 
 /// Wall-clock backstop for the cost replay, 20x the plain budget: replay work is already
@@ -15299,6 +15343,44 @@ mod tests {
         );
     }
 
+    /// Concurrent writes to one CRD with validation rules must all succeed when every
+    /// evaluation finishes within budget: upstream has no cross-request concurrency gate, so
+    /// rejecting the 7th simultaneous write with "too many rules exceeding their time budget"
+    /// makes busy CRDs unwritable although nothing is slow.
+    #[test]
+    fn concurrent_writes_to_one_crd_are_not_rejected_when_every_rule_is_within_budget() {
+        use std::sync::Barrier;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_per_key_cap(
+            MAX_CONCURRENT_CEL_EVAL_THREADS,
+            MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
+        );
+        const WRITERS: usize = 16;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, "example.com/Widget"),
+                        || std::thread::sleep(std::time::Duration::from_millis(100)),
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        let rejected = handles
+            .into_iter()
+            .map(|h| h.join().expect("writer thread must not panic"))
+            .filter(|ok| !ok)
+            .count();
+        assert_eq!(
+            rejected, 0,
+            "{rejected} of {WRITERS} concurrent in-budget writes to one CRD were rejected"
+        );
+    }
+
     /// One CRD whose evaluations are all stuck must not stop another CRD's rules from
     /// validating: the cluster-wide gate used to be shared by every CRD.
     #[test]
@@ -15569,8 +15651,9 @@ mod tests {
         static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
         assert!(GATE.try_acquire(""), "gate must start with a free slot");
 
-        let panicked = std::thread::spawn(|| {
-            let _guard = GateGuard(&GATE, String::new());
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_ABANDONED));
+        let panicked = std::thread::spawn(move || {
+            let _guard = GateGuard(&GATE, String::new(), state);
             panic!("simulated cel::Program::execute panic, e.g. cel 0.14.3 objects.rs:1546");
         })
         .join();
