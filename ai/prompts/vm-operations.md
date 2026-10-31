@@ -223,6 +223,30 @@ compose the same way (`--all-e2e` ignored, warning printed to stderr).
 
 ---
 
+## Dual-stack rig — `--dual-stack` (opt-in)
+
+`run-all.sh` / `lima-start.sh` / `add-node.sh` accept `--dual-stack`. Lima's user-v2
+switch forwards IPv6 unicast between VMs but gives no routable v6 address and drops
+multicast, so NDP does not work: each VM gets a static ULA `fd85:0:0:1::<id>/64`
+(`_lib.sh` `lan_v6_addr_for`: `lima-node`=1, `lima-node-N`=N, `lima-node-smoke`=100)
+and a permanent `ip -6 neigh` entry for every peer VM on the same network. The ULA is
+also the kubelet's 2nd `--node-ip`. State lives in `/usr/local/sbin/u7s-lan-v6` +
+`u7s-lan-v6.service` (enabled, oneshot), so it survives VM reboots; every
+`lima-start.sh`/`add-node.sh` run rewrites it for the current mesh (idempotent). Without
+the flag the rig is unchanged (per-node `fd85:<n>::1`, no peer reachability).
+Pass `--dual-stack` to every node of a stack, and put both on the same `--network`.
+
+Exercisable: in-VM v6, VM<->VM v6 ping/TCP, pod/Service v6 and node v6 addresses
+inside the cluster. Not exercisable: Mac<->VM v6 (the host apiserver reaches VMs over
+IPv4 port-forwards; user-v2 gives the host no v6 path) and any external v6 reachability
+(GCP only).
+
+Verify two running same-network VMs with
+`scripts/conformance/dualstack-smoke.sh <vm-a> <vm-b>` (ping6, TCP, re-seed, unit
+restore).
+
+---
+
 ## Testing `scripts/install.sh` on a rig VM
 
 Never run install.sh on a rig VM by hand: the rig leaves

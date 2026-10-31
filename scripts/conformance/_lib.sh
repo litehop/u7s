@@ -290,3 +290,94 @@ apply_pod_recreating_on_args_change() {
     return 1
   }
 }
+
+# --- Opt-in dual-stack rig (--dual-stack) -----------------------------------
+# Lima's user-v2 switch forwards IPv6 unicast between VMs but hands out no
+# routable v6 address (no RA/DHCPv6) and drops the multicast NDP that would
+# resolve neighbours. So every VM gets a static ULA out of ONE shared /64 plus
+# a permanent neighbour entry per peer, re-applied at boot by a oneshot unit.
+
+LAN_V6_PREFIX="fd85:0:0:1"
+
+# Host id inside the shared /64, unique per rig VM name. Fails (non-zero) for
+# names it cannot place so two VMs never silently share an address.
+lan_v6_host_for() {
+  case "$1" in
+    lima-node) echo 1 ;;
+    lima-node-smoke) echo 100 ;;
+    lima-node-[0-9]*)
+      local n="${1#lima-node-}"
+      case "$n" in *[!0-9]*) return 1 ;; esac
+      echo "$n" ;;
+    *) return 1 ;;
+  esac
+}
+
+lan_v6_addr_for() {
+  local host
+  host=$(lan_v6_host_for "$1") || return 1
+  echo "${LAN_V6_PREFIX}::${host}"
+}
+
+# Script body run at boot: own address plus one permanent neighbour per peer.
+# Args: <iface> <self-addr> [<peer-addr> <peer-mac>]...
+lan_v6_script() {
+  local iface="$1" self="$2"
+  shift 2
+  echo "#!/bin/sh"
+  echo "ip -6 addr replace ${self}/64 dev ${iface} nodad"
+  while [ "$#" -ge 2 ]; do
+    echo "ip -6 neigh replace $1 lladdr $2 dev ${iface} nud permanent"
+    shift 2
+  done
+}
+
+lan_v6_vm_iface() {
+  limactl shell "$1" ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | head -1
+}
+
+# Installs the boot unit on <vm> and applies it now. Idempotent: rewrites both
+# files and restarts the unit, so a re-run converges on the given peer set.
+# Args: <vm> <iface> <self-addr> [<peer-addr> <peer-mac>]...
+lan_v6_install() {
+  local vm="$1"
+  shift
+  lan_v6_script "$@" | limactl shell "$vm" sudo tee /usr/local/sbin/u7s-lan-v6 >/dev/null
+  limactl shell "$vm" sudo chmod 0755 /usr/local/sbin/u7s-lan-v6
+  limactl shell "$vm" sudo tee /etc/systemd/system/u7s-lan-v6.service >/dev/null <<'UNIT'
+[Unit]
+Description=u7s dual-stack rig: static ULA and neighbour entries on the user-v2 NIC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/u7s-lan-v6
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  limactl shell "$vm" sudo systemctl daemon-reload
+  limactl shell "$vm" sudo systemctl enable u7s-lan-v6.service >/dev/null 2>&1
+  limactl shell "$vm" sudo systemctl restart u7s-lan-v6.service
+}
+
+# Full-mesh seeding across the given running VMs (all on one Lima network).
+lan_v6_seed_mesh() {
+  local vms=("$@") ifaces=() macs=() addrs=() i j args
+  for i in "${!vms[@]}"; do
+    ifaces[i]=$(lan_v6_vm_iface "${vms[$i]}")
+    [ -n "${ifaces[$i]}" ] || { echo "error: no global IPv4 NIC on ${vms[$i]}" >&2; return 1; }
+    addrs[i]=$(lan_v6_addr_for "${vms[$i]}") || { echo "error: no dual-stack host id for ${vms[$i]}" >&2; return 1; }
+    macs[i]=$(limactl shell "${vms[$i]}" cat "/sys/class/net/${ifaces[$i]}/address")
+  done
+  for i in "${!vms[@]}"; do
+    args=("${vms[$i]}" "${ifaces[$i]}" "${addrs[$i]}")
+    for j in "${!vms[@]}"; do
+      [ "$i" = "$j" ] && continue
+      args+=("${addrs[$j]}" "${macs[$j]}")
+    done
+    lan_v6_install "${args[@]}"
+  done
+}
