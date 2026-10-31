@@ -9,92 +9,38 @@
 # of the run — cluster health checks never noticed, so the outage was only
 # discovered ~12 hours later via a wall of unrelated e2e failures.
 #
-# Exercises real spawned processes (the real 'sleep' binary standing in for
-# kube-controller-manager via the same "$KCM_BINARY $args" contract
-# kcm-supervisor.sh uses in production) and real elapsed wall-clock time,
-# because the bug being guarded against is specifically about process-restart
-# *timing* — a test that only inspects strings can't distinguish "restarts
-# immediately" (a crash-loop that would burn CPU/API-server load) from
-# "restarts after a bounded backoff" (the fix).
+# The supervisor's sleep and clock are replaced via KCM_SUPERVISOR_SLEEP /
+# KCM_SUPERVISOR_NOW with a fake clock, and the kcm stand-in "runs" for a
+# scripted number of fake seconds then crashes. The exact backoff schedule and
+# circuit-breaker threshold are asserted with no wall-clock waits, so the
+# result cannot depend on host load. Each case uses its own mktemp -d (crash
+# log and marker included), so the file is safe to run in parallel.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SUPERVISOR="$SCRIPT_DIR/kcm-supervisor.sh"
-STATE_DIR="$(mktemp -d)"
-export KCM_CRASH_LOG="$STATE_DIR/kcm-crashes.log"
-export KCM_CRASH_MARKER="$STATE_DIR/kcm-crashed.marker"
-CRASH_LOG="$KCM_CRASH_LOG"
-CRASH_MARKER="$KCM_CRASH_MARKER"
-
-# Stand-in for the real kcm binary: a real, independently-schedulable process
-# (not just a string) that stays up until the test kills it. Using the real
-# 'sleep' binary directly (rather than a fake script with a #!/bin/bash
-# shebang) avoids kernel shebang-interpreter indirection, where the process's
-# actual argv[0] would become "bash <script-path>" instead of the script path
-# itself — that indirection made an earlier version of this test unable to
-# tell the exec'd child apart from the supervisor wrapper (whose own argv
-# also contains the fake binary's path as an argument).
-SLEEP_BIN="$(command -v sleep || true)"
-if [ -z "$SLEEP_BIN" ]; then
-  # Unlike an optional external tool (e.g. limactl, absent by default on CI
-  # runners), 'sleep' is the load-bearing kcm stand-in this whole file's
-  # PID-matching design depends on -- an empty SLEEP_BIN would make
-  # FAKE_PATTERN=" 300" accidentally match the supervisor wrapper's own
-  # command line (its trailing "300" arg is always space-adjacent), turning
-  # every assertion below into a false PASS instead of a clear failure. Fail
-  # loud here instead of letting that vacuous-pass hazard through.
-  echo "FAIL: 'sleep' binary not found on PATH -- required as this test's kube-controller-manager stand-in" >&2
-  exit 1
-fi
-# Per-run sleep argument: pkill -f on a shared " 300" would kill other tests running in parallel.
-SLEEP_ARG="300.$$"
-FAKE_PATTERN="${SLEEP_BIN} ${SLEEP_ARG}"
 
 PASS=0
 FAIL=0
-LEFTOVER_PIDS=()
+TMPDIRS=()
 
 cleanup() {
-  local p
-  for p in "${LEFTOVER_PIDS[@]:-}"; do
-    [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+  local d
+  for d in "${TMPDIRS[@]:-}"; do
+    if [ -n "$d" ]; then rm -rf "$d"; fi
   done
-  pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
-  rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
 
-assert_alive() {
-  local label="$1" pid="$2"
-  if kill -0 "$pid" 2>/dev/null; then
+assert_eq() {
+  local label="$1" got="$2" want="$3"
+  if [ "$got" = "$want" ]; then
     echo "PASS: $label"
     PASS=$(( PASS + 1 ))
   else
-    echo "FAIL: $label — PID $pid is not running"
-    FAIL=$(( FAIL + 1 ))
-  fi
-}
-
-assert_not_alive() {
-  local label="$1" pid="$2"
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "FAIL: $label — PID $pid is still running, expected it to have exited"
-    FAIL=$(( FAIL + 1 ))
-  else
-    echo "PASS: $label"
-    PASS=$(( PASS + 1 ))
-  fi
-}
-
-assert_file_exists() {
-  local label="$1" file="$2"
-  if [ -f "$file" ]; then
-    echo "PASS: $label"
-    PASS=$(( PASS + 1 ))
-  else
-    echo "FAIL: $label — $file does not exist"
+    echo "FAIL: $label — got '$got', want '$want'"
     FAIL=$(( FAIL + 1 ))
   fi
 }
@@ -112,244 +58,154 @@ assert_contains() {
   fi
 }
 
-assert_in_range() {
-  local label="$1" value="$2" min="$3" max="$4"
-  if [ "$value" -ge "$min" ] && [ "$value" -le "$max" ]; then
-    echo "PASS: $label (measured ${value}s, expected [${min},${max}]s)"
+assert_file_exists() {
+  local label="$1" file="$2"
+  if [ -f "$file" ]; then
+    echo "PASS: $label"
     PASS=$(( PASS + 1 ))
   else
-    echo "FAIL: $label (measured ${value}s, expected [${min},${max}]s)"
+    echo "FAIL: $label — $file does not exist"
     FAIL=$(( FAIL + 1 ))
   fi
 }
 
-# Starts the supervisor against the fake 'sleep 300' kcm stand-in and echoes
-# the supervisor's own PID. Extra args are appended to the supervisor's own
-# stdout/stderr redirect target.
-start_supervisor() {
-  local kcmlog="$1" redirect_to="$2"
-  shift 2
-  env "$@" bash "$SUPERVISOR" "$SLEEP_BIN" "$kcmlog" "$SLEEP_ARG" > "$redirect_to" 2>&1 &
-  echo $!
+# Creates a case directory W with the fake clock, fake sleep and a fake kcm.
+#   W/clock    current fake epoch seconds
+#   W/sleeps   one line per supervisor sleep, in order (the backoff schedule)
+#   W/uptimes  line N = fake seconds the Nth kcm launch runs before crashing
+#              (missing lines = 0)
+#   W/launches one line per kcm launch, recording its argv
+# Sets W.
+new_case() {
+  local w
+  w="$(mktemp -d)"
+  TMPDIRS+=("$w")
+  echo 1000 > "$w/clock"
+  : > "$w/sleeps"
+  : > "$w/launches"
+  : > "$w/uptimes"
+  cat > "$w/now" <<EOF
+#!/usr/bin/env bash
+read -r c < "$w/clock"; echo "\$c"
+EOF
+  cat > "$w/sleep" <<EOF
+#!/usr/bin/env bash
+echo "\$1" >> "$w/sleeps"
+read -r c < "$w/clock"
+echo \$(( c + \$1 )) > "$w/clock"
+EOF
+  cat > "$w/kcm" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$w/launches"
+n=0
+while read -r _; do n=\$(( n + 1 )); done < "$w/launches"
+up=0
+i=0
+while read -r line; do i=\$(( i + 1 )); [ "\$i" = "\$n" ] && up=\$line; done < "$w/uptimes"
+read -r c < "$w/clock"
+echo \$(( c + up )) > "$w/clock"
+exit 137
+EOF
+  chmod +x "$w/now" "$w/sleep" "$w/kcm"
+  W="$w"
 }
 
-# Polls for a process matching 'pattern' whose PID is not 'exclude_pid', up
-# to 'timeout' seconds. Echoes the first matching PID found, or nothing.
-wait_for_new_pid() {
-  local pattern="$1" exclude_pid="$2" timeout="$3"
-  local deadline=$(( $(date +%s) + timeout ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    local found
-    found="$(pgrep -f "$pattern" 2>/dev/null | grep -vx "$exclude_pid" || true)"
-    if [ -n "$found" ]; then
-      printf '%s\n' "$found" | head -1
-      return 0
-    fi
-    sleep 0.3
-  done
-  return 0
+# run_supervisor <case-dir> [ENV=VAL...] — runs the supervisor to completion
+# (it must exit by itself via the circuit breaker) and echoes its exit status.
+run_supervisor() {
+  local w="$1" rc=0
+  shift
+  env KCM_SUPERVISOR_NOW="$w/now" KCM_SUPERVISOR_SLEEP="$w/sleep" \
+    KCM_CRASH_LOG="$w/crashes.log" KCM_CRASH_MARKER="$w/crashed.marker" \
+    "$@" bash "$SUPERVISOR" "$w/kcm" "$w/kcm.log" --flag one > /dev/null 2> "$w/stderr" || rc=$?
+  echo "$rc"
 }
+
+schedule() { paste -sd' ' "$1/sleeps"; }
+launches() { wc -l < "$1/launches" | tr -d ' '; }
 
 # ---------------------------------------------------------------------------
-# Test: supervisor_starts_kcm_and_returns_supervisor_pid
+# Default config, kcm crashing instantly every time.
 #
-# Happy path. Matters because the outer 04-start-kcm.sh script relies on
-# getting a live PID back immediately (it must "return after kcm is ready")
-# — if wrapping kcm in a supervisor broke the basic launch, every conformance
-# run would fail at step 04 instead of gaining crash protection.
+# Doubling backoff gives a still-broken kcm progressively more room; a flat or
+# immediate retry would hammer it and the API server it watches. The breaker
+# must trip on the 5th crash so a poison-pill build stops crash-looping
+# instead of burning CPU/log space for the rest of an unattended run.
 # ---------------------------------------------------------------------------
-test1_starts_and_returns_pid() {
-  echo "--- supervisor_starts_kcm_and_returns_supervisor_pid ---"
-  local kcmlog sup_pid kcm_pid
-  kcmlog="$(mktemp)"
+test_default_schedule_and_breaker() {
+  echo "--- default backoff schedule and circuit breaker ---"
+  local w rc
+  new_case; w="$W"
+  rc="$(run_supervisor "$w")"
 
-  sup_pid="$(start_supervisor "$kcmlog" /dev/null)"
-  LEFTOVER_PIDS+=("$sup_pid")
-
-  kcm_pid="$(wait_for_new_pid "$FAKE_PATTERN" "" 5)"
-
-  assert_alive "supervisor process stays running so an operator can tell kcm is under supervision" "$sup_pid"
-  if [ -n "$kcm_pid" ]; then
-    echo "PASS: supervisor launches a real kcm process reachable via ps (PID $kcm_pid)"
-    PASS=$(( PASS + 1 ))
-  else
-    echo "FAIL: supervisor launches a real kcm process reachable via ps — none found"
-    FAIL=$(( FAIL + 1 ))
-  fi
-
-  kill -9 "$sup_pid" 2>/dev/null || true
-  pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
+  assert_eq "backoff doubles from 10s and never sleeps after the tripping crash" "$(schedule "$w")" "10 20 40 80"
+  assert_eq "kcm is launched exactly 5 times: 4 restarts then give up" "$(launches "$w")" "5"
+  assert_eq "supervisor exits 1 once the breaker trips so 04-start-kcm.sh / pollers see failure" "$rc" "1"
+  assert_eq "kcm receives the caller's arguments unchanged" "$(head -1 "$w/launches")" "--flag one"
+  assert_contains "circuit-breaker banner tells an operator tailing the log WHY restarts stopped" "$w/stderr" "CIRCUIT BREAKER TRIPPED"
+  assert_file_exists "crash marker exists for a returning operator/poller once the live banner is gone" "$w/crashed.marker"
+  assert_contains "marker records the crash count" "$w/crashed.marker" "crash_count=5"
+  assert_contains "marker records the real exit code (137 = SIGKILL)" "$w/crashed.marker" "last_exit_code=137"
+  assert_eq "one crash-log line per crash" "$(wc -l < "$w/crashes.log" | tr -d ' ')" "5"
+  assert_eq "crash-log counts run 1..5 so the streak is reconstructable" \
+    "$(sed -E 's/.*crash_count=//' "$w/crashes.log" | paste -sd' ' -)" "1 2 3 4 5"
+  assert_contains "crash log records exit code and zero uptime" "$w/crashes.log" "exit_code=137 uptime_s=0"
 }
 
 # ---------------------------------------------------------------------------
-# Test: supervisor_restarts_kcm_on_exit_1_with_backoff
-# Test: supervisor_writes_crash_event_on_restart
-#
-# These share one induced crash: the first verifies the restart itself is
-# delayed (an immediate restart-loop would hammer a still-broken kcm and the
-# API server it's watching), the second verifies the crash is durably
-# recorded (an operator who missed the live stderr banner still needs to see
-# it happened).
+# Backoff is capped. Uncapped doubling would eventually park a recovering kcm
+# for hours; the cap bounds worst-case recovery delay.
 # ---------------------------------------------------------------------------
-test2_and_3_restart_and_log() {
-  echo "--- supervisor_restarts_kcm_on_exit_1_with_backoff ---"
-  local kcmlog sup_pid pid1 pid2 t0 t1 elapsed lines
-  kcmlog="$(mktemp)"
+test_backoff_cap() {
+  echo "--- backoff cap ---"
+  local w
+  new_case; w="$W"
+  run_supervisor "$w" KCM_CRASH_BURST_LIMIT=8 > /dev/null
+  assert_eq "default cap holds at 160s" "$(schedule "$w")" "10 20 40 80 160 160 160"
 
-  sup_pid="$(start_supervisor "$kcmlog" /dev/null)"
-  LEFTOVER_PIDS+=("$sup_pid")
-
-  pid1="$(wait_for_new_pid "$FAKE_PATTERN" "" 5)"
-  if [ -z "$pid1" ]; then
-    echo "FAIL: supervisor_restarts_kcm_on_exit_1_with_backoff — kcm never started"
-    FAIL=$(( FAIL + 1 ))
-    kill -9 "$sup_pid" 2>/dev/null || true
-    return
-  fi
-
-  t0="$(date +%s)"
-  kill -9 "$pid1" 2>/dev/null || true
-
-  pid2="$(wait_for_new_pid "$FAKE_PATTERN" "$pid1" 20)"
-  t1="$(date +%s)"
-
-  if [ -z "$pid2" ]; then
-    echo "FAIL: supervisor_restarts_kcm_on_exit_1_with_backoff — kcm was never restarted after crashing"
-    FAIL=$(( FAIL + 1 ))
-  else
-    elapsed=$(( t1 - t0 ))
-    assert_in_range \
-      "restart is delayed ~10s (bounded backoff), not an immediate crash-loop that would hammer a still-broken kcm" \
-      "$elapsed" 6 16
-  fi
-
-  echo "--- supervisor_writes_crash_event_on_restart ---"
-  lines="$(wc -l < "$CRASH_LOG" | tr -d ' ')"
-  if [ "$lines" = "1" ]; then
-    echo "PASS: exactly one crash event recorded for the one induced crash — a returning operator counting crashes needs one line per crash, not zero or duplicates"
-    PASS=$(( PASS + 1 ))
-  else
-    echo "FAIL: expected exactly 1 line in $CRASH_LOG after one crash, got $lines"
-    cat "$CRASH_LOG" 2>/dev/null
-    FAIL=$(( FAIL + 1 ))
-  fi
-  assert_contains "crash event records the real exit code (137 = SIGKILL) so an operator can tell a panic from a clean shutdown" "$CRASH_LOG" "exit_code=137"
-  assert_contains "crash event is numbered as the 1st crash of this streak" "$CRASH_LOG" "crash_count=1"
-
-  kill -9 "$sup_pid" 2>/dev/null || true
-  [ -n "$pid2" ] && kill -9 "$pid2" 2>/dev/null || true
-  pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
+  new_case; w="$W"
+  run_supervisor "$w" KCM_BACKOFF_MAX_SECS=30 > /dev/null
+  assert_eq "KCM_BACKOFF_MAX_SECS clamps the doubling" "$(schedule "$w")" "10 20 30 30"
 }
 
 # ---------------------------------------------------------------------------
-# Test: supervisor_gives_up_after_5_crashes_in_60s
-#
-# The poison-pill circuit breaker. Without it, a genuinely broken kcm build
-# (bad flags, a cert mismatch, an immediate panic on every launch) would
-# restart-loop forever, burning CPU/log space for the rest of an unattended
-# run instead of surfacing a clear "give up and page someone" signal.
-#
-# Backoff base is overridden to 1s here purely for test speed: the production
-# default (base 10s) reaches the 5th crash after ~150s of real backoff, which
-# is the same code path just slower — the doubling/burst-limit logic under
-# test is identical either way. The other tests exercise the real 10s
-# default.
+# Streak reset on stable uptime. A kcm that ran healthily for >= 60s before
+# crashing is a fresh incident, not the continuation of a poison pill; without
+# the reset a kcm that crashes once a day would eventually be abandoned.
 # ---------------------------------------------------------------------------
-test4_circuit_breaker() {
-  echo "--- supervisor_gives_up_after_5_crashes_in_60s ---"
-  local kcmlog suplog sup_pid prev_pid pid i deadline
-  kcmlog="$(mktemp)"
-  suplog="$(mktemp)"
+test_stable_uptime_resets_streak() {
+  echo "--- stable uptime resets the crash streak ---"
+  local w
+  new_case; w="$W"
+  printf '0\n0\n60\n' > "$w/uptimes"
+  run_supervisor "$w" > /dev/null
+  assert_eq "a 60s run restarts the streak at 1: backoff drops back to 10s and breaker needs 5 more crashes" \
+    "$(schedule "$w")" "10 20 10 20 40 80"
+  assert_eq "kcm launched 7 times (2 crashes + stable crash + 4 more)" "$(launches "$w")" "7"
 
-  sup_pid="$(start_supervisor "$kcmlog" "$suplog" KCM_BACKOFF_BASE_SECS=1)"
-  LEFTOVER_PIDS+=("$sup_pid")
-
-  prev_pid=""
-  for i in 1 2 3 4 5; do
-    pid="$(wait_for_new_pid "$FAKE_PATTERN" "$prev_pid" 15)"
-    if [ -z "$pid" ]; then
-      echo "FAIL: supervisor_gives_up_after_5_crashes_in_60s — kcm attempt #$i never started"
-      FAIL=$(( FAIL + 1 ))
-      kill -9 "$sup_pid" 2>/dev/null || true
-      pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
-      return
-    fi
-    kill -9 "$pid" 2>/dev/null || true
-    prev_pid="$pid"
-  done
-
-  deadline=$(( $(date +%s) + 10 ))
-  while kill -0 "$sup_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
-    sleep 0.3
-  done
-
-  assert_not_alive "supervisor process exits once the circuit breaker trips, instead of crash-looping forever against a poison pill" "$sup_pid"
-  assert_contains "circuit-breaker banner is printed so an operator tailing the supervisor log sees WHY kcm stopped restarting" "$suplog" "CIRCUIT BREAKER TRIPPED"
-  assert_file_exists "crash marker file exists for a returning operator/dashboard-poller to grep, since a live stderr banner is gone once the terminal session ends" "$CRASH_MARKER"
-
-  pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
+  new_case; w="$W"
+  printf '0\n0\n59\n' > "$w/uptimes"
+  run_supervisor "$w" > /dev/null
+  assert_eq "a 59s run is below the stable threshold: no reset, breaker trips on crash 5" \
+    "$(schedule "$w")" "10 20 40 80"
+  assert_contains "crash log records the measured uptime" "$w/crashes.log" "uptime_s=59 crash_count=3"
 }
 
 # ---------------------------------------------------------------------------
-# Test: supervisor_backoff_doubles
-#
-# A flat retry interval would hammer a still-crashing kcm (and the API
-# server it watches) at a constant rate forever; doubling backoff gives a
-# still-broken process progressively more room before the next attempt.
+# Env overrides of the breaker threshold and backoff base.
 # ---------------------------------------------------------------------------
-test5_backoff_doubles() {
-  echo "--- supervisor_backoff_doubles ---"
-  local kcmlog sup_pid pid1 pid2 pid3 t0 t1 t2 t3 backoff1 backoff2
-  kcmlog="$(mktemp)"
-
-  sup_pid="$(start_supervisor "$kcmlog" /dev/null)"
-  LEFTOVER_PIDS+=("$sup_pid")
-
-  pid1="$(wait_for_new_pid "$FAKE_PATTERN" "" 5)"
-  if [ -z "$pid1" ]; then
-    echo "FAIL: supervisor_backoff_doubles — kcm never started"
-    FAIL=$(( FAIL + 1 ))
-    kill -9 "$sup_pid" 2>/dev/null || true
-    return
-  fi
-
-  t0="$(date +%s)"
-  kill -9 "$pid1" 2>/dev/null || true
-  pid2="$(wait_for_new_pid "$FAKE_PATTERN" "$pid1" 20)"
-  t1="$(date +%s)"
-  backoff1=$(( t1 - t0 ))
-
-  if [ -z "$pid2" ]; then
-    echo "FAIL: supervisor_backoff_doubles — kcm was never restarted after the 1st crash"
-    FAIL=$(( FAIL + 1 ))
-    kill -9 "$sup_pid" 2>/dev/null || true
-    pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
-    return
-  fi
-
-  t2="$(date +%s)"
-  kill -9 "$pid2" 2>/dev/null || true
-  pid3="$(wait_for_new_pid "$FAKE_PATTERN" "$pid2" 30)"
-  t3="$(date +%s)"
-  backoff2=$(( t3 - t2 ))
-
-  if [ -z "$pid3" ]; then
-    echo "FAIL: supervisor_backoff_doubles — kcm was never restarted after the 2nd crash"
-    FAIL=$(( FAIL + 1 ))
-  else
-    assert_in_range \
-      "2nd restart delay is ~20s, double the 1st (~${backoff1}s) — proves growth, not a fixed retry interval" \
-      "$backoff2" 15 26
-  fi
-
-  kill -9 "$sup_pid" 2>/dev/null || true
-  pkill -9 -f "$FAKE_PATTERN" 2>/dev/null || true
+test_overrides() {
+  echo "--- env overrides ---"
+  local w
+  new_case; w="$W"
+  run_supervisor "$w" KCM_CRASH_BURST_LIMIT=2 KCM_BACKOFF_BASE_SECS=3 > /dev/null
+  assert_eq "burst limit 2 gives one restart, at the overridden base" "$(schedule "$w")" "3"
 }
 
-test1_starts_and_returns_pid
-test2_and_3_restart_and_log
-test4_circuit_breaker
-test5_backoff_doubles
+test_default_schedule_and_breaker
+test_backoff_cap
+test_stable_uptime_resets_streak
+test_overrides
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
