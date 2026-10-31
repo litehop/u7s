@@ -1574,16 +1574,27 @@ const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_mill
 /// many over-budget evaluations at once.
 const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
 
-/// Bounds how many owners may hold a slot at once, rejecting new acquisitions outright
-/// once the cap is reached instead of letting the count grow without bound. A plain
-/// struct (rather than a bare static counter) so the bounding behavior can be exercised
-/// directly in a test with its own small, local cap — the real, process-wide gate below
-/// is shared by every concurrent request's CEL evaluation, so a test that saturated it
-/// (even briefly) would spuriously reject unrelated evaluations running at the same time.
+/// Upper bound on evaluation threads alive at once, abandoned ones included. Reserved
+/// before a thread is spawned, so a burst of pathological writes cannot grow the thread
+/// count past it. Sized to upstream's `--max-mutating-requests-inflight` default (200) so
+/// ordinary request concurrency never reaches it.
+const MAX_LIVE_CEL_EVAL_THREADS: usize = 200;
+
+/// Two independent limits on CEL evaluation threads, rejecting outright once either is
+/// reached. A plain struct (rather than bare static counters) so the behavior can be
+/// exercised in a test with its own small caps — the real, process-wide gate below is
+/// shared by every concurrent request, so a test that saturated it (even briefly) would
+/// spuriously reject unrelated evaluations.
 ///
-/// Slots are also counted per key (a CRD), so one key cannot hold more than `per_key_cap`
-/// of the `cap` slots and starve the rest.
+/// - `live`: every evaluation thread, reserved before spawn and released when the thread
+///   exits, so the total thread count is bounded by construction.
+/// - abandoned (`in_flight`, `per_key`): threads whose caller timed out and left them
+///   running, charged on abandonment. At most `cap` overall and `per_key_cap` per key (a
+///   CRD) may run, so one CRD with stuck evaluations cannot use up the `live` ceiling for
+///   the others. Evaluations within budget never count here.
 struct ConcurrencyGate {
+    live: std::sync::atomic::AtomicUsize,
+    live_cap: usize,
     in_flight: std::sync::atomic::AtomicUsize,
     cap: usize,
     per_key_cap: usize,
@@ -1596,8 +1607,15 @@ impl ConcurrencyGate {
         Self::with_per_key_cap(cap, cap)
     }
 
+    #[cfg(test)]
     const fn with_per_key_cap(cap: usize, per_key_cap: usize) -> Self {
+        Self::with_caps(usize::MAX, cap, per_key_cap)
+    }
+
+    const fn with_caps(live_cap: usize, cap: usize, per_key_cap: usize) -> Self {
         Self {
+            live: std::sync::atomic::AtomicUsize::new(0),
+            live_cap,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             cap,
             per_key_cap,
@@ -1605,10 +1623,26 @@ impl ConcurrencyGate {
         }
     }
 
+    /// Reserves one of the `live_cap` thread slots; the caller must `release_live` it when
+    /// the thread exits (or was never spawned).
+    fn try_reserve_live(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.live.fetch_add(1, SeqCst) >= self.live_cap {
+            self.live.fetch_sub(1, SeqCst);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn release_live(&self) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reserves an abandoned-thread slot for `key` and returns `true`, or returns `false`
+    /// if either cap has already been reached. On `false` no slot is held, so the caller
+    /// must not call `release`.
     #[cfg(test)]
-    /// Reserves a slot for `key` and returns `true`, or returns `false` if either cap has
-    /// already been reached. On `false` no slot is held, so the caller must not call
-    /// `release`.
     fn try_acquire(&self, key: &str) -> bool {
         use std::sync::atomic::Ordering;
         {
@@ -1670,7 +1704,8 @@ impl ConcurrencyGate {
 const MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD: usize = 6;
 
 /// The process-wide gate every `execute_cel_with_budget` call reserves a slot from.
-static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_per_key_cap(
+static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_caps(
+    MAX_LIVE_CEL_EVAL_THREADS,
     MAX_CONCURRENT_CEL_EVAL_THREADS,
     MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
 );
@@ -1682,8 +1717,23 @@ const EVAL_RUNNING: u8 = 0;
 const EVAL_FINISHED: u8 = 1;
 const EVAL_ABANDONED: u8 = 2;
 
-/// On `Drop` (thread return or panic unwind), releases the slot of an abandoned evaluation
-/// thread. `execute_cel_with_budget`'s spawned thread runs an untrusted, CRD-author-supplied
+/// Caller side of the hand-off: charges an abandoned-thread slot, unless the thread
+/// finished first, in which case the charge is undone. Exactly one of this and the
+/// thread's `GateGuard` releases the slot, whichever order they run in.
+fn abandon_eval(gate: &ConcurrencyGate, key: &str, state: &std::sync::atomic::AtomicU8) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // Charge before flipping the state so the thread's release can never precede it.
+    gate.charge(key);
+    if state
+        .compare_exchange(EVAL_RUNNING, EVAL_ABANDONED, SeqCst, SeqCst)
+        .is_err()
+    {
+        gate.release(key);
+    }
+}
+
+/// On `Drop` (thread return or panic unwind), gives back the thread's `live` slot and, if
+/// the caller abandoned it, its abandoned-thread slot. `execute_cel_with_budget`'s spawned thread runs an untrusted, CRD-author-supplied
 /// CEL rule via `cel::Program::execute`, which has reachable `panic!` sites in the `cel`
 /// crate's evaluator (e.g. cel 0.14.3 `objects.rs:1546`, `:1467`); a manually-placed
 /// `gate.release()` after `execute()` would be skipped by such a panic and leak the slot,
@@ -1697,6 +1747,7 @@ struct GateGuard<'a>(
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::SeqCst;
+        self.0.release_live();
         if self
             .2
             .compare_exchange(EVAL_RUNNING, EVAL_FINISHED, SeqCst, SeqCst)
@@ -1749,8 +1800,7 @@ fn run_within_budget<T: Send + 'static>(
     (gate, crd): (&'static ConcurrencyGate, &str),
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, CelEvalOverBudget> {
-    use std::sync::atomic::Ordering::SeqCst;
-    if !gate.has_room(crd) {
+    if !gate.has_room(crd) || !gate.try_reserve_live() {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
@@ -1768,17 +1818,11 @@ fn run_within_budget<T: Send + 'static>(
             let _ = tx.send(work());
         });
     if spawned.is_err() {
+        gate.release_live();
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
     rx.recv_timeout(budget).map_err(|_| {
-        // Charge before flipping the state so the thread's release can never precede it.
-        gate.charge(crd);
-        if state
-            .compare_exchange(EVAL_RUNNING, EVAL_ABANDONED, SeqCst, SeqCst)
-            .is_err()
-        {
-            gate.release(crd);
-        }
+        abandon_eval(gate, crd, &state);
         CelEvalOverBudget::TimedOut
     })
 }
@@ -14124,15 +14168,10 @@ mod tests {
                 <= crate::handlers::cel_cost::CALL_COST_LIMIT
         });
         assert!(matches!(verdict, Ok(false)), "counted verdict expected");
-        let mut spins = 0u64;
-        while !GATE.try_acquire("") {
-            spins += 1;
-            assert!(
-                spins < 50_000_000,
-                "the replay thread never released its slot"
-            );
-            std::thread::yield_now();
-        }
+        wait_until("the replay thread to release its slot", || {
+            GATE.live.load(std::sync::atomic::Ordering::SeqCst) == 0
+        });
+        assert_eq!(GATE.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -15648,10 +15687,15 @@ mod tests {
     // sites to actually fire.
     #[test]
     fn gate_guard_releases_slot_even_when_guarded_scope_panics() {
-        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
-        assert!(GATE.try_acquire(""), "gate must start with a free slot");
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(1, 1, 1);
+        assert!(GATE.try_reserve_live());
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
+        abandon_eval(&GATE, "", &state);
+        assert!(
+            !GATE.has_room(""),
+            "setup: the abandoned thread holds its slot"
+        );
 
-        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_ABANDONED));
         let panicked = std::thread::spawn(move || {
             let _guard = GateGuard(&GATE, String::new(), state);
             panic!("simulated cel::Program::execute panic, e.g. cel 0.14.3 objects.rs:1546");
@@ -15664,11 +15708,118 @@ mod tests {
              unwind path this test is checking"
         );
         assert!(
-            GATE.try_acquire(""),
+            GATE.has_room("") && GATE.try_reserve_live(),
             "a slot leaked across a panic inside the guarded region -- GateGuard's Drop \
-             must run gate.release() during unwinding, not only on normal return, or a \
-             handful of panicking CEL rules permanently wedges the process-wide gate and \
-             blocks every future CR write's CEL validation"
+             must release during unwinding, not only on normal return, or a handful of \
+             panicking CEL rules permanently wedges the process-wide gate and blocks every \
+             future CR write's CEL validation"
+        );
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A thread that finishes just as its caller gives up must not leave a slot charged
+    /// (writes to that CRD would shrink toward permanent rejection), and one that is
+    /// abandoned first must hand its slot back exactly once when it exits (a double release
+    /// would underflow the counters and disable the cap).
+    #[test]
+    fn eval_finishing_and_caller_abandoning_in_either_order_release_exactly_once() {
+        use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8);
+
+        let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
+        assert!(GATE.try_reserve_live());
+        drop(GateGuard(&GATE, "k".into(), state.clone()));
+        abandon_eval(&GATE, "k", &state);
+        assert_eq!(GATE.in_flight.load(SeqCst), 0, "finish then abandon");
+        assert_eq!(GATE.live.load(SeqCst), 0);
+        assert!(GATE.per_key.lock().unwrap().is_empty());
+
+        let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
+        assert!(GATE.try_reserve_live());
+        abandon_eval(&GATE, "k", &state);
+        assert_eq!(
+            GATE.in_flight.load(SeqCst),
+            1,
+            "abandoned thread is charged"
+        );
+        drop(GateGuard(&GATE, "k".into(), state));
+        assert_eq!(GATE.in_flight.load(SeqCst), 0, "abandon then finish");
+        assert_eq!(GATE.live.load(SeqCst), 0);
+        assert!(GATE.per_key.lock().unwrap().is_empty());
+    }
+
+    /// A rule that panics the evaluation thread surfaces as a timeout (the channel
+    /// disconnects) and must leave nothing charged, whichever of the caller's give-up and
+    /// the thread's unwind runs first.
+    #[test]
+    fn eval_thread_panic_is_reported_as_timeout_and_leaves_the_gate_empty() {
+        use std::sync::atomic::Ordering::SeqCst;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8);
+        let result =
+            run_within_budget::<()>(std::time::Duration::from_secs(30), (&GATE, "k"), || {
+                panic!("simulated cel panic")
+            });
+        assert!(matches!(result, Err(CelEvalOverBudget::TimedOut)));
+        wait_until("panicked thread to give back its slots", || {
+            GATE.live.load(SeqCst) == 0 && GATE.in_flight.load(SeqCst) == 0
+        });
+        assert!(GATE.has_room("k"));
+    }
+
+    /// A burst of stuck evaluations must not grow the thread count past the ceiling:
+    /// the over-ceiling write is refused at once instead of spawning another uncancellable
+    /// thread, and the ceiling frees up as the threads exit.
+    #[test]
+    fn evaluation_thread_ceiling_refuses_the_extra_write_immediately_and_recovers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const CEILING: usize = 3;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(CEILING, 100, 100);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let callers: Vec<_> = (0..CEILING)
+            .map(|i| {
+                let held = Arc::clone(&held);
+                std::thread::spawn(move || {
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, &format!("crd{i}")),
+                        move || {
+                            let _ = held.lock().unwrap().recv();
+                        },
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        wait_until("all evaluation threads to be live", || {
+            GATE.live.load(SeqCst) == CEILING
+        });
+
+        let started = std::time::Instant::now();
+        let refused = run_within_budget(
+            std::time::Duration::from_secs(30),
+            (&GATE, "crd-extra"),
+            || (),
+        );
+        assert!(matches!(refused, Err(CelEvalOverBudget::TooManyInFlight)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(GATE.live.load(SeqCst), CEILING, "a refusal holds no slot");
+
+        drop(release);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        wait_until("evaluation threads to exit", || GATE.live.load(SeqCst) == 0);
+        assert!(
+            run_within_budget(std::time::Duration::from_secs(30), (&GATE, "x"), || ()).is_ok(),
+            "writes must be accepted again once the threads exit"
         );
     }
 
