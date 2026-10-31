@@ -710,6 +710,53 @@ fn allows_create_on_update(group: &str, plural: &str) -> bool {
     )
 }
 
+/// Upstream `AllowUnconditionalUpdate()` for the create-on-update kinds: every one of them
+/// (services, endpoints, events, limitranges, RBAC, leases, runtimeclasses) is true.
+fn allows_unconditional_update(group: &str, plural: &str) -> bool {
+    allows_create_on_update(group, plural)
+}
+
+/// Precondition for the update a PUT-create degrades to when it loses a create race.
+/// Upstream `GuaranteedUpdate` retries the closure against the now-existing object: an empty
+/// resourceVersion updates unconditionally only if the kind `AllowUnconditionalUpdate()`s,
+/// otherwise it is 422 "must be specified for an update"; a stated resourceVersion is compared
+/// by the store and conflicts (409) on mismatch.
+fn lost_create_race_precondition(
+    unconditional_update: bool,
+    expected_revision: Option<u64>,
+    kind: &str,
+    name: &str,
+) -> Result<Option<u64>, crate::status::StatusError> {
+    if expected_revision.is_none() && !unconditional_update {
+        return Err(Status::unprocessable_entity(format!(
+            "{kind} \"{name}\" is invalid: metadata.resourceVersion: Invalid value: 0x0: must be \
+             specified for an update"
+        )));
+    }
+    Ok(expected_revision)
+}
+
+/// Persist a PUT-create that found the object already created by a concurrent writer.
+async fn update_after_lost_create_race<S: Store>(
+    state: &AppState<S>,
+    key: &str,
+    body: Bytes,
+    expected_revision: Option<u64>,
+    (group, plural, name, kind): (&str, &str, &str, &str),
+) -> Result<u64, crate::status::StatusError> {
+    let precondition = lost_create_race_precondition(
+        allows_unconditional_update(group, plural),
+        expected_revision,
+        kind,
+        name,
+    )?;
+    state
+        .store
+        .put(key, body, precondition)
+        .await
+        .map_err(|e| store_err(e, group, plural, name, kind))
+}
+
 /// Authorize the `create` verb for a PUT/PATCH/apply that is about to create an object.
 /// The auth layer only authorized the HTTP-method verb (update/patch); upstream's
 /// create-on-update path additionally requires `create` (`withAuthorization` in
@@ -1137,9 +1184,18 @@ pub(crate) async fn replace_resource<S: Store>(
     }
 
     let put_start = std::time::Instant::now();
+    let create_only = old_object.is_none() && expected_revision.is_none();
     let put_result = state
         .store
-        .put(&key, obj.to_bytes(), expected_revision)
+        .put(
+            &key,
+            obj.to_bytes(),
+            if create_only {
+                Some(0)
+            } else {
+                expected_revision
+            },
+        )
         .await;
     tracing::debug!(
         key = %key,
@@ -1147,7 +1203,19 @@ pub(crate) async fn replace_resource<S: Store>(
         ok = put_result.is_ok(),
         "replace_resource: store.put call completed"
     );
-    let new_rv = put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
+    let new_rv = match put_result {
+        Err(StoreError::AlreadyExists { .. }) if create_only => {
+            update_after_lost_create_race(
+                &state,
+                &key,
+                obj.to_bytes(),
+                expected_revision,
+                (&group, &plural, &name, &meta.kind),
+            )
+            .await?
+        }
+        r => r.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?,
+    };
 
     obj.set_resource_version(new_rv);
     apply_cluster_write_effects(
@@ -4421,15 +4489,17 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             ) => {
                 return Err(Status::namespace_create_rejected(&ns, &e));
             }
-            // Mirrors create_namespaced_resource's POST loop: a create-on-missing PUT that
-            // loses a create race against a concurrent create of the same createOrUpdate
-            // resource (events) must still upsert, not surface the store's AlreadyExists as
-            // a spurious 409 on what the client sees as a plain PUT.
-            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => state
-                .store
-                .put(&key, obj.to_bytes(), None)
-                .await
-                .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?,
+            // Lost a create race: continue as the update upstream retries into.
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
+                update_after_lost_create_race(
+                    &state,
+                    &key,
+                    obj.to_bytes(),
+                    expected_revision,
+                    (&group, &plural, &name, &meta.kind),
+                )
+                .await?
+            }
             Err(CreateNamespacedError::Store(e)) => {
                 return Err(store_err(e, &group, &plural, &name, &meta.kind))
             }
@@ -8267,6 +8337,80 @@ mod tests {
              (createOrUpdate is an unconditional replace, not a merge) — if this fails, the \
              fallback never ran and the winner's stale object was left in place"
         );
+    }
+
+    /// A PUT-create that loses a create race continues as an update (upstream GuaranteedUpdate
+    /// retry): an empty resourceVersion overwrites only if the kind allows unconditional
+    /// update, otherwise it is 422; a stated one is CAS-compared.
+    #[test]
+    fn lost_create_race_precondition_follows_allow_unconditional_update() {
+        assert_eq!(
+            lost_create_race_precondition(true, None, "Service", "s").unwrap(),
+            None,
+            "AllowUnconditionalUpdate kinds overwrite the race winner"
+        );
+        let err = lost_create_race_precondition(false, None, "Foo", "f")
+            .expect_err("kinds without AllowUnconditionalUpdate must not clobber the winner");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.message.contains("must be specified for an update"));
+        assert_eq!(
+            lost_create_race_precondition(false, Some(7), "Foo", "f").unwrap(),
+            Some(7)
+        );
+    }
+
+    /// Cluster-scoped PUT-create has the same lost-race semantics as the namespaced path:
+    /// a clean upstream-style update (no 500), here unconditional because RuntimeClass allows it.
+    #[tokio::test]
+    async fn cluster_put_create_losing_race_updates_like_namespaced_path() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let winner = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+            "metadata": {"name": "race-rc"}, "handler": "winner"
+        });
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&winner).unwrap()),
+        ));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
+        let loser = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+            "metadata": {"name": "race-rc"}, "handler": "loser"
+        });
+        let resp = replace_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "node.k8s.io".into(),
+                "v1".into(),
+                "runtimeclasses".into(),
+                "race-rc".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&loser).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("lost create race must resolve cleanly: {e:?}"))
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let stored = inner
+            .get("/registry/node.k8s.io/runtimeclasses/race-rc")
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(body["handler"], "loser");
     }
 
     /// `do_patch`'s SSA-create branch admits against `quota::check_resource_quota` (a prior
