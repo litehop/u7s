@@ -10667,6 +10667,7 @@ mod tests {
         //    projects an SA token into a pod volume.
         let token_handler_result = handlers::tokens::create_token(
             axum::extract::State(state),
+            axum::Extension(auth::UserInfo::default()),
             axum::extract::Path(("default".to_owned(), "default".to_owned())),
             bytes::Bytes::new(), // empty body → default audience + expiration
         )
