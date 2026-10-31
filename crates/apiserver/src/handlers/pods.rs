@@ -1493,6 +1493,15 @@ pub(crate) async fn patch_pod<S: Store>(
             if !is_ssa {
                 return Err(Status::not_found("", "pods", &name));
             }
+            super::resource::authorize_create_on_write(
+                &state.rbac_index,
+                &state.node_graph,
+                &user,
+                "",
+                "pods",
+                Some(ns.as_str()),
+                &name,
+            )?;
             // Server-side apply on a missing pod creates it, through the same admission,
             // defaulting and quota path as POST.
             let mut obj = Object { body: patch };
@@ -10302,6 +10311,7 @@ mod handler_tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
         (state, store)
     }
 
@@ -19317,6 +19327,47 @@ mod handler_tests {
         );
     }
 
+    /// SSA-creating a pod needs the `create` verb in addition to `patch`, as upstream requires;
+    /// otherwise a patch-only principal can mint pods.
+    #[tokio::test]
+    async fn ssa_apply_of_missing_pod_without_create_verb_is_403() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/patcher",
+            &serde_json::json!({"rules": [{"apiGroups": [""], "resources": ["pods"], "verbs": ["patch", "update"]}]}),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/patcher",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "patcher"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "patcher"}
+            }),
+        );
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .layer(axum::Extension(crate::auth::UserInfo {
+                username: "patcher".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }))
+            .with_state(state);
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/new-pod")
+            .header(header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .body(Body::from(ssa_pod_yaml("new-pod")))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(store
+            .get("/registry/pods/default/new-pod")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// `kubectl apply --server-side --subresource=status` sends apply-patch+yaml to
     /// pods/status; refusing the content type (415) breaks applying status conditions.
     #[tokio::test]
@@ -22008,6 +22059,7 @@ mod ephemeral_containers_route_tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
         (state, store)
     }
 

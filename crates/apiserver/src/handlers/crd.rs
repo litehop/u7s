@@ -1633,6 +1633,15 @@ pub async fn patch_crd<S: Store>(
     // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
     // matching upstream: those patch types have no create-on-missing semantics.
     if is_ssa && stored_opt.is_none() {
+        super::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            None,
+            &name,
+        )?;
         let mut body_json = ssa_body_to_json(&body)?;
         crate::handlers::json_patch::strip_managed_fields(&mut body_json);
         // The URL name is authoritative for what gets created, regardless of what (if anything)
@@ -3770,6 +3779,55 @@ mod tests {
             v["metadata"]["uid"], real_uid,
             "a merge-patch carrying metadata.uid must not change the stored uid"
         );
+    }
+
+    /// Apply-creating a CRD needs `create` in addition to `patch`, as upstream requires.
+    #[tokio::test]
+    async fn ssa_apply_patch_of_missing_crd_without_create_verb_is_403() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/patcher",
+            &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["patch", "update"]}]}),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/patcher",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "patcher"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "patcher"}
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let manifest = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "gadgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget", "listKind": "GadgetList"},
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let err = patch_crd(
+            State(state.clone()),
+            Path("gadgets.example.io".to_string()),
+            Extension(UserInfo {
+                username: "patcher".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }),
+            headers,
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await
+        .err()
+        .expect("CRD apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     /// SSA apply-patch on a CRD name that does not exist yet must create it — with the same

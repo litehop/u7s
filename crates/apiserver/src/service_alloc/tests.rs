@@ -36,6 +36,7 @@ fn state_with(ranges: &str) -> AppState<SqliteStore> {
         konnectivity_proxy_addr: None,
     });
     st.secondary_service_ip_allocator = secondary.map(std::sync::Arc::new);
+    crate::handlers::test_support::grant_create_everywhere(&st.rbac_index);
     st
 }
 

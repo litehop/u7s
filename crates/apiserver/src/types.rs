@@ -288,8 +288,6 @@ pub struct ResourceMeta {
     #[cfg(test)]
     pub namespaced: bool,
     pub has_status_subresource: bool,
-    /// If true, POST behaves as createOrUpdate: if the object already exists, replace it.
-    pub create_or_update: bool,
 }
 
 // ---------------------------------------------------------------------------
