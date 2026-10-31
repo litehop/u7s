@@ -1795,6 +1795,7 @@ write_worker_branch_runner() {
     echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
     echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
     echo 'ensure_jq() { :; }'
+    grep -E '^MEMLOW_KUBELET_MIB=' "$INSTALL"
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
@@ -2526,6 +2527,73 @@ assert "the control-plane install waits after labelling the node, as its last st
   "$(awk '/^label_control_plane_node \|\| exit 1$/ {l=NR} /^wait_for_cluster_ready \|\| exit 1$/ {w=NR} /^echo "u7s bootstrap complete/ {b=NR} END {print (l && w>l && b>w) ? 1 : 0}' "$INSTALL")"
 assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
   "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
+
+# --- control-plane memory protection ------------------------------------------
+# Without these, a memory-starved 1 GiB node reclaims the control-plane
+# binaries' own mapped pages first and thrashes until the kubelet misses its
+# lease. MemoryLow only works if every ancestor cgroup has a low too, so the
+# units must sit in u7s.slice and its low must cover their sum.
+MEM_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$WORKER_MODE_WORK" "$MANIFEST_WORK" "$PERSIST_WORK" "$RESOLV_WORK" "$MEM_WORK"' EXIT
+{
+  grep -E '^MEMLOW_[A-Z]+_MIB=' "$INSTALL"
+  echo 'SYSTEMD_DIR="$1"'
+  awk '/^write_memory_protection\(\) \{$/,/^}$/' "$INSTALL" | sed 's|/etc/systemd/system|$SYSTEMD_DIR|g'
+  echo 'write_memory_protection "$2"'
+} > "$MEM_WORK/runner.sh"
+mkdir -p "$MEM_WORK/cp" "$MEM_WORK/worker"
+bash "$MEM_WORK/runner.sh" "$MEM_WORK/cp" 0
+bash "$MEM_WORK/runner.sh" "$MEM_WORK/worker" 1
+mib() { grep -m1 "^$1=" "$INSTALL" | cut -d= -f2; }
+cp_low=$(( $(mib MEMLOW_APISERVER_MIB) + $(mib MEMLOW_KCM_MIB) + $(mib MEMLOW_KUBELET_MIB) + $(mib MEMLOW_CRIO_MIB) ))
+worker_low=$(( $(mib MEMLOW_KUBELET_MIB) + $(mib MEMLOW_CRIO_MIB) ))
+assert_true "the control-plane u7s.slice low equals the sum of its units' lows, otherwise a unit's own low is capped by the slice and part of it is silently unprotected" \
+  grep -qxF "MemoryLow=${cp_low}M" "$MEM_WORK/cp/u7s.slice"
+assert_true "an agent node's u7s.slice protects kubelet and crio only (no apiserver/KCM run there, so reserving their share would shield nothing)" \
+  grep -qxF "MemoryLow=${worker_low}M" "$MEM_WORK/worker/u7s.slice"
+assert_true "u7s.slice keeps memory accounting on, or the kernel has no per-cgroup memory to protect" \
+  grep -qxF 'MemoryAccounting=yes' "$MEM_WORK/cp/u7s.slice"
+for mode in cp worker; do
+  assert_true "crio.service ($mode) is moved into u7s.slice by a drop-in (the vendor unit is not rewritten) so its low is honoured" \
+    grep -qxF 'Slice=u7s.slice' "$MEM_WORK/$mode/crio.service.d/10-u7s-memory.conf"
+  assert_true "crio.service ($mode) drop-in sets its own MemoryLow" \
+    grep -qxF "MemoryLow=$(mib MEMLOW_CRIO_MIB)M" "$MEM_WORK/$mode/crio.service.d/10-u7s-memory.conf"
+done
+assert_false "no MemoryMin anywhere: a hard minimum oversized on a 1 GiB node OOM-kills everything else instead of degrading" \
+  grep -rq 'MemoryMin' "$MEM_WORK" "$INSTALL"
+
+apiserver_block="$(awk '/^cat > \/etc\/systemd\/system\/u7s-apiserver\.service <<EOF$/{f=1} f{print} f&&/^EOF$/{exit}' "$INSTALL")"
+kcm_block="$(awk '/^cat > \/etc\/systemd\/system\/u7s-kcm\.service <<EOF$/{f=1} f{print} f&&/^EOF$/{exit}' "$INSTALL")"
+for pair in 'u7s-apiserver:apiserver_block:MEMLOW_APISERVER_MIB' 'u7s-kcm:kcm_block:MEMLOW_KCM_MIB' \
+  'worker kubelet:kubelet_worker_block:MEMLOW_KUBELET_MIB' 'control-plane kubelet:kubelet_cp_block:MEMLOW_KUBELET_MIB'; do
+  name="${pair%%:*}"; rest="${pair#*:}"; var="${rest%%:*}"; low="${rest#*:}"
+  assert_true "$name unit joins u7s.slice with its own MemoryLow and accounting (a unit outside the slice gets no protection)" \
+    bash -c 'b="$1"; printf "%s\n" "$b" | grep -qxF "Slice=u7s.slice" && printf "%s\n" "$b" | grep -qxF "MemoryAccounting=yes" && printf "%s\n" "$b" | grep -qxF "MemoryLow=\${$2}M"' _ "${!var}" "$low"
+done
+assert_false "the agent (worker) path must not give apiserver or KCM a slice: they do not run there" \
+  bash -c 'printf "%s\n" "$1" | grep -q "u7s-apiserver\|u7s-kcm"' _ "$kubelet_worker_block"
+
+mkdir -p "$MEM_WORK/kc-cp" "$MEM_WORK/kc-worker"
+{
+  echo 'STATE_DIR="$1"; CLUSTER_DNS=10.43.0.10'
+  awk '/^write_kubelet_config_yaml\(\) \{$/,/^}$/' "$INSTALL"
+  echo 'write_kubelet_config_yaml "$2"'
+} > "$MEM_WORK/kc-runner.sh"
+PATH="$RESOLV_WORK/bin-inactive:$PATH" bash "$MEM_WORK/kc-runner.sh" "$MEM_WORK/kc-cp" 0
+PATH="$RESOLV_WORK/bin-inactive:$PATH" bash "$MEM_WORK/kc-runner.sh" "$MEM_WORK/kc-worker" 1
+assert_true "kubelet reserves system and kube memory so pods cannot be scheduled into the daemons' share" \
+  awk '/^systemReserved:/{s=1} /^kubeReserved:/{k=1} END{exit !(s&&k)}' "$MEM_WORK/kc-cp/kubelet-config.yaml"
+reserved_mi() { awk -v k="$2:" '$0==k{getline; sub(/Mi$/,"",$2); print $2}' "$1"; }
+cp_sys="$(reserved_mi "$MEM_WORK/kc-cp/kubelet-config.yaml" systemReserved)"
+worker_sys="$(reserved_mi "$MEM_WORK/kc-worker/kubelet-config.yaml" systemReserved)"
+assert "kubelet and crio are reserved on every node, including a worker" \
+  "$([ -n "$(reserved_mi "$MEM_WORK/kc-worker/kubelet-config.yaml" kubeReserved)" ] && echo 1 || echo 0)"
+assert "worker systemReserved is smaller than the control plane's (no apiserver/KCM on an agent) but nonzero (the OS still needs memory)" \
+  "$([ -n "$worker_sys" ] && [ "$worker_sys" -gt 0 ] && [ "$worker_sys" -lt "$cp_sys" ] && echo 1 || echo 0)"
+assert_true "allocatable is enforced on pods only" \
+  awk '/^enforceNodeAllocatable:/{f=1;next} f&&/^  - /{n++; if($2!="pods")bad=1; next} {f=0} END{exit !(n==1&&!bad)}' "$MEM_WORK/kc-cp/kubelet-config.yaml"
+assert_false "enforcing system-reserved/kube-reserved would cap the daemons themselves and starve the control plane the reservation is meant to protect" \
+  grep -qE 'system-reserved|kube-reserved' "$MEM_WORK/kc-cp/kubelet-config.yaml" "$MEM_WORK/kc-worker/kubelet-config.yaml"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

@@ -817,6 +817,42 @@ render_vendored_manifests() {
   fi
 }
 
+# Memory protection for the host-level control-plane units
+# (docs/decisions/control-plane-memory-protection.md). MemoryLow (best-effort)
+# keeps each unit's pages, including its mapped binary text, out of reclaim
+# until everything unprotected is exhausted. It only takes effect when every
+# ancestor cgroup also has a low, so the units live in u7s.slice whose low is
+# their sum (system.slice has none). Values are MiB.
+MEMLOW_APISERVER_MIB=48
+MEMLOW_KCM_MIB=96
+MEMLOW_KUBELET_MIB=96
+MEMLOW_CRIO_MIB=80
+
+# Writes u7s.slice and the crio.service drop-in. The worker (agent) slice
+# covers kubelet and crio only. The apiserver/KCM units set their own
+# MemoryLow where they are written.
+write_memory_protection() {
+  local worker="${1:-0}" slice_low=$(( MEMLOW_KUBELET_MIB + MEMLOW_CRIO_MIB ))
+  if [ "$worker" -eq 0 ]; then
+    slice_low=$(( slice_low + MEMLOW_APISERVER_MIB + MEMLOW_KCM_MIB ))
+  fi
+  cat > /etc/systemd/system/u7s.slice <<EOF
+[Unit]
+Description=u7s host-level control-plane processes
+
+[Slice]
+MemoryAccounting=yes
+MemoryLow=${slice_low}M
+EOF
+  mkdir -p /etc/systemd/system/crio.service.d
+  cat > /etc/systemd/system/crio.service.d/10-u7s-memory.conf <<EOF
+[Service]
+Slice=u7s.slice
+MemoryAccounting=yes
+MemoryLow=${MEMLOW_CRIO_MIB}M
+EOF
+}
+
 # Minimal KubeletConfiguration: CRI-O's socket, cluster DNS from
 # --cluster-dns (default: the tenth host of the service range), and four
 # settings that are not obvious:
@@ -846,6 +882,14 @@ render_vendored_manifests() {
 # for why it must live under $STATE_DIR.
 write_kubelet_config_yaml() {
   local worker="${1:-0}" resolv_conf=/etc/resolv.conf
+  # Node allocatable is enforced on the pods cgroup only: enforcing
+  # system-reserved/kube-reserved would cap the daemons themselves.
+  # systemReserved = OS + apiserver + KCM (OS only on a worker);
+  # kubeReserved = kubelet + crio.
+  local system_reserved_mib=256 kube_reserved_mib=160
+  if [ "$worker" -eq 1 ]; then
+    system_reserved_mib=128
+  fi
   if systemctl is-active --quiet systemd-resolved; then
     resolv_conf=/run/systemd/resolve/resolv.conf
   fi
@@ -871,6 +915,12 @@ authentication:
   x509:
     clientCAFile: $client_ca
 rotateCertificates: true
+enforceNodeAllocatable:
+  - pods
+systemReserved:
+  memory: ${system_reserved_mib}Mi
+kubeReserved:
+  memory: ${kube_reserved_mib}Mi
 EOF
 }
 
@@ -1777,6 +1827,9 @@ for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
   fi
 done
 
+write_memory_protection "$WORKER_MODE"
+systemctl daemon-reload
+
 # crio.service is owned and enabled by the apt package
 # (docs/decisions/systemd-install-contract.md); this only starts it.
 # restart rather than start: on a re-run against an already-active unit,
@@ -1937,6 +1990,9 @@ Requires=crio.service
 
 [Service]
 Type=simple
+Slice=u7s.slice
+MemoryAccounting=yes
+MemoryLow=${MEMLOW_KUBELET_MIB}M
 WorkingDirectory=$STATE_DIR
 # Go-runtime memory tuning ported from the conformance dev-loop
 # (scripts/conformance/lima-start.sh), proven there: default GOGC=100 +
@@ -2067,6 +2123,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Slice=u7s.slice
+MemoryAccounting=yes
+MemoryLow=${MEMLOW_APISERVER_MIB}M
 WorkingDirectory=$STATE_DIR
 # --embedded-scheduler true: production runs scheduling as a task inside this
 # process rather than a separate u7s-scheduler binary+unit -- never also
@@ -2093,6 +2152,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Slice=u7s.slice
+MemoryAccounting=yes
+MemoryLow=${MEMLOW_KCM_MIB}M
 WorkingDirectory=$STATE_DIR
 # ca.crt is DER from u7s but KCM needs PEM, converted at start rather than at
 # install time because it does not exist until apiserver's first run.
@@ -2176,6 +2238,9 @@ Requires=crio.service u7s-apiserver.service
 
 [Service]
 Type=simple
+Slice=u7s.slice
+MemoryAccounting=yes
+MemoryLow=${MEMLOW_KUBELET_MIB}M
 WorkingDirectory=$STATE_DIR
 # Go-runtime memory tuning ported from the conformance dev-loop
 # (scripts/conformance/lima-start.sh) -- see the worker-mode kubelet.service
