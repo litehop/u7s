@@ -2847,10 +2847,23 @@ async fn seed_services(
     // default/kubernetes' VIP is reserved the same way (upstream's kubernetesservice
     // controller does this every boot), so no tenant Service can claim the apiserver's
     // in-cluster address.
-    for (ip, ns, name) in [
+    // A dual-stack CoreDNS Service also asks for the other family's tenth host (scripts/install.sh
+    // default_cluster_dns), so reserve it too.
+    let mut reservations = vec![
         (kubernetes_cluster_ip, "default", "kubernetes"),
         (kube_dns_cluster_ip, "kube-system", "kube-dns"),
-    ] {
+    ];
+    for alloc in service_range_allocators(service_cluster_ip_range)? {
+        if !alloc.contains_host(&kube_dns_cluster_ip) {
+            let ip = alloc.nth_host(10).map_err(|e| {
+                anyhow::anyhow!(
+                    "--service-cluster-ip-range '{service_cluster_ip_range}' too small for the secondary kube-dns ClusterIP: {e}"
+                )
+            })?;
+            reservations.push((ip, "kube-system", "kube-dns"));
+        }
+    }
+    for (ip, ns, name) in reservations {
         let key = format!("{}{}", state::SERVICE_IP_PREFIX, ip);
         match store
             .put(&key, service_alloc::owned_ip_sentinel(ns, name), Some(0))
@@ -7721,6 +7734,111 @@ mod tests {
             "kube-dns's clusterIP sentinel must reserve the tenth host of the configured \
              range, not the 10.96.0.10 hardcode — otherwise a custom range's dynamic Service \
              allocation could still collide with whatever IP the CoreDNS bundle is later given"
+        );
+    }
+
+    /// A dual-stack CoreDNS Service requests the other family's tenth host as its second
+    /// clusterIP. If seeding left that address free, a dynamic Service could take it while
+    /// the range fills up and the CoreDNS apply would fail "already allocated", leaving the
+    /// cluster without DNS.
+    #[tokio::test]
+    async fn dual_stack_seed_reserves_secondary_kube_dns_ip_against_dynamic_services() {
+        use axum::http::{Method, Request};
+        use state::IpFamily;
+        use tower_service::Service as _;
+
+        const RANGE: &str = "10.96.0.0/24,fd00:96::/124";
+        let mut state = make_state_with_cidr("10.96.0.0/24");
+        state.secondary_service_ip_allocator = Some(std::sync::Arc::new(
+            state::ServiceIpAllocator::from_cidr("fd00:96::/124").expect("valid CIDR"),
+        ));
+        seed_namespaces(&state.store).await.expect("namespaces");
+        seed_services(&state.store, "127.0.0.1", 6443, RANGE, None)
+            .await
+            .expect("seed");
+
+        let mut handed_out = Vec::new();
+        while let Ok(Some(ip)) = state.allocate_service_ip(IpFamily::V6, "svc", false).await {
+            handed_out.push(ip.to_string());
+        }
+        assert!(
+            !handed_out.is_empty(),
+            "the IPv6 range must have free addresses"
+        );
+        assert!(
+            !handed_out.contains(&"fd00:96::a".to_string()),
+            "fd00:96::a is the secondary kube-dns VIP and must never be handed to a dynamic Service: {handed_out:?}"
+        );
+        assert!(
+            state
+                .store
+                .get(&format!("{}10.96.0.10", state::SERVICE_IP_PREFIX))
+                .await
+                .expect("get")
+                .is_some(),
+            "the primary kube-dns VIP stays reserved"
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "kube-dns", "namespace": "kube-system" },
+            "spec": {
+                "clusterIP": "10.96.0.10",
+                "clusterIPs": ["10.96.0.10", "fd00:96::a"],
+                "ipFamilyPolicy": "PreferDualStack",
+                "selector": { "k8s-app": "kube-dns" },
+                "ports": [{ "name": "dns", "port": 53, "protocol": "UDP" }]
+            }
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces/kube-system/services")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+        let resp = build_router(state)
+            .call(req)
+            .await
+            .expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "CoreDNS with both VIPs must apply after the IPv6 pool was exhausted"
+        );
+    }
+
+    /// A single-stack cluster has no second family, so seeding reserves exactly the
+    /// kubernetes and kube-dns VIPs and nothing else.
+    #[tokio::test]
+    async fn single_stack_seed_reserves_only_kubernetes_and_kube_dns_ips() {
+        use u7s_store::ListOptions;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces first");
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("seed");
+        let mut keys: Vec<String> = store
+            .list(state::SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                format!("{}10.96.0.1", state::SERVICE_IP_PREFIX),
+                format!("{}10.96.0.10", state::SERVICE_IP_PREFIX)
+            ]
         );
     }
 
