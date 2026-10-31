@@ -8,7 +8,7 @@ use u7s_proto_generated::k8s::io::api::networking::v1 as networking_v1;
 use u7s_proto_generated::k8s::io::api::policy::v1 as policy_v1;
 use u7s_proto_generated::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 
-use crate::core_gen_adapter::json_to_object_meta_proto;
+use crate::core_gen_adapter::{ji32, json_to_list_meta_proto, json_to_object_meta_proto};
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
     crate::core_gen_adapter::gen_object_meta_to_json(meta)
@@ -591,10 +591,6 @@ fn jstr(v: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn ji32(v: &serde_json::Value, key: &str) -> Option<i32> {
-    v.get(key).and_then(|x| x.as_i64()).map(|n| n as i32)
-}
-
 fn jbool(v: &serde_json::Value, key: &str) -> Option<bool> {
     v.get(key).and_then(|x| x.as_bool())
 }
@@ -621,18 +617,6 @@ fn jstrmap(v: &serde_json::Value, key: &str) -> std::collections::HashMap<String
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
-    let meta = v
-        .get("metadata")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    meta_v1::ListMeta {
-        resource_version: jstr(&meta, "resourceVersion"),
-        r#continue: jstr(&meta, "continue"),
-        ..Default::default()
-    }
 }
 
 fn json_to_endpointslice_port_proto(v: &serde_json::Value) -> discovery_v1::EndpointPort {
@@ -1804,6 +1788,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn encode_endpointslicelist_proto_gen_carries_every_list_meta_field() {
+        crate::proto_descriptor::assert_encoder_carries_every_list_meta_field(
+            "encode_endpointslicelist_proto_gen",
+            encode_endpointslicelist_proto_gen,
+            |b| {
+                discovery_v1::EndpointSliceList::decode(b)
+                    .unwrap()
+                    .metadata
+                    .unwrap()
+                    .encode_to_vec()
+            },
+        );
+    }
+
     /// EndpointSliceList wraps each item through the same per-slice encoder.
     #[test]
     fn encode_endpointslicelist_proto_gen_round_trips_all_items() {
@@ -2489,10 +2488,6 @@ mod tests {
 
     #[test]
     fn codegen_migration_endpointslice_encode_matches_pre_migration_hand_written_output() {
-        fn old_json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
-            json_to_object_meta_proto(obj)
-        }
-
         fn old_json_to_object_reference_proto(v: &serde_json::Value) -> core_v1::ObjectReference {
             core_v1::ObjectReference {
                 kind: jstr(v, "kind"),
@@ -2557,7 +2552,7 @@ mod tests {
 
         fn old_json_to_endpointslice_proto(v: &serde_json::Value) -> discovery_v1::EndpointSlice {
             discovery_v1::EndpointSlice {
-                metadata: Some(old_json_to_object_meta_proto(v)),
+                metadata: Some(json_to_object_meta_proto(v)),
                 address_type: jstr(v, "addressType"),
                 endpoints: v
                     .get("endpoints")

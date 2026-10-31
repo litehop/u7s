@@ -219,11 +219,16 @@ fn walk(
 // ---- Encode-direction completeness ---------------------------------------------------------
 //
 // The decode-side oracle above checks what a decoder emits. The functions below check the
-// opposite direction for ObjectMeta: a JSON object with every descriptor field populated must
-// come out of a `json_to_*_proto` encoder with every descriptor field on the wire. A field
-// forgotten by the encoder (managedFields was) cannot hide behind a hand-written field list.
+// opposite direction for ObjectMeta and ListMeta: a JSON object with every descriptor field
+// populated with a distinct value must come out of a `json_to_*_proto` encoder with every
+// descriptor field on the wire carrying that field's own value. A field forgotten by the
+// encoder (managedFields was) cannot hide behind a hand-written field list, and two fields of
+// the same type wired to each other's source key (creationTimestamp/deletionTimestamp) cannot
+// pass on presence alone.
 
 pub(crate) const OBJECT_META: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta";
+pub(crate) const LIST_META: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.ListMeta";
+const TIME: &str = ".k8s.io.apimachinery.pkg.apis.meta.v1.Time";
 
 /// Wire fields an encoder legitimately never emits. Each entry is a decision.
 const ENCODE_EXCEPTIONS: &[(&str, &str, &str)] = &[
@@ -234,20 +239,39 @@ const ENCODE_EXCEPTIONS: &[(&str, &str, &str)] = &[
          by the system` — no u7s code sets it, so a JSON value is never carried",
     ),
     (
-        ".k8s.io.apimachinery.pkg.apis.meta.v1.Time",
+        LIST_META,
+        "selfLink",
+        "same deprecated, never-populated field as ObjectMeta.selfLink",
+    ),
+    (
+        LIST_META,
+        "shardInfo",
+        "alpha ShardedListAndWatch field; u7s has no sharded list support and never sets it",
+    ),
+    (
+        TIME,
         "nanos",
         "metav1.Time's JSON form is RFC3339 with whole seconds, so there is no sub-second \
          value to carry into the protobuf",
     ),
 ];
 
+static SAMPLE_SEQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+
+fn next_sample_seq() -> i64 {
+    SAMPLE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A JSON value for `message_name` with every descriptor field populated (including those in
 /// `ENCODE_EXCEPTIONS`: a field the encoder is excused from must still be harmless to supply).
+/// Integers and timestamps are distinct per field so a value routed to the wrong field differs.
 pub(crate) fn sample_json(message_name: &str) -> serde_json::Value {
     use prost_types::field_descriptor_proto::Label;
     use serde_json::{json, Value};
-    if message_name == ".k8s.io.apimachinery.pkg.apis.meta.v1.Time" {
-        return json!("2024-01-02T03:04:05Z");
+    if message_name == TIME {
+        return json!(crate::util::secs_to_rfc3339(
+            1_700_000_000 + next_sample_seq() * 86_400
+        ));
     }
     if message_name == ".k8s.io.apimachinery.pkg.apis.meta.v1.FieldsV1" {
         return json!({"f:metadata": {"f:labels": {}}});
@@ -260,7 +284,7 @@ pub(crate) fn sample_json(message_name: &str) -> serde_json::Value {
         let single = match field.r#type() {
             Type::String => json!(format!("sample-{key}")),
             Type::Bool => json!(true),
-            Type::Int32 | Type::Int64 => json!(7),
+            Type::Int32 | Type::Int64 => json!(100 + next_sample_seq()),
             Type::Message => match map_value_type(index, field.type_name()) {
                 Some(None) => {
                     obj.insert(key, json!({"k": "v"}));
@@ -284,18 +308,19 @@ pub(crate) fn sample_json(message_name: &str) -> serde_json::Value {
     Value::Object(obj)
 }
 
-/// Field number -> payload of each occurrence (non-length-delimited payloads are left empty;
-/// only presence and length-delimited bodies matter to the completeness check).
+/// Field number -> payload of each occurrence: the raw bytes for length-delimited and fixed-width
+/// fields, the re-encoded varint for varint fields.
 fn wire_fields(mut buf: &[u8]) -> HashMap<u32, Vec<Vec<u8>>> {
     use prost::bytes::Buf;
-    use prost::encoding::{decode_key, decode_varint, WireType};
+    use prost::encoding::{decode_key, decode_varint, encode_varint, WireType};
     let mut out: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
     while buf.has_remaining() {
         let (tag, wt) = decode_key(&mut buf).expect("valid protobuf key");
         let payload = match wt {
             WireType::Varint => {
-                decode_varint(&mut buf).expect("valid varint");
-                Vec::new()
+                let mut v = Vec::new();
+                encode_varint(decode_varint(&mut buf).expect("valid varint"), &mut v);
+                v
             }
             WireType::LengthDelimited => {
                 let len = decode_varint(&mut buf).expect("valid length") as usize;
@@ -304,12 +329,14 @@ fn wire_fields(mut buf: &[u8]) -> HashMap<u32, Vec<Vec<u8>>> {
                 body
             }
             WireType::ThirtyTwoBit => {
+                let body = buf[..4].to_vec();
                 buf.advance(4);
-                Vec::new()
+                body
             }
             WireType::SixtyFourBit => {
+                let body = buf[..8].to_vec();
                 buf.advance(8);
-                Vec::new()
+                body
             }
             other => panic!("unsupported wire type {other:?}"),
         };
@@ -318,15 +345,39 @@ fn wire_fields(mut buf: &[u8]) -> HashMap<u32, Vec<Vec<u8>>> {
     out
 }
 
-/// Every non-excepted descriptor field of `message_name`, recursively, that is absent from the
-/// encoded `bytes`, as dotted paths.
-pub(crate) fn missing_wire_fields(message_name: &str, bytes: &[u8]) -> Vec<String> {
-    let mut missing = Vec::new();
-    collect_missing(message_name, bytes, "", &mut missing);
-    missing
+fn scalar_payload(ty: Type, sample: &serde_json::Value) -> Option<Vec<u8>> {
+    use prost::encoding::encode_varint;
+    let mut v = Vec::new();
+    match ty {
+        Type::String => return sample.as_str().map(|s| s.as_bytes().to_vec()),
+        Type::Bool => encode_varint(u64::from(sample.as_bool()?), &mut v),
+        Type::Int32 | Type::Int64 => encode_varint(sample.as_i64()? as u64, &mut v),
+        _ => return None,
+    }
+    Some(v)
 }
 
-fn collect_missing(message_name: &str, bytes: &[u8], parent: &str, missing: &mut Vec<String>) {
+/// Every non-excepted descriptor field of `message_name`, recursively, that is absent from the
+/// encoded `bytes` or carries a value other than the one in `sample`, as dotted paths with a
+/// reason.
+pub(crate) fn wire_mismatches(
+    message_name: &str,
+    bytes: &[u8],
+    sample: &serde_json::Value,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_mismatches(message_name, bytes, sample, "", &mut out);
+    out
+}
+
+fn collect_mismatches(
+    message_name: &str,
+    bytes: &[u8],
+    sample: &serde_json::Value,
+    parent: &str,
+    out: &mut Vec<String>,
+) {
+    use prost_types::field_descriptor_proto::Label;
     let index = message_index();
     let wire = wire_fields(bytes);
     for field in &index[message_name].field {
@@ -337,45 +388,193 @@ fn collect_missing(message_name: &str, bytes: &[u8], parent: &str, missing: &mut
             continue;
         }
         let path = format!("{parent}{}", field.name());
-        let Some(occurrences) = wire.get(&(field.number() as u32)) else {
-            missing.push(path);
+        let key = json_key(message_name, field.name(), field.json_name());
+        let Some(sample_value) = sample.get(&key) else {
             continue;
         };
-        if field.r#type() == Type::Message {
-            for body in occurrences {
-                collect_missing(field.type_name(), body, &format!("{path}."), missing);
+        let Some(occurrences) = wire.get(&(field.number() as u32)) else {
+            out.push(format!("{path}: missing from the wire"));
+            continue;
+        };
+        if field.r#type() == Type::Message && map_value_type(index, field.type_name()) == Some(None)
+        {
+            let mut expected: Vec<(Vec<u8>, Vec<u8>)> = sample_value
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| {
+                            (
+                                k.as_bytes().to_vec(),
+                                v.as_str().unwrap_or("").as_bytes().to_vec(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = occurrences
+                .iter()
+                .map(|entry| {
+                    let f = wire_fields(entry);
+                    let first = |n: u32| {
+                        f.get(&n)
+                            .and_then(|v| v.first())
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    (first(1), first(2))
+                })
+                .collect();
+            expected.sort();
+            got.sort();
+            if expected != got {
+                out.push(format!(
+                    "{path}: map entries differ: expected {expected:?}, got {got:?}"
+                ));
+            }
+            continue;
+        }
+        let samples: Vec<&serde_json::Value> = if field.label() == Label::Repeated {
+            sample_value
+                .as_array()
+                .map(|a| a.iter().collect())
+                .unwrap_or_default()
+        } else {
+            vec![sample_value]
+        };
+        if samples.len() != occurrences.len() {
+            out.push(format!(
+                "{path}: expected {} occurrences, got {}",
+                samples.len(),
+                occurrences.len()
+            ));
+            continue;
+        }
+        for (occ, s) in occurrences.iter().zip(samples) {
+            if field.r#type() != Type::Message {
+                if scalar_payload(field.r#type(), s).as_ref() != Some(occ) {
+                    out.push(format!("{path}: expected {s}, wire carried {occ:?}"));
+                }
+            } else if field.type_name() == TIME {
+                let secs = s.as_str().and_then(crate::util::rfc3339_to_unix_secs);
+                let nested = serde_json::json!({ "seconds": secs });
+                collect_mismatches(TIME, occ, &nested, &format!("{path}."), out);
+            } else if !OPAQUE_MESSAGES.contains(&field.type_name()) {
+                collect_mismatches(field.type_name(), occ, s, &format!("{path}."), out);
             }
         }
     }
 }
 
 /// Feeds `encode` an object (or, for `is_list`, a one-item list) whose `metadata` has every
-/// ObjectMeta field set, then fails if `item_metadata` (which extracts the encoded
-/// ObjectMeta bytes from the encoder's output) lacks any non-excepted field.
+/// ObjectMeta field set to a distinct value, then fails if `item_metadata` (which extracts the
+/// encoded ObjectMeta bytes from the encoder's output) lacks any non-excepted field or carries
+/// a different value for it.
 pub(crate) fn assert_encoder_carries_every_object_meta_field(
     encoder: &str,
     is_list: bool,
     encode: fn(&serde_json::Value) -> Vec<u8>,
     item_metadata: fn(&[u8]) -> Vec<u8>,
 ) {
-    let item = serde_json::json!({ "metadata": sample_json(OBJECT_META) });
+    let meta = sample_json(OBJECT_META);
+    let item = serde_json::json!({ "metadata": meta });
     let input = if is_list {
         serde_json::json!({ "items": [item] })
     } else {
         item
     };
     let meta_bytes = item_metadata(&encode(&input));
-    let missing = missing_wire_fields(OBJECT_META, &meta_bytes);
+    let bad = wire_mismatches(OBJECT_META, &meta_bytes, &meta);
     assert!(
-        missing.is_empty(),
-        "{encoder} dropped ObjectMeta fields {missing:?}: a protobuf client would read an \
-         object missing metadata that a JSON client sees"
+        bad.is_empty(),
+        "{encoder} dropped or mis-carried ObjectMeta fields {bad:?}: a protobuf client would \
+         read object metadata that differs from what a JSON client sees"
+    );
+}
+
+/// Same as `assert_encoder_carries_every_object_meta_field`, for the list's own ListMeta
+/// (`resourceVersion`, `continue`, `remainingItemCount`), which `list_metadata` extracts from the
+/// list encoder's output.
+pub(crate) fn assert_encoder_carries_every_list_meta_field(
+    encoder: &str,
+    encode: fn(&serde_json::Value) -> Vec<u8>,
+    list_metadata: fn(&[u8]) -> Vec<u8>,
+) {
+    let meta = sample_json(LIST_META);
+    let input = serde_json::json!({ "metadata": meta, "items": [] });
+    let meta_bytes = list_metadata(&encode(&input));
+    let bad = wire_mismatches(LIST_META, &meta_bytes, &meta);
+    assert!(
+        bad.is_empty(),
+        "{encoder} dropped or mis-carried ListMeta fields {bad:?}: a protobuf LIST client \
+         would paginate or resume from different state than a JSON client"
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A presence-only check passes an encoder that wires creationTimestamp and
+    /// deletionTimestamp to each other's JSON key, so a protobuf client would see a live object
+    /// as deleted; the value-level oracle must flag it and accept the faithful encoding.
+    #[test]
+    fn value_check_flags_swapped_timestamps_and_accepts_faithful_encoding() {
+        let meta = sample_json(OBJECT_META);
+        let encode = |m: &serde_json::Value| {
+            crate::core_gen_adapter::json_to_object_meta_proto(
+                &serde_json::json!({ "metadata": m }),
+            )
+            .encode_to_vec()
+        };
+        assert_eq!(
+            wire_mismatches(OBJECT_META, &encode(&meta), &meta),
+            Vec::<String>::new()
+        );
+
+        let mut swapped = meta.clone();
+        swapped["creationTimestamp"] = meta["deletionTimestamp"].clone();
+        swapped["deletionTimestamp"] = meta["creationTimestamp"].clone();
+        let bad = wire_mismatches(OBJECT_META, &encode(&swapped), &meta);
+        assert!(
+            bad.iter().any(|b| b.starts_with("creationTimestamp"))
+                && bad.iter().any(|b| b.starts_with("deletionTimestamp")),
+            "swapped timestamps must be reported, got {bad:?}"
+        );
+    }
+
+    /// `remainingItemCount` was silently dropped by both list-meta encoders; with a
+    /// value-level check a wrong value (not only an absent one) is also caught.
+    #[test]
+    fn value_check_flags_wrong_and_dropped_list_meta_values() {
+        let meta = sample_json(LIST_META);
+        let encode = |m: &serde_json::Value| {
+            crate::core_gen_adapter::json_to_list_meta_proto(&serde_json::json!({ "metadata": m }))
+                .encode_to_vec()
+        };
+        assert_eq!(
+            wire_mismatches(LIST_META, &encode(&meta), &meta),
+            Vec::<String>::new()
+        );
+
+        let mut wrong = meta.clone();
+        wrong["remainingItemCount"] = serde_json::json!(1);
+        let bad = wire_mismatches(LIST_META, &encode(&wrong), &meta);
+        assert!(
+            bad.iter().any(|b| b.starts_with("remainingItemCount")),
+            "a wrong remainingItemCount must be reported, got {bad:?}"
+        );
+
+        let mut dropped = meta.clone();
+        dropped
+            .as_object_mut()
+            .unwrap()
+            .remove("remainingItemCount");
+        let bad = wire_mismatches(LIST_META, &encode(&dropped), &meta);
+        assert!(
+            bad.iter().any(|b| b.starts_with("remainingItemCount")),
+            "a dropped remainingItemCount must be reported, got {bad:?}"
+        );
+    }
 
     /// The oracle is only trustworthy if it agrees with a hand-written list that is already known
     /// to be correct. `LeaseSpec` is small enough to verify by eye against the .proto and has no

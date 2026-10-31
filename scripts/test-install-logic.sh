@@ -506,7 +506,37 @@ br_netfilter_runner "$INSTALL" "$BR_NETFILTER_WORK/r.sh" "$BR_NETFILTER_WORK" 'f
 bash "$BR_NETFILTER_WORK/r.sh"
 assert_true "a dual-stack install enables net.ipv6.conf.all.forwarding: without it the node drops routed IPv6 pod/Service packets" \
   grep -qxF 'net.ipv6.conf.all.forwarding = 1' "$BR_NETFILTER_WORK/sysctl.d/u7s-ipv6-forwarding.conf"
+assert_true "every node writes net.ipv4.ip_forward=1 to sysctl.d: relying on the CNI bridge plugin leaves a node that has not yet run a pod sandbox (or uses another CNI) unable to route pod traffic" \
+  grep -qxF 'net.ipv4.ip_forward = 1' "$BR_NETFILTER_WORK/sysctl.d/u7s-ip-forward.conf"
 rm -rf "$BR_NETFILTER_WORK"
+
+# A joining worker never sees --cluster-cidr; it learns the families from its
+# own Node's spec.podCIDRs. Runs the real function with sysctl stubbed.
+worker_ipv6_forwarding_run() {
+  local workdir="$1" node_json="$2"
+  {
+    echo 'set -euo pipefail'
+    echo 'sysctl() { echo "$*" >> "'"$workdir"'/sysctl.log"; }'
+    awk '/^worker_enable_ipv6_forwarding\(\) \{$/,/^\}$/' "$INSTALL" | sed "s#/etc/sysctl.d#$workdir/sysctl.d#g"
+    echo "worker_enable_ipv6_forwarding '$node_json'"
+  } > "$workdir/r.sh"
+  bash "$workdir/r.sh"
+}
+WORKER_V6_WORK="$(mktemp -d)"
+mkdir -p "$WORKER_V6_WORK/sysctl.d"
+worker_ipv6_forwarding_run "$WORKER_V6_WORK" '{"spec":{"podCIDRs":["10.244.1.0/24"]}}'
+assert_false "a worker in a single-stack IPv4 cluster writes no IPv6 forwarding sysctl and reloads nothing (its sysctl state stays unchanged)" \
+  test -e "$WORKER_V6_WORK/sysctl.d/u7s-ipv6-forwarding.conf" -o -e "$WORKER_V6_WORK/sysctl.log"
+worker_ipv6_forwarding_run "$WORKER_V6_WORK" '{"spec":{"podCIDRs":["10.244.1.0/24","fd00:244:0:1::/64"]}}'
+assert_true "a worker whose Node carries an IPv6 podCIDR writes net.ipv6.conf.all.forwarding=1: without it its pods get no routed IPv6" \
+  grep -qxF 'net.ipv6.conf.all.forwarding = 1' "$WORKER_V6_WORK/sysctl.d/u7s-ipv6-forwarding.conf"
+assert_true "the worker applies the new sysctl immediately (sysctl --system), not only at next boot" \
+  grep -qxF -- '--system' "$WORKER_V6_WORK/sysctl.log"
+rm -rf "$WORKER_V6_WORK"
+assert_true "a fresh join feeds the polled Node object to the IPv6-forwarding check (the function is useless unless wait_for_joined_node calls it)" \
+  grep -qF 'worker_enable_ipv6_forwarding "$resp"' "$INSTALL"
+assert_true "an in-place worker upgrade also runs the check, so workers joined before this fix get forwarding" \
+  grep -qF 'worker_enable_ipv6_forwarding "$(worker_api_get' "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Regression guard: 'systemctl enable --now UNIT' is enable+
@@ -1402,7 +1432,7 @@ write_join_runner() {
     echo 'ensure_jq() { :; }'
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns issue_cp_kubelet_identity current_client_cert wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1797,6 +1827,8 @@ write_worker_branch_runner() {
     echo 'ensure_jq() { :; }'
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
+    echo 'worker_api_get() { echo "{}"; }'
+    echo 'worker_enable_ipv6_forwarding() { :; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
     echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
