@@ -836,7 +836,6 @@ pub(crate) async fn replace_resource<S: Store>(
     // PriorityClass.value, PersistentVolume, StorageClass, and Node, (b) status restoration
     // when the resource has a dedicated status subresource, and (c) UID restoration/conflict
     // check (see stored_uid below).
-    let is_priorityclass = group == "scheduling.k8s.io" && plural == "priorityclasses";
     let is_pv = group.is_empty() && plural == "persistentvolumes";
     let is_storageclass = group == "storage.k8s.io" && plural == "storageclasses";
     let is_node = group.is_empty() && plural == "nodes";
@@ -874,19 +873,6 @@ pub(crate) async fn replace_resource<S: Store>(
             &name,
             &meta.kind,
         )?;
-
-        // Immutability check: PriorityClass.value drives scheduling/preemption ordering
-        // cluster-wide; allowing it to change post-create would silently reorder
-        // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
-        if is_priorityclass {
-            if let Some(ref stored_val) = parsed {
-                if obj.body["value"] != stored_val["value"] {
-                    return Err(Status::unprocessable_entity(format!(
-                        "{plural}/{name} .value is immutable and cannot be updated"
-                    )));
-                }
-            }
-        }
 
         let status = if meta.has_status_subresource {
             parsed.as_ref().map(|v| v["status"].clone())
@@ -1997,16 +1983,6 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // Capture PriorityClass.value before patch: it drives scheduling/preemption
-        // ordering cluster-wide and is immutable after create. Real kube-apiserver
-        // returns 422 "Invalid" if a patch changes it.
-        let priorityclass_value_before_patch =
-            if group == "scheduling.k8s.io" && plural == "priorityclasses" {
-                Some(current.body["value"].clone())
-            } else {
-                None
-            };
-
         // Capture PVC storage request + StorageClass before patch: growing storage is only
         // allowed when the bound StorageClass explicitly opts in via allowVolumeExpansion,
         // checked against the post-patch value below.
@@ -2183,14 +2159,6 @@ pub(crate) async fn do_patch<S: Store>(
             &stored_status,
         );
 
-        if let Some(ref old_value) = priorityclass_value_before_patch {
-            if &current.body["value"] != old_value {
-                return Err(Status::unprocessable_entity(format!(
-                    "{plural}/{name} .value is immutable and cannot be updated"
-                )));
-            }
-        }
-
         if let Some(old_spec) = pvc_spec_before_patch {
             let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
             validate_pvc_spec_immutable(&old_spec, &current.body["spec"], old_status)
@@ -2296,6 +2264,7 @@ pub(crate) async fn do_patch<S: Store>(
                 "clustertrustbundles" | "podcertificaterequests"
             ) | ("storagemigration.k8s.io", "storageversionmigrations")
                 | ("resource.k8s.io", "devicetaintrules")
+                | ("scheduling.k8s.io", "priorityclasses")
         ) || super::csr::is_csr(group, plural)
             || super::defaults::generation_tracked_field(group, plural).is_some();
         let old_object = if kind_reads_old_object {
@@ -22472,6 +22441,262 @@ mod tests {
             "PATCH changing only PriorityClass.description must succeed — mutable fields must \
              remain patchable even though .value is locked",
         );
+    }
+
+    /// Sends one PriorityClass write by the given method (`PUT`, `merge`, `json`, `strategic`,
+    /// `apply`) and returns the error status code and message, or `None` on success. `fields`
+    /// is the desired field set; each method encodes it in its own wire format.
+    async fn pc_write(
+        state: &crate::state::AppState,
+        method: &str,
+        name: &str,
+        fields: serde_json::Value,
+    ) -> Option<(u16, String)> {
+        use axum::extract::{Path, Query, State};
+        let path = || {
+            Path((
+                "scheduling.k8s.io".to_string(),
+                "v1".to_string(),
+                "priorityclasses".to_string(),
+                name.to_string(),
+            ))
+        };
+        let mut full = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": name },
+        });
+        for (k, v) in fields.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        let res = if method == "PUT" {
+            replace_resource(
+                State(state.clone()),
+                path(),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&full).unwrap()),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            let (ct, body) = match method {
+                "merge" => ("application/merge-patch+json", fields),
+                "strategic" => ("application/strategic-merge-patch+json", fields),
+                "json" => (
+                    "application/json-patch+json",
+                    serde_json::Value::Array(
+                        fields
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| {
+                                serde_json::json!({"op": "add", "path": format!("/{k}"), "value": v})
+                            })
+                            .collect(),
+                    ),
+                ),
+                "apply" => ("application/apply-patch+yaml", full),
+                other => panic!("unknown method {other}"),
+            };
+            let mut headers = json_headers();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(ct),
+            );
+            let query = PatchQuery {
+                field_manager: Some("test".into()),
+                force: Some(true),
+                ..Default::default()
+            };
+            patch_resource(
+                State(state.clone()),
+                path(),
+                Query(query),
+                test_user(),
+                headers,
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .map(|_| ())
+        };
+        res.err().map(|e| (e.0.as_u16(), e.1.message))
+    }
+
+    const PC_WRITE_METHODS: [&str; 5] = ["PUT", "merge", "json", "strategic", "apply"];
+
+    /// An unknown preemptionPolicy must be refused at create, and a stored one must not flip on
+    /// any write path: a flip would let a class silently start (or stop) preempting running pods.
+    #[tokio::test]
+    async fn priorityclass_preemption_policy_is_validated_on_create_and_immutable_on_every_write_path(
+    ) {
+        use axum::extract::{Query, State};
+        let state = make_state();
+        let bad = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+            "metadata": { "name": "bad" }, "value": 1, "preemptionPolicy": "Foo"
+        });
+        let err = create_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&bad).unwrap()),
+        )
+        .await
+        .err()
+        .expect("preemptionPolicy Foo must be rejected on create");
+        assert_eq!(err.0.as_u16(), 422);
+        assert_eq!(
+            err.1.message,
+            "PriorityClass.scheduling.k8s.io \"bad\" is invalid: preemptionPolicy: Unsupported \
+             value: \"Foo\": supported values: \"PreemptLowerPriority\", \"Never\""
+        );
+
+        let seed = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+            "metadata": { "name": "pp" }, "value": 5, "preemptionPolicy": "Never"
+        });
+        post_seed_cluster(&state, "scheduling.k8s.io", "v1", "priorityclasses", &seed).await;
+        for method in PC_WRITE_METHODS {
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "pp",
+                serde_json::json!({"value": 5, "preemptionPolicy": "PreemptLowerPriority"}),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{method}: flipping preemptionPolicy must be rejected"));
+            assert_eq!(code, 422, "{method}");
+            assert_eq!(
+                msg,
+                "PriorityClass.scheduling.k8s.io \"pp\" is invalid: preemptionPolicy: Invalid \
+                 value: \"PreemptLowerPriority\": field is immutable",
+                "{method}"
+            );
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "pp",
+                serde_json::json!({"value": 6, "preemptionPolicy": "Never"}),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{method}: changing value must be rejected"));
+            assert_eq!(code, 422, "{method}");
+            assert!(
+                msg.ends_with("value: Forbidden: may not be changed in an update."),
+                "{method}: {msg}"
+            );
+            assert_eq!(
+                pc_write(
+                    &state,
+                    method,
+                    "pp",
+                    serde_json::json!({"value": 5, "preemptionPolicy": "Never", "description": method})
+                )
+                .await,
+                None,
+                "{method}: mutable fields stay writable"
+            );
+        }
+    }
+
+    /// Two default classes make pod priority depend on a tie-break instead of an explicit
+    /// choice, so a second globalDefault must be refused on create, SSA-create and when an
+    /// existing class is flipped to default by any update method; the current default itself
+    /// must stay editable.
+    #[tokio::test]
+    async fn priorityclass_second_global_default_is_forbidden_on_every_write_path() {
+        let state = make_state();
+        let pc = |name: &str, gd: bool| {
+            serde_json::json!({
+                "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+                "metadata": { "name": name }, "value": 1, "globalDefault": gd
+            })
+        };
+        post_seed_cluster(
+            &state,
+            "scheduling.k8s.io",
+            "v1",
+            "priorityclasses",
+            &pc("first", true),
+        )
+        .await;
+        post_seed_cluster(
+            &state,
+            "scheduling.k8s.io",
+            "v1",
+            "priorityclasses",
+            &pc("plain", false),
+        )
+        .await;
+        let want = "priorityclasses.scheduling.k8s.io \"second\" is forbidden: PriorityClass first is already marked as default. Only one default can exist";
+
+        let (code, msg) = pc_write(
+            &state,
+            "apply",
+            "second",
+            serde_json::json!({"value": 1, "globalDefault": true}),
+        )
+        .await
+        .expect("SSA-create of a second default must be rejected");
+        assert_eq!((code, msg.as_str()), (403, want));
+
+        let create = {
+            use axum::extract::{Path, Query, State};
+            create_resource(
+                State(state.clone()),
+                Path((
+                    "scheduling.k8s.io".into(),
+                    "v1".into(),
+                    "priorityclasses".into(),
+                )),
+                Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&pc("second", true)).unwrap()),
+            )
+            .await
+        };
+        let err = create
+            .err()
+            .expect("POST of a second default must be rejected");
+        assert_eq!((err.0.as_u16(), err.1.message.as_str()), (403, want));
+
+        for method in PC_WRITE_METHODS {
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "plain",
+                serde_json::json!({"value": 1, "globalDefault": true}),
+            )
+            .await
+            .unwrap_or_else(|| {
+                panic!("{method}: flipping a second class to default must be rejected")
+            });
+            assert_eq!(code, 403, "{method}");
+            assert!(
+                msg.contains("PriorityClass first is already marked as default"),
+                "{method}: {msg}"
+            );
+            assert_eq!(
+                pc_write(
+                    &state,
+                    method,
+                    "first",
+                    serde_json::json!({"value": 1, "globalDefault": true, "description": method})
+                )
+                .await,
+                None,
+                "{method}: the existing default must stay editable"
+            );
+        }
     }
 
     /// PUT growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
