@@ -1906,12 +1906,12 @@ pub async fn put_crd_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
     if is_dry_run_header(&headers) {
         return Ok(Json(current.body));
     }
 
-    let expected_rv = parse_resource_version(incoming.resource_version())?;
-    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)

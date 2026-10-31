@@ -8374,6 +8374,56 @@ mod tests {
         );
     }
 
+    /// A create that loses the race to a concurrent writer becomes an update, so a stated
+    /// resourceVersion that no longer matches must be a retryable 409 — not a silent
+    /// overwrite of the winner's object.
+    #[tokio::test]
+    async fn lost_create_race_with_stale_stated_resource_version_conflicts() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/coordination.k8s.io/leases/default/race-lease";
+        let winner = store
+            .put(key, bytes::Bytes::from_static(b"{\"winner\":true}"), None)
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let ident = ("coordination.k8s.io", "leases", "race-lease", "Lease");
+
+        let err = update_after_lost_create_race(
+            &state,
+            key,
+            bytes::Bytes::from_static(b"{\"loser\":true}"),
+            Some(winner + 100),
+            ident,
+        )
+        .await
+        .expect_err("stale stated resourceVersion must not overwrite the winner");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        assert!(
+            String::from_utf8_lossy(&stored.value).contains("winner"),
+            "the 409 must leave the winner's object in place"
+        );
+
+        update_after_lost_create_race(
+            &state,
+            key,
+            bytes::Bytes::from_static(b"{\"loser\":true}"),
+            Some(winner),
+            ident,
+        )
+        .await
+        .expect("matching stated resourceVersion updates");
+    }
+
     /// Every served kind whose upstream `AllowUnconditionalUpdate()` is false must reject an
     /// update with no resourceVersion (422) — otherwise a client that forgot to send one
     /// silently clobbers a concurrent writer — while true kinds keep accepting it.

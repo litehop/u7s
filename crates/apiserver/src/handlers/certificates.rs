@@ -1708,7 +1708,6 @@ mod tests {
         state
     }
 
-    /// Returns the (status, message) of one update attempt, `mode` naming the write path.
     /// `v` stamped with the stored object's resourceVersion (when it exists): PUT updates of
     /// these kinds are 422 without one.
     async fn with_stored_rv(
@@ -1723,6 +1722,7 @@ mod tests {
         v
     }
 
+    /// Returns the (status, message) of one update attempt, `mode` naming the write path.
     async fn update_ctb(
         state: &crate::state::AppState,
         mode: &str,

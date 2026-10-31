@@ -395,11 +395,6 @@ pub async fn put_resource_status<S: Store>(
         &group,
         &version,
     );
-    if is_dry_run_header(&headers) {
-        inject_type_meta(&mut current.body, &group, &version, &meta.kind);
-        return Ok(Json(current.body));
-    }
-
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     super::resource::require_builtin_resourceversion_on_update(
         &group,
@@ -407,6 +402,11 @@ pub async fn put_resource_status<S: Store>(
         expected_rv,
         &name,
     )?;
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &meta.kind);
+        return Ok(Json(current.body));
+    }
+
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -771,11 +771,6 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
         &group,
         &version,
     );
-    if is_dry_run_header(&headers) {
-        inject_type_meta(&mut current.body, &group, &version, &kind);
-        return Ok(Json(current.body).into_response());
-    }
-
     let expected_rv = parse_resource_version(incoming.resource_version())?;
     if cr_ctx.is_some() {
         super::resource::require_cr_resourceversion_on_update(&group, &plural, expected_rv, &name)?;
@@ -787,6 +782,11 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
             &name,
         )?;
     }
+    if is_dry_run_header(&headers) {
+        inject_type_meta(&mut current.body, &group, &version, &kind);
+        return Ok(Json(current.body).into_response());
+    }
+
     let storage_obj = to_storage_object(&state, cr_ctx.as_ref(), &group, &current).await?;
     let new_rv = state
         .store
@@ -1295,7 +1295,7 @@ mod tests {
             "status": { "ready": false }
         });
         let key = "/registry/storage.k8s.io/csinodes/dry-run-node";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
@@ -1318,7 +1318,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "dry-run-node" },
+            "metadata": { "name": "dry-run-node", "resourceVersion": stored_rv.to_string() },
             "status": { "ready": true }
         });
         let result = put_resource_status(
@@ -1888,7 +1888,7 @@ mod tests {
             "status": { "phase": "Active" }
         });
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
@@ -1911,7 +1911,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease", "resourceVersion": stored_rv.to_string() },
             "status": { "phase": "Expired" }
         });
         let result = put_namespaced_resource_status(
@@ -1949,6 +1949,59 @@ mod tests {
              put_namespaced_resource_status's dry-run guard was removed and \
              status.phase was actually flipped to Expired in the store"
         );
+    }
+
+    /// Upstream's dry-run storage path still runs the update validation, so a status PUT
+    /// without a resourceVersion on a kind that forbids unconditional updates is 422 with
+    /// dryRun=All too — otherwise `kubectl --dry-run=server` would approve a write the real
+    /// request rejects.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_dry_run_without_resource_version_is_422() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-a" }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut dry_run_headers = json_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "dry-run-lease".into(),
+            )),
+            None,
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("dryRun=All without resourceVersion must be rejected"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// put_namespaced_resource_status with null status removes the status field.
