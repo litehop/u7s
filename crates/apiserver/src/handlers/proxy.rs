@@ -10376,6 +10376,84 @@ mod tests {
         );
     }
 
+    /// The `node_proxy` handler itself (address check, then forward). A non-loopback node
+    /// address with an `http:<node>:<port>` id reaches a plain-HTTP fake without loosening
+    /// the loopback guard.
+    #[tokio::test]
+    async fn node_proxy_handler_forwards_request_to_node_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let backend_ip = test_backend_ip();
+        let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nkubelt")
+                .await
+                .unwrap();
+        });
+
+        let state = make_state();
+        seed_node_with_address(&state, &backend_ip.to_string()).await;
+        let resp = node_proxy(
+            State(state),
+            Path((format!("http:n:{port}"), "healthz".to_owned())),
+            axum::http::Request::new(Body::empty()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"kubelt",
+            "node_proxy must forward to the node and relay its response; \
+             kubectl get --raw /api/v1/nodes/<n>/proxy/... would return nothing"
+        );
+    }
+
+    /// The `node_proxy` handler must run the address check before dialing: a node whose
+    /// address is loopback is refused, so a Node object cannot aim the apiserver at itself.
+    #[cfg(not(feature = "rig-test-knobs"))]
+    #[tokio::test]
+    async fn node_proxy_handler_rejects_loopback_node_address_before_dialing() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = make_state();
+        seed_node_with_address(&state, "127.0.0.1").await;
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            node_proxy(
+                State(state),
+                Path((format!("http:n:{port}"), "healthz".to_owned())),
+                axum::http::Request::new(Body::empty()),
+            ),
+        )
+        .await
+        .expect("node_proxy dialed the loopback listener instead of rejecting")
+        .unwrap_err();
+
+        assert_eq!(
+            (err.0.as_u16(), err.1.message.as_str()),
+            (400, "address not allowed"),
+            "node_proxy skipped the address check: a forged Node address could make the \
+             apiserver proxy requests to its own loopback services"
+        );
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await;
+        assert!(
+            accepted.is_err(),
+            "the loopback listener must never be dialed"
+        );
+    }
+
     /// pod_proxy (direct, no konnectivity) must forward the pod's Content-Type.
     ///
     /// Same client-go fallback mechanism as node_proxy, but exercised through the
