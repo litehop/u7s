@@ -1338,6 +1338,17 @@ wait_for_cluster_ready() {
   return 1
 }
 
+# A worker only runs kubelet, so it cannot know the cluster's families from
+# flags. Its own Node object can: KCM allocates spec.podCIDRs per cluster-cidr
+# family, and nodes may read themselves. $1 is that Node's JSON; an IPv6 podCIDR
+# turns on the same IPv6 forwarding sysctl the control plane writes.
+worker_enable_ipv6_forwarding() {
+  [ -e /etc/sysctl.d/u7s-ipv6-forwarding.conf ] && return 0
+  printf '%s' "$1" | jq -e '[.spec.podCIDRs[]? | select(contains(":"))] | length > 0' >/dev/null 2>&1 || return 0
+  printf 'net.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/u7s-ipv6-forwarding.conf
+  sysctl --system >/dev/null
+}
+
 # Success condition of a join, checked as the new node identity after kubelet
 # started: the Node is Ready and the kubelet's own kubelet-serving CSR
 # (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
@@ -1350,6 +1361,7 @@ wait_for_joined_node() {
   for _ in $(seq 1 150); do
     if [ -z "$ready" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+      worker_enable_ipv6_forwarding "$resp"
       ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
     fi
     if [ -z "$serving" ]; then
@@ -1753,6 +1765,9 @@ cat > /etc/sysctl.d/u7s-br-netfilter.conf <<'SYSCTL_EOF'
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 SYSCTL_EOF
+# Upstream's container-runtime prerequisites set IPv4 forwarding explicitly.
+# Otherwise only the CNI bridge plugin flips it, at the first pod sandbox.
+printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/u7s-ip-forward.conf
 # IPv6 pod/Service traffic is routed through the node, which the kernel only
 # does with forwarding on; nothing else here sets it.
 if [ -n "$SERVICE_CIDR_IPV6$POD_CLUSTER_CIDR_IPV6" ]; then
@@ -1926,6 +1941,7 @@ if [ "$WORKER_MODE" -eq 1 ]; then
       exit 1
     fi
     FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
+    worker_enable_ipv6_forwarding "$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
   fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF

@@ -18,13 +18,14 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::Store;
 
 use crate::{
+    auth::UserInfo,
     handlers::generic::validate_path_segment,
     keys::{cluster_object_key, object_key},
     proto::{decode_k8s_proto_envelope, decode_token_request},
@@ -133,6 +134,7 @@ struct ClaimRef {
 
 pub async fn create_token<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     Path((raw_ns, sa_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -203,59 +205,104 @@ pub async fn create_token<S: Store>(
         })
         .unwrap_or_default();
 
-    // 6. Resolve pod (and its node) claims from the *stored* Pod object when the
-    // request is bound to one, rather than trusting the caller-supplied
-    // boundObjectRef verbatim. A caller only needs `create` on
-    // serviceaccounts/token to mint a token, so embedding unverified pod/node
-    // identity into the signed claims would let it forge TokenReview's
-    // authentication.kubernetes.io/pod-* extra info for a pod it doesn't own.
-    // When the referenced Pod (or its node) cannot be found, the corresponding
-    // claim is simply omitted — never fabricated.
+    // 6. Resolve the bound object from the *stored* object, never from the caller's
+    // boundObjectRef: a missing object is a 404 (an unbound token would outlive it), a UID
+    // mismatch a 409 and an unsupported kind a 400, as in upstream's TokenREST.Create.
+    // Node identities may only bind to pods scheduled on themselves (NodeRestriction).
+    let node_identity = user
+        .username
+        .strip_prefix("system:node:")
+        .filter(|_| user.groups.iter().any(|g| g == "system:nodes"));
+    if node_identity.is_some() {
+        node_restriction_precheck(&sa_name, spec.bound_object_ref.as_ref())?;
+    }
     let mut pod_ref: Option<ClaimRef> = None;
     let mut node_ref: Option<ClaimRef> = None;
     if let Some(bor) = spec.bound_object_ref.as_ref() {
-        if bor["kind"].as_str() == Some("Pod") {
-            if let Some(pod_name) = bor["name"]
+        let kind = bor["kind"].as_str().unwrap_or_default();
+        let api_version = bor["apiVersion"].as_str().unwrap_or_default();
+        let ref_name = bor["name"].as_str().unwrap_or_default();
+        let ref_uid = bor["uid"].as_str().unwrap_or_default();
+        let (resource, namespaced) = match (api_version, kind) {
+            ("" | "v1", "Pod") => ("pods", true),
+            ("" | "v1", "Node") => ("nodes", false),
+            ("" | "v1", "Secret") => ("secrets", true),
+            _ => {
+                let (group, version) = api_version.split_once('/').unwrap_or(("", api_version));
+                return Err(Status::bad_request(format!(
+                    "cannot bind token to object of type {group}/{version}, Kind={kind}"
+                )));
+            }
+        };
+        validate_path_segment("name", ref_name)?;
+        let key = if namespaced {
+            object_key(resource, ns.as_str(), ref_name)
+        } else {
+            cluster_object_key(resource, ref_name)
+        };
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found("", resource, ref_name))?;
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("stored {resource} is not JSON: {e}")))?;
+        let stored_uid = obj["metadata"]["uid"].as_str().unwrap_or_default();
+        if kind == "Pod" {
+            if let Some(node_name) = node_identity {
+                node_restriction_check_pod(&sa_name, node_name, ref_uid, &obj)?;
+            }
+            let pod_sa = obj["spec"]["serviceAccountName"]
                 .as_str()
-                .filter(|n| validate_path_segment("name", n).is_ok())
-            {
-                let pod_key = object_key("pods", ns.as_str(), pod_name);
-                if let Ok(Some(pod_obj)) = state.store.get(&pod_key).await {
-                    if let Ok(pod_val) = serde_json::from_slice::<serde_json::Value>(&pod_obj.value)
+                .unwrap_or_default();
+            if pod_sa != sa_name {
+                return Err(Status::bad_request(format!(
+                    "cannot bind token for serviceaccount \"{sa_name}\" to pod running with different serviceaccount name."
+                )));
+            }
+        }
+        if !ref_uid.is_empty() && ref_uid != stored_uid {
+            return Err(Status::conflict(format!(
+                "{kind} \"{ref_name}\": the UID in the bound object reference ({ref_uid}) does not match the UID in record. The object might have been deleted and then recreated"
+            )));
+        }
+        match kind {
+            "Pod" => {
+                if !stored_uid.is_empty() {
+                    pod_ref = Some(ClaimRef {
+                        name: ref_name.to_owned(),
+                        uid: stored_uid.to_owned(),
+                    });
+                }
+                if let Some(node_name) = obj["spec"]["nodeName"].as_str().filter(|n| !n.is_empty())
+                {
+                    let node_uid = match state
+                        .store
+                        .get(&cluster_object_key("nodes", node_name))
+                        .await
                     {
-                        let pod_uid = pod_val["metadata"]["uid"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned();
-                        if !pod_uid.is_empty() {
-                            pod_ref = Some(ClaimRef {
-                                name: pod_name.to_owned(),
-                                uid: pod_uid,
-                            });
+                        Ok(Some(node_obj)) => {
+                            serde_json::from_slice::<serde_json::Value>(&node_obj.value)
+                                .ok()
+                                .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned))
+                                .unwrap_or_default()
                         }
-                        if let Some(node_name) = pod_val["spec"]["nodeName"].as_str() {
-                            if !node_name.is_empty() {
-                                let node_key = cluster_object_key("nodes", node_name);
-                                let node_uid = match state.store.get(&node_key).await {
-                                    Ok(Some(node_obj)) => {
-                                        serde_json::from_slice::<serde_json::Value>(&node_obj.value)
-                                            .ok()
-                                            .and_then(|v| {
-                                                v["metadata"]["uid"].as_str().map(str::to_owned)
-                                            })
-                                            .unwrap_or_default()
-                                    }
-                                    _ => String::new(),
-                                };
-                                node_ref = Some(ClaimRef {
-                                    name: node_name.to_owned(),
-                                    uid: node_uid,
-                                });
-                            }
-                        }
-                    }
+                        _ => String::new(),
+                    };
+                    node_ref = Some(ClaimRef {
+                        name: node_name.to_owned(),
+                        uid: node_uid,
+                    });
                 }
             }
+            "Node" => {
+                node_ref = Some(ClaimRef {
+                    name: ref_name.to_owned(),
+                    uid: stored_uid.to_owned(),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -342,6 +389,58 @@ pub async fn create_token<S: Store>(
     });
 
     Ok((StatusCode::CREATED, Json(resp)))
+}
+
+fn node_forbidden(sa_name: &str, reason: &str) -> crate::status::StatusError {
+    Status::forbidden(format!(
+        "serviceaccounts \"{sa_name}\" is forbidden: {reason}"
+    ))
+}
+
+/// NodeRestriction: a node's TokenRequest must carry a v1 Pod binding with a uid.
+fn node_restriction_precheck(
+    sa_name: &str,
+    bound_object_ref: Option<&serde_json::Value>,
+) -> Result<(), crate::status::StatusError> {
+    let bor = bound_object_ref.unwrap_or(&serde_json::Value::Null);
+    if bor["apiVersion"].as_str() != Some("v1")
+        || bor["kind"].as_str() != Some("Pod")
+        || bor["name"].as_str().unwrap_or_default().is_empty()
+    {
+        return Err(node_forbidden(
+            sa_name,
+            "node requested token not bound to a pod",
+        ));
+    }
+    if bor["uid"].as_str().unwrap_or_default().is_empty() {
+        return Err(node_forbidden(
+            sa_name,
+            "node requested token with a pod binding without a uid",
+        ));
+    }
+    Ok(())
+}
+
+/// NodeRestriction: the bound pod must be scheduled on the requesting node.
+fn node_restriction_check_pod(
+    sa_name: &str,
+    node_name: &str,
+    ref_uid: &str,
+    pod: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    if pod["metadata"]["uid"].as_str().unwrap_or_default() != ref_uid {
+        return Err(node_forbidden(
+            sa_name,
+            &format!("the UID in the bound object reference ({ref_uid}) does not match the UID in record. The object might have been deleted and then recreated"),
+        ));
+    }
+    if pod["spec"]["nodeName"].as_str() != Some(node_name) {
+        return Err(node_forbidden(
+            sa_name,
+            "node requested token bound to a pod scheduled on a different node",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +709,7 @@ mod handler_tests {
             let (state, _store) = make_state_no_key();
             let result = create_token(
                 State(state),
+                Extension(anon()),
                 Path((ns.to_owned(), sa.to_owned())),
                 Bytes::new(),
             )
@@ -634,6 +734,7 @@ mod handler_tests {
         let (state, _store) = make_state_no_key();
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("INVALID_NS".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
@@ -657,6 +758,7 @@ mod handler_tests {
         let (state, _store) = make_state_no_key();
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("no-such-ns".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
@@ -686,6 +788,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "ghost-sa".to_owned())),
             Bytes::new(),
         )
@@ -717,6 +820,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
@@ -747,6 +851,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from_static(b"{not valid json"),
         )
@@ -781,6 +886,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
@@ -839,6 +945,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -879,6 +986,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -912,6 +1020,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("kube-system".to_owned(), "node-controller".to_owned())),
             Bytes::from_static(req_body),
         )
@@ -938,6 +1047,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("kube-system".to_owned(), "coredns".to_owned())),
             Bytes::new(),
         )
@@ -1018,6 +1128,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(body),
         )
@@ -1055,6 +1166,7 @@ mod handler_tests {
         let (state, store) = make_state_with_key();
         seed_namespace(&store, "default").await;
         seed_serviceaccount(&store, "default", "my-sa", "uid-bor-test").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-abc-123", "node-a").await;
 
         let req_body = serde_json::json!({
             "spec": {
@@ -1071,6 +1183,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1124,6 +1237,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1147,7 +1261,7 @@ mod handler_tests {
         let val = serde_json::json!({
             "kind": "Pod",
             "metadata": {"name": name, "namespace": ns, "uid": uid},
-            "spec": {"nodeName": node_name}
+            "spec": {"nodeName": node_name, "serviceAccountName": "my-sa"}
         });
         store
             .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
@@ -1189,15 +1303,14 @@ mod handler_tests {
                     "apiVersion": "v1",
                     "kind": "Pod",
                     "name": "my-pod",
-                    // Deliberately wrong UID: the claim must come from the stored
-                    // Pod object, not be trusted verbatim from the request.
-                    "uid": "attacker-supplied-uid"
+                    "uid": "pod-uid-real"
                 }
             }
         });
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1232,50 +1345,203 @@ mod handler_tests {
         );
     }
 
-    /// When boundObjectRef references a Pod name that does NOT exist in the store,
-    /// the minted JWT must omit the pod/node claims entirely rather than trusting
-    /// the unverifiable caller-supplied name/uid — fabricating an unverifiable
-    /// binding claim would let TokenReview report false pod identity.
-    #[tokio::test]
-    async fn create_token_omits_pod_claim_when_pod_not_found() {
+    fn anon() -> UserInfo {
+        UserInfo {
+            username: "system:serviceaccount:default:caller".into(),
+            ..Default::default()
+        }
+    }
+
+    fn node_user(name: &str) -> UserInfo {
+        UserInfo {
+            username: format!("system:node:{name}"),
+            groups: vec!["system:nodes".into()],
+            ..Default::default()
+        }
+    }
+
+    async fn seed_secret(store: &Arc<SqliteStore>, ns: &str, name: &str, uid: &str) {
+        let val = serde_json::json!({
+            "kind": "Secret",
+            "metadata": {"name": name, "namespace": ns, "uid": uid}
+        });
+        store
+            .put(
+                &format!("/registry/secrets/{ns}/{name}"),
+                Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed secret");
+    }
+
+    /// Request a token for default/my-sa bound to `bound_object_ref` as `user`, against a
+    /// store holding pod `my-pod` (uid pod-uid-1, on node-a, SA my-sa), node-a, node-b,
+    /// secret `my-secret` and pod `other-sa-pod` (SA other).
+    async fn bound_request(
+        user: UserInfo,
+        bound_object_ref: serde_json::Value,
+    ) -> Result<serde_json::Value, crate::status::StatusError> {
         let (state, store) = make_state_with_key();
         seed_namespace(&store, "default").await;
-        seed_serviceaccount(&store, "default", "my-sa", "uid-sa-2").await;
-
-        let req_body = serde_json::json!({
-            "spec": {
-                "audiences": ["https://kubernetes.default.svc"],
-                "expirationSeconds": 3607,
-                "boundObjectRef": {
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "name": "ghost-pod",
-                    "uid": "ghost-uid"
-                }
-            }
+        seed_serviceaccount(&store, "default", "my-sa", "uid-sa").await;
+        seed_pod(&store, "default", "my-pod", "pod-uid-1", "node-a").await;
+        seed_node(&store, "node-a", "node-uid-a").await;
+        seed_node(&store, "node-b", "node-uid-b").await;
+        seed_secret(&store, "default", "my-secret", "secret-uid-1").await;
+        let other_pod = serde_json::json!({
+            "kind": "Pod",
+            "metadata": {"name": "other-sa-pod", "namespace": "default", "uid": "pod-uid-2"},
+            "spec": {"nodeName": "node-a", "serviceAccountName": "other"}
         });
-
-        let result = create_token(
+        store
+            .put(
+                "/registry/pods/default/other-sa-pod",
+                Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed pod");
+        let body = serde_json::json!({"spec": {"boundObjectRef": bound_object_ref}});
+        let r = create_token(
             State(state),
+            Extension(user),
             Path(("default".to_owned(), "my-sa".to_owned())),
-            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
-        .await;
-        let resp_body = match result {
-            Ok(r) => collect_body(r).await,
-            Err(e) => panic!(
-                "token request must succeed: status={} message={}",
-                e.0, e.1.message
-            ),
-        };
+        .await?;
+        Ok(collect_body(r).await)
+    }
 
-        let token = resp_body["status"]["token"].as_str().expect("token string");
-        let claims = decode_jwt_claims(token);
-        assert!(
-            claims["kubernetes.io"]["pod"].is_null(),
-            "pod claim must be omitted when the referenced Pod cannot be found — \
-             the caller-supplied name/uid must never be trusted verbatim"
+    fn pod_ref(name: &str, uid: &str) -> serde_json::Value {
+        serde_json::json!({"apiVersion": "v1", "kind": "Pod", "name": name, "uid": uid})
+    }
+
+    /// A token bound to a pod that does not exist would be minted unbound and outlive any pod;
+    /// the request must be a 404 instead.
+    #[tokio::test]
+    async fn token_bound_to_missing_pod_is_404_not_an_unbound_token() {
+        let err = bound_request(anon(), pod_ref("ghost", "ghost-uid"))
+            .await
+            .expect_err("missing pod must not yield a token");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    /// A caller with `create serviceaccounts/token` must not be able to mint a token for SA X
+    /// that is bound to (and so inherits the liveness of) a pod running as a different SA.
+    #[tokio::test]
+    async fn token_bound_to_pod_of_another_serviceaccount_is_rejected() {
+        let err = bound_request(anon(), pod_ref("other-sa-pod", "pod-uid-2"))
+            .await
+            .expect_err("cross-SA pod binding must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1.message,
+            "cannot bind token for serviceaccount \"my-sa\" to pod running with different serviceaccount name."
         );
+    }
+
+    /// A stale boundObjectRef.uid (pod deleted and recreated under the same name) must be a 409
+    /// rather than binding the token to the new, unrelated pod.
+    #[tokio::test]
+    async fn token_bound_with_stale_pod_uid_is_409() {
+        let err = bound_request(anon(), pod_ref("my-pod", "old-uid"))
+            .await
+            .expect_err("uid mismatch must be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// Bound kinds the authenticator cannot tie to a live object (ConfigMap, apps/v1 Pod
+    /// lookalikes) must be refused, otherwise they silently yield unbound tokens.
+    #[tokio::test]
+    async fn token_bound_to_unsupported_kind_is_400() {
+        for r in [
+            serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap", "name": "c"}),
+            serde_json::json!({"apiVersion": "apps/v1", "kind": "Pod", "name": "my-pod"}),
+        ] {
+            let err = bound_request(anon(), r)
+                .await
+                .expect_err("unsupported kind must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert!(err
+                .1
+                .message
+                .starts_with("cannot bind token to object of type "));
+        }
+    }
+
+    /// Secret bindings are validated against the stored Secret: missing is 404, stale uid 409,
+    /// and a matching one is accepted.
+    #[tokio::test]
+    async fn secret_binding_checks_existence_and_uid() {
+        let sref = |name: &str, uid: &str| serde_json::json!({"apiVersion": "v1", "kind": "Secret", "name": name, "uid": uid});
+        let e = bound_request(anon(), sref("nope", "")).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND, "missing secret must be 404");
+        let e = bound_request(anon(), sref("my-secret", "stale"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT, "stale secret uid must be 409");
+        bound_request(anon(), sref("my-secret", "secret-uid-1"))
+            .await
+            .expect("valid secret binding must be accepted");
+    }
+
+    /// Node bindings are validated against the stored (cluster-scoped) Node and the node claim
+    /// carries the stored uid, so TokenReview reports the real node.
+    #[tokio::test]
+    async fn node_binding_checks_existence_and_uid_and_sets_node_claim() {
+        let nref = |name: &str, uid: &str| serde_json::json!({"apiVersion": "v1", "kind": "Node", "name": name, "uid": uid});
+        let e = bound_request(anon(), nref("nope", "")).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND, "missing node must be 404");
+        let e = bound_request(anon(), nref("node-b", "stale"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT, "stale node uid must be 409");
+        let resp = bound_request(anon(), nref("node-b", "node-uid-b"))
+            .await
+            .expect("valid node binding must be accepted");
+        let claims = decode_jwt_claims(resp["status"]["token"].as_str().unwrap());
+        assert_eq!(claims["kubernetes.io"]["node"]["uid"], "node-uid-b");
+    }
+
+    /// NodeRestriction: a compromised node must not mint tokens bound to pods of other nodes.
+    #[tokio::test]
+    async fn node_cannot_mint_token_bound_to_pod_on_another_node() {
+        let err = bound_request(node_user("node-b"), pod_ref("my-pod", "pod-uid-1"))
+            .await
+            .expect_err("pod on node-a must not be bindable by node-b");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err
+            .1
+            .message
+            .ends_with("node requested token bound to a pod scheduled on a different node"));
+    }
+
+    /// NodeRestriction: kubelet's own request (pod on its node) keeps working, otherwise no pod
+    /// gets a projected token.
+    #[tokio::test]
+    async fn node_can_mint_token_bound_to_its_own_pod() {
+        let resp = bound_request(node_user("node-a"), pod_ref("my-pod", "pod-uid-1"))
+            .await
+            .expect("kubelet must be able to mint tokens for its own pods");
+        assert_eq!(resp["spec"]["boundObjectRef"]["uid"], "pod-uid-1");
+    }
+
+    /// NodeRestriction: nodes may only use pod bindings with a uid; an unbound or Secret/Node
+    /// bound request from a node identity would yield a token outliving the pod.
+    #[tokio::test]
+    async fn node_must_bind_to_a_pod_with_uid() {
+        for r in [
+            serde_json::Value::Null,
+            serde_json::json!({"apiVersion": "v1", "kind": "Secret", "name": "my-secret"}),
+            serde_json::json!({"apiVersion": "v1", "kind": "Node", "name": "node-a"}),
+            serde_json::json!({"apiVersion": "v1", "kind": "Pod", "name": "my-pod"}),
+        ] {
+            let err = bound_request(node_user("node-a"), r.clone())
+                .await
+                .expect_err("node request without a uid-carrying pod binding must be refused");
+            assert_eq!(err.0, StatusCode::FORBIDDEN, "ref {r}");
+        }
     }
 
     /// A very short expiration (below 600s) must be clamped to 600s by the handler.
@@ -1295,6 +1561,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1342,6 +1609,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1407,6 +1675,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::new(),
         )
@@ -1448,6 +1717,7 @@ mod handler_tests {
         let mint = |state: AppState| async move {
             let result = create_token(
                 State(state),
+                Extension(anon()),
                 Path(("default".to_owned(), "my-sa".to_owned())),
                 Bytes::new(),
             )
@@ -1508,6 +1778,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1585,6 +1856,7 @@ mod handler_tests {
             }
             let result = create_token(
                 State(state.clone()),
+                Extension(anon()),
                 Path(("default".to_owned(), "my-sa".to_owned())),
                 Bytes::from(serde_json::to_vec(&serde_json::json!({ "spec": spec })).unwrap()),
             )
@@ -1624,6 +1896,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )
@@ -1681,6 +1954,7 @@ mod handler_tests {
 
         let result = create_token(
             State(state),
+            Extension(anon()),
             Path(("default".to_owned(), "my-sa".to_owned())),
             Bytes::from(serde_json::to_vec(&req_body).unwrap()),
         )

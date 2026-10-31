@@ -2835,8 +2835,13 @@ fn ji64(v: &serde_json::Value, key: &str) -> Option<i64> {
     v.get(key).and_then(|x| x.as_i64())
 }
 
-fn ji32(v: &serde_json::Value, key: &str) -> Option<i32> {
-    v.get(key).and_then(|x| x.as_i64()).map(|n| n as i32)
+/// Absent for a value outside int32 rather than wrapped: admission rejects such objects at
+/// write time, so reaching here with one means a stored object predates that check, and a wrapped
+/// value would show protobuf clients a different number than JSON clients.
+pub(crate) fn ji32(v: &serde_json::Value, key: &str) -> Option<i32> {
+    v.get(key)
+        .and_then(|x| x.as_i64())
+        .and_then(|n| i32::try_from(n).ok())
 }
 
 fn jbool(v: &serde_json::Value, key: &str) -> Option<bool> {
@@ -2976,7 +2981,7 @@ pub(crate) fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::Obj
     }
 }
 
-fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
+pub(crate) fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
     let meta = v
         .get("metadata")
         .cloned()
@@ -2984,6 +2989,7 @@ fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
     meta_v1::ListMeta {
         resource_version: jstr(&meta, "resourceVersion"),
         r#continue: jstr(&meta, "continue"),
+        remaining_item_count: ji64(&meta, "remainingItemCount"),
         ..Default::default()
     }
 }
@@ -3801,7 +3807,7 @@ fn json_to_int_or_string_proto(v: &serde_json::Value) -> IntOrString {
         },
         _ => IntOrString {
             r#type: Some(0),
-            int_val: v.as_i64().map(|n| n as i32),
+            int_val: v.as_i64().and_then(|n| i32::try_from(n).ok()),
             ..Default::default()
         },
     }
@@ -9698,6 +9704,50 @@ mod tests {
             true,
             encode_eventlist_proto_gen,
             list!(EventList),
+        );
+    }
+
+    /// Every list encoder must carry every ListMeta field with its own value: a dropped
+    /// `remainingItemCount` or `continue` makes a protobuf LIST client mis-paginate where a JSON
+    /// client does not.
+    #[test]
+    fn encode_core_list_proto_gen_carries_every_list_meta_field() {
+        use crate::proto_descriptor::assert_encoder_carries_every_list_meta_field as check;
+        macro_rules! list_meta {
+            ($ty:ident) => {
+                |b: &[u8]| {
+                    core_v1::$ty::decode(b)
+                        .unwrap()
+                        .metadata
+                        .unwrap()
+                        .encode_to_vec()
+                }
+            };
+        }
+        check(
+            "encode_podlist_proto_gen",
+            encode_podlist_proto_gen,
+            list_meta!(PodList),
+        );
+        check(
+            "encode_servicelist_proto_gen",
+            encode_servicelist_proto_gen,
+            list_meta!(ServiceList),
+        );
+        check(
+            "encode_nodelist_proto_gen",
+            encode_nodelist_proto_gen,
+            list_meta!(NodeList),
+        );
+        check(
+            "encode_endpointslist_proto_gen",
+            encode_endpointslist_proto_gen,
+            list_meta!(EndpointsList),
+        );
+        check(
+            "encode_eventlist_proto_gen",
+            encode_eventlist_proto_gen,
+            list_meta!(EventList),
         );
     }
 
