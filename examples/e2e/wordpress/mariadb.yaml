@@ -83,6 +83,12 @@ spec:
             - name: mysql
               containerPort: 3306
               protocol: TCP
+          # No CPU limit: the image entrypoint gives its first-init temporary server a fixed
+          # ~40-55 s to accept connections, and that start burns ~28 CPU-s on an e2-micro; a 375m
+          # CFS quota (which the exec probes also draw from) throttled it for ~140 s.
+          args:
+            - --innodb-buffer-pool-size=64M
+            - --innodb-log-file-size=32M
           env:
             - name: MARIADB_ROOT_PASSWORD
               valueFrom:
@@ -104,7 +110,6 @@ spec:
               memory: 256Mi
               ephemeral-storage: 50Mi
             limits:
-              cpu: 375m
               memory: 384Mi
               ephemeral-storage: 2Gi
           securityContext:

@@ -28,6 +28,12 @@ Creates the `csi-hostpath-sc` StorageClass, a MariaDB StatefulSet+Secret+ConfigM
 Service, and a WordPress+nginx+php-fpm Deployment+Secret+ConfigMaps+Service, all in
 the `default` namespace.
 
+MariaDB has no CPU limit (request 250m) and runs with a 64M InnoDB buffer pool and
+32M redo log. The image entrypoint gives its first-init temporary server a fixed
+~40-55 s to accept connections and that start needs ~28 CPU-s, so a CPU quota (or a
+very slow shared-core node) makes the entrypoint give up; the restart skips init and
+the pod never becomes Ready.
+
 ## Ingress (Traefik, cleartext HTTP)
 
 WordPress is exposed through Traefik, not `kubectl port-forward` to the pod.
