@@ -5608,6 +5608,70 @@ fn pick_global_default(classes: &[serde_json::Value]) -> Option<&serde_json::Val
         .min_by_key(|c| c["value"].as_i64().unwrap_or(0))
 }
 
+/// Priority admission for PriorityClass writes (upstream `ValidatePriorityClass` /
+/// `ValidatePriorityClassUpdate` strategy validation plus the Priority plugin's
+/// `validatePriorityClass`): create-only name/value/preemptionPolicy rules, immutable
+/// `value`/`preemptionPolicy` on update, and at most one `globalDefault` class.
+pub(crate) async fn admit_priority_class<S: Store>(
+    state: &AppState<S>,
+    ctx: &crate::admission::AdmissionContext<'_>,
+    object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
+) -> Result<(), crate::status::StatusError> {
+    let create = ctx.operation == "CREATE";
+    if !create && ctx.operation != "UPDATE" {
+        return Ok(());
+    }
+    let name = object["metadata"]["name"].as_str().unwrap_or_default();
+    let invalid = |msg: String| {
+        Status::unprocessable_entity(format!(
+            "PriorityClass.scheduling.k8s.io \"{name}\" is invalid: {msg}"
+        ))
+    };
+    if create {
+        super::defaults::validate_priority_class(object).map_err(invalid)?;
+    } else {
+        let old = old_object.ok_or_else(|| {
+            Status::internal("PriorityClass update admitted without the stored object".to_string())
+        })?;
+        super::defaults::validate_priority_class_update(old, object).map_err(invalid)?;
+    }
+    if object["globalDefault"].as_bool() != Some(true) {
+        return Ok(());
+    }
+    let prefix = group_list_prefix("scheduling.k8s.io", "priorityclasses", None);
+    let items = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(format!("failed to get default priority class: {e}")))?
+        .items;
+    let classes: Vec<serde_json::Value> = items
+        .iter()
+        .filter_map(|item| serde_json::from_slice(&item.value).ok())
+        .collect();
+    match conflicting_default_class(&classes, name, create) {
+        Some(existing) => Err(Status::forbidden(format!(
+            "priorityclasses.scheduling.k8s.io \"{name}\" is forbidden: PriorityClass {existing} \
+             is already marked as default. Only one default can exist"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Name of the existing default class that blocks marking `name` as default: any default on
+/// create, or a default under a different name on update.
+fn conflicting_default_class(
+    classes: &[serde_json::Value],
+    name: &str,
+    create: bool,
+) -> Option<String> {
+    let existing = pick_global_default(classes)?["metadata"]["name"]
+        .as_str()?
+        .to_string();
+    (create || existing != name).then_some(existing)
+}
+
 /// Pure core of priority admission.
 ///
 /// `named_class` is the stored PriorityClass for `spec.priorityClassName`. `default_class` is the

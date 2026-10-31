@@ -3171,6 +3171,10 @@ pub async fn run_validating_webhooks<S: Store>(
     // upstream orders its built-in validating plugins before ValidatingAdmissionWebhook.
     crate::pod_security::admit(state, ctx, object, old_object).await?;
 
+    if (ctx.group, ctx.resource) == ("scheduling.k8s.io", "priorityclasses") {
+        crate::handlers::pods::admit_priority_class(state, ctx, object, old_object).await?;
+    }
+
     let start = std::time::Instant::now();
 
     // Already-flattened, typed webhook entries — the cache holds the parsed form so
