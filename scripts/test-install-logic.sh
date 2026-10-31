@@ -435,8 +435,8 @@ assert_true "manifests/flannel.yaml deploys Flannel's DaemonSet (kube-flannel-ds
 assert_true "manifests/flannel.yaml's --iface is a __IFACE__ placeholder scripts/install.sh substitutes at install time, not a value hardcoded to whichever node it was vendored from" \
   grep -qF -- '--iface=__IFACE__' "$FLANNEL_MANIFEST"
 
-assert_true "manifests/flannel.yaml's net-conf.json Network is a __POD_CLUSTER_CIDR__ placeholder scripts/install.sh substitutes, so it can never drift from kube-controller-manager's own --cluster-cidr" \
-  grep -qF '"Network": "__POD_CLUSTER_CIDR__"' "$FLANNEL_MANIFEST"
+assert_true "manifests/flannel.yaml's net-conf.json Network is a __POD_CLUSTER_CIDR_IPV4__ placeholder scripts/install.sh substitutes, so it can never drift from kube-controller-manager's own --cluster-cidr" \
+  grep -qF '"Network": "__POD_CLUSTER_CIDR_IPV4__"' "$FLANNEL_MANIFEST"
 
 assert_true "install.sh disables CRI-O's own default bridge CNI conflist(s) once Flannel supplies the real one -- CRI-O picks whichever CNI config file sorts first alphabetically, so leaving 10-crio-bridge.conflist active would silently keep winning over Flannel's 10-flannel.conflist" \
   grep -qF 'mv "$CNI_DIR/$f" "$CNI_DIR/$f.disabled"' "$INSTALL"
@@ -2315,6 +2315,44 @@ printf 'a: __POD_CLUSTER_CIDR__\nc: __POD_CLUSTER_CIDR_IPV4__\nd: __POD_CLUSTER_
 net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; IFACE=eth0; validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/ph"'" && echo rendered'
 assert "single-stack leaves the IPv6 placeholders empty rather than inventing a value" \
   "$([ "$(paste -sd'|' "$NET_WORK/ph/flannel.yaml")" = 'a: 10.244.0.0/16|c: 10.244.0.0/16|d: ' ] && echo 1 || echo 0)"
+
+# Dual-stack render of the REAL vendored manifests: each consumer must learn
+# both families, or one family silently breaks (pods unroutable, Service VIPs
+# unproxied, LoadBalancer backends rejected, DNS unreachable over IPv6).
+DUAL_DEST="$NET_WORK/rendered-dual"
+mkdir -p "$DUAL_DEST"
+cp "$ROOT_DIR"/manifests/*.yaml "$DUAL_DEST/"
+net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+validate_network_config 0 && render_vendored_manifests "'"$DUAL_DEST"'" && echo rendered'
+assert "rendering the real vendored manifests for a dual-stack install succeeds" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = rendered ] && echo 1 || echo 0)"
+assert_true "flannel enables IPv6 with the IPv6 pod range (without it v6 pod traffic is never routed over the overlay)" \
+  grep -qF '"EnableIPv6": true, "IPv6Network": "fd00:244::/56"' "$DUAL_DEST/flannel.yaml"
+assert_true "flannel's IPv4 Network stays the IPv4 entry on a dual-stack install" \
+  grep -qF '"Network": "10.244.0.0/16"' "$DUAL_DEST/flannel.yaml"
+assert_true "kube-proxy's clusterCIDR lists both families so it masquerades both" \
+  grep -qx '    clusterCIDR: 10.244.0.0/16,fd00:244::/56' "$DUAL_DEST/kube-proxy.yaml"
+assert_true "beep gets an IPv4 --pod-cidr: it admits a pod IP only against its own family's CIDR" \
+  grep -qxF '            - --pod-cidr=10.244.0.0/16' "$DUAL_DEST/beep.yaml"
+assert_true "beep gets an IPv6 --pod-cidr, or every IPv6 pod backend is rejected and LoadBalancer breaks for that family" \
+  grep -qxF '            - --pod-cidr=fd00:244::/56' "$DUAL_DEST/beep.yaml"
+assert "beep has exactly two --pod-cidr flags on a dual-stack install" \
+  "$([ "$(grep -c -- '--pod-cidr=' "$DUAL_DEST/beep.yaml")" -eq 2 ] && echo 1 || echo 0)"
+assert "CoreDNS Service is PreferDualStack with one kube-dns VIP per family, primary first" \
+  "$(grep -A4 '^  clusterIP: ' "$DUAL_DEST/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack' && echo 1 || echo 0)"
+assert_false "no dual-stack rendered manifest keeps an unresolved __PLACEHOLDER__" \
+  grep -qE '__[A-Z_]+__' "$DUAL_DEST/flannel.yaml" "$DUAL_DEST/kube-proxy.yaml" "$DUAL_DEST/beep.yaml"
+net_run 'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+mkdir -p "'"$NET_WORK/dual6"'" && cp "'"$ROOT_DIR"'"/manifests/coredns.yaml "'"$NET_WORK/dual6/"'"
+validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/dual6"'" && echo rendered'
+assert "an IPv6-primary dual-stack CoreDNS lists its IPv6 VIP first and the IPv4 VIP second" \
+  "$(grep -A2 '^  clusterIPs:' "$NET_WORK/dual6/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIPs:|  - fd00:96::a|  - 10.96.0.10' && echo 1 || echo 0)"
+mkdir -p "$NET_WORK/v6url"
+cp "$ROOT_DIR"/manifests/kube-proxy.yaml "$NET_WORK/v6url/"
+net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; IFACE=eth0; IFACE_IP=fd00::5; KUBE_VERSION=1.37.1
+render_vendored_manifests "'"$NET_WORK/v6url"'" && echo rendered'
+assert_true "an IPv6 node address is bracketed in kube-proxy's apiserver URL (https://fd00::5:6443 does not parse)" \
+  grep -qx '        server: https://\[fd00::5\]:6443' "$NET_WORK/v6url/kube-proxy.yaml"
 
 # Golden: single-stack IPv4 output must stay byte-identical to what the
 # installer wrote before dual-stack support (apiserver/KCM ExecStart lines and

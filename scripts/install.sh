@@ -757,11 +757,29 @@ kcm_node_cidr_mask_flags() {
 # each family are __POD_CLUSTER_CIDRS__, __POD_CLUSTER_CIDR_IPV4__ and
 # __POD_CLUSTER_CIDR_IPV6__ (likewise __SERVICE_CIDRS__, __SERVICE_CIDR_IPV4__,
 # __SERVICE_CIDR_IPV6__); an absent family renders empty. Single-stack IPv4
-# renders __POD_CLUSTER_CIDR__ exactly as before.
+# renders __POD_CLUSTER_CIDR__ exactly as before. Only a dual-stack install
+# changes manifest shape: flannel keeps its IPv6Network line, beep gets one
+# --pod-cidr per family, CoreDNS gets a second clusterIP, and kube-proxy's
+# server URL brackets an IPv6 node address.
 # CoreDNS ships its default VIP literally (the dev rigs apply the file as-is),
 # so its clusterIP line is rewritten and then verified.
 render_vendored_manifests() {
-  local dir="$1"
+  local dir="$1" nl=$'\\\n' iface_host="${IFACE_IP:-}" other_dns=""
+  local -a flannel_sed=() beep_sed=() coredns_sed=()
+  case "$iface_host" in *:*) iface_host="[$iface_host]" ;; esac
+  if [ -n "$POD_CLUSTER_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ]; then
+    # beep admits a pod IP only against the --pod-cidr of its own family.
+    beep_sed=(-e "s#--pod-cidr=__POD_CLUSTER_CIDR__#--pod-cidr=${POD_CLUSTER_CIDR%%,*}${nl}            - --pod-cidr=${POD_CLUSTER_CIDR#*,}#")
+  else
+    flannel_sed=(-e '/"IPv6Network": "__POD_CLUSTER_CIDR_IPV6__"/d')
+  fi
+  if [ -n "$SERVICE_CIDR_IPV4" ] && [ -n "$SERVICE_CIDR_IPV6" ]; then
+    case "$CLUSTER_DNS" in
+      *:*) other_dns="$(default_cluster_dns "$SERVICE_CIDR_IPV4")" || return 1 ;;
+      *) other_dns="$(default_cluster_dns "$SERVICE_CIDR_IPV6")" || return 1 ;;
+    esac
+    coredns_sed=(-e "s#^  clusterIP: $CLUSTER_DNS\$#  clusterIP: $CLUSTER_DNS${nl}  clusterIPs:${nl}  - $CLUSTER_DNS${nl}  - $other_dns${nl}  ipFamilyPolicy: PreferDualStack#")
+  fi
   local -a cidr_sed=(
     -e "s#__POD_CLUSTER_CIDR__#${POD_CLUSTER_CIDR%%,*}#g"
     -e "s#__POD_CLUSTER_CIDRS__#$POD_CLUSTER_CIDR#g"
@@ -774,22 +792,22 @@ render_vendored_manifests() {
   if [ -f "$dir/flannel.yaml" ]; then
     # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
     # BSD sed, and this redirect-and-replace form works identically on both.
-    sed -e "s/__IFACE__/$IFACE/g" "${cidr_sed[@]}" \
+    sed -e "s/__IFACE__/$IFACE/g" ${flannel_sed[@]+"${flannel_sed[@]}"} "${cidr_sed[@]}" \
       "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp"
     mv "$dir/flannel.yaml.tmp" "$dir/flannel.yaml"
   fi
   if [ -f "$dir/kube-proxy.yaml" ]; then
-    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" "${cidr_sed[@]}" \
+    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#https://__IFACE_IP__:#https://$iface_host:#g" -e "s#__IFACE_IP__#$IFACE_IP#g" "${cidr_sed[@]}" \
       "$dir/kube-proxy.yaml" > "$dir/kube-proxy.yaml.tmp"
     mv "$dir/kube-proxy.yaml.tmp" "$dir/kube-proxy.yaml"
   fi
   if [ -f "$dir/beep.yaml" ]; then
-    sed -e "s/__IFACE__/$IFACE/g" "${cidr_sed[@]}" \
+    sed -e "s/__IFACE__/$IFACE/g" ${beep_sed[@]+"${beep_sed[@]}"} "${cidr_sed[@]}" \
       "$dir/beep.yaml" > "$dir/beep.yaml.tmp"
     mv "$dir/beep.yaml.tmp" "$dir/beep.yaml"
   fi
   if [ -f "$dir/coredns.yaml" ]; then
-    sed -e "s#^  clusterIP: 10\.96\.0\.10\$#  clusterIP: $CLUSTER_DNS#" \
+    sed -e "s#^  clusterIP: 10\.96\.0\.10\$#  clusterIP: $CLUSTER_DNS#" ${coredns_sed[@]+"${coredns_sed[@]}"} \
       "$dir/coredns.yaml" > "$dir/coredns.yaml.tmp"
     mv "$dir/coredns.yaml.tmp" "$dir/coredns.yaml"
     if ! grep -qx "  clusterIP: $CLUSTER_DNS" "$dir/coredns.yaml"; then
