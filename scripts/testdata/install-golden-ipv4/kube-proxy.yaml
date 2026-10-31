@@ -6,9 +6,9 @@
 #
 # Three install-time placeholders scripts/install.sh substitutes before writing this file into
 # --manifest-output-dir:
-#   10.244.0.0/16 install.sh's $POD_CLUSTER_CIDR (--cluster-cidr), the same value flannel
-#                        and KCM use: kube-proxy masquerades traffic to Services that does not
-#                        originate inside it.
+#   10.244.0.0/16 install.sh's $POD_CLUSTER_CIDR (--cluster-cidr, a comma list when
+#                        dual-stack), the same value flannel and KCM use: kube-proxy masquerades
+#                        traffic to Services that does not originate inside it.
 #   1.37.1    kubelet's own --version output (install.sh's $KUBE_VERSION) -- kube-proxy
 #                        must track whichever kubelet a given release actually bundles, not a
 #                        fixed tag Renovate/Dependabot would otherwise bump independently and out
@@ -20,7 +20,8 @@
 #                         iptables DNAT rules kube-proxy itself is responsible for installing --
 #                         pointing kube-proxy's own kubeconfig at it is a bootstrap deadlock
 #                         (informer never syncs, so the DNAT rules that would make the ClusterIP
-#                         reachable never get programmed).
+#                         reachable never get programmed). Bracketed in the server URL when it
+#                         is an IPv6 literal.
 #
 # --hostname-override=$(NODE_NAME) is Kubernetes' own container-command env-var substitution
 # syntax (references the NODE_NAME env var set via fieldRef below), not a shell expansion -- as a

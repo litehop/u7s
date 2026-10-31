@@ -1,7 +1,8 @@
 # Vendored from kubeadm's cluster/addons/dns/coredns/coredns.yaml.base (kubernetes/kubernetes
 # v1.36.2). __DNS__DOMAIN__/__DNS__SERVER__ are resolved to u7s's defaults below (scripts/install.sh
-# rewrites the Service's `clusterIP: 10.96.0.10` line to its --cluster-dns), and this
-# bundle deliberately departs from upstream in three ways:
+# rewrites the Service's `clusterIP: 10.96.0.10` line to its --cluster-dns; on a dual-stack
+# install it also adds clusterIPs with the other family's kube-dns VIP and ipFamilyPolicy
+# PreferDualStack), and this bundle deliberately departs from upstream in four ways:
 #   - image bumped to v1.14.7 (latest stable CoreDNS release as of the migration off
 #     `include_bytes!` onto this real, standalone file) -- future bumps are now a manifest edit
 #     here (Renovate-scannable), not an apiserver rebuild.
