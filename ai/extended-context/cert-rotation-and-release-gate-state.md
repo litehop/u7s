@@ -1,13 +1,15 @@
 ---
-as_of: 2026-10-30
+as_of: 2026-10-31
 kind: initiative-state
 ---
 
-# Release gate and cert rotation: state as of 2026-10-30
+# Release gate and cert rotation: state as of 2026-10-31
 
 Main is NOT release-ready: the release-authoritative GCP e2-micro gate fails
-criterion (d) because MariaDB's first init does not survive a cold pd-standard
-disk (`mayor-vw7jc`). Fix choice is waiting on an operator decision
+criterion (d) because MariaDB 11.8's first-init temporary server is CPU-bound
+in crypto (not disk-bound) and overruns the image entrypoint's fixed wait on an
+e2-micro (`mayor-vw7jc`). Option A (no CPU limit plus InnoDB args, draft #2068)
+passes only ~3/6 cold starts; the next lever is waiting on an operator decision
 (`mayor-yfca9`). Cert rotation, uppercase-hostname install and advisory bumps
 shipped earlier; the Lima burst gate measured 50 pods, 3/3, on a 1 GiB VM on
 2026-10-21 (`mayor-f2gfd`; ran with a local lowercase VM name, see `zl285`).
@@ -35,11 +37,24 @@ shipped earlier; the Lima burst gate measured 50 pods, 3/3, on a 1 GiB VM on
    CPU-throttled at the 375m limit); the restart skips init and root auth stays
    broken, now correctly never Ready.
 
-Pending operator decision (`mayor-yfca9`): A (recommended) drop the CPU limit
-(keep the request) plus small-node InnoDB init settings; B marker-gated init
-recovery (initContainer wipes a datadir that never finished init; excluded
-earlier); C both. Verify on GCP through the gate (example manifests come from
-the checkout even with `--release`, no snapshot needed).
+5. Measured 2026-10-31 (`yfca9`, draft #2068, raw `temp/e2e/yfca9/`): the
+   temp server burns ~28 CPU-s single-threaded in libcrypto
+   (`BN_mod_exp_mont_consttime`, gdb; ~80% of a core for ~35 s, zero disk I/O)
+   against the entrypoint's fixed ~40-55 s wait, which has no env knob. The
+   375m limit made it worse (throttled 142.5 s of 209 s). The disk was 82-85%
+   busy but mostly from crio unpacking WordPress at the same time, so it is
+   not the dominant cost. Option A (operator-chosen) passes ~3/6 cold starts;
+   `--skip-ssl` 1/4; a Secret-supplied cert 2/3. The InnoDB args are not
+   justified by measurement. Passing starts take 186-316 s to Ready, so the
+   gate's 300 s mariadb-0 wait is tight too.
+
+Pending operator decision (`mayor-yfca9`): (1, mayor rec) a scout to name the
+startup crypto work (key/DH generation?) and supply or avoid it (pre-generated
+material via Secret, or MariaDB 10.11 LTS if it doesn't do this); (2) a command
+wrapper that runs the entrypoint with a longer temp-server wait; (3) B,
+marker-gated init recovery (excluded earlier); (4) a bigger gate node class.
+Verify on GCP through the gate (example manifests come from the checkout even
+with `--release`, no snapshot needed).
 
 ## Memory protection (`mayor-i4bvb`, PR #2039)
 
