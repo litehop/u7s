@@ -2105,11 +2105,6 @@ mod tests {
             let name = format!("deny-{case}");
             seed_with_conditions(&state, &name, &["Denied"]).await;
             for (path, err) in write_all_paths(&state, &name, conds).await {
-                // SSA drops only fields the applier owned, so an apply cannot erase
-                // another manager's Denied; it must still be rejected when adding Approved.
-                if path == "apply" && case == "erase-denied" {
-                    continue;
-                }
                 let err = err.unwrap_or_else(|| panic!("{path} {case}: write was accepted"));
                 assert!(err.contains(want), "{path} {case}: {err}");
             }
@@ -2121,6 +2116,24 @@ mod tests {
         }
     }
 
+    /// An applier that owns Denied must not be able to retract it by re-applying an empty
+    /// list: that would reopen a denied CSR for approval.
+    #[tokio::test]
+    async fn approval_apply_cannot_retract_the_denial_it_owns() {
+        let state = make_state();
+        seed_with_conditions(&state, "apply-retract", &[]).await;
+        let denied = json!({"status": {"conditions": [cond("Denied")]}}).to_string();
+        approval_apply(&state, "apply-retract", "m", true, denied)
+            .await
+            .expect("first apply of Denied is valid");
+        let empty = json!({"status": {"conditions": []}}).to_string();
+        let err = approval_apply(&state, "apply-retract", "m", true, empty)
+            .await
+            .expect_err("retracting Denied must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(stored_types(&state, "apply-retract").await, ["Denied"]);
+    }
+
     /// Failed is the signer's record; an approver erasing it hides that signing failed.
     #[tokio::test]
     async fn approval_cannot_erase_failed_condition_on_any_write_path() {
@@ -2128,9 +2141,6 @@ mod tests {
         seed_with_conditions(&state, "erase-failed", &["Approved", "Failed"]).await;
         for (path, err) in write_all_paths(&state, "erase-failed", json!([cond("Approved")])).await
         {
-            if path == "apply" {
-                continue;
-            }
             let err = err.unwrap_or_else(|| panic!("{path}: write was accepted"));
             assert!(
                 err.contains("updates may not remove a condition of type \"Failed\""),

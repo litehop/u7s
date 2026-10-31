@@ -944,11 +944,16 @@ pub(crate) fn validate_approval_conditions(
     let has = |c: &[serde_json::Value], ty| !condition_indices(c, ty).is_empty();
     let old_had_both = has(&old_conditions, "Approved") && has(&old_conditions, "Denied");
     if !old_had_both && has(&new_conditions, "Approved") && has(&new_conditions, "Denied") {
-        errs.push(
-            "status.conditions: Invalid value: \"Denied\": Approved and Denied conditions are \
+        let first = |ty| condition_indices(&new_conditions, ty)[0];
+        let second = if first("Approved") > first("Denied") {
+            "Approved"
+        } else {
+            "Denied"
+        };
+        errs.push(format!(
+            "status.conditions: Invalid value: {second:?}: Approved and Denied conditions are \
              mutually exclusive"
-                .into(),
-        );
+        ));
     }
 
     let old_types: Vec<&str> = old_conditions
@@ -966,20 +971,22 @@ pub(crate) fn validate_approval_conditions(
         if ty.is_empty() && !old_has_empty {
             errs.push(format!("status.conditions[{i}].type: Required value"));
         }
+        let supported: &[&str] = if matches!(ty, "Approved" | "Denied" | "Failed") {
+            &["True"]
+        } else {
+            &["False", "True", "Unknown"]
+        };
         match c["status"].as_str().unwrap_or("") {
             "" => errs.push(format!("status.conditions[{i}].status: Required value")),
-            s @ ("True" | "False" | "Unknown") => {
-                if s != "True" && matches!(ty, "Approved" | "Denied" | "Failed") {
-                    errs.push(format!(
-                        "status.conditions[{i}].status: Unsupported value: {s:?}: supported \
-                         values: \"True\""
-                    ));
-                }
-            }
-            s => errs.push(format!(
-                "status.conditions[{i}].status: Unsupported value: {s:?}: supported values: \
-                 \"False\", \"True\", \"Unknown\""
+            s if !supported.contains(&s) => errs.push(format!(
+                "status.conditions[{i}].status: Unsupported value: {s:?}: supported values: {}",
+                supported
+                    .iter()
+                    .map(|v| format!("{v:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
+            _ => {}
         }
         if !old_has_dup && seen.contains(&ty) {
             errs.push(format!(
