@@ -3014,27 +3014,23 @@ mod tests {
             assert_eq!(mode(&format!("{path}{suffix}")), 0o600, "fresh {suffix}");
         }
         drop(store);
-        for suffix in ["", "-wal", "-shm"] {
+        // A clean close deletes the sidecars, so recreate what an older install or a crash
+        // leaves behind: every sidecar present and world-readable.
+        for suffix in ["", "-wal", "-shm", "-journal"] {
             let p = format!("{path}{suffix}");
-            if std::fs::metadata(&p).is_ok() {
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-            }
+            std::fs::write(&p, b"").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+        restrict_db_files(&path).expect("restrict");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            assert_eq!(
+                mode(&format!("{path}{suffix}")),
+                0o600,
+                "pre-existing 0644 {suffix} must be tightened"
+            );
+        }
+        std::fs::remove_file(format!("{path}-journal")).unwrap();
         let store = SqliteStore::new(&path).expect("reopen");
-        store
-            .put("/registry/configmaps/a/y", Bytes::from_static(b"{}"), None)
-            .await
-            .expect("put");
-        for suffix in ["", "-wal", "-shm"] {
-            let p = format!("{path}{suffix}");
-            if std::fs::metadata(&p).is_ok() {
-                assert_eq!(
-                    mode(&p),
-                    0o600,
-                    "pre-existing 0644 {suffix} must be tightened"
-                );
-            }
-        }
         assert_eq!(mode(&path), 0o600);
         drop(store);
         remove_db(&path);
