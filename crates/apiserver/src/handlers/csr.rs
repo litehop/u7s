@@ -918,6 +918,84 @@ pub(crate) fn guard_csr_status_write<S: Store>(
     Ok(())
 }
 
+/// Upstream `ValidateCertificateSigningRequestApprovalUpdate` over `status.conditions`:
+/// Approved/Denied/Failed cannot be removed, Approved and Denied are mutually exclusive,
+/// types are non-empty and unique, and Approved/Denied/Failed only take status "True".
+/// Pre-existing violations (both Approved and Denied, duplicates, an empty type) are
+/// tolerated as upstream does for stored data.
+pub(crate) fn validate_approval_conditions(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let old_conditions = csr_conditions(old);
+    let new_conditions = csr_conditions(new);
+    let mut errs: Vec<String> = Vec::new();
+
+    for ty in ["Approved", "Denied", "Failed"] {
+        if condition_indices(&new_conditions, ty).len()
+            < condition_indices(&old_conditions, ty).len()
+        {
+            errs.push(format!(
+                "status.conditions: Forbidden: updates may not remove a condition of type {ty:?}"
+            ));
+        }
+    }
+
+    let has = |c: &[serde_json::Value], ty| !condition_indices(c, ty).is_empty();
+    let old_had_both = has(&old_conditions, "Approved") && has(&old_conditions, "Denied");
+    if !old_had_both && has(&new_conditions, "Approved") && has(&new_conditions, "Denied") {
+        errs.push(
+            "status.conditions: Invalid value: \"Denied\": Approved and Denied conditions are \
+             mutually exclusive"
+                .into(),
+        );
+    }
+
+    let old_types: Vec<&str> = old_conditions
+        .iter()
+        .map(|c| c["type"].as_str().unwrap_or(""))
+        .collect();
+    let old_has_dup = old_types
+        .iter()
+        .enumerate()
+        .any(|(i, t)| old_types[..i].contains(t));
+    let old_has_empty = old_types.contains(&"");
+    let mut seen: Vec<&str> = Vec::new();
+    for (i, c) in new_conditions.iter().enumerate() {
+        let ty = c["type"].as_str().unwrap_or("");
+        if ty.is_empty() && !old_has_empty {
+            errs.push(format!("status.conditions[{i}].type: Required value"));
+        }
+        match c["status"].as_str().unwrap_or("") {
+            "" => errs.push(format!("status.conditions[{i}].status: Required value")),
+            s @ ("True" | "False" | "Unknown") => {
+                if s != "True" && matches!(ty, "Approved" | "Denied" | "Failed") {
+                    errs.push(format!(
+                        "status.conditions[{i}].status: Unsupported value: {s:?}: supported \
+                         values: \"True\""
+                    ));
+                }
+            }
+            s => errs.push(format!(
+                "status.conditions[{i}].status: Unsupported value: {s:?}: supported values: \
+                 \"False\", \"True\", \"Unknown\""
+            )),
+        }
+        if !old_has_dup && seen.contains(&ty) {
+            errs.push(format!(
+                "status.conditions[{i}].type: Duplicate value: {ty:?}"
+            ));
+        }
+        seen.push(ty);
+    }
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(Status::unprocessable_entity(errs.join(", ")))
+    }
+}
+
 /// A newly issued `status.certificate` (base64 of PEM) with the intermediate that signed it
 /// appended. kube-controller-manager signs with a single-certificate file and returns the bare
 /// leaf, but clients pin only the root, so a leaf alone cannot be verified. The API allows
