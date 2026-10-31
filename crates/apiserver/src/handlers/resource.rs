@@ -8471,8 +8471,7 @@ mod tests {
         qualified: &str,
     ) {
         let err = result
-            .err()
-            .expect("kind without AllowUnconditionalUpdate must reject an empty-RV race loser");
+            .expect_err("kind without AllowUnconditionalUpdate must reject an empty-RV race loser");
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             err.1.message,
