@@ -27,6 +27,7 @@ mod go_unicode;
 pub mod handlers;
 mod health;
 mod inflight;
+mod int32_range;
 mod keys;
 mod limit_range;
 mod log_limit;
