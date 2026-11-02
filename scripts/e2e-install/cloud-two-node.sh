@@ -15,8 +15,10 @@
 # join token there and passes it to w1 on stdin, then asserts in order: both nodes Ready; a pod
 # pinned to w1 Running; logs/exec on it (apiserver -> InternalIP:10250); cross-node pod-to-pod;
 # webhook-smoke.sh; and, with beep, that a LoadBalancer Service answers from the client VPS
-# with its internal IP preserved. Without --keep only the VPSes (and, with --dual-stack, the narrow
-# IPv6 LoadBalancer firewall rule) this run created are deleted.
+# with its internal IP preserved. With --dual-stack it also curls the LB over v4 and v6 from an
+# e2-micro probe VM in the u7s-probe VPC (scripts/gcp/setup.sh): refused before the narrow per-family
+# LB firewall rules exist (sources: the probe's /32 and /96), admitted after. Without --keep only the
+# VPSes (probe included) and firewall rules this run created are deleted.
 # Exit codes: see "Release-gate exit codes" in docs/dev-setup.md. INVALID here is a failure whose
 # preemption lookup kept erroring. Results: temp/e2e-install/<ts>/.
 set -euo pipefail
@@ -54,6 +56,7 @@ SLEEP="${U7S_E2E_POLL_SLEEP:-10}"
 CP="u7s-e2e-$RUN_ID-cp"
 W1="u7s-e2e-$RUN_ID-w1"
 CLIENT="u7s-e2e-$RUN_ID-client"
+PROBE="u7s-e2e-$RUN_ID-probe"
 INSTALL_URL="https://u7s.dekiru.tech/$RELEASE/install.sh"
 KC="sudo kubectl --kubeconfig /var/lib/u7s/kubeconfig"
 AGNHOST=registry.k8s.io/e2e-test-images/agnhost:2.63.0
@@ -78,7 +81,7 @@ echo "results: $OUT"
 ZONE="$(gcp_zone)"
 
 CREATED=()
-FW_RULE=
+FW_RULES=()
 STACK_ARGS=()
 [ "$DUAL" = 0 ] || STACK_ARGS=(--stack-type IPV4_IPV6)
 RESULT=FAIL
@@ -117,23 +120,23 @@ finish() {
   echo "RESULT: $RESULT"
   for v in ${CREATED[@]+"${CREATED[@]}"}; do
     if [ "$KEEP" = 1 ]; then
-      echo "kept: scripts/gcp/vps.sh ssh $v"
+      echo "kept: scripts/gcp/vps.sh ssh $v (delete: scripts/gcp/vps.sh down $v)"
     else
       vps down "$v" || { echo "LEAKED VPS $v: could not delete; check scripts/gcp/vps.sh list" >&2; echo "$v" >>"$OUT/leaked-vps.txt"; }
     fi
   done
-  if [ -n "$FW_RULE" ]; then
+  for r in ${FW_RULES[@]+"${FW_RULES[@]}"}; do
     if [ "$KEEP" = 1 ]; then
-      echo "kept: firewall rule $FW_RULE (gcloud compute firewall-rules delete $FW_RULE)"
+      echo "kept: firewall rule $r (gcloud compute firewall-rules delete $r)"
     else
-      gcloud compute firewall-rules delete "$FW_RULE" --quiet 2>&1 | redact || true
+      gcloud compute firewall-rules delete "$r" --quiet 2>&1 | redact || true
       # A rule that never got created also fails the delete; only a rule that still exists leaked.
-      if gcloud compute firewall-rules describe "$FW_RULE" --format='value(name)' >/dev/null 2>&1; then
-        echo "LEAKED FIREWALL RULE $FW_RULE: could not delete; check gcloud compute firewall-rules list" >&2
-        echo "firewall-rule $FW_RULE" >>"$OUT/leaked-vps.txt"
+      if gcloud compute firewall-rules describe "$r" --format='value(name)' >/dev/null 2>&1; then
+        echo "LEAKED FIREWALL RULE $r: could not delete; check gcloud compute firewall-rules list" >&2
+        echo "firewall-rule $r" >>"$OUT/leaked-vps.txt"
       fi
     fi
-  fi
+  done
   [ ! -s "$OUT/leaked-vps.txt" ] || [ "$rc" != 0 ] || { rc=4; echo "RESULT: PASS but LEAKED VPS: exit 4"; }
   [ "$KEEP" = 0 ] || echo "kubeconfig on $CP: /var/lib/u7s/kubeconfig (sudo kubectl --kubeconfig /var/lib/u7s/kubeconfig ...)"
   exit "$rc"
@@ -143,9 +146,9 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 up() {
-  local n="$1"
+  local n="$1"; shift
   CREATED+=("$n")
-  vps up ${STACK_ARGS[@]+"${STACK_ARGS[@]}"} "$n" 2>&1 | redact >"$OUT/up-$n.log" || fail "creating $n (see $OUT/up-$n.log)"
+  vps up ${STACK_ARGS[@]+"${STACK_ARGS[@]}"} "$@" "$n" 2>&1 | redact >"$OUT/up-$n.log" || fail "creating $n (see $OUT/up-$n.log)"
   for _ in $(seq 1 30); do
     vps ssh "$n" -- true >/dev/null 2>&1 && return 0
     sleep "$SLEEP"
@@ -161,12 +164,59 @@ external_ipv6() {
   gcloud compute instances describe "$1" --zone="$ZONE" --format='value(networkInterfaces[0].ipv6Address)'
 }
 
-# GCE hands each NIC a /96 of external IPv6; the VPS sources from an address inside it, so the
-# firewall source is the whole /96 of the client, nothing wider. Only the LB port is opened, only
-# to VPSes carrying the test tag, and the rule is deleted by finish().
+external_ipv4() {
+  gcloud compute instances describe "$1" --zone="$ZONE" --format='value(networkInterfaces[0].accessConfigs[0].natIP)'
+}
+
+# create_lb_firewall RULE SOURCE: GCE hands each NIC a /96 of external IPv6 and the VPS sources from
+# an address inside it, so an IPv6 source is the probe's whole /96 and an IPv4 one its /32, nothing
+# wider. A rule holds one family, hence one rule each. Only the LB port is opened, only to VPSes
+# carrying the test tag, and the rules are deleted by finish().
 create_lb_firewall() {
-  gcloud compute firewall-rules create "$FW_RULE" --network="$GCP_NETWORK" --direction=INGRESS \
-    --action=allow --rules="tcp:$LB_PORT" --target-tags="$GCP_VPS_TAG" --source-ranges="$1/96"
+  gcloud compute firewall-rules create "$1" --network="$GCP_NETWORK" --direction=INGRESS \
+    --action=allow --rules="tcp:$LB_PORT" --target-tags="$GCP_VPS_TAG" --source-ranges="$2"
+}
+
+# probe_target IP: sets PROBE_FAM (-4/-6) and PROBE_URL (quoted for the remote shell).
+probe_target() {
+  if [ "$(family_of "$1")" = 6 ]; then PROBE_FAM=-6; PROBE_URL="'http://[$1]/clientip'"
+  else PROBE_FAM=-4; PROBE_URL="http://$1/clientip"; fi
+}
+
+# The probe's curl exit status travels back as data so a dead IAP tunnel (ssh fails) is never
+# mistaken for the LB refusing the probe.
+probe_curl_rc() {
+  local out
+  probe_target "$1"
+  out="$(vps ssh "$PROBE" -- "curl $PROBE_FAM -g -sS --max-time 10 $PROBE_URL >/dev/null 2>&1; echo curl-rc=\$?")" \
+    || fail "ssh to probe $PROBE (tunnel failure is not a refusal)"
+  out="${out##*curl-rc=}"
+  [[ "$out" =~ ^[0-9]+$ ]] || fail "no curl exit status from probe $PROBE"
+  echo "$out"
+}
+
+# Cross-VPC traffic to the LB's external addresses must be dropped while no rule admits it.
+assert_probe_refused() {
+  local ip rc
+  for ip in $PROBE_TARGETS; do
+    rc="$(probe_curl_rc "$ip")" || exit 1
+    [ "$rc" != 0 ] || fail "probe reached $ip with no LB firewall rule: the rule is not what admits outside traffic"
+    echo "PASS: probe refused by $ip before the LB rule (curl exit $rc)"
+  done
+}
+
+assert_probe_admitted() {
+  local ip seen
+  for ip in $PROBE_TARGETS; do
+    probe_target "$ip"
+    seen="$(vps ssh "$PROBE" -- curl "$PROBE_FAM" -g -fsS --max-time 15 "$PROBE_URL")" || fail "curl $PROBE_FAM $PROBE_URL from probe $PROBE"
+    seen="${seen%:*}"; seen="${seen#[}"; seen="${seen%]}"
+    case " $PROBE_SEEN_IPS " in
+      *" $seen "*) ;;
+      *) fail "backend saw probe as $seen via $ip, expected one of: $PROBE_SEEN_IPS" ;;
+    esac
+    echo "PASS: probe in $GCP_PROBE_NETWORK reached $ip over IPv${PROBE_FAM#-} and was seen as $seen"
+  done
 }
 
 family_of() { case "$1" in *:*) echo 6 ;; *) echo 4 ;; esac; }
@@ -256,7 +306,7 @@ YAML
 }
 
 # The join token only ever travels on stdin: never in argv, a log or the results directory.
-join_w1() { printf '%s\n' "$1" | vps ssh "$W1" -- sudo bash /tmp/install.sh --join "https://$CP_IP:6443" --token - --ca-cert-hash "$2" --node-name "$W1"; }
+join_w1() { printf '%s\n' "$1" | vps ssh "$W1" -- sudo bash /tmp/install.sh --join "https://$CP_IP:6443" --token - --ca-cert-hash "$2" --node-name "$W1" $IP_FAMILIES_ARGS; }
 apply_pods() { { pod_yaml pin "$W1"; echo ---; pod_yaml peer "$CP_NODE"; } | on_cp "$KC apply -f -"; }
 webhook_smoke() {
   vps scp "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$CP:/tmp/webhook-smoke.sh" &&
@@ -285,6 +335,12 @@ step install-cp on_cp "curl -fsSL $INSTALL_URL -o /tmp/install.sh && sudo bash /
 mint="$(on_cp sudo bash /tmp/install.sh --mint-join-token)" || fail "mint-join-token on $CP"
 token="$(sed -n 's/^Join token created.*: //p' <<<"$mint")"
 ca_hash="$(grep -oE 'sha256:[0-9a-f]{64}' <<<"$mint" | head -1)" || true
+# A worker without the cluster's IP families assumes IPv4 and drops its IPv6 address, so the
+# join carries the flag the control plane printed; --dual-stack insists on it.
+families="$(grep -oE -- '--cluster-ip-families [0-9,]+' <<<"$mint" | head -1 | cut -d' ' -f2)" || true
+[ "$DUAL" = 0 ] || [ -n "$families" ] || families=4,6
+IP_FAMILIES_ARGS=
+[ -z "$families" ] || IP_FAMILIES_ARGS="--cluster-ip-families $families"
 unset mint
 [ -n "$token" ] && [ -n "$ca_hash" ] || fail "could not parse the join token and CA hash from --mint-join-token output"
 
@@ -324,10 +380,14 @@ CLIENT_IP="$(internal_ip "$CLIENT")"
 expect_ips="$CP_IP $W1_IP"
 CLIENT_SEEN_IPS="$CLIENT_IP"
 if [ "$DUAL" = 1 ]; then
-  CLIENT_V6="$(external_ipv6 "$CLIENT")"
-  [ -n "$CLIENT_V6" ] || fail "client $CLIENT has no external IPv6 address (is the VPS dual-stack?)"
-  FW_RULE="u7s-e2e-$RUN_ID-lb-v6"   # set before creating so the cleanup trap covers a half-created rule
-  step lb-firewall create_lb_firewall "$CLIENT_V6"
+  # The probe lives in another VPC (e2-micro: it only runs curl); its IAP ssh readiness overlaps
+  # the LB setup below.
+  U7S_GCP_MACHINE_TYPE=e2-micro up "$PROBE" --network "$GCP_PROBE_NETWORK"
+  PROBE_V4="$(external_ipv4 "$PROBE")"
+  PROBE_V6="$(external_ipv6 "$PROBE")"
+  [ -n "$PROBE_V4" ] || fail "probe $PROBE has no external IPv4 address"
+  [ -n "$PROBE_V6" ] || fail "probe $PROBE has no external IPv6 address (is $GCP_PROBE_NETWORK dual-stack?)"
+  PROBE_SEEN_IPS="$PROBE_V4 $(vps ssh "$PROBE" -- ip -6 -o addr show scope global | awk '{sub("/.*","",$4); print $4}')"
   # The LB must answer on every InternalIP of both nodes, v4 and v6.
   expect_ips="$(node_ips "$CP_NODE") $(node_ips "$W1")"
   CLIENT_SEEN_IPS="$CLIENT_IP $(vps ssh "$CLIENT" -- ip -6 -o addr show scope global | awk '{sub("/.*","",$4); print $4}')"
@@ -365,6 +425,18 @@ for ip in $ingress; do
 done
 
 if [ "$DUAL" = 1 ]; then
+  # The v4 ingress addresses are the nodes' internal IPs, which another VPC cannot reach; the
+  # probe targets the nodes' external IPv4 (GCE NATs it to the same NIC) and the v6 ingress as is.
+  PROBE_TARGETS="$(external_ipv4 "$CP") $(external_ipv4 "$W1")"
+  for ip in $ingress; do [ "$(family_of "$ip")" = 6 ] && PROBE_TARGETS="$PROBE_TARGETS $ip"; done
+  { first_of 4 "$PROBE_TARGETS" && first_of 6 "$PROBE_TARGETS"; } >/dev/null || fail "probe targets lack an IPv4 or IPv6 address: '$PROBE_TARGETS'"
+  # Negative first: with no rule the probe must be refused, else a later pass proves nothing.
+  step probe-refused-without-rule assert_probe_refused
+  # Set before creating so the cleanup trap covers a half-created rule.
+  FW_RULES+=("u7s-e2e-$RUN_ID-lb-v4" "u7s-e2e-$RUN_ID-lb-v6")
+  step lb-firewall-v4 create_lb_firewall "u7s-e2e-$RUN_ID-lb-v4" "$PROBE_V4/32"
+  step lb-firewall-v6 create_lb_firewall "u7s-e2e-$RUN_ID-lb-v6" "$PROBE_V6/96"
+  step probe-reaches-lb assert_probe_admitted
   step sonobuoy-dual sonobuoy_dual
   sed -n '/^Status:/,$p' "$OUT/sonobuoy-dual.log"
 fi

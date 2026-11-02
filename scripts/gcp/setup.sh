@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One-time (idempotent) GCP project setup for the u7s test VPSes: IAP API, the
-# u7s-test VPC + subnet, and firewall rules (IAP SSH + intra-subnet only, IPv4 and IPv6).
+# u7s-test VPC + subnet, and firewall rules (IAP SSH + intra-subnet only, IPv4 and IPv6), plus the
+# u7s-probe VPC + dual-stack subnet with an IAP SSH rule for the outside-VPC probe VM.
 #
 # Usage: setup.sh [--dry-run]
 #   --dry-run  run only read-only gcloud calls and print the mutating commands that
@@ -103,4 +104,37 @@ if fw_exists "$GCP_NETWORK-allow-internal-v6"; then
 else
   mutate compute firewall-rules create "$GCP_NETWORK-allow-internal-v6" --network="$GCP_NETWORK" \
     --direction=INGRESS --allow=all --source-ranges="$subnet_v6"
+fi
+
+# The probe VPC: one dual-stack VM here reaches the test VPC only over its external addresses, so
+# a LoadBalancer answering it is reachable from outside. It gets IAP ssh (IPv4-only) and nothing else.
+probe_net=0
+if grep -qx compute.googleapis.com <<<"$enabled" \
+    && exists compute networks list --filter="name=$GCP_PROBE_NETWORK" --format='value(name)'; then
+  probe_net=1
+  echo "ok: network $GCP_PROBE_NETWORK"
+else
+  mutate compute networks create "$GCP_PROBE_NETWORK" --subnet-mode=custom
+fi
+if [ "$probe_net" = 1 ] && exists compute networks subnets list \
+    --filter="name=$GCP_PROBE_NETWORK AND region:$GCP_REGION" --format='value(name)'; then
+  probe_state="$(gcloud compute networks subnets describe "$GCP_PROBE_NETWORK" --region="$GCP_REGION" \
+    --format='value(stackType)')" || gcp_die "cannot describe subnet $GCP_PROBE_NETWORK"
+  if [ "$probe_state" = IPV4_IPV6 ]; then
+    echo "ok: subnet $GCP_PROBE_NETWORK (dual-stack)"
+  else
+    mutate compute networks subnets update "$GCP_PROBE_NETWORK" --region="$GCP_REGION" \
+      --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL
+  fi
+else
+  mutate compute networks subnets create "$GCP_PROBE_NETWORK" --network="$GCP_PROBE_NETWORK" \
+    --range="$GCP_PROBE_SUBNET_RANGE" --region="$GCP_REGION" \
+    --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL
+fi
+if [ "$probe_net" = 1 ] && exists compute firewall-rules list \
+    --filter="name=$GCP_PROBE_NETWORK-allow-iap-ssh" --format='value(name)'; then
+  echo "ok: firewall $GCP_PROBE_NETWORK-allow-iap-ssh"
+else
+  mutate compute firewall-rules create "$GCP_PROBE_NETWORK-allow-iap-ssh" --network="$GCP_PROBE_NETWORK" \
+    --direction=INGRESS --allow=tcp:22 --source-ranges="$GCP_IAP_RANGE"
 fi

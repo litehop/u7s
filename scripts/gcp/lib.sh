@@ -7,6 +7,10 @@ GCP_NETWORK=u7s-test
 GCP_REGION=us-west1
 GCP_SUBNET_RANGE=10.80.0.0/24
 GCP_IAP_RANGE=35.235.240.0/20
+# A second VPC (network and subnet share the name) that holds only the outside-VPC probe VM:
+# traffic from it to a test VPC's external addresses is external ingress, unlike in-subnet traffic.
+GCP_PROBE_NETWORK=u7s-probe
+GCP_PROBE_SUBNET_RANGE=10.81.0.0/24
 GCP_LABEL=u7s-test=1
 # Network tag on every test VPS: lets a test scope its own firewall rule to these VPSes.
 GCP_VPS_TAG=u7s-test-vps
@@ -29,18 +33,20 @@ gcp_require_config() {
     || gcp_die "gcloud configuration '$CLOUDSDK_ACTIVE_CONFIG_NAME' has no project; see docs/dev-setup.md (GCP test VPSes)"
 }
 
-# gcp_vps_create NAME ZONE [STACK_TYPE]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6.
+# gcp_vps_create NAME ZONE [STACK_TYPE [NETWORK]]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6;
+# NETWORK is u7s-test (default) or the probe VPC.
 # U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro, what the release gate runs on).
 gcp_vps_create() {
-  local stack="${3:-IPV4_ONLY}"
+  local stack="${3:-IPV4_ONLY}" net="${4:-$GCP_NETWORK}"
   case "$stack" in IPV4_ONLY|IPV4_IPV6) ;; *) gcp_die "unsupported stack type: $stack" ;; esac
+  case "$net" in "$GCP_NETWORK"|"$GCP_PROBE_NETWORK") ;; *) gcp_die "unsupported network: $net" ;; esac
   local v6=()
   [ "$stack" = IPV4_IPV6 ] && v6=(--ipv6-network-tier=PREMIUM)
   gcloud compute instances create "$1" --zone="$2" \
     --machine-type="${U7S_GCP_MACHINE_TYPE:-e2-micro}" \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
     --boot-disk-size=10GB --boot-disk-type=pd-standard \
-    --network="$GCP_NETWORK" --subnet="$GCP_NETWORK" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
+    --network="$net" --subnet="$net" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
     --labels="$GCP_LABEL" --tags="$GCP_VPS_TAG" \
     --provisioning-model=SPOT --instance-termination-action=STOP --max-run-duration=16h
 }
