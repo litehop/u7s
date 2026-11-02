@@ -83,7 +83,7 @@ case "$*" in
         case "$*" in *" AAAA "*) echo "${STUB_AAAA-fd00:96::50}" ;; *) echo "${STUB_A-10.96.0.50}" ;; esac ;;
       *kubeletVersion*) echo v1.37.1 ;;
       *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig status"*) echo "PLUGIN  STATUS  RESULT  COUNT"; echo "e2e     ${STUB_SB_STATUS-complete}  failed  1" ;;
-      *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig results"*)
+      *"sudo sonobuoy results"*)
         printf 'Plugin: e2e\nStatus: passed\nTotal: %s\nPassed: 9\nFailed: %s\nSkipped: 0\n' "${STUB_SB_TOTAL-9}" "${STUB_SB_FAILED-0}" ;;
       *"ip -6 -o addr"*) echo "2: ens4    inet6 2600:1900::4/128 scope global dynamic" ;;
       *"curl -6"*) echo "${STUB_SEEN6-[2600:1900::4]}:41234" ;;

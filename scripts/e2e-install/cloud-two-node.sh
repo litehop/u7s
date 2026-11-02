@@ -288,7 +288,7 @@ sonobuoy_dual() {
   done
   case "$status" in *" complete "*) ;; *) fail "sonobuoy never completed within $SONOBUOY_POLLS polls: $status" ;; esac
   # sonobuoy retrieve execs over SPDY, which the apiserver does not serve (501); kubectl execs over WebSocket.
-  results="$(on_cp "$KC exec -n sonobuoy sonobuoy -c kube-sonobuoy -- /sonobuoy splat /tmp/sonobuoy | tar -xzf - -C /tmp && $SB results /tmp/*_sonobuoy_*.tar.gz --plugin e2e")" || fail "retrieving sonobuoy results"
+  results="$(on_cp "$KC exec -n sonobuoy sonobuoy -c kube-sonobuoy -- /sonobuoy splat /tmp/sonobuoy | tar -xzf - -C /tmp && sudo sonobuoy results /tmp/*_sonobuoy_*.tar.gz --plugin e2e")" || fail "retrieving sonobuoy results"
   echo "$results"
   grep -qE '^Total: [1-9]' <<<"$results" || fail "sonobuoy focus '$SONOBUOY_FOCUS' ran no specs (a vacuous pass)"
   grep -qE '^Failed: 0$' <<<"$results" || fail "sonobuoy focus '$SONOBUOY_FOCUS' has failed specs"
