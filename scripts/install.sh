@@ -76,18 +76,17 @@ fi
 #                                       of different families (e.g.
 #                                       10.244.0.0/16,fd00:244::/56).
 #   --cluster-dns  / U7S_CLUSTER_DNS    kube-dns ClusterIP (default: tenth host
-#                                       of the service range). Persisted at
-#                                       first install; a conflicting re-run is
-#                                       refused. A migration target inherits
+#                                       of the service range). Control plane
+#                                       only (a --join node reads it from the
+#                                       cluster). Persisted at first install;
+#                                       a conflicting re-run is refused. A
+#                                       migration target inherits
 #                                       k3s with 10.43.0.0/16, 10.42.0.0/16 and
 #                                       10.43.0.10.
-#   --cluster-ip-families / U7S_CLUSTER_FAMILIES
-#                                       --join only: the cluster's IP families,
-#                                       primary first (4, 6, 4,6 or 6,4;
-#                                       default 4). --mint-join-token prints it
-#                                       when not 4. The node's --node-ip is
-#                                       checked against it like a control
-#                                       plane's is against its ranges.
+#   A --join node learns the cluster's Service/pod ranges and DNS from
+#   kube-system/u7s-cluster-config, read with the join token after discovery;
+#   its --node-ip is checked against the families that implies, as a control
+#   plane's is against its own ranges. The join fails if the read fails.
 #   --manifest-output-dir / U7S_MANIFEST_OUTPUT_DIR
 #                                 Where vendored manifest YAMLs from the
 #                                 tarball land (default: /etc/u7s/manifests,
@@ -111,7 +110,7 @@ usage() {
 Usage:
   install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
-  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--cluster-dns <ip>] [--cluster-ip-families <fam>]
+  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
 
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
@@ -127,11 +126,8 @@ Usage:
                          Disjoint from --service-cidr. Fixed at first install.
   --cluster-dns <ip>    ClusterIP of kube-dns, inside --service-cidr (default:
                          its tenth host, e.g. 10.96.0.10; k3s: 10.43.0.10).
-                         --join nodes must pass the control plane's value
-                         (--mint-join-token prints it when non-default).
-  --cluster-ip-families <4|6|4,6|6,4>
-                         --join only: the cluster's IP families, primary first
-                         (default 4; --mint-join-token prints it when not 4).
+                         Control plane only; --join nodes read it from the
+                         cluster.
   --manifest-output-dir <path>
                          Where vendored manifest YAMLs from the tarball land
                          (default: /etc/u7s/manifests, the apiserver's
@@ -181,9 +177,9 @@ SERVICE_CIDR="${U7S_SERVICE_CIDR:-}"
 POD_CLUSTER_CIDR="${U7S_CLUSTER_CIDR:-}"
 CLUSTER_DNS="${U7S_CLUSTER_DNS:-}"
 # The cluster's IP families, primary first ("4", "6,4"). A control plane derives
-# it from its ranges; a worker is told by the join command (--cluster-ip-families)
-# because it must pick its --node-ip before it can ask the apiserver anything.
-CLUSTER_FAMILIES="${U7S_CLUSTER_FAMILIES:-}"
+# it from its ranges; a worker derives it from the cluster's published ranges
+# (fetch_cluster_config) before it picks its --node-ip.
+CLUSTER_FAMILIES=""
 # Per-family entries of the two lists, set by validate_network_config.
 SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""
 POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""
@@ -202,6 +198,8 @@ JOIN_TOKEN=""
 CA_CERT_HASH=""
 # Set by join_cluster to the server-side creationTimestamp of this join's client CSR.
 JOIN_STARTED_AT=""
+# Set by join_discover: the validated join token, for join_cluster.
+JOIN_BOOTSTRAP_TOKEN=""
 
 # Everything below runs inside main(), invoked on the last line: bash must
 # parse the whole function before executing any of it, so a truncated
@@ -216,7 +214,6 @@ while [ $# -gt 0 ]; do
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --cluster-cidr) POD_CLUSTER_CIDR="$2"; shift 2 ;;
     --cluster-dns) CLUSTER_DNS="$2"; shift 2 ;;
-    --cluster-ip-families) CLUSTER_FAMILIES="$2"; shift 2 ;;
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
@@ -700,7 +697,7 @@ validate_network_config() {
   if [ "$worker" -eq 1 ]; then
     case "$CLUSTER_FAMILIES" in
       4|6|4,6|6,4) return 0 ;;
-      *) echo "error: --cluster-ip-families '$CLUSTER_FAMILIES' must be one of 4, 6, 4,6, 6,4" >&2; return 1 ;;
+      *) echo "error: cluster IP families '$CLUSTER_FAMILIES' must be one of 4, 6, 4,6, 6,4" >&2; return 1 ;;
     esac
   fi
   # Upstream 1.37 and the u7s apiserver bound no range size. /28 and /124 leave
@@ -1054,22 +1051,7 @@ mint_join_token() {
   echo "On the joining node, run as root. The command carries no token, so it stays out of shell"
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
-  local dns_flag="" persisted_dns
-  # shellcheck disable=SC1090
-  persisted_dns="$([ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE" && printf '%s' "${CLUSTER_DNS:-}" || true)"
-  if [ -n "$persisted_dns" ] && [ "$persisted_dns" != "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" ]; then
-    dns_flag=" --cluster-dns $persisted_dns"
-  fi
-  local families_flag="" persisted_svc persisted_pod families
-  # shellcheck disable=SC1090
-  persisted_svc="$([ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE" && printf '%s' "${SERVICE_CIDR:-}" || true)"
-  # shellcheck disable=SC1090
-  persisted_pod="$([ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE" && printf '%s' "${POD_CLUSTER_CIDR:-}" || true)"
-  families="$(cluster_families_from_cidrs "${persisted_svc:-$DEFAULT_SERVICE_CIDR}" "$persisted_pod")"
-  if [ "$families" != "$(cluster_families_from_cidrs "$DEFAULT_SERVICE_CIDR" "")" ]; then
-    families_flag=" --cluster-ip-families $families"
-  fi
-  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]$dns_flag$families_flag"
+  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
 }
 
 # base64url without padding, from stdin.
@@ -1159,6 +1141,45 @@ discover_cluster_ca() {
   printf '%s\n' "$ca_pem" > "$STATE_DIR/ca.pem"
 }
 
+# Reads kube-system/u7s-cluster-config (kubeadm's kubeadm-config analogue) with
+# the join token over TLS verified against the CA discovery pinned, and sets
+# CLUSTER_FAMILIES (derived from the published ranges) and CLUSTER_DNS (the
+# primary kube-dns VIP). The node cannot pick correct --node-ip families
+# without it, so any failure to read it fails the join.
+fetch_cluster_config() {
+  local token="$1" out svc pod dns
+  if ! out="$(curl --proto '=https' --tlsv1.2 -fsS --cacert "$STATE_DIR/ca.pem" \
+      -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+      "$JOIN_SERVER/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config" 2>&1)"; then
+    echo "error: could not read ConfigMap kube-system/u7s-cluster-config from $JOIN_SERVER ($out). The join needs the cluster's IP families and DNS from it: a 403 means the token's group lacks the u7s:nodes-cluster-config RoleBinding (control plane older than this install.sh?), a 404 that the control plane never published it; otherwise check connectivity." >&2
+    return 1
+  fi
+  svc="$(printf '%s' "$out" | jq -r '.data.serviceCIDRs // empty' 2>/dev/null || true)"
+  pod="$(printf '%s' "$out" | jq -r '.data.podCIDRs // empty' 2>/dev/null || true)"
+  dns="$(printf '%s' "$out" | jq -r '.data.clusterDNS // empty' 2>/dev/null || true)"
+  if [ -z "$svc" ] || [ -z "$dns" ]; then
+    echo "error: ConfigMap kube-system/u7s-cluster-config at $JOIN_SERVER lacks data.serviceCIDRs/data.clusterDNS -- refusing to guess the cluster's IP families" >&2
+    return 1
+  fi
+  CLUSTER_FAMILIES="$(cluster_families_from_cidrs "$svc" "$pod")"
+  CLUSTER_DNS="${dns%%,*}"
+}
+
+# --join prelude, run before the node addresses are chosen: pins the cluster
+# CA, then learns the cluster's families and DNS. Leaves the token in
+# JOIN_BOOTSTRAP_TOKEN for join_cluster.
+join_discover() {
+  if [ -z "$CA_CERT_HASH" ]; then
+    echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
+    exit 1
+  fi
+  ensure_jq
+  JOIN_BOOTSTRAP_TOKEN="$(read_join_token)"
+  install -d -m 0700 "$STATE_DIR"
+  discover_cluster_ca "${JOIN_BOOTSTRAP_TOKEN%%.*}" "${JOIN_BOOTSTRAP_TOKEN##*.}"
+  fetch_cluster_config "$JOIN_BOOTSTRAP_TOKEN" || exit 1
+}
+
 # Reads the join token from the --token flag, or from stdin when the flag is
 # absent or "-". Stdin keeps it out of argv, /proc/<pid>/cmdline and history.
 read_join_token() {
@@ -1193,18 +1214,7 @@ read_join_token() {
 # serving cert is requested by the kubelet itself (serverTLSBootstrap) once its
 # Node exists; wait_for_joined_node checks it was approved and issued.
 join_cluster() {
-  if [ -z "$CA_CERT_HASH" ]; then
-    echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
-    exit 1
-  fi
-  ensure_jq
-
-  local bootstrap_token token_id token_secret
-  bootstrap_token="$(read_join_token)"
-  token_id="${bootstrap_token%%.*}"
-  token_secret="${bootstrap_token##*.}"
-
-  discover_cluster_ca "$token_id" "$token_secret"
+  local bootstrap_token="$JOIN_BOOTSTRAP_TOKEN"
 
   openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
   chmod 600 "$STATE_DIR/kubelet-client.key"
@@ -1810,18 +1820,21 @@ fi
 # are control-plane settings, so passing them with --join is refused rather
 # than silently ignored.
 if [ "$WORKER_MODE" -eq 1 ]; then
-  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ]; then
-    echo "error: --service-cidr/--cluster-cidr are control-plane settings; a joining or already-joined worker takes only --cluster-dns and --cluster-ip-families" >&2
+  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]; then
+    echo "error: --service-cidr/--cluster-cidr/--cluster-dns are control-plane settings; a joining or already-joined worker reads them from the cluster (kube-system/u7s-cluster-config)" >&2
     exit 1
   fi
-  reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" || exit 1
-  CLUSTER_FAMILIES="${CLUSTER_FAMILIES//[[:space:]]/}"
-  reconcile_network_flag --cluster-ip-families CLUSTER_FAMILIES "$PERSISTED_CLUSTER_FAMILIES" "$(cluster_families_from_cidrs "$DEFAULT_SERVICE_CIDR" "")" || exit 1
+  if [ "$JOIN_MODE" -eq 1 ]; then
+    join_discover
+  else
+    CLUSTER_FAMILIES="$PERSISTED_CLUSTER_FAMILIES"
+    CLUSTER_DNS="$PERSISTED_CLUSTER_DNS"
+    if [ -z "$CLUSTER_FAMILIES" ] || [ -z "$CLUSTER_DNS" ]; then
+      echo "error: $CONFIG_FILE records no cluster IP families/DNS for this worker -- it joined before they were persisted. Re-join: stop kubelet, rm -rf $STATE_DIR, and run install.sh --join with a freshly minted token." >&2
+      exit 1
+    fi
+  fi
 else
-  if [ -n "$CLUSTER_FAMILIES" ]; then
-    echo "error: --cluster-ip-families is a --join setting; a control plane derives the families from --service-cidr/--cluster-cidr" >&2
-    exit 1
-  fi
   reconcile_network_flag --service-cidr SERVICE_CIDR "$PERSISTED_SERVICE_CIDR" "$DEFAULT_SERVICE_CIDR" || exit 1
   reconcile_network_flag --cluster-cidr POD_CLUSTER_CIDR "$PERSISTED_POD_CLUSTER_CIDR" "$DEFAULT_POD_CLUSTER_CIDR" || exit 1
   dns_default="$(default_cluster_dns "$SERVICE_CIDR")" || exit 1
@@ -2291,7 +2304,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $APISERVER_LISTEN --advertise-address https://$IFACE_IP_HOST:6443$APISERVER_EXTRA_SANS_FLAG --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
+ExecStart=$BIN_DIR/u7s-apiserver --listen $APISERVER_LISTEN --advertise-address https://$IFACE_IP_HOST:6443$APISERVER_EXTRA_SANS_FLAG --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --cluster-cidr $POD_CLUSTER_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.

@@ -88,6 +88,12 @@ pub struct Args {
     #[arg(long)]
     pub(crate) kube_dns_cluster_ip: Option<String>,
 
+    /// Pod CIDR(s) of the cluster (kube-controller-manager's `--cluster-cidr`), comma-separated.
+    /// Used only to publish `kube-system/u7s-cluster-config` for joining nodes; the apiserver
+    /// does not allocate from it.
+    #[arg(long, default_value = "")]
+    pub(crate) cluster_cidr: String,
+
     /// Hostname or IP to use for all kubelet proxy requests (log, exec, attach, port-forward).
     /// When set, overrides the node's InternalIP from status.addresses. Useful when the
     /// apiserver runs on a different host than the kubelet (e.g. Mac host + Lima VM) and

@@ -1467,22 +1467,12 @@ mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)" || {
 SECRET_JSON="$JOIN_CA_DIR/created-secret.json"
 mint_field() { jq -r ".stringData[\"$1\"]" "$SECRET_JSON"; }
 
-assert "a default-DNS cluster's join command carries no --cluster-dns" \
-  "$(printf '%s' "$mint_out" | grep -qF -- '--cluster-dns' && echo 0 || echo 1)"
-JOIN_CA_DIR_K3S="$JOIN_WORK/cp-state-k3s"
-cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_K3S"
-echo 'CLUSTER_DNS="10.43.0.10"' > "$JOIN_CA_DIR_K3S/config"
-mint_k3s_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_K3S" 2>&1)"
-assert "a non-default-DNS cluster's join command carries --cluster-dns, else the worker's kubelet would resolve via the default VIP and pods on it lose DNS" \
-  "$(printf '%s' "$mint_k3s_out" | grep -qF -- '--cluster-dns 10.43.0.10' && echo 1 || echo 0)"
-assert "a single-stack IPv4 cluster's join command carries no --cluster-ip-families (default 4)" \
-  "$(printf '%s' "$mint_out$mint_k3s_out" | grep -qF -- '--cluster-ip-families' && echo 0 || echo 1)"
-JOIN_CA_DIR_V6FIRST="$JOIN_WORK/cp-state-v6first"
-cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_V6FIRST"
-printf 'SERVICE_CIDR="fd00:96::/108,10.96.0.0/12"\nPOD_CLUSTER_CIDR="fd00:244::/56,10.244.0.0/16"\n' > "$JOIN_CA_DIR_V6FIRST/config"
-mint_v6first_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_V6FIRST" 2>&1)"
-assert "a v6-first dual-stack cluster's join command carries --cluster-ip-families 6,4, else the worker cannot order or filter its --node-ip" \
-  "$(printf '%s' "$mint_v6first_out" | grep -qF -- '--cluster-ip-families 6,4' && echo 1 || echo 0)"
+JOIN_CA_DIR_CUSTOM="$JOIN_WORK/cp-state-custom"
+cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_CUSTOM"
+printf 'CLUSTER_DNS="fd00:96::a"\nSERVICE_CIDR="fd00:96::/108,10.96.0.0/12"\n' > "$JOIN_CA_DIR_CUSTOM/config"
+mint_custom_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
+assert "the join command carries no network flags even for a non-default dual-stack cluster: the worker reads DNS and families from the cluster, so a forgotten or stale flag cannot make it single-stack" \
+  "$(printf '%s%s' "$mint_out" "$mint_custom_out" | grep -qE -- '--cluster-dns|--cluster-ip-families' && echo 0 || echo 1)"
 
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
@@ -2089,13 +2079,13 @@ rm -rf "$KEY_WORK"
 NET_WORK="$(mktemp -d)"
 trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
 {
-  for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs \
+  for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs fetch_cluster_config \
     reconcile_network_flag check_node_ip_outside_ranges render_vendored_manifests write_kubelet_config_yaml; do
     awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
   done
 } > "$NET_WORK/fns.sh"
 assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
-  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 21 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 22 ] && echo 1 || echo 0)"
 
 # net_run <scenario>: runs <scenario> after the extracted functions with the
 # production defaults loaded; sets NET_STATUS/NET_OUT.
@@ -2105,7 +2095,7 @@ net_run() {
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
     echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
-    echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s'
+    echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
     cat "$NET_WORK/fns.sh"
     echo "$1"
   } > "$NET_WORK/scenario.sh"
@@ -2233,13 +2223,11 @@ assert "a CoreDNS manifest whose clusterIP line changed shape fails the install 
 
 # Units and persistence: structural, like the KCM assertions above.
 assert_true "u7s-apiserver.service passes --service-cluster-ip-range and --kube-dns-cluster-ip from the resolved values (the apiserver derives the kubernetes Service VIP and ServiceCIDR from the range)" \
-  grep -qF -- '--service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS' "$INSTALL"
+  grep -qF -- '--service-cluster-ip-range $SERVICE_CIDR --cluster-cidr $POD_CLUSTER_CIDR --kube-dns-cluster-ip $CLUSTER_DNS' "$INSTALL"
 assert_true "u7s-kcm.service passes --service-cluster-ip-range=\$SERVICE_CIDR next to --cluster-cidr" \
   grep -qF -- '--cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR' "$INSTALL"
 assert_true "the config file persists all three values so a re-run can detect a conflict" \
   grep -qF 'printf '"'"'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n'"'" "$INSTALL"
-assert_true "--mint-join-token prints --cluster-dns for a non-default cluster so a joining worker's kubelet gets the right DNS" \
-  grep -qF 'dns_flag=" --cluster-dns $persisted_dns"' "$INSTALL"
 assert_false "no hardcoded 10.96.0.10 / 10.244.0.0/16 assignment is left outside the defaults block" \
   grep -nE '^\s*(POD_CLUSTER_CIDR|CLUSTER_DNS)="?10\.' "$INSTALL"
 
@@ -2506,10 +2494,22 @@ assert "dual-stack ranges on a single-family interface abort the install flow it
 # ---------------------------------------------------------------------------
 # Node-address x cluster-family matrix, through the real derivation block for
 # both roles. A control plane learns the families from its ranges; a worker
-# from --cluster-ip-families. Both must end in a --node-ip whose first address
+# from the published u7s-cluster-config. Both must end in a --node-ip whose first address
 # has the cluster's primary family, or a clear error.
 # ---------------------------------------------------------------------------
 V4A=10.0.0.5; V6A=2001:db8::5
+# The u7s-cluster-config ConfigMap a control plane with these families
+# publishes (same values the apiserver's cluster_config_data tests pin).
+cluster_config_json() {
+  local svc pod dns
+  case "$1" in
+    4) svc=10.96.0.0/12; pod=10.244.0.0/16; dns=10.96.0.10 ;;
+    4,6) svc=10.96.0.0/12,fd00:96::/108; pod=10.244.0.0/16,fd00:244::/56; dns=10.96.0.10,fd00:96::a ;;
+    6,4) svc=fd00:96::/108,10.96.0.0/12; pod=fd00:244::/56,10.244.0.0/16; dns=fd00:96::a,10.96.0.10 ;;
+    6) svc=fd00:96::/108; pod=fd00:244::/56; dns=fd00:96::a ;;
+  esac
+  jq -n -c --arg s "$svc" --arg p "$pod" --arg d "$dns" '{data: {serviceCIDRs: $s, podCIDRs: $p, clusterDNS: $d}}'
+}
 cell_scenario() {
   local role="$1" iface="$2" mode="$3" fams="$4" node_ip="" ranges
   case "$mode:$iface" in
@@ -2532,7 +2532,7 @@ cell_scenario() {
     esac
     printf 'WORKER_MODE=0; %s\nvalidate_network_config 0 || exit 1\nCLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"\n' "$ranges"
   else
-    printf 'WORKER_MODE=1; CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=%s\nvalidate_network_config 1 || exit 1\n' "$fams"
+    printf 'WORKER_MODE=1\ncurl() { printf "%%s" %q; }\nfetch_cluster_config abcdef.0123456789abcdef || exit 1\nvalidate_network_config 1 || exit 1\n' "$(cluster_config_json "$fams")"
   fi
   printf '%s\necho "RESULT:$NODE_IPS"\n' "$NODE_DERIVE"
 }
@@ -2583,7 +2583,30 @@ for role in cp worker; do
 done
 echo "cells: $MATRIX_OK/$MATRIX_TOTAL"
 
-assert "a worker rejects a malformed --cluster-ip-families instead of guessing a family set" \
+for fail_code in 403 404; do
+  net_run 'curl() { echo "curl: (22) The requested URL returned error: '"$fail_code"'" >&2; return 22; }
+CLUSTER_FAMILIES=untouched; fetch_cluster_config abcdef.0123456789abcdef; echo "STATUS:$? FAMILIES:$CLUSTER_FAMILIES"'
+  assert "a $fail_code reading u7s-cluster-config fails the join naming the ConfigMap (never a silent default to IPv4, which would leave a dual-stack node single-stack)" \
+    "$(printf '%s' "$NET_OUT" | grep -qF 'kube-system/u7s-cluster-config' && printf '%s' "$NET_OUT" | grep -qF "returned error: $fail_code" && printf '%s' "$NET_OUT" | grep -qF 'STATUS:1 FAMILIES:untouched' && echo 1 || echo 0)"
+done
+net_run 'curl() { printf "%s" "{\"data\":{\"podCIDRs\":\"10.244.0.0/16\"}}"; }
+fetch_cluster_config abcdef.0123456789abcdef'
+assert "a ConfigMap without serviceCIDRs/clusterDNS fails the join instead of guessing families" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'refusing to guess' && echo 1 || echo 0)"
+net_run 'curl() { printf "%s\n" "$@" > "$STATE_DIR_ARGV"; printf "%s" "{\"data\":{\"serviceCIDRs\":\"10.96.0.0/12\",\"clusterDNS\":\"10.96.0.10\"}}"; }
+STATE_DIR_ARGV='"$NET_WORK"'/argv; fetch_cluster_config abcdef.0123456789abcdef; cat "$STATE_DIR_ARGV"; echo "FAM:$CLUSTER_FAMILIES DNS:$CLUSTER_DNS"'
+assert "the ConfigMap is read over TLS pinned to the discovered CA and with the token off argv (an unverified or argv-visible read would leak the join token to a MITM or ps)" \
+  "$(printf '%s' "$NET_OUT" | grep -qxF -- '--cacert' && printf '%s' "$NET_OUT" | grep -qF "/var/lib/u7s/ca.pem" && ! printf '%s' "$NET_OUT" | grep -qE -- '^-[a-zA-Z]*k$|^--insecure$|abcdef\.0123456789abcdef' && printf '%s' "$NET_OUT" | grep -qF 'https://cp.example:6443/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config' && echo 1 || echo 0)"
+UNKNOWN_FLAG_OK=1
+for removed in --cluster-ip-families; do
+  removed_out="$(bash "$INSTALL" "$removed" 4 2>&1)" || true
+  printf '%s' "$removed_out" | grep -qF "unknown argument: $removed" || UNKNOWN_FLAG_OK=0
+done
+assert "--cluster-ip-families is gone: a worker's families come from the cluster, and a flag that could contradict it would silently re-create the single-stack-on-dual-stack bug" \
+  "$UNKNOWN_FLAG_OK"
+assert "a worker refuses --cluster-dns, --service-cidr and --cluster-cidr instead of letting them contradict the cluster's published values" \
+  "$(grep -qF 'a joining or already-joined worker reads them from the cluster' "$INSTALL" && sed -n '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/,/^else$/p' "$INSTALL" | grep -qF -- '[ -n "$CLUSTER_DNS" ]' && echo 1 || echo 0)"
+assert "a worker validates the families it derived from the cluster, and rejects a malformed set instead of guessing" \
   "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'must be one of' && echo 1 || echo 0)"
 net_run 'cluster_families_from_cidrs "fd00:96::/108,10.96.0.0/12" "10.244.0.0/16"'
 assert "families are the Service ranges' families in order (the primary Service range decides the node's primary family)" \

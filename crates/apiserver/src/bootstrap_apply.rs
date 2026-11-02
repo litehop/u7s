@@ -873,6 +873,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],

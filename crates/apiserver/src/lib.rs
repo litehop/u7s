@@ -271,6 +271,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         args.kube_dns_cluster_ip.as_deref(),
     )
     .await?;
+    seed_cluster_config(
+        &store,
+        &args.service_cluster_ip_range,
+        &args.cluster_cidr,
+        args.kube_dns_cluster_ip.as_deref(),
+    )
+    .await?;
     service_alloc::repair(&*store).await?;
     seed_serviceaccounts(&store).await?;
     seed_servicecidrs(&store, &args.service_cluster_ip_range).await?;
@@ -2697,6 +2704,19 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "00000000-0000-0000-0000-000000000307",
             "00000000-0000-0000-0000-000000000308",
         ),
+        (
+            "kube-system",
+            "u7s:nodes-cluster-config",
+            serde_json::json!([
+                { "apiGroups": [""], "resources": ["configmaps"], "resourceNames": [CLUSTER_CONFIG_NAME], "verbs": ["get"] }
+            ]),
+            serde_json::json!([
+                { "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:bootstrappers" },
+                { "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }
+            ]),
+            "00000000-0000-0000-0000-000000000310",
+            "00000000-0000-0000-0000-000000000311",
+        ),
     ];
     for (ns, name, rules, subjects, role_uid, binding_uid) in namespace_policy {
         let key = keys::group_object_key(GROUP, "roles", Some(ns), name);
@@ -2815,6 +2835,116 @@ fn validate_kube_dns_ip(
     Ok(ip)
 }
 
+/// The kube-dns ClusterIPs: the primary (`--kube-dns-cluster-ip` or the primary range's tenth
+/// host) first, then the tenth host of every other range, because a dual-stack CoreDNS Service
+/// holds one VIP per family.
+fn kube_dns_cluster_ips(
+    service_cluster_ip_range: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let (kubernetes_ip, derived) = bootstrap_service_ips(service_cluster_ip_range)?;
+    let primary = match kube_dns_override {
+        Some(ip) => validate_kube_dns_ip(service_cluster_ip_range, kubernetes_ip, ip)?,
+        None => derived,
+    };
+    let mut ips = vec![primary];
+    for alloc in service_range_allocators(service_cluster_ip_range)? {
+        if !alloc.contains_host(&primary) {
+            ips.push(alloc.nth_host(10).map_err(|e| {
+                anyhow::anyhow!(
+                    "--service-cluster-ip-range '{service_cluster_ip_range}' too small for the secondary kube-dns ClusterIP: {e}"
+                )
+            })?);
+        }
+    }
+    Ok(ips)
+}
+
+const CLUSTER_CONFIG_NAME: &str = "u7s-cluster-config";
+
+/// The `data` of `kube-system/u7s-cluster-config`: what a joining node needs to configure
+/// itself for this cluster. IP families are not stored; readers derive them from the ranges.
+fn cluster_config_data(
+    service_cluster_ip_range: &str,
+    pod_cidr: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let service_cidrs = if service_cluster_ip_range.is_empty() {
+        "10.96.0.0/12"
+    } else {
+        service_cluster_ip_range
+    };
+    let dns = kube_dns_cluster_ips(service_cluster_ip_range, kube_dns_override)?
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(serde_json::json!({
+        "serviceCIDRs": service_cidrs,
+        "podCIDRs": pod_cidr,
+        "clusterDNS": dns,
+    }))
+}
+
+/// Publish `kube-system/u7s-cluster-config` (the join-side analogue of kubeadm's
+/// `kube-system/kubeadm-config`), rewriting it whenever the configured ranges change.
+async fn seed_cluster_config(
+    store: &SqliteStore,
+    service_cluster_ip_range: &str,
+    pod_cidr: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let data = cluster_config_data(service_cluster_ip_range, pod_cidr, kube_dns_override)?;
+    let key = keys::object_key("configmaps", "kube-system", CLUSTER_CONFIG_NAME);
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": CLUSTER_CONFIG_NAME,
+            "namespace": "kube-system",
+            "creationTimestamp": boot_timestamp()
+        },
+        "data": data
+    });
+    for _ in 0..5 {
+        let res = match store.get(&key).await? {
+            None => store
+                .put(&key, Bytes::from(body.to_string()), Some(0))
+                .await
+                .map(|_| tracing::info!("seeded ConfigMap: kube-system/{CLUSTER_CONFIG_NAME}")),
+            Some(stored) => {
+                let mut cm: serde_json::Value = serde_json::from_slice(&stored.value)?;
+                if cm["data"] == data {
+                    return Ok(());
+                }
+                cm["data"] = data.clone();
+                store
+                    .put(&key, Bytes::from(cm.to_string()), Some(stored.revision))
+                    .await
+                    .map(|_| tracing::info!("updated kube-system/{CLUSTER_CONFIG_NAME}"))
+            }
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(
+                u7s_store::StoreError::AlreadyExists { .. }
+                | u7s_store::StoreError::RevisionMismatch { .. },
+            ) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "seed ConfigMap kube-system/{CLUSTER_CONFIG_NAME}: {e}"
+                ))
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "seed ConfigMap kube-system/{CLUSTER_CONFIG_NAME}: gave up after conflicting writes"
+    ))
+}
+
 /// A bootstrap VIP whose sentinel already exists is a re-seed unless a different Service's
 /// spec lists the address, which would break `ns/name`: that fails startup naming the
 /// holder. Returns true for an orphan: a sentinel not owned by `ns/name` that no Service
@@ -2874,11 +3004,8 @@ async fn seed_services(
     use bytes::Bytes;
     use u7s_store::Store;
 
-    let (kubernetes_cluster_ip, derived_dns_ip) = bootstrap_service_ips(service_cluster_ip_range)?;
-    let kube_dns_cluster_ip = match kube_dns_override {
-        Some(ip) => validate_kube_dns_ip(service_cluster_ip_range, kubernetes_cluster_ip, ip)?,
-        None => derived_dns_ip,
-    };
+    let (kubernetes_cluster_ip, _) = bootstrap_service_ips(service_cluster_ip_range)?;
+    let kube_dns_cluster_ips = kube_dns_cluster_ips(service_cluster_ip_range, kube_dns_override)?;
 
     // default/kubernetes — reaches the API server from inside pods via
     // in-cluster DNS (kubernetes.default.svc.cluster.local:443 → 10.96.0.1).
@@ -2923,20 +3050,12 @@ async fn seed_services(
     // in-cluster address.
     // A dual-stack CoreDNS Service also asks for the other family's tenth host (scripts/install.sh
     // default_cluster_dns), so reserve it too.
-    let mut reservations = vec![
-        (kubernetes_cluster_ip, "default", "kubernetes"),
-        (kube_dns_cluster_ip, "kube-system", "kube-dns"),
-    ];
-    for alloc in service_range_allocators(service_cluster_ip_range)? {
-        if !alloc.contains_host(&kube_dns_cluster_ip) {
-            let ip = alloc.nth_host(10).map_err(|e| {
-                anyhow::anyhow!(
-                    "--service-cluster-ip-range '{service_cluster_ip_range}' too small for the secondary kube-dns ClusterIP: {e}"
-                )
-            })?;
-            reservations.push((ip, "kube-system", "kube-dns"));
-        }
-    }
+    let mut reservations = vec![(kubernetes_cluster_ip, "default", "kubernetes")];
+    reservations.extend(
+        kube_dns_cluster_ips
+            .iter()
+            .map(|ip| (*ip, "kube-system", "kube-dns")),
+    );
     for (ip, ns, name) in reservations {
         let key = format!("{}{}", state::SERVICE_IP_PREFIX, ip);
         match store
@@ -8946,6 +9065,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cluster_config_data_carries_ranges_and_one_dns_vip_per_family() {
+        // A joining node derives its IP families and kubelet clusterDNS from this; a missing
+        // secondary VIP or a wrong primary would leave a dual-stack worker single-stack.
+        let d = cluster_config_data(
+            "10.96.0.0/12,fd00:96::/108",
+            "10.244.0.0/16,fd00:244::/56",
+            None,
+        )
+        .unwrap();
+        assert_eq!(d["serviceCIDRs"], "10.96.0.0/12,fd00:96::/108");
+        assert_eq!(d["podCIDRs"], "10.244.0.0/16,fd00:244::/56");
+        assert_eq!(d["clusterDNS"], "10.96.0.10,fd00:96::a");
+
+        let v6 = cluster_config_data("fd00:96::/108", "", None).unwrap();
+        assert_eq!(v6["clusterDNS"], "fd00:96::a", "v6-primary single range");
+        assert_eq!(v6["podCIDRs"], "");
+
+        let d = cluster_config_data("fd00:96::/108,10.96.0.0/12", "", Some("10.96.0.53")).unwrap();
+        assert_eq!(
+            d["clusterDNS"], "10.96.0.53,fd00:96::a",
+            "an explicit kube-dns IP leads, the other family keeps its tenth host"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_cluster_config_publishes_and_follows_range_changes() {
+        // A control-plane re-run with new ranges must update the ConfigMap or new workers join
+        // with the old cluster's families.
+        let store = make_store();
+        seed_cluster_config(&store, "10.96.0.0/12", "10.244.0.0/16", None)
+            .await
+            .unwrap();
+        let key = keys::object_key("configmaps", "kube-system", CLUSTER_CONFIG_NAME);
+        let read = || async {
+            let v = store.get(&key).await.unwrap().expect("must exist");
+            serde_json::from_slice::<serde_json::Value>(&v.value).unwrap()
+        };
+        assert_eq!(read().await["data"]["clusterDNS"], "10.96.0.10");
+
+        seed_cluster_config(&store, "10.96.0.0/12,fd00:96::/108", "10.244.0.0/16", None)
+            .await
+            .unwrap();
+        let cm = read().await;
+        assert_eq!(cm["data"]["serviceCIDRs"], "10.96.0.0/12,fd00:96::/108");
+        assert_eq!(cm["data"]["clusterDNS"], "10.96.0.10,fd00:96::a");
+    }
+
+    #[tokio::test]
+    async fn cluster_config_is_readable_by_joiners_and_nodes_but_not_by_anyone_else() {
+        // Joining workers read the ConfigMap with their bootstrap token; anonymous callers and
+        // other kube-system ConfigMaps / list must stay closed.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.unwrap();
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+        let check = |user: &str, groups: &[&str], verb: &str, name: Option<&str>| {
+            let groups: Vec<String> = groups.iter().map(|g| (*g).to_owned()).collect();
+            state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                username: user,
+                groups: &groups,
+                verb,
+                api_group: "",
+                resource: "configmaps",
+                subresource: "",
+                namespace: Some("kube-system"),
+                name,
+                non_resource_url: None,
+            })
+        };
+        let bootstrapper = ["system:bootstrappers", "system:authenticated"];
+        assert!(check(
+            "system:bootstrap:abcdef",
+            &bootstrapper,
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
+        assert!(check(
+            "system:node:n1",
+            &["system:nodes", "system:authenticated"],
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
+        assert!(
+            !check(
+                "system:bootstrap:abcdef",
+                &bootstrapper,
+                "get",
+                Some("coredns")
+            ),
+            "only the one resourceName"
+        );
+        assert!(
+            !check("system:bootstrap:abcdef", &bootstrapper, "list", None),
+            "no list"
+        );
+        assert!(
+            !check("system:bootstrap:abcdef", &bootstrapper, "watch", None),
+            "no watch"
+        );
+        assert!(
+            !check(
+                "system:anonymous",
+                &["system:unauthenticated"],
+                "get",
+                Some(CLUSTER_CONFIG_NAME)
+            ),
+            "cluster topology must not be anonymously readable"
+        );
+        assert!(!check(
+            "alice",
+            &["system:authenticated"],
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
+    }
+
     #[tokio::test]
     async fn seed_cluster_info_carries_server_and_ca_and_keeps_signer_jws_across_restart() {
         // bootstrapsigner only signs an existing kube-public/cluster-info, and a restart
@@ -12975,6 +13216,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13793,6 +14035,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13995,6 +14238,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
