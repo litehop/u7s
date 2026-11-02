@@ -1178,10 +1178,11 @@ fn build_routes(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/pods/{name}/log",
             get(handlers::proxy::pod_log),
         )
-        // Pods — exec/attach/portforward: 501 stubs until SPDY/WebSocket is implemented.
+        // Pods — exec/attach/portforward: GET serves WebSocket; POST (SPDY upgrade) is
+        // passed through to the kubelet like upstream's UpgradeAwareHandler.
         //
         // exec/attach's POST legs run the same pre-upgrade checks (pod lookup +
-        // admission) as their GET/WebSocket siblings before returning 501 — see
+        // admission) as their GET/WebSocket siblings before dialing the kubelet — see
         // pod_exec_post/pod_attach_post: a denied GET/WebSocket dial is retried by
         // client-go as POST/SPDY, and that retry must surface the same denial Status
         // instead of a generic 405.
