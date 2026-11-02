@@ -236,8 +236,16 @@ also the kubelet's 2nd `--node-ip`. State lives in `/usr/local/sbin/u7s-lan-v6` 
 the flag the rig is unchanged (per-node `fd85:<n>::1`, no peer reachability).
 Pass `--dual-stack` to every node of a stack, and put both on the same `--network`.
 
-Exercisable: in-VM v6, VM<->VM v6 ping/TCP, pod/Service v6 and node v6 addresses
-inside the cluster. Not exercisable: Mac<->VM v6 (the host apiserver reaches VMs over
+`--dual-stack` also makes the cluster dual-stack, mirroring install.sh's
+conventions: pod CIDRs `10.244.0.0/16,fd00:244::/56` (KCM per-family node masks
+/24 and /64, flannel `IPv6Network`, kube-proxy dual `clusterCIDR`), Service CIDRs
+`10.96.0.0/12,fd00:96::/108` (default for `run-all.sh --dual-stack` when
+`--service-cidr` is omitted), and CoreDNS with a second VIP `fd00:96::a`.
+
+Verified on a two-node pair: node v6 InternalIPs, VM<->VM v6 ping/TCP, dual
+podCIDRs and pod IPs, cross-node pod-to-pod over v4 and v6, a
+`RequireDualStack` Service reachable per family from a pod on the other node,
+CoreDNS A and AAAA, and `--focus '\[Feature:IPv6DualStack\]'` 10/10. Not exercisable: Mac<->VM v6 (the host apiserver reaches VMs over
 IPv4 port-forwards; user-v2 gives the host no v6 path) and any external v6 reachability
 (GCP only).
 

@@ -382,3 +382,50 @@ lan_v6_seed_mesh() {
     lan_v6_install "${args[@]}"
   done
 }
+
+# Dual-stack pod/Service ranges, as scripts/install.sh documents them
+# (--cluster-cidr 10.244.0.0/16,fd00:244::/56, --service-cidr
+# 10.96.0.0/12,fd00:96::/108; kube-dns is the tenth host of each range).
+# Single-stack rigs keep the IPv4 values.
+RIG_POD_CIDR_V4="10.244.0.0/16"
+RIG_POD_CIDR_V6="fd00:244::/56"
+RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
+RIG_KUBE_DNS_V6="fd00:96::a"
+
+# KCM pod-CIDR flags. Upstream rejects --node-cidr-mask-size with two cluster
+# CIDRs and wants one flag per family (install.sh kcm_node_cidr_mask_flags).
+# Arg: 1 for dual-stack.
+rig_kcm_cidr_flags() {
+  if [ "$1" -eq 1 ]; then
+    echo "--cluster-cidr=${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6} --node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64"
+  else
+    echo "--cluster-cidr=${RIG_POD_CIDR_V4} --node-cidr-mask-size=24"
+  fi
+}
+
+# kube-proxy clusterCIDR value. Arg: 1 for dual-stack.
+rig_kube_proxy_cluster_cidr() {
+  if [ "$1" -eq 1 ]; then echo "${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6}"; else echo "${RIG_POD_CIDR_V4}"; fi
+}
+
+# Renders manifests/flannel.yaml (stdin to stdout) like install.sh: the
+# IPv6Network line survives only on dual-stack. Args: <iface> <1 if dual-stack>.
+rig_render_flannel() {
+  local v6=(-e '/"IPv6Network"/d')
+  [ "$2" -eq 1 ] && v6=(-e "s#__POD_CLUSTER_CIDR_IPV6__#${RIG_POD_CIDR_V6}#g")
+  sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" "${v6[@]}"
+}
+
+# Renders manifests/coredns.yaml (stdin to stdout): a dual-stack Service gets a
+# second kube-dns VIP and PreferDualStack, as install.sh does. Arg: 1 if dual-stack.
+rig_render_coredns() {
+  if [ "$1" -eq 1 ]; then
+    sed -e "s#^  clusterIP: 10.96.0.10\$#  clusterIP: 10.96.0.10\\
+  clusterIPs:\\
+  - 10.96.0.10\\
+  - ${RIG_KUBE_DNS_V6}\\
+  ipFamilyPolicy: PreferDualStack#"
+  else
+    cat
+  fi
+}

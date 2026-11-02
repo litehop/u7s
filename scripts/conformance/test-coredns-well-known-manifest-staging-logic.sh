@@ -46,7 +46,7 @@ assert "manifests/coredns.yaml exists in the repo (the file every harness below 
 # into its own $MANIFEST_DIR before the apiserver launches.
 # ---------------------------------------------------------------------------
 assert "u7s-start.sh copies manifests/coredns.yaml into \$MANIFEST_DIR before launch" \
-  "$(grep -qF 'cp "$REPO/manifests/coredns.yaml" "$MANIFEST_DIR/"' "$U7S_START" && echo 1 || echo 0)"
+  "$(grep -qF '< "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml"' "$U7S_START" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Simulation: mirrors u7s-start.sh's actual mkdir+cp sequence against a scratch

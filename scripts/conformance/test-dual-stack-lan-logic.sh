@@ -61,5 +61,40 @@ check "boot unit re-applies after a networkd restart (an apt systemd upgrade flu
 check "peer discovery never pipes limactl list into grep -q (SIGPIPE under pipefail silently drops every peer)" \
   "0" "$(grep -c 'limactl list.*| grep -q' "$START")"
 
+# Pod/Service v6 wiring. Without every piece, "this cluster is not configured
+# for dual-stack services" and pods stay v4-only.
+ROOT="$(cd "$DIR/../.." && pwd)"
+check "dual-stack KCM gets both pod CIDRs and one mask flag per family (upstream rejects the single flag with two CIDRs)" \
+  "--cluster-cidr=10.244.0.0/16,fd00:244::/56 --node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64" "$(rig_kcm_cidr_flags 1)"
+check "single-stack KCM flags stay as before" \
+  "--cluster-cidr=10.244.0.0/16 --node-cidr-mask-size=24" "$(rig_kcm_cidr_flags 0)"
+check "dual-stack kube-proxy clusterCIDR lists both families" \
+  "10.244.0.0/16,fd00:244::/56" "$(rig_kube_proxy_cluster_cidr 1)"
+check "single-stack kube-proxy clusterCIDR stays v4" \
+  "10.244.0.0/16" "$(rig_kube_proxy_cluster_cidr 0)"
+flannel_dual=$(rig_render_flannel eth0 1 < "$ROOT/manifests/flannel.yaml")
+check "dual-stack flannel keeps IPv6Network (lima-start used to delete it)" \
+  "1" "$(printf '%s\n' "$flannel_dual" | grep -cF '"EnableIPv6": true, "IPv6Network": "fd00:244::/56"')"
+flannel_single=$(rig_render_flannel eth0 0 < "$ROOT/manifests/flannel.yaml")
+check "single-stack flannel has no IPv6Network" \
+  "0" "$(printf '%s\n' "$flannel_single" | grep -c 'IPv6Network"')"
+check "single-stack flannel render is byte-identical to the pre-dual-stack sed" \
+  "$(sed -e 's/__IFACE__/eth0/g' -e 's#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g' -e '/"IPv6Network"/d' "$ROOT/manifests/flannel.yaml")" "$flannel_single"
+check "no unresolved placeholder in either flannel render" \
+  "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z0-9_]+__[",]' || true)"
+check "dual-stack CoreDNS Service has a VIP per family, PreferDualStack" \
+  "  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack" \
+  "$(rig_render_coredns 1 < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -)"
+check "single-stack CoreDNS manifest is staged unchanged" \
+  "$(cat "$ROOT/manifests/coredns.yaml")" "$(rig_render_coredns 0 < "$ROOT/manifests/coredns.yaml")"
+check "04-start-kcm.sh takes its CIDR flags from the rig helper" \
+  "1" "$(grep -cF '$KCM_CIDR_FLAGS' "$DIR/04-start-kcm.sh")"
+check "run-all.sh forwards --dual-stack to KCM" \
+  "1" "$(grep -c '04-start-kcm.sh.*_DUAL_STACK_ARG' "$DIR/run-all.sh")"
+check "run-all.sh defaults a dual-stack apiserver to the dual Service range" \
+  "1" "$(grep -cF 'SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"' "$DIR/run-all.sh")"
+check "lima-start.sh renders kube-proxy and flannel via the dual-stack-aware helpers" \
+  "2" "$(grep -cE 'rig_kube_proxy_cluster_cidr "\$DUAL_STACK"|rig_render_flannel .*"\$DUAL_STACK"' "$START")"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]

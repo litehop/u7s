@@ -823,11 +823,11 @@ users:
     token: ${KUBE_PROXY_TOKEN}
 KUBEEOF
 
-limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<'CONFEOF'
+limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<CONFEOF
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 mode: iptables
-clusterCIDR: 10.244.0.0/16
+clusterCIDR: $(rig_kube_proxy_cluster_cidr "$DUAL_STACK")
 clientConnection:
   kubeconfig: /etc/kube-proxy/kubeconfig.conf
 CONFEOF
@@ -1027,8 +1027,7 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 # whichever node's --iface value wins the last apply is not a correctness issue.
 echo "Applying flannel CNI DaemonSet..."
 FLANNEL_RENDERED="$(mktemp)"
-sed -e "s/__IFACE__/$LIMA_VM_IFACE/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g" -e '/"IPv6Network"/d' \
-  "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
+rig_render_flannel "$LIMA_VM_IFACE" "$DUAL_STACK" < "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$FLANNEL_RENDERED"
 rm -f "$FLANNEL_RENDERED"
 

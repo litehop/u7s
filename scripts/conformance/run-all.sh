@@ -121,8 +121,10 @@
 #             reprovisions it back onto the shared default network.
 #   --dual-stack  Opt-in: give each VM a static ULA in one shared /64 plus static
 #             neighbour entries (and use it as the kubelet's 2nd --node-ip), so
-#             VM<->VM IPv6 works on Lima's user-v2 network. Forwarded to
-#             lima-start.sh and add-node.sh. Default rig is unchanged. See
+#             VM<->VM IPv6 works on Lima's user-v2 network. Also makes the cluster
+#             dual-stack (pod/Service CIDRs, KCM, flannel, kube-proxy, CoreDNS).
+#             Forwarded to lima-start.sh, 04-start-kcm.sh and add-node.sh.
+#             Default rig is unchanged. See
 #             ai/prompts/vm-operations.md.
 #   --ip      Host IP for the apiserver and konnectivity-server to bind to
 #             (default: 127.0.0.1). Set to a loopback alias (e.g. 127.0.0.2) to
@@ -448,6 +450,11 @@ _K8S_VERSION_ARG=""
 _EMBEDDED_SCHEDULER_ARG=""
 [ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
 _SERVICE_CIDR_ARG=""
+if [ -n "$_DUAL_STACK_ARG" ]; then
+  # shellcheck source=scripts/conformance/_lib.sh
+  source "$DIR/_lib.sh"
+  [ -n "$SERVICE_CIDR" ] || SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"
+fi
 [ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
 if [ "$RESET" -eq 1 ]; then
@@ -541,7 +548,7 @@ bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERV
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG} ${_DUAL_STACK_ARG}
 
 # Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
 # true already made the apiserver itself schedule: starting both would
