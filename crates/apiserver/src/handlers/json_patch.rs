@@ -2925,6 +2925,8 @@ mod tests {
     const SAFE_NO_DRY_RUN_SIGNAL: &[&str] = &[
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
+        // Reached from the replace handlers only after their dry-run early-return.
+        "update_after_lost_create_race",
         // CRD finalization (finalize_crd and its helpers): reached from delete_crd only after
         // its dry-run early-return, and from the background terminating-CRD sweep.
         "finalize_crd",

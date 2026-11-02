@@ -1,89 +1,117 @@
 ---
-as_of: 2026-10-25
+as_of: 2026-10-31
 kind: initiative-state
 ---
 
-# Cert rotation and the release gate: state as of 2026-10-25
+# Release gate and cert rotation: state as of 2026-10-31
 
-Main is NOT release-ready: `v0.4.2-snapshot.1` (main `89de86f6`, prerelease
-2026-10-25) FAILS criterion (d) of the release-authoritative GCP e2-micro
-gate, reproducing the `v0.4.1-snapshot.1` failure (`mayor-vw7jc`). Cert
-rotation, install on uppercase hostnames and the advisory bumps are done; the
-Lima burst gate (50 pods, 3/3, 1 GiB) passed on 2026-10-21.
+Main is NOT release-ready: the release-authoritative GCP e2-micro gate fails
+criterion (d) because MariaDB 11.8's first-init temporary server is CPU-bound
+in crypto (not disk-bound) and overruns the image entrypoint's fixed wait on an
+e2-micro (`mayor-vw7jc`). Option A (no CPU limit plus InnoDB args, draft #2068)
+passes only ~3/6 cold starts; the next lever is waiting on an operator decision
+(`mayor-yfca9`). Cert rotation, uppercase-hostname install and advisory bumps
+shipped earlier; the Lima burst gate measured 50 pods, 3/3, on a 1 GiB VM on
+2026-10-21 (`mayor-f2gfd`; ran with a local lowercase VM name, see `zl285`).
 
-## The GCP gate failure (`vw7jc`)
+## Root-cause chain (`vw7jc`)
 
-On a fresh e2-micro, io PSI reaches 72% and cpu PSI ~61% for the first ~20
-min, and mariadb's 375m CPU limit is throttled. The official mariadb
-entrypoint's 30 s temporary-server wait then expires: it logs `Unable to
-start server.` and exits 1 after the datadir is initialised but before the
-root password is set. The container restarts on the same emptyDir, skips
-init, and root auth is broken forever, while `mariadb-admin ping` still
-succeeds so the pod stays Ready. WordPress returns 000 and the marker write
-fails. A `startupProbe` does not help (the exit is self-inflicted). Aged nodes
-start the same pod in 12-100 s.
+1. Saturation is ours, not the platform's (`mayor-uaasp`, #2032): install,
+   image pull/unpack and MariaDB/WordPress start-up drive the 10 GB pd-standard
+   to 85-93% busy (3.8 GiB read, 2.7 GiB written). The same saturation shows at
+   VM age 55 min, so it is not a fresh-VM or burst-credit effect; the earlier
+   "~20 min saturated fresh VM" premise was wrong. Disk-IO attribution is well
+   supported; "CPU dominant" is not established.
+2. Install now exits only once node and kube-system are Ready (`mayor-csud5`,
+   #2034), so the example no longer overlaps install pulls. (d) still fails
+   (`mayor-kbpw7`, `v0.4.2-snapshot.2`, 2/2 runs; install PASS ~12 min).
+3. Not memory on GCP: refault_file <= ~800 pages/s (A/B pre-burst <= ~1.7k/s)
+   versus ~100k/s idle and ~1.2M/s under an 80-pod burst on Lima
+   (`mayor-rdy7h`, `mayor-i4bvb`). Memory PSI full ~1%, MemAvailable min 278
+   MiB, 0 OOM. Lima thrash numbers do not transfer to GCP.
+4. MariaDB: the old liveness (initialDelay 120 s, timeout 1 s) killed init
+   mid-run, and readiness `mariadb-admin ping` hid broken root auth. Probes are
+   changed by #2046 (`mayor-vnmcw`: startupProbe, `healthcheck.sh`). (d) still
+   fails: the first container exits ~3 min in with `[Entrypoint]: Unable to
+   start server.` (the entrypoint's own 30 s temp-server wait on the cold disk,
+   CPU-throttled at the 375m limit); the restart skips init and root auth stays
+   broken, now correctly never Ready.
 
-Ruled out: OOM, steal, MTU, DNS, memory pressure. Not isolated: cold
-pd-standard disk versus e2 shared-core burst-credit exhaustion.
+5. Measured 2026-10-31 (`yfca9`, draft #2068, raw `temp/e2e/yfca9/`): the
+   temp server burns ~28 CPU-s single-threaded in libcrypto
+   (`BN_mod_exp_mont_consttime`, gdb; ~80% of a core for ~35 s, zero disk I/O)
+   against the entrypoint's fixed ~40-55 s wait, which has no env knob. The
+   375m limit made it worse (throttled 142.5 s of 209 s). The disk was 82-85%
+   busy but mostly from crio unpacking WordPress at the same time, so it is
+   not the dominant cost. Option A (operator-chosen) passes ~3/6 cold starts;
+   `--skip-ssl` 1/4; a Secret-supplied cert 2/3. The InnoDB args are not
+   justified by measurement. Passing starts take 186-316 s to Ready, so the
+   gate's 300 s mariadb-0 wait is tight too.
 
-Options awaiting operator decision (none chosen):
+Pending operator decision (`mayor-yfca9`): (1, mayor rec) a scout to name the
+startup crypto work (key/DH generation?) and supply or avoid it (pre-generated
+material via Secret, or MariaDB 10.11 LTS if it doesn't do this); (2) a command
+wrapper that runs the entrypoint with a longer temp-server wait; (3) B,
+marker-gated init recovery (excluded earlier); (4) a bigger gate node class.
+Verify on GCP through the gate (example manifests come from the checkout even
+with `--release`, no snapshot needed).
 
-- Robust mariadb workload (init tolerant of slow start); the mayor's recommendation (`vw7jc` note), still pending the
-  operator's decision.
-- Gate waits for mariadb-0 Ready before applying WordPress, and pre-pulls images.
-- pd-balanced boot disk (`scripts/gcp/lib.sh`); pd-standard is deliberate,
-  see `docs/dev-setup.md`.
+## Memory protection (`mayor-i4bvb`, PR #2039)
 
-Harness notes: gate VPSes are named `u7s-rg-<MMDDHHMMSS>-<n>` with no
-per-worker prefix (`mayor-ddhlo`), so check for strays by that pattern. A
-Google preemption mid-run yields no verdict.
+Option A (decision recorded in `mayor-i4bvb`): systemd MemoryLow on u7s-apiserver,
+scheduler, kcm, kubelet and crio plus kubelet systemReserved/kubeReserved with
+`enforceNodeAllocatable=pods`; zram by default was not chosen (u7s configures
+no swap). Lima: refaults 64.4M -> 25.7M, reads 269.6 -> 110.2 GB, MemAvailable
+min 187 -> 288 MiB, but only 21/80 pods Ready in ~250 s. The GCP A/B
+(both arms experiment tarballs) is INCONCLUSIVE: neither arm reached a burst
+because MariaDB failed first; B showed no pre-burst memory regression. Sizing
+evidence, page-cache-inflated: systemReserved ~160Mi (non-control-plane
+system.slice idle 150-187 MiB), kubeReserved ~136Mi (kubelet+crio idle
+115-233 MiB). Re-run A/B with bursts once (d) passes.
 
-## Other release checks
+## Harness and rules
 
-| Check | Result |
-|---|---|
-| Cert rotation (`xdw6u.2-.5`, `.11`, `zboqh`) | merged; control-plane kubelet runs as `system:node:<name>` with rotating certs (#1932) |
-| Install on uppercase hostnames (`zl285`) | fixed (#1935); hosts that already failed recover on re-run |
-| Advisories (`09au3`) | `cmov`, `rustls-webpki`, `webpki-root-certs` bumped (#1938) |
+- GCP experiment mode (`mayor-086v6`, #2041): `burst-gate.sh --backend gcp
+  --tarball` installs an unpublished x86_64 tarball built by
+  `scripts/release-gate/build-experiment-tarball.sh <ref>`; verdicts are tagged
+  EXPERIMENT. Use it for both A/B arms so they share a base.
+- The sampler records refault/majfault/pgscan and per-cgroup memory from before
+  install (#2043).
+- The publish job needs operator approval on the Release environment; snapshot
+  cuts are operator-only.
+- Operator rules (2026-10-30): no pre-pull or sequencing in the gate (users just
+  `kubectl apply`); pd-standard stays (it models the cheapest VPS); do not
+  publish unmerged code.
+- Gate VPSes are `u7s-rg-<MMDDHHMMSS>-<n>` (`mayor-ddhlo`); check for strays by
+  that pattern; node name must stay <= 52 chars. A Google preemption mid-run
+  yields no verdict.
+- Burst gate: `scripts/release-gate/burst-gate.sh --confirm` (~1-2 h). On Lima,
+  "quiet" means no other Lima VM, host CPU >= 70% idle, no cargo builds; a noisy
+  run counts as FAIL (`6uez9`).
 
-Non-gating: `xdw6u.8` (two-tier CA), `.9` (root succession; carries a note
-about worker `ca.pem` going stale after succession).
-`pki-rotation-e2e` is ADVISORY, removed from required checks 2026-10-24
-(`fhdqw`, #2013) after hitting the merge queue's 20-min check timeout. Observe
-its wall-clock; do not re-require it without asking the operator.
-`d7uta`: the pinned pkgs.k8s.io apt key expires 2026-12-29 and upstream had
-not extended it on 2026-10-21; re-check by 2026-12-08.
+## Cert rotation and other checks
 
-## Re-running the burst gate
+Control-plane kubelet runs as `system:node:<name>` with rotating certs (#1932);
+uppercase-hostname install (#1935, `zl285`; live checks need an uppercase
+hostname); advisories bumped (#1938). Non-gating: `xdw6u.8` (two-tier CA),
+`.9` (root succession; worker `ca.pem` goes stale after succession).
+`pki-rotation-e2e` is ADVISORY (removed from required checks 2026-10-24,
+`fhdqw`, #2013); do not re-require it without asking the operator. `d7uta`: the
+pinned pkgs.k8s.io apt key expires 2026-12-29; re-check by 2026-12-08.
 
-`scripts/release-gate/burst-gate.sh --confirm` (~1-2 h). For the Lima
-backend "quiet" means no other Lima VM, host CPU >= 70% idle, no cargo
-builds. Put the dashboard on a dispatch hold, skip the hygiene loop (a remote
-branch delete triggers the pre-push hook's full cargo run), then ONE worker
-runs the gate and any measurement back to back. A noisy run counts as FAIL (no
-INVALID verdict yet, `6uez9`). The harness names Lima VMs with an uppercase
-UTC stamp, the only live test of uppercase-hostname installs.
+## Memory measurement (`w898x`)
 
-## Memory measurement (`w898x`, feeds the Rust-rewrite go/no-go `vc844`)
-
-On the loaded 1 GiB node a rewrite would save at most ~22-34 MB (KCM) and
-~27-32 MB (kubelet); flags recover ~12 / ~8 MB today (trimmed `--controllers`
-+ `GOMEMLIMIT`; `GOMEMLIMIT=40MiB` on the full controller set costs ~22% vCPU
-in GC). Findings: tag `archive/mayor-w898x-findings`.
+A Rust rewrite would save at most ~22-34 MB (KCM) and ~27-32 MB (kubelet) on the
+loaded 1 GiB node (feeds `vc844`). Findings: `git show
+archive/mayor-w898x-findings`.
 
 ## Working rules
 
-- Match upstream unless incompatible with a deliberate u7s choice; check
-  bead notes and upstream source before surfacing a "decide" bead.
-- Any PR that narrows a component's identity (e.g. kubelet off admin), or
-  changes admission/watch/RBAC semantics, stays draft until a full two-node
-  Conformance run is green; focus specs missed 8 failures on #1932.
-- Live `install.sh` checks need an uppercase hostname.
-- `cargo audit` is non-blocking for PRs (operator decision); the hygiene
-  loop's STEP H flags a red main audit as exit bit 4.
-- The tick queues a PR the moment it has an LGTM(-with-suggestions) and
-  removes its worktree on merge: convert to draft before sending follow-ups,
-  and never leave commits unpushed in a queued worker's worktree.
-- The tick discards the regenerated `.beads/issues.jsonl` before each pull;
-  run `bd export -o .beads/issues.jsonl` and land it in the wrap PR, or bead
-  state stays only in the local DB.
+- Match upstream unless incompatible with a deliberate u7s choice.
+- A PR that narrows a component's identity or changes admission/watch/RBAC
+  semantics stays draft until a full two-node Conformance run is green.
+- `cargo audit` is non-blocking for PRs (operator decision).
+- The tick queues a PR on LGTM and removes its worktree on merge: convert to
+  draft before follow-ups; never leave commits unpushed in a queued worktree.
+- The tick discards the regenerated `.beads/issues.jsonl` before each pull; run
+  `bd export -o .beads/issues.jsonl` and land it in the wrap PR.

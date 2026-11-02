@@ -980,6 +980,7 @@ pub async fn replace_crd<S: Store>(
     } else {
         crd.metadata.resource_version.parse::<u64>().ok()
     };
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
 
     // Admission webhook pipeline (mutating then validating).
     {
@@ -1633,6 +1634,15 @@ pub async fn patch_crd<S: Store>(
     // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
     // matching upstream: those patch types have no create-on-missing semantics.
     if is_ssa && stored_opt.is_none() {
+        super::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            None,
+            &name,
+        )?;
         let mut body_json = ssa_body_to_json(&body)?;
         crate::handlers::json_patch::strip_managed_fields(&mut body_json);
         // The URL name is authoritative for what gets created, regardless of what (if anything)
@@ -1896,11 +1906,12 @@ pub async fn put_crd_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
     if is_dry_run_header(&headers) {
         return Ok(Json(current.body));
     }
 
-    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -2257,13 +2268,27 @@ mod tests {
         );
 
         let replace = |versions: serde_json::Value, generation: Option<i64>| {
-            replace_crd(
-                State(state.clone()),
-                Path(name.to_string()),
-                test_user(),
-                HeaderMap::new(),
-                crd_with_versions(name, versions, generation),
-            )
+            let state = state.clone();
+            async move {
+                let rv = state
+                    .store
+                    .get(&store_key(name))
+                    .await
+                    .unwrap()
+                    .expect("stored CRD")
+                    .revision;
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(&crd_with_versions(name, versions, generation)).unwrap();
+                body["metadata"]["resourceVersion"] = rv.to_string().into();
+                replace_crd(
+                    State(state),
+                    Path(name.to_string()),
+                    test_user(),
+                    HeaderMap::new(),
+                    Bytes::from(body.to_string()),
+                )
+                .await
+            }
         };
         assert!(replace(two.clone(), None).await.is_ok());
         assert_eq!(
@@ -3772,6 +3797,55 @@ mod tests {
         );
     }
 
+    /// Apply-creating a CRD needs `create` in addition to `patch`, as upstream requires.
+    #[tokio::test]
+    async fn ssa_apply_patch_of_missing_crd_without_create_verb_is_403() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/patcher",
+            &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["patch", "update"]}]}),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/patcher",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "patcher"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "patcher"}
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let manifest = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "gadgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget", "listKind": "GadgetList"},
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let err = patch_crd(
+            State(state.clone()),
+            Path("gadgets.example.io".to_string()),
+            Extension(UserInfo {
+                username: "patcher".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }),
+            headers,
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await
+        .err()
+        .expect("CRD apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     /// SSA apply-patch on a CRD name that does not exist yet must create it — with the same
     /// Established/NamesAccepted status stamping `create_crd` gives a plain POST — instead of
     /// 404ing. Real Server-Side Apply creates the target object on first apply; before this
@@ -4174,9 +4248,16 @@ mod tests {
             .await
             .expect("create must succeed");
 
+        let rv = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("stored CRD")
+            .revision;
         let put_body = Bytes::from(
             serde_json::json!({
-                "metadata": { "name": name },
+                "metadata": { "name": name, "resourceVersion": rv.to_string() },
                 "status": null
             })
             .to_string(),
@@ -6311,6 +6392,15 @@ mod ratchet_tests {
             serde_json::from_slice(&minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"))
                 .unwrap();
         body["metadata"]["finalizers"] = serde_json::json!([CLEANUP_FINALIZER]);
+        body["metadata"]["resourceVersion"] = state
+            .store
+            .get(&store_key(FIN_CRD))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string()
+            .into();
         replace_crd(
             State(state.clone()),
             Path(FIN_CRD.to_string()),

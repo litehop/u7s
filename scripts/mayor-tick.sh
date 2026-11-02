@@ -296,6 +296,15 @@ pr_gate_eligible() {
   return 0
 }
 
+pr_gate_ineligible_reason() {
+  local mss="$1" pending="$2" failed="$3" is_draft="${4:-false}"
+  if [ "$is_draft" = "true" ]; then echo "draft PR"
+  elif [ "$mss" != "CLEAN" ] && [ "$mss" != "BEHIND" ]; then echo "mergeStateStatus is $mss, not CLEAN/BEHIND"
+  elif [ "${pending:-0}" -ne 0 ]; then echo "$pending check(s) still pending"
+  else echo "$failed check(s) failed"
+  fi
+}
+
 # Highest-signal-wins exit code selection: non-zero exit codes are OR-able
 # -- the highest set signal wins if multiple fire. 30 (worktree/hygiene)
 # outranks 20 (gate/queue exception) outranks 10 (new
@@ -657,11 +666,19 @@ gate_and_merge_prs() {
     pending=$(printf '%s' "$pr" | jq '[.statusCheckRollup[]? | select(.status!=null and .status!="COMPLETED")] | length')
     failed=$(printf '%s' "$pr" | jq '[.statusCheckRollup[]? | select(.conclusion!=null and (.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT" or .conclusion=="ACTION_REQUIRED"))] | length')
     is_draft=$(printf '%s' "$pr" | jq -r '.isDraft')
-    pr_gate_eligible "$mss" "$pending" "$failed" "$is_draft" || continue
+    if [ "$mss" = "UNKNOWN" ]; then
+      # GitHub computes mergeability lazily; the list call often returns UNKNOWN for a PR that is CLEAN a moment later.
+      mss=$(gh pr view "$n" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null || echo UNKNOWN)
+    fi
+    if ! pr_gate_eligible "$mss" "$pending" "$failed" "$is_draft"; then
+      echo "mayor-tick: PR #$n not enqueued: $(pr_gate_ineligible_reason "$mss" "$pending" "$failed" "$is_draft")"
+      continue
+    fi
 
     reviews_json=$(gh pr view "$n" --json reviews --jq '.reviews' 2>/dev/null || echo '[]')
     latest=$(latest_reviewer_review "$reviews_json")
     if [ -z "$latest" ] || [ "$latest" = "null" ]; then
+      echo "mayor-tick: PR #$n not enqueued: no critical-reviewer review"
       GATE_EXCEPTIONS+=("$(jq -nc --argjson pr "$n" '{pr:$pr, reason:"no-qualifying-review"}')")
       continue
     fi
@@ -672,6 +689,7 @@ gate_and_merge_prs() {
         run_cmd gh pr merge "$n"
         ;;
       *)
+        echo "mayor-tick: PR #$n not enqueued: latest critical-reviewer verdict is '${verdict:-unparseable}', not LGTM"
         GATE_EXCEPTIONS+=("$(jq -nc --argjson pr "$n" --arg verdict "$verdict" '{pr:$pr, verdict:$verdict, reason:"verdict-not-lgtm"}')")
         ;;
     esac
@@ -723,30 +741,41 @@ extract_bead_ids() {
 # "(partial". A PR title alone cannot tell a completing PR from a partial one,
 # so beads without the note (including all pre-convention PRs), epics and beads
 # with open children are never closed here; the mayor closes those by hand.
-# IDs come from the PR title only. A close failure is recorded as a gate
-# exception (exit 20); the scan repeats every tick, so it retries naturally.
+# IDs come from the PR title plus every in_progress bead (INPROGRESS_BEADS_JSON)
+# carrying a "PR #N opened" note for this PR -- worker PR titles usually carry
+# no bead ID. A close failure is recorded as a gate exception (exit 20); the
+# scan repeats every tick, so it retries naturally. Every skip logs a reason.
+INPROGRESS_BEADS_JSON='[]'
+
 close_merged_pr_beads() {
-  local num="$1" title="$2" sha="$3" id show status type notes
-  for id in $(extract_bead_ids "$title"); do
+  local num="$1" title="$2" sha="$3" id ids show status type notes
+  ids=$({ extract_bead_ids "$title"
+    printf '%s' "$INPROGRESS_BEADS_JSON" | jq -r --arg re "PR #${num} opened([^0-9]|\$)" \
+      '.[]? | select((.notes // "") | test($re)) | .id' 2>/dev/null || true; } | sort -u)
+  if [ -z "$ids" ]; then
+    echo "mayor-tick: PR #$num has no bead to close (no bead ID in title, no in_progress bead notes it)"
+    return 0
+  fi
+  for id in $ids; do
     show=$(bd show "$id" --json 2>/dev/null || true)
     status=$(printf '%s' "$show" | jq -r '.[0].status // empty' 2>/dev/null || true)
     case "$status" in
       closed) continue ;;
-      "") echo "mayor-tick: bead $id not found, not closing (PR #$num)"; continue ;;
+      "") echo "mayor-tick: bead $id not closed: not found (PR #$num)"; continue ;;
     esac
     type=$(printf '%s' "$show" | jq -r '.[0].issue_type // empty' 2>/dev/null || true)
     if [ "$type" = "epic" ]; then
-      echo "mayor-tick: bead $id is an epic, not auto-closing (PR #$num)"; continue
+      echo "mayor-tick: bead $id not closed: is an epic (PR #$num)"; continue
     fi
     if [ "$(bd children "$id" --json 2>/dev/null | jq '[.[]? | select(.status != "closed")] | length' 2>/dev/null || echo 0)" != "0" ]; then
-      echo "mayor-tick: bead $id has open children, not auto-closing (PR #$num)"; continue
+      echo "mayor-tick: bead $id not closed: has open children (PR #$num)"; continue
     fi
     notes=$(printf '%s' "$show" | jq -r '.[0].notes // ""' 2>/dev/null | { grep -E "PR #${num} opened([^0-9]|\$)" || true; })
     if [ -z "$notes" ]; then
-      echo "mayor-tick: bead $id has no 'PR #$num opened' note, not auto-closing"; continue
+      echo "mayor-tick: bead $id not closed: no 'PR #$num opened' note"; continue
     fi
     if printf '%s' "$notes" | grep -q '(partial'; then
-      echo "mayor-tick: bead $id marked partial by PR #$num, not auto-closing"; continue
+      echo "mayor-tick: bead $id not closed: marked partial by PR #$num"; continue
     fi
     if run_cmd bd close "$id" --reason "merged in #$num ($sha)" >/dev/null 2>&1; then
       echo "mayor-tick: closed bead $id (merged in #$num, $sha)"
@@ -769,6 +798,8 @@ close_beads_of_merged_prs() {
     || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%d)
   prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit 100 \
     --json number,title,mergeCommit 2>/dev/null || echo '[]')
+  INPROGRESS_BEADS_JSON=$(bd list --status in_progress --limit 0 --json 2>/dev/null || echo '[]')
+  printf '%s' "$INPROGRESS_BEADS_JSON" | jq -e 'type=="array"' >/dev/null 2>&1 || INPROGRESS_BEADS_JSON='[]'
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     close_merged_pr_beads \

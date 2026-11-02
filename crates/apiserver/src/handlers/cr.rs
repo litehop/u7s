@@ -1565,24 +1565,46 @@ pub(crate) fn json_to_cel_value(
 /// Callers receive it through `CelBudgets` so tests can inject their own.
 const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Caps how many `execute_cel_with_budget` threads may be alive at once. Each thread
-/// that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than joined, so
-/// without a cap a flood of concurrent writes carrying a pathological CEL rule could
-/// still exhaust host threads/CPU even though each individual request keeps returning
-/// in ~`CEL_RULE_EVAL_BUDGET`. A legitimate cluster should essentially never hit this —
-/// it only bounds a sustained attempt to spawn many over-budget evaluations at once.
+/// Caps how many abandoned `execute_cel_with_budget` threads may be alive at once. Each
+/// thread that outlives `CEL_RULE_EVAL_BUDGET` is abandoned (see below) rather than
+/// joined, so without a cap a flood of concurrent writes carrying a pathological CEL rule
+/// could still exhaust host threads/CPU even though each individual request keeps
+/// returning in ~`CEL_RULE_EVAL_BUDGET`. Evaluations still within budget are not counted,
+/// so a legitimate cluster never hits this — it only bounds a sustained attempt to spawn
+/// many over-budget evaluations at once.
 const MAX_CONCURRENT_CEL_EVAL_THREADS: usize = 24;
 
-/// Bounds how many owners may hold a slot at once, rejecting new acquisitions outright
-/// once the cap is reached instead of letting the count grow without bound. A plain
-/// struct (rather than a bare static counter) so the bounding behavior can be exercised
-/// directly in a test with its own small, local cap — the real, process-wide gate below
-/// is shared by every concurrent request's CEL evaluation, so a test that saturated it
-/// (even briefly) would spuriously reject unrelated evaluations running at the same time.
+/// Upper bound on evaluation threads alive at once, abandoned ones included. Reserved
+/// before a thread is spawned, so a burst of pathological writes cannot grow the thread
+/// count past it. Sized to upstream's `--max-mutating-requests-inflight` default (200) so
+/// ordinary request concurrency never reaches it.
+const MAX_LIVE_CEL_EVAL_THREADS: usize = 200;
+
+/// How many of `MAX_LIVE_CEL_EVAL_THREADS` one CRD may hold. A burst of stuck writes to one
+/// CRD is only charged as abandoned after the eval budget elapses, so this share is what
+/// stops that burst from pinning the whole ceiling meanwhile. Far above the overlap of
+/// ordinary writes to one CRD.
+const MAX_LIVE_CEL_EVAL_THREADS_PER_CRD: usize = 64;
+
+/// Two independent limits on CEL evaluation threads, rejecting outright once either is
+/// reached. A plain struct (rather than bare static counters) so the behavior can be
+/// exercised in a test with its own small caps — the real, process-wide gate below is
+/// shared by every concurrent request, so a test that saturated it (even briefly) would
+/// spuriously reject unrelated evaluations.
 ///
-/// Slots are also counted per key (a CRD), so one key cannot hold more than `per_key_cap`
-/// of the `cap` slots and starve the rest.
+/// - `live`: every evaluation thread, reserved before spawn and released when the thread
+///   exits, so the total thread count is bounded by construction. Each key (a CRD) may
+///   hold at most `live_per_key_cap` of them, so a burst of stuck writes to one CRD, which
+///   is only charged as abandoned after the eval budget, cannot pin the whole ceiling.
+/// - abandoned (`in_flight`, `per_key`): threads whose caller timed out and left them
+///   running, charged on abandonment. At most `cap` overall and `per_key_cap` per key (a
+///   CRD) may run, so one CRD with stuck evaluations cannot use up the `live` ceiling for
+///   the others. Evaluations within budget never count here.
 struct ConcurrencyGate {
+    live: std::sync::atomic::AtomicUsize,
+    live_cap: usize,
+    live_per_key_cap: usize,
+    live_per_key: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
     in_flight: std::sync::atomic::AtomicUsize,
     cap: usize,
     per_key_cap: usize,
@@ -1595,8 +1617,22 @@ impl ConcurrencyGate {
         Self::with_per_key_cap(cap, cap)
     }
 
+    #[cfg(test)]
     const fn with_per_key_cap(cap: usize, per_key_cap: usize) -> Self {
+        Self::with_caps(usize::MAX, usize::MAX, cap, per_key_cap)
+    }
+
+    const fn with_caps(
+        live_cap: usize,
+        live_per_key_cap: usize,
+        cap: usize,
+        per_key_cap: usize,
+    ) -> Self {
         Self {
+            live: std::sync::atomic::AtomicUsize::new(0),
+            live_cap,
+            live_per_key_cap,
+            live_per_key: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             cap,
             per_key_cap,
@@ -1604,9 +1640,47 @@ impl ConcurrencyGate {
         }
     }
 
-    /// Reserves a slot for `key` and returns `true`, or returns `false` if either cap has
-    /// already been reached. On `false` no slot is held, so the caller must not call
-    /// `release`.
+    /// Reserves one of the `live_cap` thread slots, and one of `key`'s `live_per_key_cap`
+    /// share of them; the caller must `release_live(key)` when the thread exits (or was
+    /// never spawned). On `false` nothing is held.
+    fn try_reserve_live(&self, key: &str) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        {
+            let mut held = self.live_per_key.lock().unwrap_or_else(|e| e.into_inner());
+            let count = held.entry(key.to_string()).or_insert(0);
+            if *count >= self.live_per_key_cap {
+                return false;
+            }
+            *count += 1;
+        }
+        if self.live.fetch_add(1, SeqCst) >= self.live_cap {
+            self.live.fetch_sub(1, SeqCst);
+            Self::decrement(&self.live_per_key, key);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn release_live(&self, key: &str) {
+        self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        Self::decrement(&self.live_per_key, key);
+    }
+
+    fn decrement(map: &std::sync::Mutex<std::collections::BTreeMap<String, usize>>, key: &str) {
+        let mut held = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = held.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(key);
+            }
+        }
+    }
+
+    /// Reserves an abandoned-thread slot for `key` and returns `true`, or returns `false`
+    /// if either cap has already been reached. On `false` no slot is held, so the caller
+    /// must not call `release`.
+    #[cfg(test)]
     fn try_acquire(&self, key: &str) -> bool {
         use std::sync::atomic::Ordering;
         {
@@ -1626,6 +1700,22 @@ impl ConcurrencyGate {
         }
     }
 
+    /// Whether `try_acquire(key)` would succeed right now, without taking a slot.
+    fn has_room(&self, key: &str) -> bool {
+        let held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
+        held.get(key).copied().unwrap_or(0) < self.per_key_cap
+            && self.in_flight.load(std::sync::atomic::Ordering::SeqCst) < self.cap
+    }
+
+    /// Takes a slot for `key` regardless of the caps: the thread it accounts for already
+    /// exists, so refusing the count would only hide it.
+    fn charge(&self, key: &str) {
+        let mut held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
+        *held.entry(key.to_string()).or_insert(0) += 1;
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn release(&self, key: &str) {
         self.in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1633,13 +1723,7 @@ impl ConcurrencyGate {
     }
 
     fn release_key(&self, key: &str) {
-        let mut held = self.per_key.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = held.get_mut(key) {
-            *count -= 1;
-            if *count == 0 {
-                held.remove(key);
-            }
-        }
+        Self::decrement(&self.per_key, key);
     }
 }
 
@@ -1652,25 +1736,58 @@ impl ConcurrencyGate {
 const MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD: usize = 6;
 
 /// The process-wide gate every `execute_cel_with_budget` call reserves a slot from.
-static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_per_key_cap(
+static CEL_EVAL_THREAD_GATE: ConcurrencyGate = ConcurrencyGate::with_caps(
+    MAX_LIVE_CEL_EVAL_THREADS,
+    MAX_LIVE_CEL_EVAL_THREADS_PER_CRD,
     MAX_CONCURRENT_CEL_EVAL_THREADS,
     MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
 );
 
-/// Releases a `ConcurrencyGate` slot on `Drop`, so the slot is freed whether the guarded
-/// scope returns normally or unwinds from a panic. `execute_cel_with_budget`'s spawned
-/// thread runs an untrusted, CRD-author-supplied CEL rule via `cel::Program::execute`,
-/// which has reachable `panic!` sites in the `cel` crate's evaluator (e.g. cel 0.14.3
-/// `objects.rs:1546`, `:1467`). A manually-placed `gate.release()` call *after*
-/// `execute()` would be skipped by such a panic, permanently leaking the slot -- enough
-/// leaked panics wedge `CEL_EVAL_THREAD_GATE` for every future CR write's CEL
-/// validation, the exact DoS this file exists to prevent, just triggered by malformed
-/// input instead of slow input.
-struct GateGuard<'a>(&'a ConcurrencyGate, String);
+/// Where an evaluation thread stands with its caller. Only an `ABANDONED` thread (the
+/// caller timed out and left it running) holds a gate slot, so evaluations within budget
+/// never count against the cap, however many overlap.
+const EVAL_RUNNING: u8 = 0;
+const EVAL_FINISHED: u8 = 1;
+const EVAL_ABANDONED: u8 = 2;
+
+/// Caller side of the hand-off: charges an abandoned-thread slot, unless the thread
+/// finished first, in which case the charge is undone. Exactly one of this and the
+/// thread's `GateGuard` releases the slot, whichever order they run in.
+fn abandon_eval(gate: &ConcurrencyGate, key: &str, state: &std::sync::atomic::AtomicU8) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // Charge before flipping the state so the thread's release can never precede it.
+    gate.charge(key);
+    if state
+        .compare_exchange(EVAL_RUNNING, EVAL_ABANDONED, SeqCst, SeqCst)
+        .is_err()
+    {
+        gate.release(key);
+    }
+}
+
+/// On `Drop` (thread return or panic unwind), gives back the thread's `live` slot and, if
+/// the caller abandoned it, its abandoned-thread slot. `execute_cel_with_budget`'s spawned thread runs an untrusted, CRD-author-supplied
+/// CEL rule via `cel::Program::execute`, which has reachable `panic!` sites in the `cel`
+/// crate's evaluator (e.g. cel 0.14.3 `objects.rs:1546`, `:1467`); a manually-placed
+/// `gate.release()` after `execute()` would be skipped by such a panic and leak the slot,
+/// wedging `CEL_EVAL_THREAD_GATE` for every future CR write.
+struct GateGuard<'a>(
+    &'a ConcurrencyGate,
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicU8>,
+);
 
 impl Drop for GateGuard<'_> {
     fn drop(&mut self) {
-        self.0.release(&self.1);
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.release_live(&self.1);
+        if self
+            .2
+            .compare_exchange(EVAL_RUNNING, EVAL_FINISHED, SeqCst, SeqCst)
+            .is_err()
+        {
+            self.0.release(&self.1);
+        }
     }
 }
 
@@ -1716,27 +1833,31 @@ fn run_within_budget<T: Send + 'static>(
     (gate, crd): (&'static ConcurrencyGate, &str),
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, CelEvalOverBudget> {
-    if !gate.try_acquire(crd) {
+    if !gate.has_room(crd) || !gate.try_reserve_live(crd) {
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
     // The interpreter and cost replay recurse once per level of the rule's AST, which
     // compilation bounds at cel-go's 250 levels; the default 2 MiB thread stack is not
     // sized for that, so size it explicitly.
     let guard_key = crd.to_string();
+    let thread_state = std::sync::Arc::clone(&state);
     let spawned = std::thread::Builder::new()
         .stack_size(crate::cel_runtime::EVAL_STACK_SIZE)
         .spawn(move || {
-            let _guard = GateGuard(gate, guard_key);
+            let _guard = GateGuard(gate, guard_key, thread_state);
             let _ = tx.send(work());
         });
     if spawned.is_err() {
-        gate.release(crd);
+        gate.release_live(crd);
         return Err(CelEvalOverBudget::TooManyInFlight);
     }
-    rx.recv_timeout(budget)
-        .map_err(|_| CelEvalOverBudget::TimedOut)
+    rx.recv_timeout(budget).map_err(|_| {
+        abandon_eval(gate, crd, &state);
+        CelEvalOverBudget::TimedOut
+    })
 }
 
 /// Wall-clock backstop for the cost replay, 20x the plain budget: replay work is already
@@ -3432,6 +3553,12 @@ pub async fn replace_cr<S: Store>(
     // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
     // permanent 422 validation failure instead of the retryable 409 that tells client-go's
     // Update-on-conflict loop to re-GET and resubmit.
+    super::resource::require_cr_resourceversion_on_update(
+        &group,
+        &plural,
+        expected_revision,
+        &name,
+    )?;
     if let Some(expected) = expected_revision {
         if expected != stored.revision {
             return Err(store_err_cr(
@@ -4483,6 +4610,12 @@ pub async fn replace_cr_namespaced<S: Store>(
     // resourceVersion) would otherwise misclassify a legitimate concurrent-write race as a
     // permanent 422 validation failure instead of the retryable 409 that tells client-go's
     // Update-on-conflict loop to re-GET and resubmit.
+    super::resource::require_cr_resourceversion_on_update(
+        &group,
+        &plural,
+        expected_revision,
+        &name,
+    )?;
     if let Some(expected) = expected_revision {
         if expected != stored.revision {
             return Err(store_err_cr(
@@ -5008,6 +5141,15 @@ pub async fn patch_cr<S: Store>(
     // handles kubelet SSA bodies that happen to be JSON, CR SSA bodies from the conformance
     // test binary are real YAML. ssa_body_to_json (yaml-rust2) handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
+        crate::handlers::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            None,
+            &name,
+        )?;
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
@@ -5311,6 +5453,15 @@ pub async fn patch_cr_namespaced<S: Store>(
     // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
     // ssa_body_to_json (yaml-rust2) handles both JSON and genuine YAML bodies.
     if is_ssa && stored_opt.is_none() {
+        crate::handlers::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            Some(&ns),
+            &name,
+        )?;
         ctx.forbid_create_if_terminating(&group, &plural, &name)?;
         let mut obj: serde_json::Value = crate::handlers::json_patch::ssa_body_to_json(&body)?;
         crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
@@ -5758,14 +5909,24 @@ pub async fn put_cr_status<S: Store>(
         &group,
         &version,
     );
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current));
-    }
-
     let incoming_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
+    if cr_ctx.is_some() {
+        super::resource::require_cr_resourceversion_on_update(&group, &plural, expected_rv, &name)?;
+    } else {
+        super::resource::require_builtin_resourceversion_on_update(
+            &group,
+            &plural,
+            expected_rv,
+            &name,
+        )?;
+    }
+    if is_dry_run_header(&headers) {
+        return Ok(Json(current));
+    }
+
     let converted = match &cr_ctx {
         Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
         None => None,
@@ -6606,6 +6767,111 @@ mod tests {
     use u7s_store::SqliteStore;
 
     use crate::handlers::test_support::make_state;
+
+    // Custom resources never allow unconditional update, so a client PUT must carry the
+    // resourceVersion it read. These shims stand in for such a client: they stamp the stored
+    // resourceVersion onto bodies that omit one, and shadow the handlers of the same name.
+    // Tests of the missing-resourceVersion rejection call `super::` directly.
+    async fn with_stored_rv<S: Store>(state: &AppState<S>, key: &str, body: Bytes) -> Bytes {
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return body;
+        };
+        let absent = v["metadata"]["resourceVersion"]
+            .as_str()
+            .is_none_or(str::is_empty);
+        if absent {
+            let builtin_key = key.replacen("/registry/cr/", "/registry/", 1);
+            for key in [key, builtin_key.as_str()] {
+                if let Some(stored) = state.store.get(key).await.unwrap() {
+                    v["metadata"]["resourceVersion"] = stored.revision.to_string().into();
+                    break;
+                }
+            }
+        }
+        Bytes::from(v.to_string())
+    }
+
+    async fn replace_cr<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, plural, name)): Path<(String, String, String, String)>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(&state, &cr_store_key(&group, &plural, None, &name), body).await;
+        super::replace_cr(
+            State(state),
+            Path((group, version, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn replace_cr_namespaced<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(
+            &state,
+            &cr_store_key(&group, &plural, Some(&ns), &name),
+            body,
+        )
+        .await;
+        super::replace_cr_namespaced(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn put_cr_status<S: Store>(
+        State(state): State<AppState<S>>,
+        user: axum::Extension<crate::auth::UserInfo>,
+        Path((group, version, plural, name)): Path<(String, String, String, String)>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(&state, &cr_store_key(&group, &plural, None, &name), body).await;
+        super::put_cr_status(
+            State(state),
+            user,
+            Path((group, version, plural, name)),
+            headers,
+            body,
+        )
+        .await
+    }
+
+    async fn put_namespaced_resource_status<S: Store>(
+        State(state): State<AppState<S>>,
+        Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+        user: Option<axum::Extension<crate::auth::UserInfo>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<impl IntoResponse, crate::status::StatusError> {
+        let body = with_stored_rv(
+            &state,
+            &cr_store_key(&group, &plural, Some(&ns), &name),
+            body,
+        )
+        .await;
+        crate::handlers::status::put_namespaced_resource_status(
+            State(state),
+            Path((group, version, ns, plural, name)),
+            user,
+            headers,
+            body,
+        )
+        .await
+    }
 
     fn no_watch_query() -> super::super::generic::CollectionQuery {
         super::super::generic::CollectionQuery {
@@ -9974,7 +10240,7 @@ mod tests {
             "metadata": { "name": "g", "namespace": "default" },
             "status": { "ready": true }
         });
-        let resp = crate::handlers::status::put_namespaced_resource_status(
+        let resp = put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
             None,
@@ -10213,7 +10479,7 @@ mod tests {
         let state = seed_gizmo_with_subresources(&base_url).await;
         let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
 
-        let result = crate::handlers::status::put_namespaced_resource_status(
+        let result = put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v9", "default", "g"),
             None,
@@ -10304,7 +10570,7 @@ mod tests {
             start_mock_conversion_server(hostport_conversion_router(Arc::clone(&call_count))).await;
         let state = seed_gizmo_with_subresources(&base_url).await;
 
-        crate::handlers::status::put_namespaced_resource_status(
+        put_namespaced_resource_status(
             State(state.clone()),
             gizmo_version_path("v1", "default", "g"),
             None,
@@ -10360,7 +10626,7 @@ mod tests {
         let state = seed_gizmo_with_subresources(&base_url).await;
         let before = stored_gizmo(&state, Some("default"), "g").await.unwrap();
 
-        let result = crate::handlers::status::put_namespaced_resource_status(
+        let result = put_namespaced_resource_status(
             State(state.clone()),
             v2_path("default", "g"),
             None,
@@ -11454,7 +11720,7 @@ mod tests {
             .to_string(),
         );
         assert!(
-            crate::handlers::status::put_namespaced_resource_status(
+            put_namespaced_resource_status(
                 State(state.clone()),
                 Path((
                     group.clone(),
@@ -11666,7 +11932,7 @@ mod tests {
         );
 
         assert!(
-            super::super::status::put_namespaced_resource_status(
+            put_namespaced_resource_status(
                 State(state.clone()),
                 Path((
                     group.clone(),
@@ -11965,9 +12231,15 @@ mod tests {
         check_schema_inner(obj, schema, None, budgets)
     }
 
+    /// Each context gets its own kind, hence its own key in the process-wide CEL eval gate:
+    /// with one shared key, more than `MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD` tests
+    /// evaluating at once on parallel test threads trip the per-CRD cap and fail with a
+    /// spurious "too many rules exceeding their time budget" rejection.
     fn test_ctx(schema: serde_json::Value) -> CrContext {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         CrContext {
-            kind: "Test".into(),
+            kind: format!("Test{n}"),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12003,6 +12275,38 @@ mod tests {
         // calls with different schemas would return the wrong compiled schema.
         let cache = crate::state::CrSchemaCache::new();
         validate_cr_schema_with_budgets(obj, &ctx, &cache, old_object, budgets)
+    }
+
+    // A CEL test must not depend on what other parallel tests hold in the per-CRD eval gate:
+    // with every context on one shared key, six overlapping evaluations made unrelated tests
+    // fail with a spurious "too many rules" rejection.
+    #[test]
+    fn test_ctx_cel_evaluation_is_unaffected_by_stuck_permits_on_another_test_ctx_key() {
+        let first = test_ctx(serde_json::json!({}));
+        let first_key = format!("{}/{}", first.schema_cache_key.0, first.kind);
+        let mut stuck = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let timed_out = run_within_budget(
+                std::time::Duration::from_millis(10),
+                (&CEL_EVAL_THREAD_GATE, &first_key),
+                move || {
+                    let _ = held.recv();
+                },
+            );
+            assert!(matches!(timed_out, Err(CelEvalOverBudget::TimedOut)));
+            stuck.push(release);
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "x": {
+                "type": "integer",
+                "x-kubernetes-validations": [{ "rule": "self >= 0" }]
+            } }
+        });
+        check_schema(&serde_json::json!({ "x": 1 }), schema)
+            .expect("a fresh test context must not share the gate key of another test's context");
+        drop(stuck);
     }
 
     // type:object with valid object passes.
@@ -12121,7 +12425,7 @@ mod tests {
             "properties": { "spec": { "type": "object" } }
         });
         let ctx = CrContext {
-            kind: "Test".into(),
+            kind: "CacheReuseTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12174,7 +12478,7 @@ mod tests {
             ]
         });
         let ctx = CrContext {
-            kind: "Test".into(),
+            kind: "CacheCelTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema)),
@@ -12244,7 +12548,7 @@ mod tests {
             "properties": { "spec": { "type": "object" } }
         });
         let make_ctx = |rv: &str| CrContext {
-            kind: "Test".into(),
+            kind: "CacheRebuildTest".into(),
             namespaced: false,
             has_status_subresource: false,
             schema: Some(std::sync::Arc::new(schema.clone())),
@@ -12500,12 +12804,23 @@ mod tests {
             "sanity check: spec.color must be optional under the original schema"
         );
 
+        let mut replacement: serde_json::Value =
+            serde_json::from_slice(&crd_with_schema(true)).unwrap();
+        replacement["metadata"]["resourceVersion"] = state
+            .store
+            .get("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io")
+            .await
+            .unwrap()
+            .expect("stored CRD")
+            .revision
+            .to_string()
+            .into();
         crd::replace_crd(
             State(state.clone()),
             Path("widgets.example.io".to_string()),
             test_user(),
             HeaderMap::new(),
-            crd_with_schema(true),
+            Bytes::from(replacement.to_string()),
         )
         .await
         .expect("replace_crd must succeed");
@@ -14080,15 +14395,10 @@ mod tests {
                 <= crate::handlers::cel_cost::CALL_COST_LIMIT
         });
         assert!(matches!(verdict, Ok(false)), "counted verdict expected");
-        let mut spins = 0u64;
-        while !GATE.try_acquire("") {
-            spins += 1;
-            assert!(
-                spins < 50_000_000,
-                "the replay thread never released its slot"
-            );
-            std::thread::yield_now();
-        }
+        wait_until("the replay thread to release its slot", || {
+            GATE.live.load(std::sync::atomic::Ordering::SeqCst) == 0
+        });
+        assert_eq!(GATE.in_flight.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -15299,6 +15609,44 @@ mod tests {
         );
     }
 
+    /// Concurrent writes to one CRD with validation rules must all succeed when every
+    /// evaluation finishes within budget: upstream has no cross-request concurrency gate, so
+    /// rejecting the 7th simultaneous write with "too many rules exceeding their time budget"
+    /// makes busy CRDs unwritable although nothing is slow.
+    #[test]
+    fn concurrent_writes_to_one_crd_are_not_rejected_when_every_rule_is_within_budget() {
+        use std::sync::Barrier;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_per_key_cap(
+            MAX_CONCURRENT_CEL_EVAL_THREADS,
+            MAX_CONCURRENT_CEL_EVAL_THREADS_PER_CRD,
+        );
+        const WRITERS: usize = 16;
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, "example.com/Widget"),
+                        || std::thread::sleep(std::time::Duration::from_millis(100)),
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        let rejected = handles
+            .into_iter()
+            .map(|h| h.join().expect("writer thread must not panic"))
+            .filter(|ok| !ok)
+            .count();
+        assert_eq!(
+            rejected, 0,
+            "{rejected} of {WRITERS} concurrent in-budget writes to one CRD were rejected"
+        );
+    }
+
     /// One CRD whose evaluations are all stuck must not stop another CRD's rules from
     /// validating: the cluster-wide gate used to be shared by every CRD.
     #[test]
@@ -15566,11 +15914,17 @@ mod tests {
     // sites to actually fire.
     #[test]
     fn gate_guard_releases_slot_even_when_guarded_scope_panics() {
-        static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
-        assert!(GATE.try_acquire(""), "gate must start with a free slot");
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(1, 1, 1, 1);
+        assert!(GATE.try_reserve_live(""));
+        let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
+        abandon_eval(&GATE, "", &state);
+        assert!(
+            !GATE.has_room(""),
+            "setup: the abandoned thread holds its slot"
+        );
 
-        let panicked = std::thread::spawn(|| {
-            let _guard = GateGuard(&GATE, String::new());
+        let panicked = std::thread::spawn(move || {
+            let _guard = GateGuard(&GATE, String::new(), state);
             panic!("simulated cel::Program::execute panic, e.g. cel 0.14.3 objects.rs:1546");
         })
         .join();
@@ -15581,12 +15935,177 @@ mod tests {
              unwind path this test is checking"
         );
         assert!(
-            GATE.try_acquire(""),
+            GATE.has_room("") && GATE.try_reserve_live(""),
             "a slot leaked across a panic inside the guarded region -- GateGuard's Drop \
-             must run gate.release() during unwinding, not only on normal return, or a \
-             handful of panicking CEL rules permanently wedges the process-wide gate and \
-             blocks every future CR write's CEL validation"
+             must release during unwinding, not only on normal return, or a handful of \
+             panicking CEL rules permanently wedges the process-wide gate and blocks every \
+             future CR write's CEL validation"
         );
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A thread that finishes just as its caller gives up must not leave a slot charged
+    /// (writes to that CRD would shrink toward permanent rejection), and one that is
+    /// abandoned first must hand its slot back exactly once when it exits (a double release
+    /// would underflow the counters and disable the cap).
+    #[test]
+    fn eval_finishing_and_caller_abandoning_in_either_order_release_exactly_once() {
+        use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8, 8);
+
+        let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
+        assert!(GATE.try_reserve_live("k"));
+        drop(GateGuard(&GATE, "k".into(), state.clone()));
+        abandon_eval(&GATE, "k", &state);
+        assert_eq!(GATE.in_flight.load(SeqCst), 0, "finish then abandon");
+        assert_eq!(GATE.live.load(SeqCst), 0);
+        assert!(GATE.per_key.lock().unwrap().is_empty());
+
+        let state = std::sync::Arc::new(AtomicU8::new(EVAL_RUNNING));
+        assert!(GATE.try_reserve_live("k"));
+        abandon_eval(&GATE, "k", &state);
+        assert_eq!(
+            GATE.in_flight.load(SeqCst),
+            1,
+            "abandoned thread is charged"
+        );
+        drop(GateGuard(&GATE, "k".into(), state));
+        assert_eq!(GATE.in_flight.load(SeqCst), 0, "abandon then finish");
+        assert_eq!(GATE.live.load(SeqCst), 0);
+        assert!(GATE.per_key.lock().unwrap().is_empty());
+    }
+
+    /// A rule that panics the evaluation thread surfaces as a timeout (the channel
+    /// disconnects) and must leave nothing charged, whichever of the caller's give-up and
+    /// the thread's unwind runs first.
+    #[test]
+    fn eval_thread_panic_is_reported_as_timeout_and_leaves_the_gate_empty() {
+        use std::sync::atomic::Ordering::SeqCst;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(8, 8, 8, 8);
+        let result =
+            run_within_budget::<()>(std::time::Duration::from_secs(30), (&GATE, "k"), || {
+                panic!("simulated cel panic")
+            });
+        assert!(matches!(result, Err(CelEvalOverBudget::TimedOut)));
+        wait_until("panicked thread to give back its slots", || {
+            GATE.live.load(SeqCst) == 0 && GATE.in_flight.load(SeqCst) == 0
+        });
+        assert!(GATE.has_room("k"));
+    }
+
+    /// A burst of stuck evaluations must not grow the thread count past the ceiling:
+    /// the over-ceiling write is refused at once instead of spawning another uncancellable
+    /// thread, and the ceiling frees up as the threads exit.
+    #[test]
+    fn evaluation_thread_ceiling_refuses_the_extra_write_immediately_and_recovers() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const CEILING: usize = 3;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(CEILING, CEILING, 100, 100);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let callers: Vec<_> = (0..CEILING)
+            .map(|i| {
+                let held = Arc::clone(&held);
+                std::thread::spawn(move || {
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, &format!("crd{i}")),
+                        move || {
+                            let _ = held.lock().unwrap().recv();
+                        },
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        wait_until("all evaluation threads to be live", || {
+            GATE.live.load(SeqCst) == CEILING
+        });
+
+        let started = std::time::Instant::now();
+        let refused = run_within_budget(
+            std::time::Duration::from_secs(30),
+            (&GATE, "crd-extra"),
+            || (),
+        );
+        assert!(matches!(refused, Err(CelEvalOverBudget::TooManyInFlight)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(GATE.live.load(SeqCst), CEILING, "a refusal holds no slot");
+
+        drop(release);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        wait_until("evaluation threads to exit", || GATE.live.load(SeqCst) == 0);
+        assert!(
+            run_within_budget(std::time::Duration::from_secs(30), (&GATE, "x"), || ()).is_ok(),
+            "writes must be accepted again once the threads exit"
+        );
+    }
+
+    /// A burst of simultaneous stuck writes to one CRD is not yet charged as abandoned (that
+    /// happens only after the eval budget), so its live share is what keeps it from taking
+    /// every thread slot and rejecting other CRDs' writes.
+    #[test]
+    fn burst_of_stuck_writes_to_one_crd_cannot_take_other_crds_thread_slots() {
+        use std::sync::atomic::Ordering::SeqCst;
+        const SHARE: usize = 2;
+        static GATE: ConcurrencyGate = ConcurrencyGate::with_caps(10, SHARE, 100, 100);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let callers: Vec<_> = (0..SHARE)
+            .map(|_| {
+                let held = Arc::clone(&held);
+                std::thread::spawn(move || {
+                    run_within_budget(
+                        std::time::Duration::from_secs(30),
+                        (&GATE, "a.example.com/A"),
+                        move || {
+                            let _ = held.lock().unwrap().recv();
+                        },
+                    )
+                    .is_ok()
+                })
+            })
+            .collect();
+        wait_until("CRD A's evaluation threads to be live", || {
+            GATE.live.load(SeqCst) == SHARE
+        });
+
+        let a_extra = run_within_budget(
+            std::time::Duration::from_secs(30),
+            (&GATE, "a.example.com/A"),
+            || (),
+        );
+        assert!(
+            matches!(a_extra, Err(CelEvalOverBudget::TooManyInFlight)),
+            "CRD A is past its live share"
+        );
+        assert!(
+            run_within_budget(
+                std::time::Duration::from_secs(30),
+                (&GATE, "b.example.com/B"),
+                || ()
+            )
+            .is_ok(),
+            "CRD A's stuck writes must not reject CRD B's"
+        );
+
+        drop(release);
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        wait_until("evaluation threads to exit", || GATE.live.load(SeqCst) == 0);
+        wait_until("per-CRD live counts to drain", || {
+            GATE.live_per_key.lock().unwrap().is_empty()
+        });
     }
 
     // Before this fix, validate_cel_rules only recursed via `properties`/`items`, so a
@@ -16453,6 +16972,169 @@ mod tests {
             obj["status"].is_null() || obj.get("status").is_none(),
             "status must NOT be stored by main PUT when status subresource is declared"
         );
+    }
+
+    /// Every status PUT site must run the resourceVersion requirement before its dry-run
+    /// return: upstream's dry-run storage path still validates the update, so `kubectl
+    /// --dry-run=server` must not approve a status write the real request rejects (422). With
+    /// the stored RV it is 200 and persists nothing.
+    #[tokio::test]
+    async fn status_put_dry_run_requires_resource_version_at_every_status_site() {
+        use crate::handlers::{crd, status};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+        create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1".into(), "widgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("w"),
+        )
+        .await
+        .expect("seed CR");
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+            "metadata": { "name": "n" }, "spec": { "drivers": [] }
+        });
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+            "metadata": { "name": "l", "namespace": "kube-node-lease" }, "spec": {}
+        });
+        for (key, v) in [
+            ("/registry/storage.k8s.io/csinodes/n", &csinode),
+            (
+                "/registry/coordination.k8s.io/leases/kube-node-lease/l",
+                &lease,
+            ),
+        ] {
+            state
+                .store
+                .put(key, Bytes::from(v.to_string()), None)
+                .await
+                .unwrap();
+        }
+        let crd_obj = {
+            let resp = crd::get_crd(State(state.clone()), Path("widgets.example.io".into()))
+                .await
+                .expect("get crd");
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+        let cr_obj = serde_json::json!({
+            "apiVersion": "example.io/v1", "kind": "Widget",
+            "metadata": { "name": "w" }, "spec": { "color": "blue" },
+            "status": { "x": 1 }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+
+        let sites: [(&str, &str, serde_json::Value); 4] = [
+            (
+                "put_resource_status",
+                "/registry/storage.k8s.io/csinodes/n",
+                csinode.clone(),
+            ),
+            (
+                "put_namespaced_resource_status_guarded",
+                "/registry/coordination.k8s.io/leases/kube-node-lease/l",
+                lease.clone(),
+            ),
+            (
+                "put_crd_status",
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io",
+                crd_obj,
+            ),
+            ("put_cr_status", "/registry/cr/example.io/widgets/w", cr_obj),
+        ];
+        for (site, key, obj) in sites {
+            let before = state.store.get(key).await.unwrap().unwrap().revision;
+            for stated in [false, true] {
+                let mut body = obj.clone();
+                body["metadata"]["resourceVersion"] = if stated {
+                    before.to_string().into()
+                } else {
+                    serde_json::Value::Null
+                };
+                let body = Bytes::from(body.to_string());
+                let (st, h) = (State(state.clone()), headers.clone());
+                let result = match site {
+                    "put_resource_status" => status::put_resource_status(
+                        st,
+                        Path((
+                            "storage.k8s.io".into(),
+                            "v1".into(),
+                            "csinodes".into(),
+                            "n".into(),
+                        )),
+                        Extension(crate::auth::UserInfo::default()),
+                        h,
+                        body,
+                    )
+                    .await
+                    .map(|r| r.into_response()),
+                    "put_namespaced_resource_status_guarded" => {
+                        status::put_namespaced_resource_status_guarded(
+                            st,
+                            Path((
+                                "coordination.k8s.io".into(),
+                                "v1".into(),
+                                "kube-node-lease".into(),
+                                "leases".into(),
+                                "l".into(),
+                            )),
+                            None,
+                            h,
+                            body,
+                            None,
+                        )
+                        .await
+                    }
+                    "put_crd_status" => {
+                        crd::put_crd_status(st, Path("widgets.example.io".into()), None, h, body)
+                            .await
+                            .map(|r| r.into_response())
+                    }
+                    _ => super::put_cr_status(
+                        st,
+                        Extension(crate::auth::UserInfo::default()),
+                        Path((
+                            "example.io".into(),
+                            "v1".into(),
+                            "widgets".into(),
+                            "w".into(),
+                        )),
+                        h,
+                        body,
+                    )
+                    .await
+                    .map(|r| r.into_response()),
+                };
+                if stated {
+                    let resp =
+                        result.unwrap_or_else(|e| panic!("{site}: stated RV must pass: {e:?}"));
+                    assert_eq!(resp.status(), StatusCode::OK, "{site}");
+                } else {
+                    let err = result.err().unwrap_or_else(|| {
+                        panic!("{site}: dryRun without resourceVersion must be rejected")
+                    });
+                    assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY, "{site}");
+                }
+                let after = state.store.get(key).await.unwrap().unwrap().revision;
+                assert_eq!(before, after, "{site}: dryRun must persist nothing");
+            }
+        }
     }
 
     // Regression: mirrors VolumeSnapshotContent's real lifecycle — csi-snapshotter PATCHes
@@ -20697,6 +21379,116 @@ mod tests {
         );
     }
 
+    /// SSA apply-create of a CR (cluster and namespaced) must also authorize `create`, as
+    /// upstream does; patch alone must not mint objects.
+    #[tokio::test]
+    async fn ssa_create_of_a_cr_requires_the_create_verb_because_patch_alone_must_not_create() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+        let cluster_state = make_state();
+        install_cluster_crd(&cluster_state).await;
+        let user = |state: &AppState, verbs: &[&str]| {
+            let name = verbs.join("-");
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{name}"),
+                &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": verbs}]}),
+            );
+            state.rbac_index.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"),
+                &serde_json::json!({
+                    "subjects": [{"kind": "User", "name": name}],
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name}
+                }),
+            );
+            axum::extract::Extension(crate::auth::UserInfo {
+                username: name,
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            })
+        };
+        let apply_headers = || {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+            );
+            h
+        };
+        let widget = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": {"name": "w1"}
+            })
+            .to_string(),
+        );
+        let ns_path = || {
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+                "new-app".to_string(),
+            ))
+        };
+        let cluster_path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "w1".to_string(),
+            ))
+        };
+
+        let patcher = user(&state, &["patch", "update"]);
+        let err = patch_cr_namespaced(
+            State(state.clone()),
+            ns_path(),
+            patcher,
+            apply_headers(),
+            app_body("new-app", "argocd"),
+        )
+        .await
+        .err()
+        .expect("namespaced CR apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let key = cr_store_key("argoproj.io", "applications", Some("argocd"), "new-app");
+        assert!(state.store.get(&key).await.unwrap().is_none());
+        let creator = user(&state, &["patch", "create"]);
+        assert!(patch_cr_namespaced(
+            State(state.clone()),
+            ns_path(),
+            creator,
+            apply_headers(),
+            app_body("new-app", "argocd"),
+        )
+        .await
+        .is_ok());
+
+        let patcher = user(&cluster_state, &["patch", "update"]);
+        let err = patch_cr(
+            State(cluster_state.clone()),
+            cluster_path(),
+            patcher,
+            apply_headers(),
+            widget.clone(),
+        )
+        .await
+        .err()
+        .expect("cluster CR apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let creator = user(&cluster_state, &["patch", "create"]);
+        assert!(patch_cr(
+            State(cluster_state.clone()),
+            cluster_path(),
+            creator,
+            apply_headers(),
+            widget,
+        )
+        .await
+        .is_ok());
+    }
+
     /// patch_cr_namespaced's SSA-upsert branch (is_ssa && stored_opt.is_none()) had no
     /// Terminating-namespace gate, unlike create_cr_namespaced — so `kubectl apply
     /// --server-side` creating a brand-new CR instance could inject content into a namespace
@@ -23992,12 +24784,10 @@ mod tests {
         );
     }
 
-    /// put_cr_status with an absent resourceVersion in the body succeeds unconditionally.
-    ///
-    /// Upstream k8s allows omitting resourceVersion in a subresource PUT, treating it as
-    /// an unconditional write.  The fix must not break this.
+    /// put_cr_status with an absent resourceVersion is 422: upstream's custom resource
+    /// strategy does not allow unconditional update.
     #[tokio::test]
-    async fn put_cr_status_absent_rv_is_unconditional_write() {
+    async fn put_cr_status_absent_rv_is_422_because_custom_resources_forbid_unconditional_update() {
         let state = make_state();
         install_cluster_crd_with_status_subresource(&state).await;
 
@@ -24033,7 +24823,7 @@ mod tests {
             })
             .to_string(),
         );
-        let result = put_cr_status(
+        let result = super::put_cr_status(
             State(state.clone()),
             axum::Extension(crate::auth::UserInfo::default()),
             Path((
@@ -24046,10 +24836,11 @@ mod tests {
             put_body,
         )
         .await;
-        assert!(
-            result.is_ok(),
-            "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
-             single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
+        assert_eq!(
+            result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::UNPROCESSABLE_ENTITY),
+            "custom resources forbid unconditional update, so a status PUT without a \
+             resourceVersion must be 422 instead of silently overwriting concurrent writers"
         );
     }
 

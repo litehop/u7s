@@ -627,14 +627,6 @@ pub(crate) async fn create_resource<S: Store>(
         );
         match result {
             Ok(rv) => break rv,
-            Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
-                // createOrUpdate: replace existing object unconditionally.
-                break state
-                    .store
-                    .put(&key, obj.to_bytes(), None)
-                    .await
-                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
-            }
             // The client never chose this name (it came from generateName) — a collision
             // is the server's random suffix landing on an existing object, not a real
             // conflict the client should see. Retry with a fresh suffix, matching
@@ -718,6 +710,150 @@ fn allows_create_on_update(group: &str, plural: &str) -> bool {
     )
 }
 
+/// Upstream `AllowUnconditionalUpdate()` for every served kind (release-1.37 `strategy.go` of
+/// each registry; status strategies inherit). Exactly the served kinds whose strategy returns
+/// false are listed; every other built-in (core, apps, batch, autoscaling, networking, rbac,
+/// storage.k8s.io classes, scheduling.k8s.io priorityclasses, flowcontrol, ...) is true.
+/// Custom resources, CRDs and APIServices are false too (see `require_resourceversion_on_update`).
+fn allows_unconditional_update(group: &str, plural: &str) -> bool {
+    !matches!(
+        (group, plural),
+        (
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations"
+                | "mutatingwebhookconfigurations"
+                | "validatingadmissionpolicies"
+                | "validatingadmissionpolicybindings"
+                | "mutatingadmissionpolicies"
+                | "mutatingadmissionpolicybindings"
+        ) | ("apiextensions.k8s.io", "customresourcedefinitions")
+            | ("apiregistration.k8s.io", "apiservices")
+            | (
+                "certificates.k8s.io",
+                "clustertrustbundles" | "podcertificaterequests"
+            )
+            | ("coordination.k8s.io", "leases" | "leasecandidates")
+            | ("node.k8s.io", "runtimeclasses")
+            | ("policy", "poddisruptionbudgets")
+            | ("resource.k8s.io", "devicetaintrules")
+            | (
+                "storage.k8s.io",
+                "csidrivers" | "csinodes" | "csistoragecapacities" | "volumeattachments"
+            )
+            | ("storagemigration.k8s.io", "storageversionmigrations")
+    )
+}
+
+/// Upstream generic store `Update`: a PUT to an existing object with no resourceVersion is
+/// 422 unless the kind's strategy `AllowUnconditionalUpdate()`s. `unconditional_update` is
+/// false for every custom resource.
+pub(crate) fn require_resourceversion_on_update(
+    unconditional_update: bool,
+    expected_revision: Option<u64>,
+    qualified_resource: &str,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    if expected_revision.is_none() && !unconditional_update {
+        return Err(Status::unprocessable_entity(format!(
+            "{qualified_resource} \"{name}\" is invalid: metadata.resourceVersion: Invalid value: 0x0: must be \
+             specified for an update"
+        )));
+    }
+    Ok(())
+}
+
+/// `require_resourceversion_on_update` for a built-in kind.
+pub(crate) fn require_builtin_resourceversion_on_update(
+    group: &str,
+    plural: &str,
+    expected_revision: Option<u64>,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    require_resourceversion_on_update(
+        allows_unconditional_update(group, plural),
+        expected_revision,
+        &qualified_resource(group, plural),
+        name,
+    )
+}
+
+/// `require_resourceversion_on_update` for a custom resource (upstream
+/// `customResourceStrategy.AllowUnconditionalUpdate()` is false).
+pub(crate) fn require_cr_resourceversion_on_update(
+    group: &str,
+    plural: &str,
+    expected_revision: Option<u64>,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    require_resourceversion_on_update(
+        false,
+        expected_revision,
+        &qualified_resource(group, plural),
+        name,
+    )
+}
+
+fn qualified_resource(group: &str, plural: &str) -> String {
+    if group.is_empty() {
+        plural.to_string()
+    } else {
+        format!("{plural}.{group}")
+    }
+}
+
+/// Persist a PUT-create that found the object already created by a concurrent writer.
+/// Upstream `GuaranteedUpdate` retries the closure against the now-existing object, so the
+/// update rules apply: see `require_resourceversion_on_update`; a stated resourceVersion is
+/// compared by the store and conflicts (409) on mismatch.
+async fn update_after_lost_create_race<S: Store>(
+    state: &AppState<S>,
+    key: &str,
+    body: Bytes,
+    expected_revision: Option<u64>,
+    (group, plural, name, kind): (&str, &str, &str, &str),
+) -> Result<u64, crate::status::StatusError> {
+    require_builtin_resourceversion_on_update(group, plural, expected_revision, name)?;
+    state
+        .store
+        .put(key, body, expected_revision)
+        .await
+        .map_err(|e| store_err(e, group, plural, name, kind))
+}
+
+/// Authorize the `create` verb for a PUT/PATCH/apply that is about to create an object.
+/// The auth layer only authorized the HTTP-method verb (update/patch); upstream's
+/// create-on-update path additionally requires `create` (`withAuthorization` in
+/// `handlers/update.go` and `patch.go`), so a principal holding only update/patch cannot
+/// create objects.
+pub(crate) fn authorize_create_on_write(
+    rbac: &crate::rbac::RbacIndex,
+    graph: &crate::node_authz::NodeGraph,
+    user: &UserInfo,
+    group: &str,
+    plural: &str,
+    ns: Option<&str>,
+    name: &str,
+) -> Result<(), crate::status::StatusError> {
+    let req = crate::rbac::AuthzRequest {
+        username: &user.username,
+        groups: &user.groups,
+        verb: "create",
+        api_group: group,
+        resource: plural,
+        subresource: "",
+        namespace: ns,
+        name: Some(name),
+        non_resource_url: None,
+    };
+    if crate::node_authz::authorize(&req, None, graph, rbac) || rbac.is_allowed(&req) {
+        return Ok(());
+    }
+    Err(Status::forbidden(format!(
+        "{} is not allowed to create {plural}",
+        user.username
+    )))
+}
+
 /// Reject a PUT whose declared `resourceVersion` no longer matches the object's current
 /// stored value, before any field-immutability validation below ever runs.
 ///
@@ -753,6 +889,9 @@ fn check_replace_resource_version_precondition(
     kind: &str,
 ) -> Result<(), crate::status::StatusError> {
     let Some(expected) = expected_revision else {
+        if parsed.is_some() {
+            require_builtin_resourceversion_on_update(group, resource, None, name)?;
+        }
         return Ok(());
     };
     let current = parsed
@@ -836,7 +975,6 @@ pub(crate) async fn replace_resource<S: Store>(
     // PriorityClass.value, PersistentVolume, StorageClass, and Node, (b) status restoration
     // when the resource has a dedicated status subresource, and (c) UID restoration/conflict
     // check (see stored_uid below).
-    let is_priorityclass = group == "scheduling.k8s.io" && plural == "priorityclasses";
     let is_pv = group.is_empty() && plural == "persistentvolumes";
     let is_storageclass = group == "storage.k8s.io" && plural == "storageclasses";
     let is_node = group.is_empty() && plural == "nodes";
@@ -874,19 +1012,6 @@ pub(crate) async fn replace_resource<S: Store>(
             &name,
             &meta.kind,
         )?;
-
-        // Immutability check: PriorityClass.value drives scheduling/preemption ordering
-        // cluster-wide; allowing it to change post-create would silently reorder
-        // priorities. Real kube-apiserver returns 422 "Invalid" if an update changes it.
-        if is_priorityclass {
-            if let Some(ref stored_val) = parsed {
-                if obj.body["value"] != stored_val["value"] {
-                    return Err(Status::unprocessable_entity(format!(
-                        "{plural}/{name} .value is immutable and cannot be updated"
-                    )));
-                }
-            }
-        }
 
         let status = if meta.has_status_subresource {
             parsed.as_ref().map(|v| v["status"].clone())
@@ -971,6 +1096,17 @@ pub(crate) async fn replace_resource<S: Store>(
 
     if old_object.is_none() && !allows_create_on_update(&group, &plural) {
         return Err(Status::not_found(&group, &plural, &name));
+    }
+    if old_object.is_none() {
+        authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            None,
+            &name,
+        )?;
     }
     if old_object.is_none() {
         resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
@@ -1100,9 +1236,18 @@ pub(crate) async fn replace_resource<S: Store>(
     }
 
     let put_start = std::time::Instant::now();
+    let create_only = old_object.is_none() && expected_revision.is_none();
     let put_result = state
         .store
-        .put(&key, obj.to_bytes(), expected_revision)
+        .put(
+            &key,
+            obj.to_bytes(),
+            if create_only {
+                Some(0)
+            } else {
+                expected_revision
+            },
+        )
         .await;
     tracing::debug!(
         key = %key,
@@ -1110,7 +1255,19 @@ pub(crate) async fn replace_resource<S: Store>(
         ok = put_result.is_ok(),
         "replace_resource: store.put call completed"
     );
-    let new_rv = put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
+    let new_rv = match put_result {
+        Err(StoreError::AlreadyExists { .. }) if create_only => {
+            update_after_lost_create_race(
+                &state,
+                &key,
+                obj.to_bytes(),
+                expected_revision,
+                (&group, &plural, &name, &meta.kind),
+            )
+            .await?
+        }
+        r => r.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?,
+    };
 
     obj.set_resource_version(new_rv);
     apply_cluster_write_effects(
@@ -1531,6 +1688,15 @@ pub(crate) async fn do_patch<S: Store>(
 
     // SSA upsert: apply-patch+yaml on a missing resource creates it.
     if is_ssa && stored_opt.is_none() {
+        authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            user,
+            group,
+            plural,
+            ns,
+            name,
+        )?;
         // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side), which
         // Object::from_bytes (JSON-only) rejects outright — ssa_body_to_json handles both.
         let mut obj = Object {
@@ -1997,16 +2163,6 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // Capture PriorityClass.value before patch: it drives scheduling/preemption
-        // ordering cluster-wide and is immutable after create. Real kube-apiserver
-        // returns 422 "Invalid" if a patch changes it.
-        let priorityclass_value_before_patch =
-            if group == "scheduling.k8s.io" && plural == "priorityclasses" {
-                Some(current.body["value"].clone())
-            } else {
-                None
-            };
-
         // Capture PVC storage request + StorageClass before patch: growing storage is only
         // allowed when the bound StorageClass explicitly opts in via allowVolumeExpansion,
         // checked against the post-patch value below.
@@ -2183,14 +2339,6 @@ pub(crate) async fn do_patch<S: Store>(
             &stored_status,
         );
 
-        if let Some(ref old_value) = priorityclass_value_before_patch {
-            if &current.body["value"] != old_value {
-                return Err(Status::unprocessable_entity(format!(
-                    "{plural}/{name} .value is immutable and cannot be updated"
-                )));
-            }
-        }
-
         if let Some(old_spec) = pvc_spec_before_patch {
             let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
             validate_pvc_spec_immutable(&old_spec, &current.body["spec"], old_status)
@@ -2296,6 +2444,7 @@ pub(crate) async fn do_patch<S: Store>(
                 "clustertrustbundles" | "podcertificaterequests"
             ) | ("storagemigration.k8s.io", "storageversionmigrations")
                 | ("resource.k8s.io", "devicetaintrules")
+                | ("scheduling.k8s.io", "priorityclasses")
         ) || super::csr::is_csr(group, plural)
             || super::defaults::generation_tracked_field(group, plural).is_some();
         let old_object = if kind_reads_old_object {
@@ -3602,16 +3751,6 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             ) => {
                 return Err(Status::namespace_create_rejected(&ns, &e));
             }
-            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
-                if meta.create_or_update =>
-            {
-                // createOrUpdate: replace existing object unconditionally.
-                break state
-                    .store
-                    .put(&key, obj.to_bytes(), None)
-                    .await
-                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
-            }
             // The client never chose this name (it came from generateName) — a collision is
             // the server's random suffix landing on an existing object, not a real conflict
             // the client should see. Retry with a fresh suffix, matching upstream's
@@ -4108,6 +4247,17 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     if !object_existed && !allows_create_on_update(&group, &plural) {
         return Err(Status::not_found(&group, &plural, &name));
     }
+    if !object_existed {
+        authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            &group,
+            &plural,
+            Some(&ns),
+            &name,
+        )?;
+    }
 
     // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
     // omits metadata.generation. Restamp the stored value onto the incoming body before
@@ -4374,18 +4524,16 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             ) => {
                 return Err(Status::namespace_create_rejected(&ns, &e));
             }
-            // Mirrors create_namespaced_resource's POST loop: a create-on-missing PUT that
-            // loses a create race against a concurrent create of the same createOrUpdate
-            // resource (events) must still upsert, not surface the store's AlreadyExists as
-            // a spurious 409 on what the client sees as a plain PUT.
-            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. }))
-                if meta.create_or_update =>
-            {
-                state
-                    .store
-                    .put(&key, obj.to_bytes(), None)
-                    .await
-                    .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
+            // Lost a create race: continue as the update upstream retries into.
+            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
+                update_after_lost_create_race(
+                    &state,
+                    &key,
+                    obj.to_bytes(),
+                    expected_revision,
+                    (&group, &plural, &name, &meta.kind),
+                )
+                .await?
             }
             Err(CreateNamespacedError::Store(e)) => {
                 return Err(store_err(e, &group, &plural, &name, &meta.kind))
@@ -5903,7 +6051,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "argoproj.io/v1alpha1",
             "kind": "Application",
-            "metadata": { "name": name, "namespace": ns },
+            "metadata": { "name": name, "namespace": ns, "resourceVersion": store.get(&cr_key).await.unwrap().unwrap().revision.to_string() },
             "status": { "health": { "status": "Healthy" }, "sync": { "status": "Synced" } }
         });
         let body_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
@@ -6212,6 +6360,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         let patch = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
@@ -6270,6 +6419,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         let patch = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -6330,6 +6480,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         for (body_name, body_ns) in [("other", "kube-node-lease"), ("lima-node", "other-ns")] {
             let patch = serde_json::json!({
@@ -6857,6 +7008,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // The ClusterRole both bindings below reference.
         state.rbac_index.apply_object(
@@ -6982,6 +7134,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // Same escalation-satisfying setup as the sequential test above: "admin" (the
         // creator, via test_user()) must already hold every rule of the role it binds to.
@@ -7222,6 +7375,7 @@ mod tests {
         use axum::response::IntoResponse;
 
         let state = make_state();
+        crate::handlers::test_support::grant_create_to_user(&state.rbac_index, "eve");
         let group = "rbac.authorization.k8s.io";
 
         state.rbac_index.apply_object(
@@ -7390,6 +7544,7 @@ mod tests {
         use axum::response::IntoResponse;
 
         let state = make_state();
+        crate::handlers::test_support::grant_create_to_user(&state.rbac_index, "eve");
         let group = "rbac.authorization.k8s.io";
 
         // "eve" already holds get-pods cluster-wide via her own ClusterRoleBinding.
@@ -7576,6 +7731,7 @@ mod tests {
         use axum::response::IntoResponse;
 
         let state = make_state();
+        crate::handlers::test_support::grant_create_to_user(&state.rbac_index, "eve");
         let group = "rbac.authorization.k8s.io";
         let ns = "default";
 
@@ -8160,6 +8316,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         let event = serde_json::json!({
             "apiVersion": "v1",
@@ -8215,6 +8372,267 @@ mod tests {
              (createOrUpdate is an unconditional replace, not a merge) — if this fails, the \
              fallback never ran and the winner's stale object was left in place"
         );
+    }
+
+    /// A create that loses the race to a concurrent writer becomes an update, so a stated
+    /// resourceVersion that no longer matches must be a retryable 409 — not a silent
+    /// overwrite of the winner's object.
+    #[tokio::test]
+    async fn lost_create_race_with_stale_stated_resource_version_conflicts() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let key = "/registry/coordination.k8s.io/leases/default/race-lease";
+        let winner = store
+            .put(key, bytes::Bytes::from_static(b"{\"winner\":true}"), None)
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let ident = ("coordination.k8s.io", "leases", "race-lease", "Lease");
+
+        let err = update_after_lost_create_race(
+            &state,
+            key,
+            bytes::Bytes::from_static(b"{\"loser\":true}"),
+            Some(winner + 100),
+            ident,
+        )
+        .await
+        .expect_err("stale stated resourceVersion must not overwrite the winner");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        assert!(
+            String::from_utf8_lossy(&stored.value).contains("winner"),
+            "the 409 must leave the winner's object in place"
+        );
+
+        update_after_lost_create_race(
+            &state,
+            key,
+            bytes::Bytes::from_static(b"{\"loser\":true}"),
+            Some(winner),
+            ident,
+        )
+        .await
+        .expect("matching stated resourceVersion updates");
+    }
+
+    /// Every served kind whose upstream `AllowUnconditionalUpdate()` is false must reject an
+    /// update with no resourceVersion (422) — otherwise a client that forgot to send one
+    /// silently clobbers a concurrent writer — while true kinds keep accepting it.
+    #[test]
+    fn allow_unconditional_update_matches_upstream_strategies() {
+        let adm = "admissionregistration.k8s.io";
+        let false_kinds = [
+            (adm, "validatingwebhookconfigurations"),
+            (adm, "mutatingwebhookconfigurations"),
+            (adm, "validatingadmissionpolicies"),
+            (adm, "validatingadmissionpolicybindings"),
+            (adm, "mutatingadmissionpolicies"),
+            (adm, "mutatingadmissionpolicybindings"),
+            ("apiextensions.k8s.io", "customresourcedefinitions"),
+            ("apiregistration.k8s.io", "apiservices"),
+            ("certificates.k8s.io", "clustertrustbundles"),
+            ("certificates.k8s.io", "podcertificaterequests"),
+            ("coordination.k8s.io", "leases"),
+            ("coordination.k8s.io", "leasecandidates"),
+            ("node.k8s.io", "runtimeclasses"),
+            ("policy", "poddisruptionbudgets"),
+            ("resource.k8s.io", "devicetaintrules"),
+            ("storage.k8s.io", "csidrivers"),
+            ("storage.k8s.io", "csinodes"),
+            ("storage.k8s.io", "csistoragecapacities"),
+            ("storage.k8s.io", "volumeattachments"),
+            ("storagemigration.k8s.io", "storageversionmigrations"),
+        ];
+        for (g, p) in false_kinds {
+            let err = require_builtin_resourceversion_on_update(g, p, None, "x")
+                .expect_err(&format!("{g}/{p} must require a resourceVersion"));
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{g}/{p}"
+            );
+            assert!(
+                err.1.message.starts_with(p)
+                    && err
+                        .1
+                        .message
+                        .ends_with("metadata.resourceVersion: Invalid value: 0x0: must be specified for an update"),
+                "{}",
+                err.1.message
+            );
+            require_builtin_resourceversion_on_update(g, p, Some(7), "x")
+                .expect("a stated resourceVersion is always accepted here");
+        }
+        let true_kinds = [
+            ("", "configmaps"),
+            ("", "secrets"),
+            ("", "services"),
+            ("", "endpoints"),
+            ("", "events"),
+            ("", "pods"),
+            ("", "nodes"),
+            ("", "namespaces"),
+            ("", "persistentvolumes"),
+            ("apps", "deployments"),
+            ("batch", "jobs"),
+            (RBAC_GROUP, "roles"),
+            (RBAC_GROUP, "clusterrolebindings"),
+            ("storage.k8s.io", "storageclasses"),
+            ("scheduling.k8s.io", "priorityclasses"),
+            ("certificates.k8s.io", "certificatesigningrequests"),
+            ("discovery.k8s.io", "endpointslices"),
+            ("flowcontrol.apiserver.k8s.io", "flowschemas"),
+        ];
+        for (g, p) in true_kinds {
+            require_builtin_resourceversion_on_update(g, p, None, "x")
+                .unwrap_or_else(|_| panic!("{g}/{p} allows unconditional update upstream"));
+        }
+    }
+
+    /// PUT-create (empty resourceVersion) of `plural`/`name` that loses a create race to a
+    /// concurrent writer; returns the response and the object left in the store.
+    async fn put_create_losing_race(
+        group: &str,
+        plural: &str,
+        ns: Option<&str>,
+        extra: serde_json::Value,
+    ) -> (
+        Result<Response, crate::status::StatusError>,
+        serde_json::Value,
+    ) {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let api_version = if group.is_empty() {
+            "v1".to_string()
+        } else {
+            format!("{group}/v1")
+        };
+        let obj = |who: &str| {
+            let mut o = extra.clone();
+            o["apiVersion"] = api_version.clone().into();
+            o["metadata"] = serde_json::json!({"name": "race-obj", "annotations": {"who": who}});
+            if let Some(ns) = ns {
+                o["metadata"]["namespace"] = ns.into();
+            }
+            o
+        };
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&obj("winner")).unwrap()),
+        ));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
+        let body = bytes::Bytes::from(serde_json::to_vec(&obj("loser")).unwrap());
+        let result = match ns {
+            Some(ns) => replace_namespaced_resource(
+                axum::extract::State(state),
+                axum::extract::Path((
+                    group.into(),
+                    "v1".into(),
+                    ns.into(),
+                    plural.into(),
+                    "race-obj".into(),
+                )),
+                axum::extract::Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+            None => replace_resource(
+                axum::extract::State(state),
+                axum::extract::Path((group.into(), "v1".into(), plural.into(), "race-obj".into())),
+                axum::extract::Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response),
+        };
+        let key = group_object_key(group, plural, ns, "race-obj");
+        let stored = inner.get(&key).await.unwrap().expect("winner persisted");
+        (result, serde_json::from_slice(&stored.value).unwrap())
+    }
+
+    fn assert_race_rejected(
+        result: Result<Response, crate::status::StatusError>,
+        stored: &serde_json::Value,
+        qualified: &str,
+    ) {
+        let err = result
+            .expect_err("kind without AllowUnconditionalUpdate must reject an empty-RV race loser");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            err.1.message,
+            format!(
+                "{qualified} \"race-obj\" is invalid: metadata.resourceVersion: Invalid value: \
+                 0x0: must be specified for an update"
+            )
+        );
+        assert_eq!(
+            stored["metadata"]["annotations"]["who"], "winner",
+            "a rejected loser must not clobber the winner"
+        );
+    }
+
+    /// RuntimeClass has AllowUnconditionalUpdate() == false upstream, so losing a create race
+    /// with an empty resourceVersion is a 422, never a silent overwrite of the winner.
+    #[tokio::test]
+    async fn cluster_put_create_losing_race_is_422_for_runtimeclass() {
+        let (result, stored) = put_create_losing_race(
+            "node.k8s.io",
+            "runtimeclasses",
+            None,
+            serde_json::json!({"kind": "RuntimeClass", "handler": "runc"}),
+        )
+        .await;
+        assert_race_rejected(result, &stored, "runtimeclasses.node.k8s.io");
+    }
+
+    /// Leases (leader election) have AllowUnconditionalUpdate() == false upstream.
+    #[tokio::test]
+    async fn namespaced_put_create_losing_race_is_422_for_lease() {
+        let (result, stored) = put_create_losing_race(
+            "coordination.k8s.io",
+            "leases",
+            Some("default"),
+            serde_json::json!({"kind": "Lease", "spec": {"holderIdentity": "x"}}),
+        )
+        .await;
+        assert_race_rejected(result, &stored, "leases.coordination.k8s.io");
+    }
+
+    /// Endpoints allow unconditional update upstream, so the loser overwrites the winner.
+    #[tokio::test]
+    async fn namespaced_put_create_losing_race_overwrites_for_endpoints() {
+        let (result, stored) = put_create_losing_race(
+            "",
+            "endpoints",
+            Some("default"),
+            serde_json::json!({"kind": "Endpoints"}),
+        )
+        .await;
+        assert_eq!(result.unwrap().status(), axum::http::StatusCode::OK);
+        assert_eq!(stored["metadata"]["annotations"]["who"], "loser");
     }
 
     /// `do_patch`'s SSA-create branch admits against `quota::check_resource_quota` (a prior
@@ -8759,6 +9177,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         let patch = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -12272,7 +12691,7 @@ mod tests {
 
         let state = make_state();
 
-        // Node is registered with create_or_update=false, so duplicate create must 409.
+        // Node has no upsert semantics, so duplicate create must 409.
         let node = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
@@ -12657,6 +13076,7 @@ mod tests {
             "metadata": {
                 "name": "put-gc-node",
                 "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "drivers": [] }
@@ -12745,6 +13165,7 @@ mod tests {
             "kind": "CSINode",
             "metadata": {
                 "name": "proto-gc-node",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "drivers": [] }
@@ -12828,6 +13249,7 @@ mod tests {
                 "name": "put-gc-lease",
                 "namespace": "default",
                 "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "holderIdentity": "test-holder" }
@@ -12911,6 +13333,7 @@ mod tests {
             "metadata": {
                 "name": "proto-gc-lease",
                 "namespace": "default",
+                "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string(),
                 "finalizers": []
             },
             "spec": { "holderIdentity": "test-holder" }
@@ -12991,6 +13414,16 @@ mod tests {
         metadata: serde_json::Value,
     ) {
         use axum::extract::{Path, State};
+        let mut metadata = metadata;
+        let stored = state
+            .store
+            .get(&format!(
+                "/registry/coordination.k8s.io/leases/default/{name}"
+            ))
+            .await
+            .unwrap()
+            .expect("lease seeded before PUT");
+        metadata["resourceVersion"] = stored.revision.to_string().into();
         let body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
             "metadata": metadata, "spec": {"holderIdentity": "h"}
@@ -13040,6 +13473,141 @@ mod tests {
         )
         .await
         .expect("PATCH must succeed (the server ignores the client's deletion fields)");
+    }
+
+    /// PUT of an existing object without a resourceVersion: 422 for a kind whose strategy
+    /// forbids unconditional update (a blind overwrite would clobber concurrent writers, e.g.
+    /// two leader-election candidates), 200 for one that allows it; a stated resourceVersion
+    /// always works. Covers both the namespaced and the cluster-scoped handler.
+    #[tokio::test]
+    async fn put_without_resource_version_is_422_only_for_kinds_forbidding_unconditional_update() {
+        use axum::extract::{Path, Query, State};
+        let (store, state) = deletion_guard_state().await;
+        seed_lease(&store, "l", serde_json::json!({})).await;
+        let lease = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "metadata": {"name": "l", "namespace": "default"},
+                "spec": {"holderIdentity": "other"}
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_lease = |body| {
+            replace_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "leases".into(),
+                    "l".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        let err = put_lease(lease(None))
+            .await
+            .err()
+            .expect("a Lease PUT without resourceVersion must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err.1.message.contains("must be specified for an update"),
+            "{}",
+            err.1.message
+        );
+        let rv = store
+            .get("/registry/coordination.k8s.io/leases/default/l")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string();
+        put_lease(lease(Some(&rv)))
+            .await
+            .expect("a Lease PUT with the stored resourceVersion must succeed");
+
+        let cm = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "c", "namespace": "default"}, "data": {"k": "v"}
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_cm = |body| {
+            replace_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    String::new(),
+                    "v1".into(),
+                    "default".into(),
+                    "configmaps".into(),
+                    "c".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        store
+            .put(
+                &group_object_key("", "configmaps", Some("default"), "c"),
+                cm(None),
+                None,
+            )
+            .await
+            .unwrap();
+        put_cm(cm(None))
+            .await
+            .expect("ConfigMap allows unconditional update, as upstream");
+
+        let rc = |rv: Option<&str>| {
+            let mut b = serde_json::json!({
+                "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+                "metadata": {"name": "rc"}, "handler": "h"
+            });
+            if let Some(rv) = rv {
+                b["metadata"]["resourceVersion"] = rv.into();
+            }
+            bytes::Bytes::from(serde_json::to_vec(&b).unwrap())
+        };
+        let put_rc = |body| {
+            replace_resource(
+                State(state.clone()),
+                Path((
+                    "node.k8s.io".into(),
+                    "v1".into(),
+                    "runtimeclasses".into(),
+                    "rc".into(),
+                )),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                body,
+            )
+        };
+        store
+            .put(
+                &group_object_key("node.k8s.io", "runtimeclasses", None, "rc"),
+                rc(None),
+                None,
+            )
+            .await
+            .unwrap();
+        let err = put_rc(rc(None))
+            .await
+            .err()
+            .expect("a RuntimeClass PUT without resourceVersion must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     /// A caller holding only `update` must not be able to hard-delete a finalizer-free object
@@ -14351,6 +14919,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // PUT body deliberately omits metadata.namespace — simulates a test client or
         // kubectl apply that does not include the namespace field in the body.
@@ -14793,6 +15362,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // PUT body deliberately omits kind/apiVersion — simulates an unstructured/dynamic
         // client (e.g. the Deployment lifecycle conformance test) that relies on the server
@@ -18974,6 +19544,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
         let ns = "default";
         let template = serde_json::json!({
             "metadata": {"labels": {"app": "myapp"}},
@@ -20693,7 +21264,7 @@ mod tests {
                 serde_json::to_vec(&serde_json::json!({
                     "apiVersion": "coordination.k8s.io/v1",
                     "kind": "Lease",
-                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease" },
+                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease", "resourceVersion": state.store.get("/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-node").await.unwrap().unwrap().revision.to_string() },
                     "spec": { "holderIdentity": "new-holder", "leaseDurationSeconds": 40 }
                 }))
                 .unwrap(),
@@ -22472,6 +23043,262 @@ mod tests {
             "PATCH changing only PriorityClass.description must succeed — mutable fields must \
              remain patchable even though .value is locked",
         );
+    }
+
+    /// Sends one PriorityClass write by the given method (`PUT`, `merge`, `json`, `strategic`,
+    /// `apply`) and returns the error status code and message, or `None` on success. `fields`
+    /// is the desired field set; each method encodes it in its own wire format.
+    async fn pc_write(
+        state: &crate::state::AppState,
+        method: &str,
+        name: &str,
+        fields: serde_json::Value,
+    ) -> Option<(u16, String)> {
+        use axum::extract::{Path, Query, State};
+        let path = || {
+            Path((
+                "scheduling.k8s.io".to_string(),
+                "v1".to_string(),
+                "priorityclasses".to_string(),
+                name.to_string(),
+            ))
+        };
+        let mut full = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": { "name": name },
+        });
+        for (k, v) in fields.as_object().unwrap() {
+            full[k] = v.clone();
+        }
+        let res = if method == "PUT" {
+            replace_resource(
+                State(state.clone()),
+                path(),
+                Query(ReplaceQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&full).unwrap()),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            let (ct, body) = match method {
+                "merge" => ("application/merge-patch+json", fields),
+                "strategic" => ("application/strategic-merge-patch+json", fields),
+                "json" => (
+                    "application/json-patch+json",
+                    serde_json::Value::Array(
+                        fields
+                            .as_object()
+                            .unwrap()
+                            .iter()
+                            .map(|(k, v)| {
+                                serde_json::json!({"op": "add", "path": format!("/{k}"), "value": v})
+                            })
+                            .collect(),
+                    ),
+                ),
+                "apply" => ("application/apply-patch+yaml", full),
+                other => panic!("unknown method {other}"),
+            };
+            let mut headers = json_headers();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(ct),
+            );
+            let query = PatchQuery {
+                field_manager: Some("test".into()),
+                force: Some(true),
+                ..Default::default()
+            };
+            patch_resource(
+                State(state.clone()),
+                path(),
+                Query(query),
+                test_user(),
+                headers,
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .map(|_| ())
+        };
+        res.err().map(|e| (e.0.as_u16(), e.1.message))
+    }
+
+    const PC_WRITE_METHODS: [&str; 5] = ["PUT", "merge", "json", "strategic", "apply"];
+
+    /// An unknown preemptionPolicy must be refused at create, and a stored one must not flip on
+    /// any write path: a flip would let a class silently start (or stop) preempting running pods.
+    #[tokio::test]
+    async fn priorityclass_preemption_policy_is_validated_on_create_and_immutable_on_every_write_path(
+    ) {
+        use axum::extract::{Query, State};
+        let state = make_state();
+        let bad = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+            "metadata": { "name": "bad" }, "value": 1, "preemptionPolicy": "Foo"
+        });
+        let err = create_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "scheduling.k8s.io".into(),
+                "v1".into(),
+                "priorityclasses".into(),
+            )),
+            Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&bad).unwrap()),
+        )
+        .await
+        .err()
+        .expect("preemptionPolicy Foo must be rejected on create");
+        assert_eq!(err.0.as_u16(), 422);
+        assert_eq!(
+            err.1.message,
+            "PriorityClass.scheduling.k8s.io \"bad\" is invalid: preemptionPolicy: Unsupported \
+             value: \"Foo\": supported values: \"PreemptLowerPriority\", \"Never\""
+        );
+
+        let seed = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+            "metadata": { "name": "pp" }, "value": 5, "preemptionPolicy": "Never"
+        });
+        post_seed_cluster(&state, "scheduling.k8s.io", "v1", "priorityclasses", &seed).await;
+        for method in PC_WRITE_METHODS {
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "pp",
+                serde_json::json!({"value": 5, "preemptionPolicy": "PreemptLowerPriority"}),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{method}: flipping preemptionPolicy must be rejected"));
+            assert_eq!(code, 422, "{method}");
+            assert_eq!(
+                msg,
+                "PriorityClass.scheduling.k8s.io \"pp\" is invalid: preemptionPolicy: Invalid \
+                 value: \"PreemptLowerPriority\": field is immutable",
+                "{method}"
+            );
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "pp",
+                serde_json::json!({"value": 6, "preemptionPolicy": "Never"}),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{method}: changing value must be rejected"));
+            assert_eq!(code, 422, "{method}");
+            assert!(
+                msg.ends_with("value: Forbidden: may not be changed in an update."),
+                "{method}: {msg}"
+            );
+            assert_eq!(
+                pc_write(
+                    &state,
+                    method,
+                    "pp",
+                    serde_json::json!({"value": 5, "preemptionPolicy": "Never", "description": method})
+                )
+                .await,
+                None,
+                "{method}: mutable fields stay writable"
+            );
+        }
+    }
+
+    /// Two default classes make pod priority depend on a tie-break instead of an explicit
+    /// choice, so a second globalDefault must be refused on create, SSA-create and when an
+    /// existing class is flipped to default by any update method; the current default itself
+    /// must stay editable.
+    #[tokio::test]
+    async fn priorityclass_second_global_default_is_forbidden_on_every_write_path() {
+        let state = make_state();
+        let pc = |name: &str, gd: bool| {
+            serde_json::json!({
+                "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass",
+                "metadata": { "name": name }, "value": 1, "globalDefault": gd
+            })
+        };
+        post_seed_cluster(
+            &state,
+            "scheduling.k8s.io",
+            "v1",
+            "priorityclasses",
+            &pc("first", true),
+        )
+        .await;
+        post_seed_cluster(
+            &state,
+            "scheduling.k8s.io",
+            "v1",
+            "priorityclasses",
+            &pc("plain", false),
+        )
+        .await;
+        let want = "priorityclasses.scheduling.k8s.io \"second\" is forbidden: PriorityClass first is already marked as default. Only one default can exist";
+
+        let (code, msg) = pc_write(
+            &state,
+            "apply",
+            "second",
+            serde_json::json!({"value": 1, "globalDefault": true}),
+        )
+        .await
+        .expect("SSA-create of a second default must be rejected");
+        assert_eq!((code, msg.as_str()), (403, want));
+
+        let create = {
+            use axum::extract::{Path, Query, State};
+            create_resource(
+                State(state.clone()),
+                Path((
+                    "scheduling.k8s.io".into(),
+                    "v1".into(),
+                    "priorityclasses".into(),
+                )),
+                Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&pc("second", true)).unwrap()),
+            )
+            .await
+        };
+        let err = create
+            .err()
+            .expect("POST of a second default must be rejected");
+        assert_eq!((err.0.as_u16(), err.1.message.as_str()), (403, want));
+
+        for method in PC_WRITE_METHODS {
+            let (code, msg) = pc_write(
+                &state,
+                method,
+                "plain",
+                serde_json::json!({"value": 1, "globalDefault": true}),
+            )
+            .await
+            .unwrap_or_else(|| {
+                panic!("{method}: flipping a second class to default must be rejected")
+            });
+            assert_eq!(code, 403, "{method}");
+            assert!(
+                msg.contains("PriorityClass first is already marked as default"),
+                "{method}: {msg}"
+            );
+            assert_eq!(
+                pc_write(
+                    &state,
+                    method,
+                    "first",
+                    serde_json::json!({"value": 1, "globalDefault": true, "description": method})
+                )
+                .await,
+                None,
+                "{method}: the existing default must stay editable"
+            );
+        }
     }
 
     /// PUT growing a PVC's `spec.resources.requests.storage` must return 403 Forbidden when
@@ -25409,11 +26236,14 @@ mod tests {
             value: bytes::Bytes,
             expected_revision: Option<u64>,
         ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
-            let inject = self
-                .fire_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-            let inner = self.inner.clone();
             let key: String = key.into();
+            // AppState::new bootstraps namespaces through put(); the race must fire on the
+            // request's own create, not on that.
+            let inject = !key.starts_with("/registry/namespaces/")
+                && self
+                    .fire_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
             let winner_body = self.winner_body.clone();
             async move {
                 if inject {
@@ -25543,6 +26373,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // This request loses the create race (the mock injects the winner first) and
         // lands in the AlreadyExists merge branch. Its "status" is a validly-shaped
@@ -25711,6 +26542,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
 
         // This request's own body carries no status at all — isolating the test to the
         // webhook's reinjection, not the client's own forged status (see the sibling test
@@ -30348,6 +31180,224 @@ mod tests {
         .err()
         .expect("invalid name must be rejected");
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    fn user_with_verbs(state: &crate::state::AppState, name: &str, verbs: &[&str]) -> UserInfo {
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{name}"),
+            &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": verbs}]}),
+        );
+        state.rbac_index.apply_object(
+            &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}"),
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": name}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": name}
+            }),
+        );
+        UserInfo {
+            username: name.into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        }
+    }
+
+    /// A principal with update but not create must not be able to mint objects via
+    /// PUT-create-on-update: upstream additionally authorizes `create` there. Creates with both
+    /// verbs still work, so the extra check cannot break kubelet/controller PUT-create flows.
+    #[tokio::test]
+    async fn put_create_requires_create_verb_because_update_alone_must_not_create_objects() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        crate::handlers::test_support::seed_namespace(&state, "default").await;
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+            "metadata": {"name": "put-rc"}, "handler": "runc"
+        });
+        let ep = serde_json::json!({
+            "apiVersion": "v1", "kind": "Endpoints",
+            "metadata": {"name": "put-ep", "namespace": "default"}
+        });
+        let updater = user_with_verbs(&state, "updater", &["update", "patch"]);
+        let creator = user_with_verbs(&state, "creator", &["create", "update"]);
+
+        let put_rc = |user: UserInfo| {
+            replace_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "node.k8s.io".into(),
+                    "v1".into(),
+                    "runtimeclasses".into(),
+                    "put-rc".into(),
+                )),
+                axum::extract::Query(ReplaceQuery::default()),
+                Extension(user),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+            )
+        };
+        let put_ep = |user: UserInfo| {
+            replace_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "endpoints".into(),
+                    "put-ep".into(),
+                )),
+                axum::extract::Query(ReplaceQuery::default()),
+                Extension(user),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&ep).unwrap()),
+            )
+        };
+
+        let err = put_rc(updater.clone())
+            .await
+            .err()
+            .expect("cluster PUT-create");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = put_ep(updater).await.err().expect("namespaced PUT-create");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        for key in [
+            "/registry/node.k8s.io/runtimeclasses/put-rc",
+            "/registry/endpoints/default/put-ep",
+        ] {
+            assert!(
+                state.store.get(key).await.unwrap().is_none(),
+                "a forbidden PUT-create must not persist {key}"
+            );
+        }
+
+        assert!(put_rc(creator.clone()).await.is_ok());
+        assert!(put_ep(creator).await.is_ok());
+    }
+
+    /// Same invariant for server-side apply, the other create-on-missing PATCH path: patch
+    /// alone must not create, patch+create must.
+    #[tokio::test]
+    async fn ssa_create_requires_create_verb_because_patch_alone_must_not_create_objects() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        crate::handlers::test_support::seed_namespace(&state, "default").await;
+        let cm = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": "ssa-cm", "namespace": "default"}
+        });
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1", "kind": "RuntimeClass",
+            "metadata": {"name": "ssa-rc"}, "handler": "runc"
+        });
+        let patcher = user_with_verbs(&state, "patcher", &["update", "patch"]);
+        let creator = user_with_verbs(&state, "creator", &["create", "patch"]);
+
+        let apply_cm = |user: UserInfo| {
+            patch_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "configmaps".into(),
+                    "ssa-cm".into(),
+                )),
+                axum::extract::Query(PatchQuery::default()),
+                Extension(user),
+                apply_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+            )
+        };
+        let apply_rc = |user: UserInfo| {
+            patch_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path((
+                    "node.k8s.io".into(),
+                    "v1".into(),
+                    "runtimeclasses".into(),
+                    "ssa-rc".into(),
+                )),
+                axum::extract::Query(PatchQuery::default()),
+                Extension(user),
+                apply_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+            )
+        };
+
+        let err = apply_cm(patcher.clone())
+            .await
+            .err()
+            .expect("namespaced apply-create");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = apply_rc(patcher).await.err().expect("cluster apply-create");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        for key in [
+            "/registry/configmaps/default/ssa-cm",
+            "/registry/node.k8s.io/runtimeclasses/ssa-rc",
+        ] {
+            assert!(
+                state.store.get(key).await.unwrap().is_none(),
+                "a forbidden apply-create must not persist {key}"
+            );
+        }
+
+        assert!(apply_cm(creator.clone()).await.is_ok());
+        assert!(apply_rc(creator).await.is_ok());
+    }
+
+    /// POST of an Event or CSINode that already exists must 409 like upstream's generic store
+    /// Create; silently overwriting let a create-only principal clobber existing objects.
+    #[tokio::test]
+    async fn post_on_existing_event_and_csinode_is_409_because_create_must_not_overwrite() {
+        use axum::http::StatusCode;
+        let state = make_state();
+        crate::handlers::test_support::seed_namespace(&state, "default").await;
+        let ev = serde_json::json!({
+            "apiVersion": "v1", "kind": "Event",
+            "metadata": {"name": "ev1", "namespace": "default"},
+            "involvedObject": {"kind": "Pod", "name": "p", "namespace": "default"},
+            "reason": "R", "message": "first"
+        });
+        let csi = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1", "kind": "CSINode",
+            "metadata": {"name": "n1"}, "spec": {"drivers": []}
+        });
+        let post_ev = || {
+            create_namespaced_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("".into(), "v1".into(), "default".into(), "events".into())),
+                axum::extract::Query(CreateQuery::default()),
+                admin_ext(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&ev).unwrap()),
+            )
+        };
+        let post_csi = || {
+            create_resource(
+                axum::extract::State(state.clone()),
+                axum::extract::Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+                axum::extract::Query(CreateQuery::default()),
+                admin_ext(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&csi).unwrap()),
+            )
+        };
+        assert_eq!(
+            post_ev().await.unwrap().into_response().status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_csi().await.unwrap().into_response().status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_ev().await.unwrap().into_response().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post_csi().await.unwrap().into_response().status(),
+            StatusCode::CONFLICT
+        );
     }
 
     // -- streaming LIST path must match the pre-optimization materializing path --

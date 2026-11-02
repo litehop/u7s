@@ -120,6 +120,7 @@ async fn admit_approval<S: Store>(
             } else {
                 out["status"]["conditions"] = conditions;
             }
+            super::csr::validate_approval_conditions(old, &out)?;
             Ok(out)
         },
     )
@@ -1988,5 +1989,193 @@ mod tests {
             assert_eq!(m["operation"], "Update");
             assert_eq!(m["subresource"], "approval");
         }
+    }
+
+    fn cond(ty: &str) -> serde_json::Value {
+        json!({"type": ty, "status": "True", "reason": "r", "message": "m",
+               "lastUpdateTime": "2026-01-01T00:00:00Z",
+               "lastTransitionTime": "2026-01-01T00:00:00Z"})
+    }
+
+    async fn seed_with_conditions(state: &crate::state::AppState, name: &str, types: &[&str]) {
+        let key = seed_csr(&state.store, name, None).await;
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        body["status"]["conditions"] = types.iter().map(|t| cond(t)).collect();
+        let bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+        state.store.put(&key, bytes, None).await.unwrap();
+    }
+
+    async fn stored_types(state: &crate::state::AppState, name: &str) -> Vec<String> {
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        v["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn patch_headers(ct: &'static str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(ct),
+        );
+        h
+    }
+
+    /// Every /approval write path with `conditions` as the wanted final list; the error
+    /// text of each rejection, or None when accepted.
+    async fn write_all_paths(
+        state: &crate::state::AppState,
+        name: &str,
+        conditions: serde_json::Value,
+    ) -> Vec<(&'static str, Option<String>)> {
+        let mut out = Vec::new();
+        let put_body = json!({"metadata": {"name": name}, "status": {"conditions": conditions}});
+        let r = put_approval(
+            axum::extract::State(state.clone()),
+            approver(state),
+            axum::extract::Path(name.to_owned()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .map(|_| ());
+        out.push(("PUT", r.err().map(|e| e.1.message)));
+
+        let patch_body = json!({"status": {"conditions": conditions}});
+        for (label, ct) in [
+            ("merge-patch", "application/merge-patch+json"),
+            ("strategic-merge", "application/strategic-merge-patch+json"),
+        ] {
+            let r = patch_approval(
+                axum::extract::State(state.clone()),
+                approver(state),
+                axum::extract::Path(name.to_owned()),
+                patch_headers(ct),
+                bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+            )
+            .await
+            .map(|_| ());
+            out.push((label, r.err().map(|e| e.1.message)));
+        }
+
+        let jp = json!([{"op": "replace", "path": "/status/conditions", "value": conditions}]);
+        let r = patch_approval(
+            axum::extract::State(state.clone()),
+            approver(state),
+            axum::extract::Path(name.to_owned()),
+            patch_headers("application/json-patch+json"),
+            bytes::Bytes::from(serde_json::to_vec(&jp).unwrap()),
+        )
+        .await
+        .map(|_| ());
+        out.push(("json-patch", r.err().map(|e| e.1.message)));
+
+        let yaml = patch_body.to_string();
+        let r = approval_apply(state, name, "m", true, yaml)
+            .await
+            .map(|_| ());
+        out.push(("apply", r.err().map(|e| e.1.message)));
+        out
+    }
+
+    /// A signer approver must not be able to un-deny a CSR: if /approval could drop
+    /// Denied (or add Approved next to it) the signer would issue a certificate for a
+    /// request that was explicitly denied.
+    #[tokio::test]
+    async fn approval_cannot_undeny_a_csr_on_any_write_path() {
+        let state = make_state();
+        for (case, conds, want) in [
+            (
+                "erase-denied",
+                json!([cond("Approved")]),
+                "updates may not remove a condition of type \"Denied\"",
+            ),
+            (
+                "approved-alongside-denied",
+                json!([cond("Denied"), cond("Approved")]),
+                "mutually exclusive",
+            ),
+        ] {
+            let name = format!("deny-{case}");
+            seed_with_conditions(&state, &name, &["Denied"]).await;
+            for (path, err) in write_all_paths(&state, &name, conds).await {
+                let err = err.unwrap_or_else(|| panic!("{path} {case}: write was accepted"));
+                assert!(err.contains(want), "{path} {case}: {err}");
+            }
+            assert_eq!(
+                stored_types(&state, &name).await,
+                ["Denied"],
+                "{case}: a rejected write must leave the Denied condition untouched"
+            );
+        }
+    }
+
+    /// An applier that owns Denied must not be able to retract it by re-applying an empty
+    /// list: that would reopen a denied CSR for approval.
+    #[tokio::test]
+    async fn approval_apply_cannot_retract_the_denial_it_owns() {
+        let state = make_state();
+        seed_with_conditions(&state, "apply-retract", &[]).await;
+        let denied = json!({"status": {"conditions": [cond("Denied")]}}).to_string();
+        approval_apply(&state, "apply-retract", "m", true, denied)
+            .await
+            .expect("first apply of Denied is valid");
+        let empty = json!({"status": {"conditions": []}}).to_string();
+        let err = approval_apply(&state, "apply-retract", "m", true, empty)
+            .await
+            .expect_err("retracting Denied must be rejected");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(stored_types(&state, "apply-retract").await, ["Denied"]);
+    }
+
+    /// Failed is the signer's record; an approver erasing it hides that signing failed.
+    #[tokio::test]
+    async fn approval_cannot_erase_failed_condition_on_any_write_path() {
+        let state = make_state();
+        seed_with_conditions(&state, "erase-failed", &["Approved", "Failed"]).await;
+        for (path, err) in write_all_paths(&state, "erase-failed", json!([cond("Approved")])).await
+        {
+            let err = err.unwrap_or_else(|| panic!("{path}: write was accepted"));
+            assert!(
+                err.contains("updates may not remove a condition of type \"Failed\""),
+                "{path}: {err}"
+            );
+        }
+        assert_eq!(
+            stored_types(&state, "erase-failed").await,
+            ["Approved", "Failed"]
+        );
+    }
+
+    /// Denied/Approved/Failed with status False would read as "not denied" to clients that
+    /// only check the type; upstream accepts only "True" for them.
+    #[tokio::test]
+    async fn approval_rejects_false_status_on_decision_conditions() {
+        let state = make_state();
+        seed_with_conditions(&state, "false-status", &[]).await;
+        let mut c = cond("Denied");
+        c["status"] = json!("False");
+        for (path, err) in write_all_paths(&state, "false-status", json!([c])).await {
+            let err = err.unwrap_or_else(|| panic!("{path}: write was accepted"));
+            assert!(err.contains("supported values: \"True\""), "{path}: {err}");
+        }
+    }
+
+    /// Echoing the stored conditions (kubectl approve of an already-approved CSR) and
+    /// appending Approved to a fresh CSR must keep working.
+    #[tokio::test]
+    async fn approval_still_accepts_valid_approve_and_idempotent_resend() {
+        let state = make_state();
+        seed_with_conditions(&state, "valid", &[]).await;
+        for (path, err) in write_all_paths(&state, "valid", json!([cond("Approved")])).await {
+            assert!(err.is_none(), "{path}: {err:?}");
+        }
+        assert_eq!(stored_types(&state, "valid").await, ["Approved"]);
     }
 }

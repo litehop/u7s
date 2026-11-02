@@ -89,6 +89,7 @@ pub fn build_table(
         ("apps", "daemonsets") => build_daemonset_table(objects),
         ("", "namespaces") => build_namespace_table(objects),
         ("", "configmaps") => build_configmap_table(objects),
+        ("scheduling.k8s.io", "priorityclasses") => build_priorityclass_table(objects),
         ("", "secrets") => build_secret_table(objects),
         ("", "serviceaccounts") => build_serviceaccount_table(objects),
         ("batch", "jobs") => build_job_table(objects),
@@ -853,6 +854,39 @@ fn namespace_row(obj: serde_json::Value) -> serde_json::Value {
     let object_ref = make_object_ref(&obj, "Namespace");
     serde_json::json!({
         "cells": [name, status, age],
+        "object": object_ref
+    })
+}
+
+// ── PriorityClasses ───────────────────────────────────────────────────────────
+
+fn build_priorityclass_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+    let columns = vec![
+        col("Name", "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names", "string"),
+        col("Value", "value represents the integer value of this priority class. This is the actual priority that pods receive when they have the name of this class in their pod spec.", "integer"),
+        col("Global-Default", "globalDefault specifies whether this PriorityClass should be considered as the default priority for pods that do not have any priority class. Only one PriorityClass can be marked as `globalDefault`. However, if more than one PriorityClasses exists with their `globalDefault` field set to true, the smallest value of such global default PriorityClasses will be used as the default priority.", "boolean"),
+        col("Age", "Time since creation", "string"),
+        col("PreemptionPolicy", "preemptionPolicy is the Policy for preempting pods with lower priority. One of Never, PreemptLowerPriority. Defaults to PreemptLowerPriority if unset.", "string"),
+    ];
+    let rows: Vec<serde_json::Value> = objects.into_iter().map(priorityclass_row).collect();
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "Table",
+        "columnDefinitions": columns,
+        "rows": rows
+    })
+}
+
+fn priorityclass_row(obj: serde_json::Value) -> serde_json::Value {
+    let meta = parse_metadata(&obj);
+    let name = meta.name.clone().unwrap_or_default();
+    let age = age_string(meta.creation_timestamp.as_deref().unwrap_or(""));
+    let value = obj["value"].as_i64().unwrap_or(0);
+    let global_default = obj["globalDefault"].as_bool().unwrap_or(false);
+    let preemption_policy = obj["preemptionPolicy"].as_str().unwrap_or("");
+    let object_ref = make_object_ref(&obj, "PriorityClass");
+    serde_json::json!({
+        "cells": [name, value, global_default, age, preemption_policy],
         "object": object_ref
     })
 }
@@ -2457,6 +2491,34 @@ mod tests {
         let cells = table["rows"][0]["cells"].as_array().unwrap();
         assert_eq!(cells[0], "production");
         assert_eq!(cells[1], "Active", "STATUS must be status.phase");
+    }
+
+    /// Without Value/Global-Default columns an operator cannot see which class is the cluster
+    /// default or how classes rank without `-o yaml`; cell order must match the columns.
+    #[test]
+    fn build_table_for_priorityclasses_shows_value_default_and_preemption_policy() {
+        let pc = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": {"name": "high", "creationTimestamp": "2020-01-01T00:00:00Z"},
+            "value": 1000,
+            "globalDefault": true,
+            "preemptionPolicy": "Never"
+        });
+        let table = build_table("scheduling.k8s.io", "priorityclasses", vec![pc]);
+        let cols = table["columnDefinitions"].as_array().unwrap();
+        let names: Vec<&str> = cols.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["Name", "Value", "Global-Default", "Age", "PreemptionPolicy"]
+        );
+        let types: Vec<&str> = cols.iter().map(|c| c["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["string", "integer", "boolean", "string", "string"]);
+        let cells = table["rows"][0]["cells"].as_array().unwrap();
+        assert_eq!(cells[0], "high");
+        assert_eq!(cells[1], 1000);
+        assert_eq!(cells[2], true);
+        assert_eq!(cells[4], "Never");
     }
 
     // ── ConfigMap tests ───────────────────────────────────────────────────────

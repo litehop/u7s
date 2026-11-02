@@ -1,0 +1,318 @@
+# Vendored from litehop/beep v0.7.0 (deploy/base, rendered -- no kustomize at install time),
+# u7s's default Service type=LoadBalancer provider (the k3s klipper-lb role), applied via the
+# well-known-manifest-folder mechanism (docs/decisions/well-known-manifest-folder.md).
+#
+# Two install-time placeholders scripts/install.sh substitutes before writing this file into
+# --manifest-output-dir:
+#   eth0              install.sh's own resolved --iface value: the node's client-facing
+#                           uplink beep admits LoadBalancer traffic on.
+#   10.244.0.0/16    install.sh's $POD_CLUSTER_CIDR, the same value flannel and
+#                           kube-controller-manager use. Wrong here and beep rejects every
+#                           backend Pod. On a dual-stack install the --pod-cidr line is
+#                           expanded to one line per family (beep admits a pod IP only against
+#                           the CIDR of its own family).
+#
+# Departures from upstream deploy/base:
+#   - Image pinned by index digest instead of :latest (both containers).
+#   - --pod-cidr and --uplink-iface are the placeholders above (upstream: k3s's 10.42.0.0/16
+#     and eth0).
+# Everything else, including the privileged node-prep initContainer, the hostPath mounts and
+# AppArmor Unconfined, is upstream's security posture unchanged. beep's v0.6.0 CHANGELOG records
+# the externalTrafficPolicy=Local semantics that differ from kube-proxy (a node with no local
+# endpoint forwards cross-node, client IP preserved); sessionAffinity ClientIP is honoured but
+# timeoutSeconds is not.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: servicelb-controller
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: servicelb-controller
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["list", "watch", "get"]
+  - apiGroups: [""]
+    resources: ["services/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch", "get"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list", "watch", "get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: servicelb-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: servicelb-controller
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
+# Cluster-wide flow-hash seed Secret: the first controller to start creates it, the rest read
+# it. `create` cannot be limited by resourceNames, so it is scoped to this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-flow-hash-seed
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["servicelb-flow-hash-seed"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-flow-hash-seed
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-flow-hash-seed
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
+# Per-node liveness Leases (`beep-node-<node>`). `create` cannot be limited by resourceNames, so
+# the Role is namespace-wide; a dedicated namespace keeps Lease write access away from
+# kube-system, where it would let a compromised beep pod hijack control-plane leader election.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: beep-leases
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-node-lease
+  namespace: beep-leases
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-node-lease
+  namespace: beep-leases
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-node-lease
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
+# MapRestoreFailed Warning Events (best-effort), on the Node (in `default`) and on this pod (in
+# kube-system). Create only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-events
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-events
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-events
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: servicelb-controller-events
+  namespace: kube-system
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: servicelb-controller-events
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: servicelb-controller-events
+subjects:
+  - kind: ServiceAccount
+    name: servicelb-controller
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: beep-config
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: servicelb-controller
+data:
+  BEEP_MAX_FRONTS: "1024"
+  BEEP_ENDPOINTS_PER_FRONT: "4"
+  BEEP_UDP_IDLE_SWEEP_SECS: "120"
+  BEEP_TCP_IDLE_SWEEP_SECS: "43200"
+  BEEP_FLOW_TABLE_MAX_ENTRIES: "16384"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: servicelb-controller
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: servicelb-controller
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: servicelb-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: servicelb-controller
+    spec:
+      serviceAccountName: servicelb-controller
+      priorityClassName: system-node-critical
+      # Pod-level automount is off so the privileged node-prep initContainer, which never calls
+      # the API, gets no token; the `serviceaccount` volume below is mounted into the controller
+      # container only.
+      automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Runs on every node, control-plane included: the dataplane must be present wherever
+      # Service traffic can land.
+      tolerations:
+        - key: CriticalAddonsOnly
+          operator: Exists
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      initContainers:
+        # Privileged only here: containerd masks /proc/sys for a non-privileged container, so
+        # the geneve0 rp_filter=0 write (persisted in the host's /etc/sysctl.d/60-beep.conf)
+        # must happen before the unprivileged controller starts.
+        - name: node-prep
+          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
+          securityContext:
+            privileged: true
+          args:
+            - --node-prep
+          volumeMounts:
+            - name: host-sysctl-d
+              mountPath: /etc/sysctl.d/60-beep.conf
+      containers:
+        - name: servicelb-controller
+          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              # Clears the ~31 MiB transient peak while parsing /sys/kernel/btf/vmlinux at
+              # startup (steady state is ~7 MiB).
+              memory: 96Mi
+          securityContext:
+            privileged: false
+            # containerd's default AppArmor profile denies all bpffs writes regardless of
+            # capabilities.
+            appArmorProfile:
+              type: Unconfined
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "NET_ADMIN", "PERFMON"]
+          envFrom:
+            - configMapRef:
+                name: beep-config
+          env:
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          args:
+            - --pod-cidr=10.244.0.0/16
+            - --node-ip=$(NODE_IP)
+            - --uplink-iface=eth0
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/beep-ready"]
+            periodSeconds: 5
+          volumeMounts:
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: serviceaccount
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: host-sysctl-d
+          hostPath:
+            path: /etc/sysctl.d/60-beep.conf
+            type: FileOrCreate
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: serviceaccount
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace

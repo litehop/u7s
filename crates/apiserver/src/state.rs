@@ -1934,17 +1934,6 @@ fn rm(kind: &str, _namespaced: bool, has_status: bool) -> ResourceMeta {
         #[cfg(test)]
         namespaced: _namespaced,
         has_status_subresource: has_status,
-        create_or_update: false,
-    }
-}
-
-fn rm_cou(kind: &str, _namespaced: bool) -> ResourceMeta {
-    ResourceMeta {
-        kind: kind.to_string(),
-        #[cfg(test)]
-        namespaced: _namespaced,
-        has_status_subresource: false,
-        create_or_update: true,
     }
 }
 
@@ -1967,7 +1956,7 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("", "v1", "configmaps"), rm("ConfigMap", true, false));
     m.insert(rk("", "v1", "podtemplates"), rm("PodTemplate", true, false));
     m.insert(rk("", "v1", "secrets"), rm("Secret", true, false));
-    m.insert(rk("", "v1", "events"), rm_cou("Event", true));
+    m.insert(rk("", "v1", "events"), rm("Event", true, false));
     m.insert(rk("", "v1", "endpoints"), rm("Endpoints", true, false));
     m.insert(
         rk("", "v1", "persistentvolumeclaims"),
@@ -2063,7 +2052,10 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     );
 
     // events.k8s.io/v1
-    m.insert(rk("events.k8s.io", "v1", "events"), rm_cou("Event", true));
+    m.insert(
+        rk("events.k8s.io", "v1", "events"),
+        rm("Event", true, false),
+    );
 
     // admissionregistration.k8s.io/v1
     m.insert(
@@ -2141,10 +2133,9 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     );
 
     // storage.k8s.io/v1 — all cluster-scoped
-    // kubelet uses create-or-update (PUT) semantics for csinodes
     m.insert(
         rk("storage.k8s.io", "v1", "csinodes"),
-        rm_cou("CSINode", false),
+        rm("CSINode", false, false),
     );
     m.insert(
         rk("storage.k8s.io", "v1", "csidrivers"),
@@ -2475,18 +2466,12 @@ mod tests {
     }
 
     #[test]
-    fn csinodes_registered_as_cluster_scoped_create_or_update() {
+    fn csinodes_registered_as_cluster_scoped() {
         let registry = build_registry();
         let key = rk("storage.k8s.io", "v1", "csinodes");
         let meta = registry
             .get(&key)
             .expect("csinodes must be in build_registry");
-        // kubelet PUTs CSINode on every boot; create_or_update must be true so the
-        // handler doesn't reject the request when the object already exists.
-        assert!(
-            meta.create_or_update,
-            "csinodes must have create_or_update=true"
-        );
         assert!(!meta.namespaced, "csinodes is cluster-scoped");
     }
 

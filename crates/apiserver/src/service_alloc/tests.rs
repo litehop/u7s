@@ -36,6 +36,7 @@ fn state_with(ranges: &str) -> AppState<SqliteStore> {
         konnectivity_proxy_addr: None,
     });
     st.secondary_service_ip_allocator = secondary.map(std::sync::Arc::new);
+    crate::handlers::test_support::grant_create_everywhere(&st.rbac_index);
     st
 }
 
@@ -345,16 +346,29 @@ async fn dry_run_create_does_not_reserve_preset_values() {
 #[tokio::test]
 async fn failed_create_does_not_leak_its_reservations() {
     let st = state();
-    create(&st, "a", json!({"ports": [{"port": 80}]}), false)
-        .await
-        .unwrap();
+    // Pinned so a random auto-allocation can never land on 10.96.0.91 below.
+    create(
+        &st,
+        "a",
+        json!({"clusterIP": "10.96.0.10", "ports": [{"port": 80}]}),
+        false,
+    )
+    .await
+    .unwrap();
     // Name conflict: the object write fails after the reservations were taken.
     let dup = create(&st, "a", np_spec(80, 30090), false).await;
     assert!(matches!(dup, Ok((StatusCode::CONFLICT, _))), "{dup:?}");
     eventually_free(&st, &port_key(30090)).await;
 
     // IP reserved first, then the port conflicts: the IP must be given back.
-    create(&st, "p", np_spec(80, 30091), false).await.unwrap();
+    create(
+        &st,
+        "p",
+        json!({"type": "NodePort", "clusterIP": "10.96.0.11", "ports": [{"port": 80, "nodePort": 30091}]}),
+        false,
+    )
+    .await
+    .unwrap();
     let both = create(
         &st,
         "q",
@@ -362,7 +376,7 @@ async fn failed_create_does_not_leak_its_reservations() {
         false,
     )
     .await;
-    assert_422(both, "already allocated");
+    assert_422(both, "provided port is already allocated");
     eventually_free(&st, &ip_key("10.96.0.91")).await;
 }
 
@@ -1264,7 +1278,7 @@ async fn primary_cluster_ip_cannot_change_and_secondary_release_needs_single_sta
     let (_, v) = create(
         &st,
         "i",
-        json!({"ipFamilyPolicy": "RequireDualStack", "ports": [{"port": 80}]}),
+        json!({"ipFamilyPolicy": "RequireDualStack", "clusterIPs": ["10.96.0.40", "fd00:96::40"], "ports": [{"port": 80}]}),
         false,
     )
     .await

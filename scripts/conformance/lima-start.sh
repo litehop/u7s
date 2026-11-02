@@ -1027,7 +1027,7 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 # whichever node's --iface value wins the last apply is not a correctness issue.
 echo "Applying flannel CNI DaemonSet..."
 FLANNEL_RENDERED="$(mktemp)"
-sed -e "s/__IFACE__/$LIMA_VM_IFACE/g" -e "s#__POD_CLUSTER_CIDR__#10.244.0.0/16#g" \
+sed -e "s/__IFACE__/$LIMA_VM_IFACE/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g" -e '/"IPv6Network"/d' \
   "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$FLANNEL_RENDERED"
 rm -f "$FLANNEL_RENDERED"

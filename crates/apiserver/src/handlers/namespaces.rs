@@ -512,7 +512,6 @@ pub(crate) async fn patch_namespace<S: Store>(
             #[cfg(test)]
             namespaced: false,
             has_status_subresource: true,
-            create_or_update: false,
         };
         let key = cluster_object_key("namespaces", &name);
         return do_patch(

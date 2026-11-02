@@ -8,7 +8,7 @@
 # measured from scaling the warmed-up 1-replica Deployment to N until readyReplicas == N.
 set -uo pipefail
 
-RG=/var/tmp/rg
+RG="${RG_DIR:-/var/tmp/rg}"
 OUT="$RG/out"
 KCFG=/var/lib/u7s/kubeconfig
 SETTLE_IDLE="${SETTLE_IDLE:-180}"
@@ -144,10 +144,19 @@ fi
 
 phase install
 calibrate_boundary
+WATCH_PID=""; CAPTURE_PID=""
+stop_bg() {
+  touch "$OUT/watch-stop"
+  [ -n "$WATCH_PID" ] && pkill -P "$WATCH_PID" 2>/dev/null
+  kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID 2>/dev/null
+}
+trap stop_bg EXIT
+bash "$RG/vm-sampler.sh" "$OUT" 5 </dev/null >> "$OUT/sampler.log" 2>&1 &
+SAMPLER_PID=$!
 install_args=()
 if [ -n "$INSTALL_TARBALL" ]; then log "install.sh --tarball $INSTALL_TARBALL (experiment)"; install_args=(--tarball "$INSTALL_TARBALL"); else log "zero-arg install.sh"; fi
 install_t0=$SECONDS
-if ! bash "$RG/install.sh" "${install_args[@]}" > "$OUT/install.log" 2>&1; then
+if ! bash "$RG/install.sh" ${install_args[@]+"${install_args[@]}"} > "$OUT/install.log" 2>&1; then
   log "install.sh failed (tail of $OUT/install.log):"; tail -20 "$OUT/install.log" | tee -a "$OUT/run.log"
   res install_ok 0; exit 1
 fi
@@ -181,16 +190,7 @@ WATCH_T0="$(date +%s)"
     sleep 5
   done ) &
 WATCH_PID=$!
-bash "$RG/vm-sampler.sh" "$OUT" 5 &
-SAMPLER_PID=$!
-CAPTURE_PID=""
 [ "$CAPTURE" = 1 ] && { bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 5 & CAPTURE_PID=$!; }
-stop_bg() {
-  touch "$OUT/watch-stop"
-  pkill -P "$WATCH_PID" 2>/dev/null
-  kill "$WATCH_PID" "$SAMPLER_PID" $CAPTURE_PID 2>/dev/null
-}
-trap stop_bg EXIT
 if [ "$COREDNS_REQ" = 1 ]; then
   k -n kube-system set resources deployment/coredns --requests=cpu=100m,memory=70Mi >> "$OUT/run.log" 2>&1
   kw -n kube-system rollout status deployment/coredns --timeout=180s >> "$OUT/run.log" 2>&1 || log "coredns rollout not complete"

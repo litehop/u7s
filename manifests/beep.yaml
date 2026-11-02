@@ -1,4 +1,4 @@
-# Vendored from litehop/beep v0.6.0 (deploy/base, rendered -- no kustomize at install time),
+# Vendored from litehop/beep v0.7.0 (deploy/base, rendered -- no kustomize at install time),
 # u7s's default Service type=LoadBalancer provider (the k3s klipper-lb role), applied via the
 # well-known-manifest-folder mechanism (docs/decisions/well-known-manifest-folder.md).
 #
@@ -8,7 +8,9 @@
 #                           uplink beep admits LoadBalancer traffic on.
 #   __POD_CLUSTER_CIDR__    install.sh's $POD_CLUSTER_CIDR, the same value flannel and
 #                           kube-controller-manager use. Wrong here and beep rejects every
-#                           backend Pod.
+#                           backend Pod. On a dual-stack install the --pod-cidr line is
+#                           expanded to one line per family (beep admits a pod IP only against
+#                           the CIDR of its own family).
 #
 # Departures from upstream deploy/base:
 #   - Image pinned by index digest instead of :latest (both containers).
@@ -199,6 +201,7 @@ spec:
         app.kubernetes.io/name: servicelb-controller
     spec:
       serviceAccountName: servicelb-controller
+      priorityClassName: system-node-critical
       # Pod-level automount is off so the privileged node-prep initContainer, which never calls
       # the API, gets no token; the `serviceaccount` volume below is mounted into the controller
       # container only.
@@ -221,7 +224,7 @@ spec:
         # the geneve0 rp_filter=0 write (persisted in the host's /etc/sysctl.d/60-beep.conf)
         # must happen before the unprivileged controller starts.
         - name: node-prep
-          image: docker.io/valerauko/beep-lb@sha256:076a8474721eb81196a4b13e6fa0b29dfbc19a269a451d025521b53cfed04ab7
+          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
           securityContext:
             privileged: true
           args:
@@ -231,7 +234,7 @@ spec:
               mountPath: /etc/sysctl.d/60-beep.conf
       containers:
         - name: servicelb-controller
-          image: docker.io/valerauko/beep-lb@sha256:076a8474721eb81196a4b13e6fa0b29dfbc19a269a451d025521b53cfed04ab7
+          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
           resources:
             requests:
               cpu: 25m
@@ -277,6 +280,10 @@ spec:
             - --pod-cidr=__POD_CLUSTER_CIDR__
             - --node-ip=$(NODE_IP)
             - --uplink-iface=__IFACE__
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/tmp/beep-ready"]
+            periodSeconds: 5
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
