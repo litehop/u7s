@@ -1435,7 +1435,7 @@ write_join_runner() {
     echo 'ensure_jq() { :; }'
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns cluster_families_from_cidrs issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1475,6 +1475,14 @@ echo 'CLUSTER_DNS="10.43.0.10"' > "$JOIN_CA_DIR_K3S/config"
 mint_k3s_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_K3S" 2>&1)"
 assert "a non-default-DNS cluster's join command carries --cluster-dns, else the worker's kubelet would resolve via the default VIP and pods on it lose DNS" \
   "$(printf '%s' "$mint_k3s_out" | grep -qF -- '--cluster-dns 10.43.0.10' && echo 1 || echo 0)"
+assert "a single-stack IPv4 cluster's join command carries no --cluster-ip-families (default 4)" \
+  "$(printf '%s' "$mint_out$mint_k3s_out" | grep -qF -- '--cluster-ip-families' && echo 0 || echo 1)"
+JOIN_CA_DIR_V6FIRST="$JOIN_WORK/cp-state-v6first"
+cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_V6FIRST"
+printf 'SERVICE_CIDR="fd00:96::/108,10.96.0.0/12"\nPOD_CLUSTER_CIDR="fd00:244::/56,10.244.0.0/16"\n' > "$JOIN_CA_DIR_V6FIRST/config"
+mint_v6first_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_V6FIRST" 2>&1)"
+assert "a v6-first dual-stack cluster's join command carries --cluster-ip-families 6,4, else the worker cannot order or filter its --node-ip" \
+  "$(printf '%s' "$mint_v6first_out" | grep -qF -- '--cluster-ip-families 6,4' && echo 1 || echo 0)"
 
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
@@ -2081,13 +2089,13 @@ rm -rf "$KEY_WORK"
 NET_WORK="$(mktemp -d)"
 trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
 {
-  for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_cidrs \
+  for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs \
     reconcile_network_flag check_node_ip_outside_ranges render_vendored_manifests write_kubelet_config_yaml; do
     awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
   done
 } > "$NET_WORK/fns.sh"
 assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
-  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 20 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 21 ] && echo 1 || echo 0)"
 
 # net_run <scenario>: runs <scenario> after the extracted functions with the
 # production defaults loaded; sets NET_STATUS/NET_OUT.
@@ -2095,7 +2103,7 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
-    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; EXISTING_INSTALL=0'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
     echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s'
     cat "$NET_WORK/fns.sh"
@@ -2161,7 +2169,7 @@ net_run "$RESOLVE$K3S"'; CLUSTER_DNS=10.43.0.53; resolve && echo "$CLUSTER_DNS"'
 assert "an explicit --cluster-dns inside the range is honoured, not overwritten by the derived tenth host" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.43.0.53" ] && echo 1 || echo 0)"
 
-net_run 'CLUSTER_DNS=10.43.0.10; validate_network_config 1 && echo ok'
+net_run 'CLUSTER_DNS=10.43.0.10; CLUSTER_FAMILIES=4; validate_network_config 1 && echo ok'
 assert "a worker validates only --cluster-dns syntax (it has no service range to check against)" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
 
@@ -2290,7 +2298,7 @@ net_bad "an IPv6 --cluster-dns equal to the network address is refused" \
 net_run "$RESOLVE"'SERVICE_CIDR=10.96.0.0/12,fd00:96::/124; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; CLUSTER_DNS=fd00:96::f; validate_network_config 0 && echo ok'
 assert "the last address of a /124 IPv6 service range is allocatable (IPv6 has no broadcast), unlike IPv4's" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
-net_run 'CLUSTER_DNS=fd00:96::a; validate_network_config 1 && echo ok'
+net_run 'CLUSTER_DNS=fd00:96::a; CLUSTER_FAMILIES=6,4; validate_network_config 1 && echo ok'
 assert "a worker accepts an IPv6 --cluster-dns (the DNS VIP of an IPv6-primary cluster)" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
 
@@ -2397,7 +2405,7 @@ GOLDEN_OUT="$NET_WORK/golden"
 mkdir -p "$GOLDEN_OUT" "$NET_WORK/golden-man"
 cp "$ROOT_DIR"/manifests/*.yaml "$NET_WORK/golden-man/"
 golden_scenario='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10
-BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.1
+BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; APISERVER_LISTEN=192.168.1.5:6443; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.1
 validate_network_config 0 || exit 1
 KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
 '
@@ -2465,33 +2473,12 @@ net_run 'parse_node_ip_list "10.0.0.5,"'
 assert "--node-ip rejects an empty list entry" \
   "$([ "$NET_STATUS" -ne 0 ] && echo 1 || echo 0)"
 
-RECON='SERVICE_CIDR_IPV4=10.96.0.0/12; POD_CLUSTER_CIDR_IPV4=10.244.0.0/16; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV6=""; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
-RECON_DUAL='SERVICE_CIDR_IPV4=10.96.0.0/12; POD_CLUSTER_CIDR_IPV4=10.244.0.0/16; SERVICE_CIDR_IPV6=fd00:96::/108; POD_CLUSTER_CIDR_IPV6=fd00:244::/56; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56'
-net_run "$RECON_DUAL"'; NODE_IPS=10.0.0.5; NODE_IPS_EXPLICIT=0; reconcile_node_ips_with_cidrs'
-assert "dual-stack ranges on a node with only an IPv4 address fail, naming the missing IPv6 family (otherwise IPv6 pods are allocated on a node that cannot route them)" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv6 address' && echo 1 || echo 0)"
-net_run "$RECON_DUAL"'; NODE_IPS=fd00::5; NODE_IPS_EXPLICIT=1; reconcile_node_ips_with_cidrs'
-assert "dual-stack ranges on an IPv6-only --node-ip fail, naming the missing IPv4 family" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv4 address' && echo 1 || echo 0)"
-net_run "$RECON_DUAL"'; NODE_IPS=10.0.0.5,fd00::5; NODE_IPS_EXPLICIT=0; reconcile_node_ips_with_cidrs && echo "$NODE_IPS"'
-assert "dual-stack ranges on a dual-stack node pass and keep both addresses" \
-  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.0.0.5,fd00::5" ] && echo 1 || echo 0)"
-net_run "$RECON"'; NODE_IPS=10.0.0.5,fd00::5; NODE_IPS_EXPLICIT=1; reconcile_node_ips_with_cidrs'
-assert "an explicit IPv6 --node-ip with single-stack IPv4 ranges is an error (a contradictory flag, not something to guess around)" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv6 range' && echo 1 || echo 0)"
-net_run "$RECON"'; NODE_IPS=10.0.0.5,2001:db8::5; NODE_IPS_EXPLICIT=0; reconcile_node_ips_with_cidrs && echo "$NODE_IPS"'
-assert "an auto-detected IPv6 address on a host installing a single-stack IPv4 cluster is dropped, so a merely IPv6-capable host keeps today's single-stack install" \
-  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.0.0.5" ] && echo 1 || echo 0)"
-net_run "$RECON"'; NODE_IPS=2001:db8::5; NODE_IPS_EXPLICIT=0; reconcile_node_ips_with_cidrs'
-assert "an IPv6-only interface with IPv4 ranges fails naming IPv4 instead of installing with no node address" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv4 address' && echo 1 || echo 0)"
-
 # The real derivation block and the real unit ExecStart lines, run with a
 # dual-stack and an IPv6-primary node.
 NODE_DERIVE="$(awk '/^if \[ -n "\$NODE_IP" \]; then$/,/^\[ "\$NODE_IPS" = "\$IFACE_IP" \]/' "$INSTALL")"
 NODE_UNITS="$(grep -E '^ExecStart=.*(--node-ip=|u7s-apiserver)' "$INSTALL")"
 node_scenario() {
-  printf '%s\nWORKER_MODE=0; IFACE=eth0; NODE_NAME=n1; BIN_DIR=/b; STATE_DIR=/s; KUBELET_ROUND2_FLAGS=""; ALLOW_SERVICE_EXTERNAL_IPS=0; CLUSTER_DNS=%s\n%s\nvalidate_network_config 0 || exit 1\n%s\neval "cat <<EOF\n%s\nEOF"\n' \
+  printf '%s\nWORKER_MODE=0; IFACE=eth0; NODE_NAME=n1; BIN_DIR=/b; STATE_DIR=/s; KUBELET_ROUND2_FLAGS=""; ALLOW_SERVICE_EXTERNAL_IPS=0; CLUSTER_DNS=%s\n%s\nvalidate_network_config 0 || exit 1\nCLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"\n%s\neval "cat <<EOF\n%s\nEOF"\n' \
     "$IP_STUB" "$3" "$1" "$NODE_DERIVE" "$NODE_UNITS"
   : "$2"
 }
@@ -2504,14 +2491,106 @@ assert "the apiserver advertises the primary IPv4 address and carries the IPv6 a
 V6_PRIMARY='NODE_IP="fd00::5,10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16'
 net_run "$(node_scenario "$V6_PRIMARY" "" fd00:96::a)"
 assert "an IPv6 primary address is bracketed in --listen and --advertise-address (an unbracketed v6 host:port does not parse)" \
-  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--listen \[fd00::5\]:6443 --advertise-address https://\[fd00::5\]:6443 --apiserver-cert-extra-sans 10.0.0.5 ' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--listen \[fd00::5\]:6443,10.0.0.5:6443 --advertise-address https://\[fd00::5\]:6443 --apiserver-cert-extra-sans 10.0.0.5 ' && echo 1 || echo 0)"
 SINGLE='NODE_IP="10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
 net_run "$(node_scenario "$SINGLE" "" 10.96.0.10)"
-assert "a single-stack --node-ip yields a single --node-ip address and no extra-SANs flag" \
-  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--node-ip=10.0.0.5 ' && ! echo "$NET_OUT" | grep -q 'extra-sans' && echo 1 || echo 0)"
+assert "a single-stack --node-ip yields a single --node-ip address, one --listen address and no extra-SANs flag (single-stack unit output is unchanged)" \
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--node-ip=10.0.0.5 ' && echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q 'extra-sans' && echo 1 || echo 0)"
+net_run "$(node_scenario "$DUAL_RANGES" "" 10.96.0.10)"
+assert "a dual-stack node's apiserver listens on every node address, not only the primary (the cert and kubelet advertise both, so an unbound family is unreachable), and never on a wildcard" \
+  "$(echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443,\[2001:db8::5\]:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q -- '--listen 0.0.0.0\|--listen \[::\]' && echo 1 || echo 0)"
 net_run "$(node_scenario "$DUAL_RANGES"$'\nip() { echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\\\       valid_lft forever preferred_lft forever"; }' "" 10.96.0.10)"
 assert "dual-stack ranges on a single-family interface abort the install flow itself (not just the helper)" \
   "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv6 address' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Node-address x cluster-family matrix, through the real derivation block for
+# both roles. A control plane learns the families from its ranges; a worker
+# from --cluster-ip-families. Both must end in a --node-ip whose first address
+# has the cluster's primary family, or a clear error.
+# ---------------------------------------------------------------------------
+V4A=10.0.0.5; V6A=2001:db8::5
+cell_scenario() {
+  local role="$1" iface="$2" mode="$3" fams="$4" node_ip="" ranges
+  case "$mode:$iface" in
+    a:*) ;;
+    e:v4) node_ip="$V4A" ;;
+    e:v6) node_ip="$V6A" ;;
+    e:d46) node_ip="$V4A,$V6A" ;;
+    e:d64) node_ip="$V6A,$V4A" ;;
+  esac
+  printf 'ip() {\n'
+  case "$iface" in v4|d46|d64) printf '  echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\\\       valid_lft forever preferred_lft forever"\n' ;; esac
+  case "$iface" in v6|d46|d64) printf '  echo "2: eth0    inet6 2001:db8::5/64 scope global eth0\\\\       valid_lft forever preferred_lft forever"\n' ;; esac
+  printf '}\nIFACE=eth0; NODE_IP="%s"; NODE_IPS_EXPLICIT=0; BIN_DIR=/b\n' "$node_ip"
+  if [ "$role" = cp ]; then
+    case "$fams" in
+      4) ranges='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10' ;;
+      4,6) ranges='SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; CLUSTER_DNS=10.96.0.10' ;;
+      6,4) ranges='SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a' ;;
+      6) ranges='SERVICE_CIDR=fd00:96::/108; POD_CLUSTER_CIDR=fd00:244::/56; CLUSTER_DNS=fd00:96::a' ;;
+    esac
+    printf 'WORKER_MODE=0; %s\nvalidate_network_config 0 || exit 1\nCLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"\n' "$ranges"
+  else
+    printf 'WORKER_MODE=1; CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=%s\nvalidate_network_config 1 || exit 1\n' "$fams"
+  fi
+  printf '%s\necho "RESULT:$NODE_IPS"\n' "$NODE_DERIVE"
+}
+# iface mode families expected (an ERR:<text> row must fail with <text>)
+MATRIX_ROWS="
+v4 a 4 $V4A
+v4 a 4,6 ERR:no IPv6 address
+v4 a 6,4 ERR:no IPv6 address
+v4 a 6 ERR:no IPv6 address
+v6 a 4 ERR:no IPv4 address
+v6 a 4,6 ERR:no IPv4 address
+v6 a 6,4 ERR:no IPv4 address
+v6 a 6 $V6A
+d46 a 4 $V4A
+d46 a 4,6 $V4A,$V6A
+d46 a 6,4 $V6A,$V4A
+d46 a 6 $V6A
+v4 e 4 $V4A
+v4 e 4,6 ERR:no IPv6 address
+v4 e 6,4 ERR:no IPv6 address
+v6 e 4 ERR:no IPv4 address
+v6 e 4,6 ERR:no IPv4 address
+v6 e 6,4 ERR:no IPv4 address
+v6 e 6 $V6A
+d46 e 4 ERR:no IPv6 range
+d46 e 4,6 $V4A,$V6A
+d46 e 6,4 ERR:lists an IPv4 address first
+d46 e 6 ERR:no IPv4 range
+d64 e 4 ERR:no IPv6 range
+d64 e 4,6 ERR:lists an IPv6 address first
+d64 e 6,4 $V6A,$V4A
+d64 e 6 ERR:no IPv4 range
+"
+MATRIX_TOTAL=0; MATRIX_OK=0
+for role in cp worker; do
+  while read -r m_iface m_mode m_fams m_expect_rest; do
+    [ -n "$m_iface" ] || continue
+    MATRIX_TOTAL=$(( MATRIX_TOTAL + 1 ))
+    net_run "$(cell_scenario "$role" "$m_iface" "$m_mode" "$m_fams")"
+    m_ok=0
+    case "$m_expect_rest" in
+      ERR:*) [ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- "${m_expect_rest#ERR:}" && m_ok=1 ;;
+      *) [ "$NET_STATUS" -eq 0 ] && [ "$(printf '%s' "$NET_OUT" | grep '^RESULT:')" = "RESULT:$m_expect_rest" ] && m_ok=1 ;;
+    esac
+    [ "$m_ok" -eq 1 ] && MATRIX_OK=$(( MATRIX_OK + 1 ))
+    assert "$role, iface=$m_iface, node-ip mode=$m_mode, cluster families=$m_fams -> $m_expect_rest (a node whose first address is not the cluster's primary family, or which lacks/has a surplus family, must be rebuilt or refused, never registered as-is)" "$m_ok"
+  done <<< "$MATRIX_ROWS"
+done
+echo "cells: $MATRIX_OK/$MATRIX_TOTAL"
+
+assert "a worker rejects a malformed --cluster-ip-families instead of guessing a family set" \
+  "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'must be one of' && echo 1 || echo 0)"
+net_run 'cluster_families_from_cidrs "fd00:96::/108,10.96.0.0/12" "10.244.0.0/16"'
+assert "families are the Service ranges' families in order (the primary Service range decides the node's primary family)" \
+  "$([ "$NET_OUT" = "6,4" ] && echo 1 || echo 0)"
+net_run 'cluster_families_from_cidrs "10.96.0.0/12" "10.244.0.0/16,fd00:244::/56"'
+assert "a family only the pod ranges use still counts, after the Service families (pods need a node address of it)" \
+  "$([ "$NET_OUT" = "4,6" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # wait_for_cluster_ready: install must not exit 0 while the node or a
