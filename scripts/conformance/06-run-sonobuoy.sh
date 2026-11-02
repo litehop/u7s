@@ -309,6 +309,11 @@ FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass, Sideca
 # picks it up alongside e2e.txt/junit_01.xml.
 JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 
+# NODES lists every node in the run: its length is the e2e --num-nodes, and
+# pod-log evacuation and host-log collection loop over it.
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+
 # build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
 # elements for this invocation. apply=1 wires in the FeatureGate allow-set
 # above plus the existing [Flaky] skip; apply=0 (the --unsafe-focus escape
@@ -330,9 +335,18 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 #
 # GINKGO_SUITE_TIMEOUT (e.g. "3600s"), when set, adds ginkgo's own --timeout so a
 # total hang is cut off at suite level instead of ginkgo's 24h default.
+#
+# E2E_EXTRA_ARGS (e2e.test flags) replaces the plugin manifest's own value, so
+# it repeats --progress-report-url and adds --num-nodes: under --provider=local
+# the framework's node count defaults to -1 and SkipUnlessNodeCountIsAtLeast
+# self-skips every multi-node spec. It splits on the same separator as the
+# ginkgo args.
 build_filter_args() {
   local apply="$1"
   local gt="" gt_pipe=""
+  local e2e_sep=" "
+  [ "$apply" -eq 1 ] && e2e_sep="|"
+  local e2e_args="--progress-report-url=http://localhost:8099/progress${e2e_sep}--num-nodes=${#NODES[@]}"
   if [ -n "${GINKGO_SUITE_TIMEOUT:-}" ]; then
     gt=" --timeout=${GINKGO_SUITE_TIMEOUT}"
     gt_pipe="|--timeout=${GINKGO_SUITE_TIMEOUT}"
@@ -350,6 +364,7 @@ build_filter_args() {
     FILTER_ARGS=(
       "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}${gt_pipe}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS=${e2e_args}"
       "--e2e-skip=${skip}"
     )
   else
@@ -357,7 +372,8 @@ build_filter_args() {
     # passes split on the ginkgo label instead -- complementary by construction.
     local extra=" --label-filter=!Disruptive"
     [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS=${e2e_args}")
   fi
 }
 
@@ -468,11 +484,6 @@ fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
 fi
-
-# NODES lists every node in the run (computed here, before evacuation, so
-# both this step and the tarball search below use the same list).
-NODES=("$VM_NAME")
-[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
 
 # Evacuate pod logs immediately — before namespace GC removes them.
 # sonobuoy --wait returns after the e2e binary exits but before namespace teardown,
