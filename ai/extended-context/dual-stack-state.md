@@ -31,8 +31,10 @@ remaining phase.
   from the token-readable `kube-system/u7s-cluster-config`; the apiserver
   listens on every node address.
 - #2080: proxy v6 host:port and upstream node-address type order.
-- #2083: openssl-free node CSR; node names must be at most 63 characters (the
-  hostname label limit).
+- #2083: openssl-free node CSR; removed install.sh's 52-character node-name
+  guard (the openssl CN limit). The effective limit is 63 because kubelet
+  puts the node name in the `kubernetes.io/hostname` label; install.sh does
+  not enforce it yet (`mayor-2qk05`).
 - #2087: SPDY exec/attach passed through to the kubelet like upstream
   UpgradeAwareHandler.
 - #2089: hostNetwork pods' podIPs follow `status.hostIPs`.
@@ -46,10 +48,12 @@ remaining phase.
   IPV4_IPV6/EXTERNAL `10.80.0.0/24` + `2600:1900:4040:51a::/64` is dedicated,
   with no ULA internal v6; `u7s-probe` is `10.81.0.0/24`. IPv6 access type is
   one-way (#2037). IAP SSH is IPv4-only and returns 4047 for about a minute
-  after VM create (retry). Never run `vps.sh gc` during a live run.
+  after VM create (retry; `mayor-8w6at.9` notes, #2037). Never run `vps.sh gc` during a live run.
 - Lima: `run-all.sh --dual-stack` (#2045, #2090, #2091). user-v2 forwards v6
-  unicast but drops multicast, so each VM gets a static ULA address and seeded
-  neighbours (NDP does not work); a v6 Service route is added; `--num-nodes`
+  unicast but drops multicast, so IPv6 neighbour discovery does not work. Each
+  VM gets a static ULA address and the rig seeds neighbour entries (observed:
+  a deleted entry went FAILED and ping6 returned "Address unreachable";
+  `mayor-8w6at.11` notes). A v6 Service route is added; `--num-nodes`
   and `sonobuoy retrieve` are used. The default rig stays IPv4-only.
 - Release tarballs are x86_64 only, so Lima (aarch64) cannot install from a
   release.
@@ -67,8 +71,11 @@ remaining phase.
   contains #2087.
 - `mayor-sy83n`: re-mint serving cert on SAN change; persist auto-detected
   node IPs.
-- `mayor-5f4ey`: harness hardening (gc LB firewall rule after crash, per-family
-  source-IP assertion).
+- `mayor-5f4ey`: harness hardening: per-family client source-IP assertion,
+  `pipefail` in `sonobuoy_dual`, scope `vps.sh gc`'s LB-rule sweep by run id
+  or age (the sweep itself shipped in #2079).
+- `mayor-8w6at.22`: Lima dual-stack rig's v6 Service route ignores a custom
+  `--service-cidr`.
 - `mayor-l5wmt`: `--external-iface`/`--external-ip`, data-plane default iface,
   stable control-plane endpoint.
 - `mayor-2qk05` (P2): label key/value validation across kinds, incl. Node.
