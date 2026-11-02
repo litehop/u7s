@@ -42,6 +42,12 @@ check "boot script assigns own ULA without DAD (no multicast to run DAD)" \
   "1" "$(printf '%s\n' "$script" | grep -cxF 'ip -6 addr replace fd85:0:0:1::3/64 dev eth0 nodad')"
 check "boot script pins peer as a permanent neighbour (NDP is dropped by the switch)" \
   "1" "$(printf '%s\n' "$script" | grep -cxF 'ip -6 neigh replace fd85:0:0:1::100 lladdr 52:55:55:aa:bb:cc dev eth0 nud permanent')"
+check "boot script routes the v6 Service CIDR from the rig constant (else node->v6 ClusterIP is ENETUNREACH before kube-proxy DNAT)" \
+  "1" "$(printf '%s\n' "$script" | grep -cxF "ip -6 route replace ${RIG_SERVICE_CIDR_V6} dev lo")"
+check "the v6 Service CIDR constant is the v6 half of the dual Service range" \
+  "fd00:96::/108" "$RIG_SERVICE_CIDR_V6"
+check "lima-start.sh adds no v6 route itself, so the single-stack rig gets none (route lives only in the dual-stack boot script)" \
+  "0" "$(grep -c 'ip -6 route' "$DIR/lima-start.sh" || true)"
 check "script with no peers has no neighbour lines" \
   "0" "$(lan_v6_script eth0 fd85:0:0:1::3 | grep -c neigh || true)"
 

@@ -326,6 +326,9 @@ lan_v6_script() {
   shift 2
   echo "#!/bin/sh"
   echo "ip -6 addr replace ${self}/64 dev ${iface} nodad"
+  # Lima VMs have no default v6 route (no RA), so locally originated traffic to
+  # a v6 ClusterIP dies with ENETUNREACH before kube-proxy's OUTPUT DNAT runs.
+  echo "ip -6 route replace ${RIG_SERVICE_CIDR_V6} dev lo"
   while [ "$#" -ge 2 ]; do
     echo "ip -6 neigh replace $1 lladdr $2 dev ${iface} nud permanent"
     shift 2
@@ -390,6 +393,7 @@ lan_v6_seed_mesh() {
 RIG_POD_CIDR_V4="10.244.0.0/16"
 RIG_POD_CIDR_V6="fd00:244::/56"
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
+RIG_SERVICE_CIDR_V6="${RIG_SERVICE_CIDR_DUAL#*,}"
 RIG_KUBE_DNS_V6="fd00:96::a"
 
 # KCM pod-CIDR flags. Upstream rejects --node-cidr-mask-size with two cluster
