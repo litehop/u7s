@@ -34,21 +34,24 @@ impl std::fmt::Debug for StatusError {
     }
 }
 
+/// Private marker in `details`, set only by `Status::internal_actionable` and stripped
+/// before the response is serialized.
+const ACTIONABLE_KEY: &str = "u7sActionable";
+
+fn is_actionable(status: &Status) -> bool {
+    status
+        .details
+        .as_ref()
+        .is_some_and(|d| d.get(ACTIONABLE_KEY).is_some())
+}
+
 /// Generic client-facing body for a 500/502 `Status`, or `None` when the status carries a
 /// message meant for the client. Internal errors embed store keys, sqlite and TLS/dial
 /// errors with internal addresses; those go to the server log, never the response.
-/// A 500 built by `Status::internal_actionable` carries `details.causes` and is the only
-/// one exempt.
+/// Only a 500 built by `Status::internal_actionable` (which sets `ACTIONABLE_KEY`) is exempt.
 fn redacted_message(status: &Status) -> Option<&'static str> {
     match (status.code, status.reason) {
-        (500, "InternalError")
-            if status
-                .details
-                .as_ref()
-                .is_some_and(|d| d.get("causes").is_some()) =>
-        {
-            None
-        }
+        (500, "InternalError") if is_actionable(status) => None,
         (500, "InternalError") => Some("Internal error occurred"),
         (502, "BadGateway") => Some("Bad Gateway"),
         _ => None,
@@ -66,6 +69,8 @@ impl IntoResponse for StatusError {
                 "request failed with a server error"
             );
             self.1.message = generic.to_owned();
+        } else if let Some(d) = self.1.details.as_mut().and_then(|d| d.as_object_mut()) {
+            d.remove(ACTIONABLE_KEY);
         }
         let retry_after = self
             .1
@@ -324,7 +329,8 @@ impl Status {
     pub fn internal_actionable(cause: String) -> StatusError {
         let mut err = Status::internal(format!("Internal error occurred: {cause}"));
         err.1.details = Some(Box::new(serde_json::json!({
-            "causes": [{"message": cause}]
+            "causes": [{"message": cause}],
+            ACTIONABLE_KEY: true
         })));
         err
     }
@@ -575,6 +581,24 @@ mod tests {
         assert_eq!(
             v["details"]["causes"][0]["message"],
             "failed calling webhook \"deny.example.com\": failed to call webhook"
+        );
+        assert!(
+            v["details"].get(ACTIONABLE_KEY).is_none(),
+            "the internal marker must not leak into the response"
+        );
+    }
+
+    // A future 500 that merely carries details.causes (e.g. built from a store error) must
+    // stay redacted; only the explicit constructor opts out.
+    #[tokio::test]
+    async fn internal_error_with_causes_built_otherwise_stays_redacted() {
+        let mut err = Status::internal("sqlite: disk I/O error at /var/lib/u7s/db".into());
+        err.1.details = Some(Box::new(serde_json::json!({
+            "causes": [{"message": "sqlite: disk I/O error at /var/lib/u7s/db"}]
+        })));
+        assert_eq!(
+            body_message(err.into_response()).await,
+            "Internal error occurred"
         );
     }
 
