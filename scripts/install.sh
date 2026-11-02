@@ -57,7 +57,17 @@ fi
 # (docs/decisions/install-script-ux.md):
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
 #   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
-#                                 physical non-loopback interface).
+#                                 physical non-loopback interface). Its first
+#                                 global-scope IPv4 and IPv6 address (IPv4
+#                                 first) are the node addresses.
+#   --node-ip   / U7S_NODE_IP     Node addresses instead of the interface's:
+#                                 one IP, or one per family comma-separated
+#                                 (e.g. 10.0.0.5,fd00::5). The first is the
+#                                 primary: apiserver advertise address and
+#                                 kube-proxy's server; every address goes to
+#                                 kubelet --node-ip and the serving cert SANs.
+#                                 With dual-stack --service-cidr/--cluster-cidr
+#                                 the node needs an address of each family.
 #   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12);
 #                                       or two comma-separated ranges of
 #                                       different IP families (dual-stack,
@@ -147,6 +157,12 @@ DEFAULT_TARBALL_URL=""
 
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
+# Operator-supplied node addresses (comma-separated, at most one per family);
+# empty = use the interface's global-scope addresses. NODE_IPS is the resolved
+# list either way, the primary (first) address being IFACE_IP.
+NODE_IP="${U7S_NODE_IP:-}"
+NODE_IPS=""
+NODE_IPS_EXPLICIT=0
 # Empty = not passed; the defaults below apply after the persisted config is
 # consulted (an unset flag on a re-run keeps what the first install chose).
 DEFAULT_SERVICE_CIDR="10.96.0.0/12"
@@ -182,6 +198,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
+    --node-ip) NODE_IP="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --cluster-cidr) POD_CLUSTER_CIDR="$2"; shift 2 ;;
     --cluster-dns) CLUSTER_DNS="$2"; shift 2 ;;
@@ -200,6 +217,7 @@ done
 # "a, b" and "a,b" are one dual-stack value: persist and compare one form.
 SERVICE_CIDR="${SERVICE_CIDR//[[:space:]]/}"
 POD_CLUSTER_CIDR="${POD_CLUSTER_CIDR//[[:space:]]/}"
+NODE_IP="${NODE_IP//[[:space:]]/}"
 
 if [ -n "$TARBALL" ] && [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; then
   echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
@@ -718,6 +736,81 @@ reconcile_network_flag() {
     return 1
   fi
   printf -v "$var" '%s' "${given:-$effective}"
+}
+
+# Prints the first stable global-scope address of each family on interface $1,
+# IPv4 first, one per line. Link-local, tentative, deprecated, dadfailed and
+# temporary (privacy) IPv6 addresses are skipped: a node identity must not
+# change when the kernel rotates a privacy address or DAD has not finished.
+iface_global_addrs() {
+  ip -o addr show dev "$1" | awk '
+    ($3 == "inet" || $3 == "inet6") {
+      scope = ""; bad = 0
+      for (i = 4; i <= NF; i++) {
+        if ($i == "valid_lft") break
+        if ($i == "scope") scope = $(i + 1)
+        if ($i ~ /^(tentative|deprecated|dadfailed|temporary)$/) bad = 1
+      }
+      if (scope != "global" || bad) next
+      a = $4; sub(/\/.*/, "", a)
+      if ($3 == "inet" && v4 == "") v4 = a
+      if ($3 == "inet6" && v6 == "") v6 = a
+    }
+    END { if (v4 != "") print v4; if (v6 != "") print v6 }'
+}
+
+# Validates a comma-separated --node-ip list (each entry a literal IPv4/IPv6
+# address, at most one per family) and sets NODE_IPS to it.
+parse_node_ip_list() {
+  local list="$1" ip have4="" have6=""
+  [ -n "$list" ] || { echo "error: --node-ip is empty" >&2; return 1; }
+  for ip in ${list//,/ }; do
+    if ipv4_to_int "$ip" >/dev/null; then
+      [ -z "$have4" ] || { echo "error: --node-ip $list has two IPv4 addresses ($have4 and $ip); at most one per IP family" >&2; return 1; }
+      have4="$ip"
+    elif ip6_to_hex "$ip" >/dev/null; then
+      [ -z "$have6" ] || { echo "error: --node-ip $list has two IPv6 addresses ($have6 and $ip); at most one per IP family" >&2; return 1; }
+      have6="$ip"
+    else
+      echo "error: --node-ip entry '$ip' is not a literal IPv4 or IPv6 address" >&2; return 1
+    fi
+  done
+  case "$list" in ,*|*,|*,,*) echo "error: --node-ip '$list' has an empty entry" >&2; return 1 ;; esac
+  NODE_IPS="$list"
+}
+
+# Control plane only: the node address families must be exactly the families
+# the cluster ranges use. A family the ranges need but the node lacks is always
+# an error (a dual-stack cluster cannot run on a single-family node). A node
+# family the ranges do not use is an error when the operator passed --node-ip
+# (almost certainly a typo'd or mismatched flag) and is dropped when the
+# addresses were auto-detected from the interface (a host that happens to
+# carry an IPv6 address must still install a single-stack IPv4 cluster).
+# Rewrites NODE_IPS in the latter case.
+reconcile_node_ips_with_cidrs() {
+  local need=" " have=" " ip kept="" fam
+  [ -z "$SERVICE_CIDR_IPV4$POD_CLUSTER_CIDR_IPV4" ] || need+="4 "
+  [ -z "$SERVICE_CIDR_IPV6$POD_CLUSTER_CIDR_IPV6" ] || need+="6 "
+  for ip in ${NODE_IPS//,/ }; do
+    case "$ip" in *:*) have+="6 " ;; *) have+="4 " ;; esac
+  done
+  for fam in 4 6; do
+    case "$need" in *" $fam "*) ;; *) continue ;; esac
+    case "$have" in *" $fam "*) continue ;; esac
+    echo "error: --service-cidr/--cluster-cidr ($SERVICE_CIDR / $POD_CLUSTER_CIDR) use IPv$fam, but the node addresses ($NODE_IPS) have no IPv$fam address. Give the node one (--node-ip <v4>,<v6> or an --iface that carries both) or use single-stack ranges." >&2
+    return 1
+  done
+  for ip in ${NODE_IPS//,/ }; do
+    case "$ip" in *:*) fam=6 ;; *) fam=4 ;; esac
+    case "$need" in
+      *" $fam "*) kept="${kept:+$kept,}$ip" ;;
+      *) if [ "$NODE_IPS_EXPLICIT" -eq 1 ]; then
+           echo "error: --node-ip $NODE_IPS has an IPv$fam address ($ip) but --service-cidr/--cluster-cidr ($SERVICE_CIDR / $POD_CLUSTER_CIDR) have no IPv$fam range. Add an IPv$fam range for dual-stack, or drop $ip from --node-ip." >&2
+           return 1
+         fi ;;
+    esac
+  done
+  NODE_IPS="$kept"
 }
 
 # Fails when $IFACE_IP (arg 1) sits inside either range: the node's own address
@@ -1597,6 +1690,7 @@ fi
 # conditionally today (for --mint-join-token/--join).
 PERSISTED_NODE_NAME=""
 PERSISTED_IFACE=""
+PERSISTED_NODE_IP=""
 PERSISTED_SERVICE_CIDR=""
 PERSISTED_POD_CLUSTER_CIDR=""
 PERSISTED_CLUSTER_DNS=""
@@ -1609,6 +1703,8 @@ if [ -f "$CONFIG_FILE" ]; then
   PERSISTED_NODE_NAME="$(normalize_node_name "$(. "$CONFIG_FILE"; printf '%s' "${NODE_NAME:-}")")"
   # shellcheck disable=SC1090
   PERSISTED_IFACE="$(. "$CONFIG_FILE"; printf '%s' "${IFACE:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_NODE_IP="$(. "$CONFIG_FILE"; printf '%s' "${NODE_IP:-}")"
   # shellcheck disable=SC1090
   PERSISTED_SERVICE_CIDR="$(. "$CONFIG_FILE"; printf '%s' "${SERVICE_CIDR:-}")"
   # shellcheck disable=SC1090
@@ -1636,6 +1732,17 @@ if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_IFACE" ]; then
     IFACE="$PERSISTED_IFACE"
   elif [ "$IFACE" != "$PERSISTED_IFACE" ]; then
     echo "error: --iface $IFACE conflicts with the interface persisted at install time ($PERSISTED_IFACE, recorded in $CONFIG_FILE). Changing it would rebake a different --advertise-address into every kubeconfig the apiserver rewrites, silently breaking any copy already distributed off this box. To proceed anyway: delete $CONFIG_FILE (a flat sibling file next to state.db/CA/kubeconfig -- this touches no cluster data) and re-run install.sh." >&2
+    exit 1
+  fi
+fi
+
+# An explicit --node-ip is persisted like --iface and guarded the same way: a
+# different list would rebake another --advertise-address and cert SAN set.
+if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_NODE_IP" ]; then
+  if [ -z "$NODE_IP" ]; then
+    NODE_IP="$PERSISTED_NODE_IP"
+  elif [ "$NODE_IP" != "$PERSISTED_NODE_IP" ]; then
+    echo "error: --node-ip $NODE_IP conflicts with the node address list persisted at install time ($PERSISTED_NODE_IP, recorded in $CONFIG_FILE). Changing it would rebake a different --advertise-address into every kubeconfig the apiserver rewrites, silently breaking any copy already distributed off this box. To proceed anyway: delete $CONFIG_FILE (a flat sibling file next to state.db/CA/kubeconfig -- this touches no cluster data) and re-run install.sh." >&2
     exit 1
   fi
 fi
@@ -1694,17 +1801,37 @@ if [ -z "$IFACE" ]; then
   fi
 fi
 
-IFACE_IP="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | sed -n 1p)"
-if [ -z "$IFACE_IP" ]; then
-  echo "error: interface $IFACE has no IPv4 address assigned" >&2
-  exit 1
+if [ -n "$NODE_IP" ]; then
+  NODE_IPS_EXPLICIT=1
+  parse_node_ip_list "$NODE_IP" || exit 1
+else
+  NODE_IPS="$(iface_global_addrs "$IFACE" | paste -sd, -)"
+  if [ -z "$NODE_IPS" ]; then
+    echo "error: interface $IFACE has no global-scope IPv4 or IPv6 address assigned (pass --node-ip to set the node address explicitly)" >&2
+    exit 1
+  fi
 fi
-[ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$IFACE_IP" || exit 1
+# A worker does not know the cluster's ranges: its Node's families are
+# whatever it is given, and the apiserver validates the registration.
+[ "$WORKER_MODE" -eq 1 ] || reconcile_node_ips_with_cidrs || exit 1
+for node_ip in ${NODE_IPS//,/ }; do
+  [ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$node_ip" || exit 1
+done
+IFACE_IP="${NODE_IPS%%,*}"
+# Brackets for an IPv6 primary wherever the address becomes part of a
+# host:port or URL.
+IFACE_IP_HOST="$IFACE_IP"
+case "$IFACE_IP" in *:*) IFACE_IP_HOST="[$IFACE_IP]" ;; esac
+# Every address but the primary (already the advertise host) still has to be
+# in the serving certificate, so a client dialling the node by its other
+# family verifies.
+APISERVER_EXTRA_SANS_FLAG=""
+[ "$NODE_IPS" = "$IFACE_IP" ] || APISERVER_EXTRA_SANS_FLAG=" --apiserver-cert-extra-sans ${NODE_IPS#*,}"
 
 if [ "$EXISTING_INSTALL" -eq 1 ]; then
-  echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+  echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($NODE_IPS)"
 else
-  echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+  echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($NODE_IPS)"
 fi
 
 # An already-joined worker upgrades with its own identity and no token; refuse
@@ -1861,6 +1988,9 @@ install -d -m 0755 /etc/u7s/static-pods
 # identity.
 {
   printf 'NODE_NAME="%s"\nIFACE="%s"\nCLUSTER_DNS="%s"\n' "$NODE_NAME" "$IFACE" "$CLUSTER_DNS"
+  if [ "$NODE_IPS_EXPLICIT" -eq 1 ]; then
+    printf 'NODE_IP="%s"\n' "$NODE_IP"
+  fi
   if [ "$WORKER_MODE" -eq 0 ]; then
     printf 'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n' "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"
   fi
@@ -1971,7 +2101,7 @@ Environment=GOMAXPROCS=2
 # --cert-dir CLI flag, not a KubeletConfiguration yaml field -- kubelet has
 # no certDir/certDirectory config-file key, so setting it in
 # kubelet-config.yaml is a silent no-op.
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$NODE_IPS --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -2088,7 +2218,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
+ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP_HOST:6443 --advertise-address https://$IFACE_IP_HOST:6443$APISERVER_EXTRA_SANS_FLAG --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
@@ -2210,7 +2340,7 @@ Environment=GOMAXPROCS=2
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 # --cert-dir -- see the worker-mode kubelet.service block above for why this
 # must be a CLI flag under $STATE_DIR rather than a kubelet-config.yaml key.
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$NODE_IPS --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 

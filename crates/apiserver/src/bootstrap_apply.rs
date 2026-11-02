@@ -870,6 +870,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
