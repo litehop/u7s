@@ -269,7 +269,7 @@ impl<S: Store> Reserver<'_, S> {
                 return Ok(port);
             }
         }
-        Err(Status::internal(
+        Err(Status::internal_actionable(
             "failed to allocate a nodePort: range is full".to_string(),
         ))
     }

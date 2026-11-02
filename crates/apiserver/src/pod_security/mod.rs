@@ -637,7 +637,7 @@ async fn namespace_labels<S: Store>(
         Ok(None) => Ok(BTreeMap::new()),
         Err(e) => {
             tracing::error!(namespace, err = %e, "PodSecurity: failed to fetch pod namespace");
-            Err(Status::internal(format!(
+            Err(Status::internal_actionable(format!(
                 "failed to lookup namespace {}",
                 go_quote(namespace)
             )))

@@ -37,8 +37,18 @@ impl std::fmt::Debug for StatusError {
 /// Generic client-facing body for a 500/502 `Status`, or `None` when the status carries a
 /// message meant for the client. Internal errors embed store keys, sqlite and TLS/dial
 /// errors with internal addresses; those go to the server log, never the response.
+/// A 500 built by `Status::internal_actionable` carries `details.causes` and is the only
+/// one exempt.
 fn redacted_message(status: &Status) -> Option<&'static str> {
     match (status.code, status.reason) {
+        (500, "InternalError")
+            if status
+                .details
+                .as_ref()
+                .is_some_and(|d| d.get("causes").is_some()) =>
+        {
+            None
+        }
         (500, "InternalError") => Some("Internal error occurred"),
         (502, "BadGateway") => Some("Bad Gateway"),
         _ => None,
@@ -307,6 +317,18 @@ impl Status {
         )
     }
 
+    /// Upstream `NewInternalError` shape (`Internal error occurred: <cause>` plus
+    /// `details.causes`) whose message reaches the client unredacted. Only for text that is
+    /// actionable and built from user-supplied config (webhook name, CRD content), never from
+    /// store, sqlite, TLS or dial errors.
+    pub fn internal_actionable(cause: String) -> StatusError {
+        let mut err = Status::internal(format!("Internal error occurred: {cause}"));
+        err.1.details = Some(Box::new(serde_json::json!({
+            "causes": [{"message": cause}]
+        })));
+        err
+    }
+
     pub fn request_entity_too_large(message: String) -> StatusError {
         StatusError(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -505,10 +527,14 @@ mod tests {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
 
-        let resp = Status::internal(
-            "sqlite error: no such table; key not found: /registry/secrets/x".into(),
-        )
-        .into_response();
+        let resp = {
+            let span = tracing::info_span!("request", request_id = "req-redact-1");
+            let _entered = span.enter();
+            Status::internal(
+                "sqlite error: no such table; key not found: /registry/secrets/x".into(),
+            )
+            .into_response()
+        };
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let msg = body_message(resp).await;
         assert_eq!(msg, "Internal error occurred");
@@ -517,6 +543,38 @@ mod tests {
         assert!(
             log.contains("sqlite error: no such table; key not found: /registry/secrets/x"),
             "the redacted detail must be logged server-side: {log}"
+        );
+        assert!(
+            log.contains("request_id=\"req-redact-1\""),
+            "the log line must carry the request_id echoed as x-request-id, or an operator \
+             cannot find the detail behind a client-reported failure: {log}"
+        );
+    }
+
+    // An operator debugging a failing failurePolicy=Fail webhook must see which webhook
+    // failed; the generic body would leave them guessing across every configured webhook.
+    #[tokio::test]
+    async fn internal_actionable_keeps_message_and_causes_for_the_client() {
+        let resp = Status::internal_actionable(
+            "failed calling webhook \"deny.example.com\": failed to call webhook".into(),
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["reason"], "InternalError",
+            "clients match IsInternalError"
+        );
+        assert_eq!(
+            v["message"],
+            "Internal error occurred: failed calling webhook \"deny.example.com\": failed to call webhook"
+        );
+        assert_eq!(
+            v["details"]["causes"][0]["message"],
+            "failed calling webhook \"deny.example.com\": failed to call webhook"
         );
     }
 

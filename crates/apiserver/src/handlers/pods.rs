@@ -1993,7 +1993,7 @@ async fn check_pdb_allows_eviction<S: Store>(
         .collect();
 
     if matching.len() > 1 {
-        return Err(Status::internal(
+        return Err(Status::internal_actionable(
             "This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.".to_string(),
         ));
     }

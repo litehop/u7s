@@ -795,8 +795,9 @@ async fn build_new_crd<S: Store>(
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(state, obj_val, None, &admission_ctx).await?;
         run_validating_webhooks(state, &mutated, None, &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     crd.metadata.generation = 1;
     if !crd
@@ -1003,8 +1004,9 @@ pub async fn replace_crd<S: Store>(
         let mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
     record_crd_write(&headers, &existing, &mut crd)?;
@@ -1775,8 +1777,9 @@ pub async fn patch_crd<S: Store>(
         let mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
     if !is_ssa {

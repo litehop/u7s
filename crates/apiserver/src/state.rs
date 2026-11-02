@@ -1858,14 +1858,9 @@ impl<S: Store> AppState<S> {
 
         loop {
             if tried >= alloc.size {
-                let cause = format!(
+                return Err(Status::internal_actionable(format!(
                     "failed to allocate a serviceIP for Service {service_name:?}: range is full"
-                );
-                let mut err = Status::internal(format!("Internal error occurred: {cause}"));
-                err.1.details = Some(Box::new(serde_json::json!({
-                    "causes": [{"message": cause}]
-                })));
-                return Err(err);
+                )));
             }
 
             // Skip reserved offsets.
