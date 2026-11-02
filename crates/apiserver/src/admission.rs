@@ -727,8 +727,22 @@ fn blocked_ipv4_range(octets: [u8; 4]) -> Option<&'static str> {
 /// normalized to dotted-quad here exactly as reqwest will normalize them, instead of silently
 /// skipping every check the way hand-splitting the raw URL string did.
 pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| format!("webhook url is not a valid URL: {url} ({e})"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        format!("webhook url must be a valid URL: {e}; desired format: https://host[/path]")
+    })?;
+
+    // Same rejections as upstream ValidateWebhookURL. The offending values are deliberately
+    // not echoed: this error reaches clients triggering the webhook, and userinfo/query
+    // routinely carry credentials.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("webhook url: user information is not permitted in the URL".into());
+    }
+    if parsed.fragment().is_some_and(|f| !f.is_empty()) {
+        return Err("webhook url: fragments are not permitted in the URL".into());
+    }
+    if parsed.query().is_some_and(|q| !q.is_empty()) {
+        return Err("webhook url: query parameters are not permitted in the URL".into());
+    }
 
     let scheme = parsed.scheme();
     if scheme != "https" && scheme != "http" {
@@ -13491,6 +13505,41 @@ quoted""" && object.b == '''x'y'''"#,
             "https://webhook.example.com must be accepted — \
              normal production webhook URLs must not be blocked by SSRF prevention"
         );
+    }
+
+    /// Upstream ValidateWebhookURL rejects userinfo, fragments and query strings. The
+    /// call-failure message echoes the URL to clients, so accepting them leaks credentials.
+    #[test]
+    fn validate_webhook_url_rejects_userinfo_without_echoing_it() {
+        let err = validate_webhook_url("https://user:s3cret@webhook.example.com/admit")
+            .expect_err("userinfo must be rejected");
+        assert_eq!(
+            err,
+            "webhook url: user information is not permitted in the URL"
+        );
+        assert!(
+            !err.contains("s3cret"),
+            "credentials must not reach clients"
+        );
+        assert!(validate_webhook_url("https://user@webhook.example.com/").is_err());
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_query_without_echoing_it() {
+        let err = validate_webhook_url("https://webhook.example.com/admit?token=s3cret")
+            .expect_err("query must be rejected");
+        assert_eq!(
+            err,
+            "webhook url: query parameters are not permitted in the URL"
+        );
+        assert!(!err.contains("s3cret"), "tokens must not reach clients");
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_fragment() {
+        let err = validate_webhook_url("https://webhook.example.com/admit#frag")
+            .expect_err("fragment must be rejected");
+        assert_eq!(err, "webhook url: fragments are not permitted in the URL");
     }
 
     /// http://127.0.0.1 must be accepted for loopback (used by in-process test servers).
