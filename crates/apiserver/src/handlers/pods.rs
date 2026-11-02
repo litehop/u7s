@@ -2703,6 +2703,7 @@ fn accepts_patch_content_type(ct: &str) -> bool {
 struct HostNetworkPodIp<'a> {
     host_network: bool,
     host_ip: Option<&'a str>,
+    host_ips: Vec<&'a str>,
 }
 
 impl<'a> HostNetworkPodIp<'a> {
@@ -2710,6 +2711,15 @@ impl<'a> HostNetworkPodIp<'a> {
         Self {
             host_network: pod["spec"]["hostNetwork"].as_bool().unwrap_or(false),
             host_ip: pod["status"]["hostIP"].as_str().filter(|s| !s.is_empty()),
+            host_ips: pod["status"]["hostIPs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|h| h["ip"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -2823,14 +2833,23 @@ pub(crate) fn apply_status_patch(
     // case hostNetwork.  Override podIP/podIPs here so the downward API exposes
     // the correct value (HOST_IP == POD_IP for hostNetwork pods).
     let host_net = HostNetworkPodIp::read(&result);
-    let podip_override = if host_net.host_network {
-        host_net.host_ip.map(str::to_owned)
+    // A dual-stack node reports both families in status.hostIPs; podIPs must carry all of
+    // them (primary first) so the per-family EndpointSlices get an address.
+    let podips_override: Vec<String> = if host_net.host_network {
+        if host_net.host_ips.is_empty() {
+            host_net.host_ip.map(str::to_owned).into_iter().collect()
+        } else {
+            host_net.host_ips.iter().map(|s| (*s).to_owned()).collect()
+        }
     } else {
-        None
+        Vec::new()
     };
-    if let Some(host_ip) = podip_override {
-        result["status"]["podIP"] = serde_json::json!(host_ip);
-        result["status"]["podIPs"] = serde_json::json!([{"ip": host_ip}]);
+    if let Some(primary) = podips_override.first() {
+        result["status"]["podIP"] = serde_json::json!(primary);
+        result["status"]["podIPs"] = podips_override
+            .iter()
+            .map(|ip| serde_json::json!({"ip": ip}))
+            .collect();
     }
 
     Ok(result)
@@ -4540,6 +4559,37 @@ mod status_tests {
         assert_eq!(
             result["status"]["hostIP"], "192.168.5.15",
             "hostIP must remain unchanged at the node IP"
+        );
+    }
+
+    /// A dual-stack hostNetwork pod must keep both node IP families in podIPs, otherwise the
+    /// IPv6 EndpointSlice of a Service backed by hostNetwork pods is empty.
+    #[test]
+    fn dual_stack_host_network_pod_ips_follow_host_ips_order() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "hn", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"hostNetwork": true, "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending"}
+        });
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "hostIP": "192.168.108.5",
+                "hostIPs": [{"ip": "192.168.108.5"}, {"ip": "fd85:0:0:1::3"}],
+                "podIP": "10.85.1.153",
+                "podIPs": [{"ip": "10.85.1.153"}]
+            }
+        });
+        let result = apply_status_patch(&stored, &patch).unwrap();
+        assert_eq!(
+            result["status"]["podIPs"],
+            serde_json::json!([{"ip": "192.168.108.5"}, {"ip": "fd85:0:0:1::3"}]),
+            "podIPs must mirror hostIPs (both families, primary first)"
+        );
+        assert_eq!(
+            result["status"]["podIP"], result["status"]["hostIP"],
+            "downward API POD_IP must equal HOST_IP for the primary family"
         );
     }
 
