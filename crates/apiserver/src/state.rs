@@ -1299,7 +1299,9 @@ impl<S: Store> AppState<S> {
         cluster_ca_ders: Option<&[Vec<u8>]>,
         konnectivity_proxy_addr: Option<&str>,
     ) -> Result<reqwest::Client, String> {
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10));
 
         if let Some(ca_ders) = cluster_ca_ders {
             // tls_certs_only disables the system/Mozilla root store and trusts only
@@ -2756,6 +2758,37 @@ mod tests {
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
         let _client = AppState::<SqliteStore>::build_webhook_client(None, None)
             .expect("no-CA no-identity must produce Ok client");
+    }
+
+    /// The shared webhook client is the fallback for every webhook call; following a 307
+    /// would re-POST the AdmissionReview to a host validate_webhook_url never vetted.
+    #[tokio::test]
+    async fn build_webhook_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/x\r\n\
+                              Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        let client = AppState::<SqliteStore>::build_webhook_client(None, None).unwrap();
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .body("x")
+            .send()
+            .await
+            .expect("a 307 must surface as a response, not a followed redirect error");
+        assert_eq!(resp.status(), 307);
     }
 
     /// build_webhook_client succeeds with a konnectivity proxy addr configured.

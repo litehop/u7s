@@ -34,8 +34,29 @@ impl std::fmt::Debug for StatusError {
     }
 }
 
+/// Generic client-facing body for a 500/502 `Status`, or `None` when the status carries a
+/// message meant for the client. Internal errors embed store keys, sqlite and TLS/dial
+/// errors with internal addresses; those go to the server log, never the response.
+fn redacted_message(status: &Status) -> Option<&'static str> {
+    match (status.code, status.reason) {
+        (500, "InternalError") => Some("Internal error occurred"),
+        (502, "BadGateway") => Some("Bad Gateway"),
+        _ => None,
+    }
+}
+
 impl IntoResponse for StatusError {
-    fn into_response(self) -> Response {
+    fn into_response(mut self) -> Response {
+        if let Some(generic) = redacted_message(&self.1) {
+            // Logged inside the request span, so `request_id` (echoed as x-request-id) is attached.
+            tracing::error!(
+                code = self.1.code,
+                reason = self.1.reason,
+                detail = %self.1.message,
+                "request failed with a server error"
+            );
+            self.1.message = generic.to_owned();
+        }
         let retry_after = self
             .1
             .details
@@ -467,6 +488,64 @@ impl Status {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    async fn body_message(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["message"].as_str().unwrap().to_owned()
+    }
+
+    // A 500 built from a store/sqlite error must not reach the client (key layout, SQL
+    // messages) but must reach the server log, or operators cannot diagnose it.
+    #[tokio::test]
+    async fn internal_error_body_is_generic_and_detail_is_logged() {
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let resp = Status::internal(
+            "sqlite error: no such table; key not found: /registry/secrets/x".into(),
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let msg = body_message(resp).await;
+        assert_eq!(msg, "Internal error occurred");
+
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("sqlite error: no such table; key not found: /registry/secrets/x"),
+            "the redacted detail must be logged server-side: {log}"
+        );
+    }
+
+    // The pod-log proxy's 502 embeds the kubelet dial/TLS error with internal addresses.
+    #[tokio::test]
+    async fn bad_gateway_body_is_generic() {
+        let resp = StatusError(
+            StatusCode::BAD_GATEWAY,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message: "kubelet request failed: tls handshake with 10.0.0.7:10250".into(),
+                reason: "BadGateway",
+                code: 502,
+                metadata: None,
+                details: None,
+            },
+        )
+        .into_response();
+        assert_eq!(body_message(resp).await, "Bad Gateway");
+    }
+
+    // 4xx messages are for the client (validation errors etc.) and must stay intact.
+    #[tokio::test]
+    async fn client_error_messages_are_not_redacted() {
+        let resp = Status::bad_request("spec.replicas: Invalid value".into()).into_response();
+        assert_eq!(body_message(resp).await, "spec.replicas: Invalid value");
+    }
 
     // Upstream's NotFound carries details{name, group, kind=lowercase plural resource};
     // clients (kubectl, client-go retries keyed on the missing object) read them instead of

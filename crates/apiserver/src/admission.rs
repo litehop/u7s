@@ -1466,11 +1466,13 @@ fn build_webhook_call_client(
             }
         }
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(request_timeout)
             .connect_timeout(connect_timeout)
             .tls_certs_only(certs)
     } else {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(request_timeout)
             .connect_timeout(connect_timeout)
     };
@@ -5238,6 +5240,69 @@ mod tests {
     // added latency (TLS failures, timeouts, and any response the webhook actually sent,
     // including a 5xx).
     // ---------------------------------------------------------------------------
+
+    /// Spawn a plain-TCP backend answering every request with `307 Location: <location>`;
+    /// returns its address and a counter of connections accepted.
+    async fn spawn_redirecting_backend(
+        location: String,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let loc = location.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {loc}\r\n\
+                                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// validate_webhook_url only vets the configured URL; a webhook backend answering 307
+    /// must not make the apiserver re-POST the AdmissionReview to the Location, or an
+    /// attacker-run webhook can aim apiserver-originated requests at internal hosts.
+    #[tokio::test]
+    async fn webhook_call_client_does_not_follow_redirects() {
+        let (internal, internal_hits) = spawn_redirecting_backend("/unused".into()).await;
+        let (backend, _) = spawn_redirecting_backend(format!("http://{internal}/internal")).await;
+
+        let fallback = reqwest::Client::new();
+        let client = build_webhook_call_client(None, None, None, None, None, &fallback, None);
+        let resp = client
+            .post(format!("http://{backend}/"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 307);
+        assert_eq!(
+            internal_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "redirect target was contacted: webhook client followed a redirect past \
+             validate_webhook_url"
+        );
+    }
 
     /// A bare connection-refused error (nothing listening on the port) is exactly the
     /// kube-proxy IPVS-programming race signature and must be classified as retryable —

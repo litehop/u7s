@@ -834,6 +834,21 @@ fn request_verb(
     }
 }
 
+/// Upstream (AuthorizePodWebsocketUpgradeCreatePermission, beta and on by default since
+/// 1.35) additionally requires `create` for pods/exec, pods/attach and pods/portforward
+/// whenever the request verb is not already `create`: SPDY is a POST (`create`) but the
+/// WebSocket upgrade is a GET (`get`), and a policy granting only `get` on these
+/// subresources must not gain exec.
+fn needs_extra_create_check(parsed: &ParsedPath, verb: &str) -> bool {
+    verb != "create"
+        && parsed.api_group.is_empty()
+        && parsed.resource == "pods"
+        && matches!(
+            parsed.subresource.as_str(),
+            "exec" | "attach" | "portforward"
+        )
+}
+
 /// Whether the query asks for a watch, decided on the decoded query as the list handlers'
 /// deserializer sees it. A value the handler would reject (400) counts as a watch too, as
 /// upstream does when parsing fails: anything but `false`/`0`.
@@ -1819,6 +1834,18 @@ where
             let allowed =
                 node_authz::authorize(&authz_req, req.uri().query(), &node_graph, &rbac_index)
                     || rbac_index.is_allowed(&authz_req);
+            let (allowed, verb) = if allowed && needs_extra_create_check(&parsed, verb) {
+                let create_req = AuthzRequest {
+                    verb: "create",
+                    ..authz_req
+                };
+                let create_allowed =
+                    node_authz::authorize(&create_req, req.uri().query(), &node_graph, &rbac_index)
+                        || rbac_index.is_allowed(&create_req);
+                (create_allowed, if create_allowed { verb } else { "create" })
+            } else {
+                (allowed, verb)
+            };
 
             // Cardinality-bounded labels for apiserver_request_total only — RBAC/routing
             // above always used the raw `parsed` fields. Non-resource URLs are left alone:
@@ -5065,6 +5092,111 @@ mod tests {
             groups.contains(&"custom-group".to_owned()),
             "the caller's explicit group must still be present alongside the backstop"
         );
+    }
+
+    /// kubectl exec/attach/port-forward use a WebSocket upgrade, which is a GET (verb `get`),
+    /// while SPDY is a POST (`create`). A role granting only `get` on pods/exec must not let
+    /// the WebSocket form through (upstream additionally requires `create`), and a
+    /// create-only role keeps working over SPDY. Every route is covered by the one AuthLayer
+    /// check, so the matrix is {exec, attach, portforward} x {WebSocket GET, plain GET, POST}.
+    #[tokio::test]
+    async fn pod_stream_subresources_require_create_even_over_get_websocket() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let idx = Arc::new(RbacIndex::new());
+        let bind = |user: &str, verbs: &[&str]| {
+            idx.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterroles/{user}-role"),
+                &serde_json::json!({ "rules": [{
+                    "apiGroups": [""],
+                    "resources": ["pods/exec", "pods/attach", "pods/portforward"],
+                    "verbs": verbs
+                }]}),
+            );
+            idx.apply_object(
+                &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{user}-b"),
+                &serde_json::json!({
+                    "subjects": [{ "kind": "User", "name": user }],
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole",
+                        "name": format!("{user}-role")
+                    }
+                }),
+            );
+        };
+        bind("getter", &["get"]);
+        bind("creator", &["create"]);
+        bind("both", &["get", "create"]);
+
+        let mut token_map = HashMap::new();
+        for u in ["getter", "creator", "both"] {
+            token_map.insert(
+                format!("{u}-token"),
+                UserInfo {
+                    username: u.to_owned(),
+                    uid: "1".to_owned(),
+                    groups: vec!["system:authenticated".to_owned()],
+                    extra: Default::default(),
+                },
+            );
+        }
+
+        let mut router = Router::new();
+        for sub in ["exec", "attach", "portforward"] {
+            router = router.route(
+                &format!("/api/v1/namespaces/default/pods/p/{sub}"),
+                get(|| async { "ok" }).post(|| async { "ok" }),
+            );
+        }
+        let app = router.layer(AuthLayer::new(
+            idx,
+            token_map,
+            None,
+            Arc::new(make_test_store()),
+            Arc::new(make_test_sig_cache()),
+            Arc::new(FlowControlCache::new()),
+            Arc::new(NodeGraph::new()),
+            Arc::new(HashMap::new()),
+            Arc::new(DiscoveryCache::new()),
+        ));
+
+        for sub in ["exec", "attach", "portforward"] {
+            for (method, upgrade) in [("GET", true), ("GET", false), ("POST", false)] {
+                for (user, expect_ok) in [
+                    ("getter", false),
+                    ("creator", method == "POST"),
+                    ("both", true),
+                ] {
+                    let mut b = Request::builder()
+                        .method(method)
+                        .uri(format!("/api/v1/namespaces/default/pods/p/{sub}"))
+                        .header("authorization", format!("Bearer {user}-token"));
+                    if upgrade {
+                        b = b
+                            .header("connection", "Upgrade")
+                            .header("upgrade", "websocket");
+                    }
+                    let resp = app
+                        .clone()
+                        .oneshot(b.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    let want = if expect_ok {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::FORBIDDEN
+                    };
+                    assert_eq!(
+                        resp.status(),
+                        want,
+                        "{user} {method} (upgrade={upgrade}) pods/{sub}: a get-only role must \
+                         not exec/attach/port-forward over WebSocket; create is always required"
+                    );
+                }
+            }
+        }
     }
 
     // --- SA-shaped Impersonate-User must check resource=serviceaccounts, not users ---
