@@ -745,32 +745,17 @@ pub async fn pod_attach<S: Store>(
 /// and the client's terminal error was axum's generic "Request method must be
 /// `GET`" instead of the webhook's denial message.
 ///
-/// Run the same pre-upgrade checks here so the fallback surfaces the same Status
-/// (denial, not-found, not-scheduled, ...) that the GET attempt already computed.
-/// Real SPDY streaming is not implemented; if every check passes there is nothing
-/// left to report here — the GET/WebSocket attempt above already succeeds in that
-/// case, so a working client never depends on this branch.
+/// Run the same pre-upgrade checks here (pod lookup, CONNECT admission) so a denial
+/// surfaces as the same Status the GET attempt computed, never a 101; then pass the
+/// SPDY upgrade through to the kubelet (`spdy_stream_pass_through`).
 pub async fn pod_attach_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
     FirstValueQuery(query): FirstValueQuery<AttachQuery>,
+    req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
-    Err(crate::status::StatusError(
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        crate::status::Status {
-            kind: "Status",
-            api_version: "v1",
-            status: "Failure",
-            message:
-                "attach via SPDY (POST upgrade) is not implemented; use a WebSocket-capable client"
-                    .to_string(),
-            reason: "NotImplemented",
-            code: 501,
-            metadata: None,
-            details: None,
-        },
-    ))
+    let target = resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
+    spdy_stream_pass_through(req, target.tls_config, &target.kubelet_ws_url).await
 }
 
 /// Build a rustls `ClientConfig` that pins trust to the cluster CA and optionally
@@ -1330,19 +1315,17 @@ pub async fn pod_exec<S: Store>(
 /// and the client's terminal error was axum's generic "Request method must be
 /// `GET`" instead of the webhook's denial message.
 ///
-/// Run the same pre-upgrade checks here so the fallback surfaces the same Status
-/// (denial, not-found, not-scheduled, ...) that the GET attempt already computed.
-/// Real SPDY streaming is not implemented; if every check passes there is nothing
-/// left to report here — the GET/WebSocket attempt above already succeeds in that
-/// case, so a working client never depends on this branch.
+/// Run the same pre-upgrade checks here (pod lookup, CONNECT admission) so a denial
+/// surfaces as the same Status the GET attempt computed, never a 101; then pass the
+/// SPDY upgrade through to the kubelet (`spdy_stream_pass_through`).
 pub async fn pod_exec_post<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
     FirstValueQuery(query): FirstValueQuery<ExecQuery>,
-    uri: axum::http::Uri,
+    req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let raw_query = uri.query().unwrap_or("").to_owned();
-    resolve_exec_target(
+    let raw_query = req.uri().query().unwrap_or("").to_owned();
+    let target = resolve_exec_target(
         &state,
         &raw_ns,
         &pod_name,
@@ -1350,21 +1333,7 @@ pub async fn pod_exec_post<S: Store>(
         &raw_query,
     )
     .await?;
-    Err(crate::status::StatusError(
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        crate::status::Status {
-            kind: "Status",
-            api_version: "v1",
-            status: "Failure",
-            message:
-                "exec via SPDY (POST upgrade) is not implemented; use a WebSocket-capable client"
-                    .to_string(),
-            reason: "NotImplemented",
-            code: 501,
-            metadata: None,
-            details: None,
-        },
-    ))
+    spdy_stream_pass_through(req, target.tls_config, &target.kubelet_ws_url).await
 }
 
 /// Channel byte values used by the exec subprotocol (v4/v5.channel.k8s.io).
@@ -1926,83 +1895,283 @@ pub async fn pod_portforward<S: Store>(
     portforward_proxy_raw_upgrade(req, params).await
 }
 
-fn portforward_post_request(path: &str, host: &str, port: u16) -> String {
+fn portforward_post_request(path: &str, host: &str, port: u16, protocols: &[String]) -> String {
+    let protocol_lines: String = protocols
+        .iter()
+        .map(|p| format!("X-Stream-Protocol-Version: {p}\r\n"))
+        .collect();
     format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {}\r\n\
          Connection: Upgrade\r\n\
          Upgrade: SPDY/3.1\r\n\
-         X-Stream-Protocol-Version: {PORTFORWARD_KUBELET_PROTOCOL}\r\n\
+         {protocol_lines}\
          Content-Length: 0\r\n\r\n",
         host_port(host, port)
     )
 }
 
-/// Dial kubelet's legacy raw-SPDY-over-HTTP portForward endpoint.
+/// Stream protocol names a client may offer on a SPDY exec/attach upgrade
+/// (`k8s.io/apimachinery/pkg/util/remotecommand/constants.go`, plus v5 which
+/// client-go lists first even though only WebSocket serves it).
+const SPDY_CLIENT_STREAM_PROTOCOLS: &[&str] = &[
+    "v5.channel.k8s.io",
+    "v4.channel.k8s.io",
+    "v3.channel.k8s.io",
+    "v2.channel.k8s.io",
+    "v1.channel.k8s.io",
+    "channel.k8s.io",
+];
+
+/// Positive-allowlist the client's `X-Stream-Protocol-Version` values: they are
+/// written verbatim into the hand-built kubelet request, so anything outside the
+/// known protocol names (CR/LF, other header text) is rejected rather than forwarded.
+fn parse_client_stream_protocols<'a>(
+    values: impl Iterator<Item = &'a str>,
+) -> Result<Vec<String>, crate::status::StatusError> {
+    let mut protocols = Vec::new();
+    for value in values {
+        for p in value.split(',').map(str::trim) {
+            if !SPDY_CLIENT_STREAM_PROTOCOLS.contains(&p) {
+                return Err(Status::bad_request(format!(
+                    "unsupported X-Stream-Protocol-Version {p:?}; supported: \
+                     {SPDY_CLIENT_STREAM_PROTOCOLS:?}"
+                )));
+            }
+            protocols.push(p.to_owned());
+        }
+    }
+    if protocols.is_empty() {
+        return Err(Status::bad_request(
+            "X-Stream-Protocol-Version header is required".to_string(),
+        ));
+    }
+    Ok(protocols)
+}
+
+/// The kubelet answered the SPDY upgrade with something other than 101.
+#[derive(Debug)]
+struct KubeletRefusedUpgrade {
+    status: u16,
+    body: String,
+}
+
+impl std::fmt::Display for KubeletRefusedUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "kubelet refused SPDY upgrade: HTTP {}: {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for KubeletRefusedUpgrade {}
+
+/// Map a failed kubelet SPDY dial to the Status the client sees: a kubelet refusal
+/// keeps the kubelet's status code (upstream's `UpgradeAwareHandler` relays a non-101
+/// backend response as-is); anything else is an unreachable kubelet.
+fn kubelet_dial_status(err: anyhow::Error) -> crate::status::StatusError {
+    let Some(refused) = err.downcast_ref::<KubeletRefusedUpgrade>() else {
+        return Status::service_unavailable(format!("kubelet SPDY dial failed: {err}"));
+    };
+    let code = axum::http::StatusCode::from_u16(refused.status)
+        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let reason = match code.as_u16() {
+        400 => "BadRequest",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "NotFound",
+        500 => "InternalError",
+        503 => "ServiceUnavailable",
+        _ => "Failure",
+    };
+    crate::status::StatusError(
+        code,
+        Status {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            message: refused.to_string(),
+            reason,
+            code: code.as_u16(),
+            metadata: None,
+            details: None,
+        },
+    )
+}
+
+const KUBELET_SPDY_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+type KubeletSpdyStream = RawStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// Dial kubelet's raw-SPDY-over-HTTP streaming endpoint and complete the upgrade.
 ///
-/// This is the only wire shape kubelet's `handleHTTPStreams` accepts unconditionally
-/// on every supported release — kubelet's native websocket portforward path exists
-/// but requires an exact-match subprotocol negotiation apiserver cannot rely on any
-/// given kubelet having enabled. u7s never parses the SPDY frames kubectl and kubelet
-/// exchange after this point: once kubelet answers 101, the connection is handed to
-/// `splice()` as an opaque byte stream.
-async fn dial_kubelet_portforward(
-    params: &PortforwardParams,
-) -> anyhow::Result<RawStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>> {
+/// Returns the connection plus the `X-Stream-Protocol-Version` kubelet negotiated
+/// (clients need it to pick their stream handler). A non-101 answer is
+/// `KubeletRefusedUpgrade`. This is the only wire shape kubelet's
+/// `handleHTTPStreams` accepts unconditionally on every supported release; u7s never
+/// parses the SPDY frames exchanged after the 101 — the connection is an opaque byte
+/// stream handed to `splice()`.
+async fn dial_kubelet_spdy(
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+    https_url: &str,
+    protocols: &[String],
+) -> anyhow::Result<(KubeletSpdyStream, Option<String>)> {
     use rustls::pki_types::ServerName;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
 
+    let (host, port, path) = parse_https_url(https_url)?;
+
+    tokio::time::timeout(KUBELET_SPDY_DIAL_TIMEOUT, async {
+        let tcp = TcpStream::connect((host.as_str(), port)).await?;
+        let server_name = ServerName::try_from(host.clone())
+            .map_err(|e| anyhow::anyhow!("invalid kubelet server name '{host}': {e}"))?;
+        let mut tls = TlsConnector::from(tls_config)
+            .connect(server_name, tcp)
+            .await?;
+
+        let request = portforward_post_request(&path, &host, port, protocols);
+        tls.write_all(request.as_bytes()).await?;
+
+        // Kubelet may pipeline the first SPDY frame in the same TCP segment as the
+        // response headers — buffer until the "\r\n\r\n" terminator, then preserve
+        // (rather than discard) any bytes read past it.
+        let mut buf = Vec::with_capacity(4096);
+        let header_end = loop {
+            let mut chunk = [0u8; 4096];
+            let n = tls.read(&mut chunk).await?;
+            if n == 0 {
+                anyhow::bail!("kubelet closed connection during SPDY upgrade");
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) {
+                break end;
+            }
+            if buf.len() > 64 * 1024 {
+                anyhow::bail!("kubelet SPDY upgrade response too large");
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let mut lines = head.lines();
+        let status: u16 = lines
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("malformed kubelet SPDY upgrade response"))?;
+        if status != 101 {
+            let body = String::from_utf8_lossy(&buf[header_end..]);
+            return Err(KubeletRefusedUpgrade {
+                status,
+                body: body.trim().chars().take(512).collect(),
+            }
+            .into());
+        }
+        let negotiated = lines.find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("x-stream-protocol-version")
+                .then(|| value.trim().to_owned())
+        });
+
+        let prefix = bytes::Bytes::copy_from_slice(&buf[header_end..]);
+        Ok((RawStream::new_with_prefix(tls, prefix), negotiated))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out dialing kubelet SPDY upgrade"))?
+}
+
+/// Dial kubelet's portForward endpoint with the fixed `portforward.k8s.io` protocol.
+async fn dial_kubelet_portforward(params: &PortforwardParams) -> anyhow::Result<KubeletSpdyStream> {
     let tls_config = build_kubelet_tls_config_for(
         params.cluster_ca_ders.as_deref(),
         params.client_identity_pem.as_deref(),
         params.verify_name.as_deref(),
     )?;
+    let protocols = [PORTFORWARD_KUBELET_PROTOCOL.to_owned()];
+    let (stream, _) = dial_kubelet_spdy(tls_config, &params.kubelet_url, &protocols).await?;
+    Ok(stream)
+}
 
-    let (host, port, path) = parse_https_url(&params.kubelet_url)?;
+/// Detach the client's connection for a raw SPDY upgrade.
+fn take_on_upgrade(
+    req: &mut axum::http::Request<Body>,
+) -> Result<hyper::upgrade::OnUpgrade, crate::status::StatusError> {
+    req.extensions_mut()
+        .remove::<hyper::upgrade::OnUpgrade>()
+        .ok_or_else(|| Status::bad_request("connection does not support HTTP upgrades".to_string()))
+}
 
-    let tcp = TcpStream::connect((host.as_str(), port)).await?;
-    let server_name = ServerName::try_from(host.clone())
-        .map_err(|e| anyhow::anyhow!("invalid kubelet server name '{host}': {e}"))?;
-    let mut tls = TlsConnector::from(tls_config)
-        .connect(server_name, tcp)
-        .await?;
-
-    let request = portforward_post_request(&path, &host, port);
-    tls.write_all(request.as_bytes()).await?;
-
-    // Kubelet may pipeline the first SPDY frame in the same TCP segment as the
-    // response headers — buffer until the "\r\n\r\n" terminator, then preserve
-    // (rather than discard) any bytes read past it.
-    let mut buf = Vec::with_capacity(4096);
-    let header_end = loop {
-        let mut chunk = [0u8; 4096];
-        let n = tls.read(&mut chunk).await?;
-        if n == 0 {
-            anyhow::bail!("kubelet closed connection during portforward upgrade");
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) {
-            break end;
-        }
-        if buf.len() > 64 * 1024 {
-            anyhow::bail!("kubelet portforward upgrade response too large");
-        }
-    };
-
-    let status_line = std::str::from_utf8(&buf[..header_end])
-        .unwrap_or("")
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_owned();
-    if !status_line.contains(" 101 ") {
-        anyhow::bail!("kubelet rejected portforward upgrade: {status_line}");
+/// Answer the client 101 (relaying kubelet's negotiated stream protocol) and splice
+/// the hijacked client connection with the already-upgraded kubelet connection.
+fn spdy_switching_protocols(
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    kubelet: KubeletSpdyStream,
+    negotiated_protocol: Option<String>,
+) -> Result<Response, crate::status::StatusError> {
+    let mut builder = Response::builder()
+        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
+        .header(axum::http::header::CONNECTION, "Upgrade")
+        .header(axum::http::header::UPGRADE, "SPDY/3.1");
+    if let Some(p) = negotiated_protocol {
+        builder = builder.header("X-Stream-Protocol-Version", p);
     }
+    let response = builder
+        .body(Body::empty())
+        .map_err(|e| Status::internal(e.to_string()))?;
 
-    let prefix = bytes::Bytes::copy_from_slice(&buf[header_end..]);
-    Ok(RawStream::new_with_prefix(tls, prefix))
+    tokio::spawn(async move {
+        let upgraded = match on_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("SPDY upgrade failed: {e}");
+                return;
+            }
+        };
+        splice(
+            RawStream::new(hyper_util::rt::TokioIo::new(upgraded)),
+            kubelet,
+        )
+        .await;
+    });
+    Ok(response)
+}
+
+/// SPDY exec/attach POST: pass the client's upgrade through to the kubelet, like
+/// upstream's `UpgradeAwareHandler`. The kubelet is dialed before the client gets
+/// its 101 so a refusal reaches the client as a plain status.
+async fn spdy_stream_pass_through(
+    mut req: axum::http::Request<Body>,
+    tls_config: std::sync::Arc<rustls::ClientConfig>,
+    kubelet_wss_url: &str,
+) -> Result<Response, crate::status::StatusError> {
+    if !is_raw_spdy_upgrade_request(&req) {
+        return Err(Status::bad_request(
+            "this endpoint requires a streaming upgrade (WebSocket GET or \
+             Upgrade: SPDY/3.1 POST)"
+                .to_string(),
+        ));
+    }
+    let header_values: Vec<&str> = req
+        .headers()
+        .get_all("x-stream-protocol-version")
+        .iter()
+        .map(|v| v.to_str().unwrap_or("\u{0}"))
+        .collect();
+    let protocols = parse_client_stream_protocols(header_values.into_iter())?;
+    let on_upgrade = take_on_upgrade(&mut req)?;
+    let https_url = kubelet_wss_url
+        .strip_prefix("wss://")
+        .map(|rest| format!("https://{rest}"))
+        .ok_or_else(|| {
+            Status::internal(format!("kubelet URL must use wss://: {kubelet_wss_url}"))
+        })?;
+    let (kubelet, negotiated) = dial_kubelet_spdy(tls_config, &https_url, &protocols)
+        .await
+        .map_err(kubelet_dial_status)?;
+    spdy_switching_protocols(on_upgrade, kubelet, negotiated)
 }
 
 /// Splice the client's websocket-tunneled connection with kubelet's raw-SPDY leg.
@@ -2104,59 +2273,29 @@ async fn portforward_proxy_v4(inbound: WebSocket, params: PortforwardParams) -> 
     Ok(())
 }
 
-/// Splice kubectl's legacy raw-SPDY-over-HTTP connection with kubelet's raw-SPDY leg.
-///
-/// Neither leg is a websocket here — both are raw hijacked TCP/TLS streams, so this is
-/// a pure byte relay with zero framing translation in either direction.
-async fn portforward_proxy_raw(
-    inbound: RawStream<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>>,
-    params: PortforwardParams,
-) -> anyhow::Result<()> {
-    let kubelet = dial_kubelet_portforward(&params).await?;
-    splice(inbound, kubelet).await;
-    Ok(())
-}
-
 /// Handle kubectl's legacy raw-SPDY-over-HTTP port-forward fallback.
 ///
 /// Mirrors real kube-apiserver's non-websocket `UpgradeAwareHandler` pass-through:
-/// hijack the client's raw connection, answer 101 immediately, then dial kubelet and
-/// splice — no SPDY frame is inspected on either leg. With u7s's apiserver correctly
-/// advertising `PORTFORWARD_KUBECTL_SUBPROTOCOL` on the primary GET, no supported
-/// kubectl version actually reaches this path at default settings; it exists for
-/// robustness, matching real apiserver's own dual-path behavior.
+/// dial kubelet first, then hijack the client's raw connection, answer 101 with
+/// kubelet's negotiated protocol and splice — no SPDY frame is inspected on either
+/// leg, and a kubelet refusal reaches the client as a plain status instead of a
+/// dropped post-101 connection.
 async fn portforward_proxy_raw_upgrade(
     mut req: axum::http::Request<Body>,
     params: PortforwardParams,
 ) -> Result<Response, crate::status::StatusError> {
-    let on_upgrade = req
-        .extensions_mut()
-        .remove::<hyper::upgrade::OnUpgrade>()
-        .ok_or_else(|| {
-            Status::bad_request("connection does not support HTTP upgrades".to_string())
-        })?;
-
-    tokio::spawn(async move {
-        let upgraded = match on_upgrade.await {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!("portforward raw upgrade failed: {e}");
-                return;
-            }
-        };
-        let inbound = RawStream::new(hyper_util::rt::TokioIo::new(upgraded));
-        if let Err(e) = portforward_proxy_raw(inbound, params).await {
-            tracing::warn!("portforward proxy error: {e}");
-        }
-    });
-
-    Response::builder()
-        .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)
-        .header(axum::http::header::CONNECTION, "Upgrade")
-        .header(axum::http::header::UPGRADE, "SPDY/3.1")
-        .header("X-Stream-Protocol-Version", PORTFORWARD_KUBELET_PROTOCOL)
-        .body(Body::empty())
-        .map_err(|e| Status::internal(e.to_string()))
+    let on_upgrade = take_on_upgrade(&mut req)?;
+    let tls_config = build_kubelet_tls_config_for(
+        params.cluster_ca_ders.as_deref(),
+        params.client_identity_pem.as_deref(),
+        params.verify_name.as_deref(),
+    )
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
+    let protocols = [PORTFORWARD_KUBELET_PROTOCOL.to_owned()];
+    let (kubelet, negotiated) = dial_kubelet_spdy(tls_config, &params.kubelet_url, &protocols)
+        .await
+        .map_err(kubelet_dial_status)?;
+    spdy_switching_protocols(on_upgrade, kubelet, negotiated)
 }
 
 // ---------------------------------------------------------------------------
@@ -4375,7 +4514,12 @@ mod tests {
             connect_request("10.0.0.9", 80),
             "CONNECT 10.0.0.9:80 HTTP/1.1\r\nHost: 10.0.0.9:80\r\n\r\n"
         );
-        let req = portforward_post_request("/portForward/ns/p", "fd00::7", 10250);
+        let req = portforward_post_request(
+            "/portForward/ns/p",
+            "fd00::7",
+            10250,
+            &["portforward.k8s.io".to_owned()],
+        );
         assert!(req.contains("\r\nHost: [fd00::7]:10250\r\n"), "{req}");
     }
 
@@ -6787,6 +6931,248 @@ mod tests {
             }),
             "kubelet leg must send Connection: Upgrade alongside Upgrade: SPDY/3.1: \
              {request}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SPDY exec/attach POST pass-through
+    // -----------------------------------------------------------------------
+
+    /// A TLS "kubelet" that records the request head, answers with `response`, then
+    /// (when it answered 101) echoes `pong` for a 4-byte `ping` to prove the splice.
+    async fn spawn_mock_spdy_kubelet(
+        response: &'static [u8],
+    ) -> (u16, Vec<u8>, tokio::sync::oneshot::Receiver<String>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der.clone())],
+                PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            stream.write_all(response).await.unwrap();
+            if response.starts_with(b"HTTP/1.1 101") {
+                let mut ping = [0u8; 4];
+                stream.read_exact(&mut ping).await.unwrap();
+                assert_eq!(&ping, b"ping", "client bytes must reach kubelet verbatim");
+                stream.write_all(b"pong").await.unwrap();
+            }
+            let _ = stream.shutdown().await;
+        });
+        (port, cert_der, rx)
+    }
+
+    async fn spdy_post(
+        kubelet_port: u16,
+        ca_der: Vec<u8>,
+        path_and_query: &str,
+        protocol_lines: &str,
+    ) -> (String, Option<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        seed_portforward_pod(&store).await;
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_keys: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_ders: Some(vec![ca_der]),
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
+        let addr = spawn_upgradeable_server(make_router(state));
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "POST /api/v1/namespaces/default/pods/pf-pod/{path_and_query} HTTP/1.1\r\n\
+             Host: x\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n{protocol_lines}\
+             Content-Length: 0\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut byte),
+            )
+            .await
+            .expect("apiserver must answer")
+            .expect("read response head");
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        if !head.starts_with("HTTP/1.1 101") {
+            return (head, None);
+        }
+        client.write_all(b"ping").await.unwrap();
+        let mut pong = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut pong),
+        )
+        .await
+        .expect("splice must relay the kubelet's bytes")
+        .unwrap();
+        (head, Some(pong.to_vec()))
+    }
+
+    /// kubectl picks its stream handler from the 101's `X-Stream-Protocol-Version`, so the
+    /// kubelet's negotiated choice must reach the client and the client's offer must reach
+    /// the kubelet — else SPDY exec/attach negotiates the wrong protocol or none.
+    #[tokio::test]
+    async fn spdy_exec_post_relays_protocol_both_ways_and_splices_bytes() {
+        let (port, ca, rx) = spawn_mock_spdy_kubelet(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\
+              X-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n",
+        )
+        .await;
+        let (head, pong) = spdy_post(
+            port,
+            ca,
+            "exec?container=app&command=ls&stdout=true&stderr=true",
+            "X-Stream-Protocol-Version: v5.channel.k8s.io\r\n\
+             X-Stream-Protocol-Version: v4.channel.k8s.io\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("x-stream-protocol-version: v4.channel.k8s.io"),
+            "kubelet's negotiated protocol must be relayed to the client: {head}"
+        );
+        assert_eq!(pong.as_deref(), Some(&b"pong"[..]));
+
+        let kubelet_req = rx.await.unwrap();
+        let line = kubelet_req.lines().next().unwrap();
+        assert!(
+            line.starts_with("POST /exec/default/pf-pod/app?")
+                && line.contains("command=ls")
+                && line.contains("output=1")
+                && line.contains("error=1"),
+            "kubelet exec request line: {line}"
+        );
+        for p in ["v5.channel.k8s.io", "v4.channel.k8s.io"] {
+            assert!(
+                kubelet_req.contains(&format!("X-Stream-Protocol-Version: {p}\r\n")),
+                "client's offered protocol {p} must be forwarded to kubelet: {kubelet_req}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spdy_attach_post_reaches_kubelet_attach_endpoint() {
+        let (port, ca, rx) = spawn_mock_spdy_kubelet(
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: SPDY/3.1\r\n\
+              X-Stream-Protocol-Version: v4.channel.k8s.io\r\n\r\n",
+        )
+        .await;
+        let (head, pong) = spdy_post(
+            port,
+            ca,
+            "attach?container=app&stdin=true&stdout=true",
+            "X-Stream-Protocol-Version: v4.channel.k8s.io\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert_eq!(pong.as_deref(), Some(&b"pong"[..]));
+        let line = rx.await.unwrap();
+        assert!(
+            line.starts_with("POST /attach/default/pf-pod/app?")
+                && line.contains("input=1")
+                && line.contains("output=1"),
+            "kubelet attach request line: {line}"
+        );
+    }
+
+    /// A kubelet that refuses the upgrade must surface as its own status, never a 101:
+    /// otherwise the client believes the stream is open and hangs on a dead connection.
+    #[tokio::test]
+    async fn spdy_exec_post_kubelet_refusal_is_not_a_101() {
+        let (port, ca, _rx) = spawn_mock_spdy_kubelet(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 27\r\n\r\nunable to negotiate protocol",
+        )
+        .await;
+        let (head, pong) = spdy_post(
+            port,
+            ca,
+            "exec?container=app&command=ls",
+            "X-Stream-Protocol-Version: v4.channel.k8s.io\r\n",
+        )
+        .await;
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "kubelet's 403 expected: {head}"
+        );
+        assert!(pong.is_none());
+    }
+
+    /// The protocol header is written verbatim into a hand-built kubelet request, so a
+    /// value smuggling CR/LF (a second header or request) must be rejected, not forwarded.
+    #[test]
+    fn client_stream_protocols_reject_header_injection() {
+        for bad in [
+            "v4.channel.k8s.io\r\nX-Injected: 1",
+            "v4.channel.k8s.io\nX-Injected: 1",
+            "v4.channel.k8s.io, \r\nGET / HTTP/1.1",
+            "portforward.k8s.io",
+            "",
+        ] {
+            assert!(
+                parse_client_stream_protocols([bad].into_iter()).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(parse_client_stream_protocols(std::iter::empty()).is_err());
+        assert_eq!(
+            parse_client_stream_protocols(
+                ["v5.channel.k8s.io", "v4.channel.k8s.io, v3.channel.k8s.io"].into_iter()
+            )
+            .unwrap(),
+            [
+                "v5.channel.k8s.io",
+                "v4.channel.k8s.io",
+                "v3.channel.k8s.io"
+            ]
+        );
+    }
+
+    /// A bad protocol header must be refused before any kubelet dial (the mock is never
+    /// contacted), so injection attempts never touch the kubelet connection.
+    #[tokio::test]
+    async fn spdy_exec_post_rejects_unknown_protocol_without_dialing_kubelet() {
+        let (port, ca, mut rx) = spawn_mock_spdy_kubelet(b"HTTP/1.1 101 x\r\n\r\n").await;
+        let (head, _) = spdy_post(
+            port,
+            ca,
+            "exec?container=app&command=ls",
+            "X-Stream-Protocol-Version: v4.channel.k8s.io X-Injected: 1\r\n",
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(
+            rx.try_recv().is_err(),
+            "kubelet must not be dialed for a rejected request"
         );
     }
 
