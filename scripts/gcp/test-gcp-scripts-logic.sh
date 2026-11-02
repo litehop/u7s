@@ -35,6 +35,8 @@ case "$*" in
   "compute instances list "*) echo "${STUB_INSTANCES:-}"; exit 0 ;;
   "compute instances describe "*) case "$* " in *" ${STUB_DESCRIBE_FAIL:-<none>} "*) exit 1 ;; *" ${STUB_NOTFOUND:-<none>} "*) echo "ERROR: (gcloud.compute.instances.describe) The resource was not found" >&2; exit 1 ;; esac; echo "${STUB_LABEL-1}"; exit 0 ;;
   "compute operations list "*) [ "${STUB_OPS_FAIL:-0}" = 1 ] && { echo "ERROR: denied on proj" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
+  "compute firewall-rules list "*"-lb-v"*) [ "${STUB_FWLIST_FAIL:-0}" = 1 ] && exit 1; [ -z "${STUB_LB_RULES:-}" ] || echo "$STUB_LB_RULES"; exit 0 ;;
+  "compute firewall-rules delete "*) [[ "$*" == *"${STUB_FWDEL_FAIL:-<none>}"* ]] && exit 1; exit 0 ;;
   "compute "*" list "*)
     [ "${STUB_LIST_FAIL:-0}" = 1 ] && exit 1
     for w in ${STUB_EXISTING:-}; do case "$* " in *"name=$w "*) echo "$w" ;; esac; done
@@ -54,6 +56,7 @@ run() {
   ENVS="$(sort -u "$TMP/log.env")"
 }
 
+PROBE_EXIST="u7s-probe u7s-probe-allow-iap-ssh"
 SETUP="$HERE/setup.sh"
 VPS="$HERE/vps.sh"
 
@@ -96,7 +99,7 @@ assert "setup.sh has no mutating gcloud call except via mutate()" \
 
 # idempotent: everything exists -> nothing to do, in both modes
 export STUB_SERVICES=$'compute.googleapis.com\niap.googleapis.com'
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6 $PROBE_EXIST"
 run "$SETUP" --dry-run
 assert "a fully set-up project yields no planned changes (setup must be re-runnable)" "$(hasnt 'WOULD RUN' "$OUT")"
 run "$SETUP"
@@ -104,11 +107,11 @@ assert "real mode on a fully set-up project makes no mutating call" \
   "$([ -z "$(grep -E ' (create|enable)( |$)' <<<"$LOG")" ] && [ "$RC" = 0 ] && echo 1 || echo 0)"
 
 # partial state: only the missing pieces are planned
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh $PROBE_EXIST"
 run "$SETUP" --dry-run
 assert "partial state plans only the missing internal firewall rule (existing ones must not be recreated)" \
   "$(has 'WOULD RUN: gcloud compute firewall-rules create u7s-test-allow-internal' "$OUT")$(hasnt 'networks create' "$OUT")$(hasnt 'allow-iap-ssh' "$(grep 'WOULD RUN' <<<"$OUT")")$(hasnt 'subnets create' "$OUT")"
-export STUB_EXISTING="u7s-test"
+export STUB_EXISTING="u7s-test $PROBE_EXIST"
 run "$SETUP" --dry-run
 assert "network without firewalls plans both firewall rules but no network" \
   "$(has 'create u7s-test-allow-iap-ssh' "$OUT")$(has 'create u7s-test-allow-internal' "$OUT")$(hasnt 'networks create' "$OUT")"
@@ -116,19 +119,19 @@ export STUB_EXISTING="u7s-test-allow-iap-ssh"
 run "$SETUP" --dry-run
 assert "a name that merely contains another resource's name does not count as existing" \
   "$(has 'networks create u7s-test --subnet-mode=custom' "$OUT")"
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6 $PROBE_EXIST"
 STUB_LIST_FAIL=1 run "$SETUP" --dry-run
 assert "a failing gcloud list (e.g. permission denied) aborts instead of reading as 'not found'" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'WOULD RUN' "$OUT")"
 
 # --- dual-stack subnet and IPv6 firewall
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6 $PROBE_EXIST"
 STUB_STACK=IPV4_ONLY run "$SETUP" --dry-run
 assert "an IPV4_ONLY subnet is updated in place to external dual-stack (dual-stack VMs cannot get IPv6 otherwise) and not recreated" \
   "$(has 'WOULD RUN: gcloud compute networks subnets update u7s-test --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")$(hasnt 'subnets create' "$OUT")"
 STUB_STACK=IPV4_IPV6 run "$SETUP" --dry-run
 assert "an already dual-stack subnet is left alone (setup must be re-runnable)" "$(hasnt 'subnets update' "$OUT")"
-export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal $PROBE_EXIST"
 run "$SETUP" --dry-run
 assert "the IPv6 internal rule mirrors the IPv4 one (allow all, source restricted to the subnet's own range) and never opens ::/0" \
   "$(has 'WOULD RUN: gcloud compute firewall-rules create u7s-test-allow-internal-v6 --network=u7s-test --direction=INGRESS --allow=all --source-ranges=<subnet-external-ipv6-prefix>' "$OUT")$(hasnt '::/0' "$OUT")$(hasnt '0.0.0.0/0' "$OUT")"
@@ -143,6 +146,26 @@ unset STUB_EXISTING
 run "$SETUP" --dry-run
 assert "a missing subnet is created dual-stack from the start" \
   "$(has '--range=10.80.0.0/24 --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")"
+
+# --- probe VPC (outside-VPC source for the external-reachability check)
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6"
+run "$SETUP" --dry-run
+assert "a project without the probe VPC plans a custom-mode u7s-probe network (an auto-mode one would add a subnet in every region)" \
+  "$(has 'WOULD RUN: gcloud compute networks create u7s-probe --subnet-mode=custom' "$OUT")"
+assert "the probe subnet is dual-stack with EXTERNAL IPv6 on a range that does not overlap u7s-test (10.80.0.0/24)" \
+  "$(has 'subnets create u7s-probe --network=u7s-probe --range=10.81.0.0/24 --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")"
+assert "the probe VPC gets IAP ssh (tcp:22 from IAP's range only) so the harness can reach the probe VM" \
+  "$(has 'firewall-rules create u7s-probe-allow-iap-ssh --network=u7s-probe --direction=INGRESS --allow=tcp:22 --source-ranges=35.235.240.0/20' "$OUT")"
+probe_plan="$(grep 'WOULD RUN' <<<"$OUT" | grep -E 'u7s-probe' || true)"
+assert "the probe VPC gets no allow-internal or any-source rule: it must stay unable to reach u7s-test except as an outsider" \
+  "$(hasnt 'allow-internal' "$probe_plan")$(hasnt '0.0.0.0/0' "$probe_plan")$(hasnt '::/0' "$probe_plan")$(hasnt '--allow=all' "$probe_plan")"
+export STUB_EXISTING="u7s-test u7s-test-allow-iap-ssh u7s-test-allow-internal u7s-test-allow-internal-v6 $PROBE_EXIST"
+run "$SETUP"
+assert "an existing probe VPC is left alone (setup must be re-runnable)" \
+  "$(has 'ok: network u7s-probe' "$OUT")$(has 'ok: subnet u7s-probe (dual-stack)' "$OUT")$(has 'ok: firewall u7s-probe-allow-iap-ssh' "$OUT")$(hasnt 'u7s-probe' "$(grep -E ' (create|update) ' <<<"$LOG" || true)")"
+STUB_STACK=IPV4_ONLY run "$SETUP" --dry-run
+assert "a non-dual-stack probe subnet is updated in place" \
+  "$(has 'WOULD RUN: gcloud compute networks subnets update u7s-probe --region=us-west1 --stack-type=IPV4_IPV6 --ipv6-access-type=EXTERNAL' "$OUT")"
 
 # real mode executes what dry-run would print
 export STUB_SERVICES="compute.googleapis.com"
@@ -198,6 +221,14 @@ run "$VPS" up --stack-type IPV6_ONLY t3
 assert "an unsupported stack type is rejected before any instance is created" \
   "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances create' "$LOG")"
 
+run "$VPS" up --stack-type IPV4_IPV6 --network u7s-probe p1
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "up --network u7s-probe puts a Spot, labelled, dual-stack VM in the probe VPC and not in u7s-test (else it is not an outsider and the label-based gc misses it)" \
+  "$(has '--network=u7s-probe --subnet=u7s-probe' "$create")$(hasnt 'u7s-test ' "$create")$(has '--labels=u7s-test=1' "$create")$(has '--provisioning-model=SPOT' "$create")$(has '--stack-type=IPV4_IPV6' "$create")"
+run "$VPS" up --network evil-net p2
+assert "a network other than u7s-test/u7s-probe is rejected before any instance is created" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(hasnt 'instances create' "$LOG")"
+
 # --- ssh / scp go through IAP
 run "$VPS" ssh t1 -- free -m
 assert "ssh tunnels through IAP (port 22 is closed to the internet)" "$(has 'compute ssh t1 --tunnel-through-iap -- free -m' "$LOG")"
@@ -219,6 +250,23 @@ assert "gc reports the failed instance and exits non-zero (a silent partial swee
 unset STUB_INSTANCES
 run "$VPS" gc
 assert "gc with no labelled instances deletes nothing" "$(hasnt 'delete' "$LOG")"
+export STUB_INSTANCES=$'u7s-e2e-1-probe\tus-west1-b'
+run "$VPS" gc
+assert "gc sweeps a leftover probe VM in the probe VPC (it carries the u7s-test=1 label like every harness VM)" \
+  "$(has 'instances delete u7s-e2e-1-probe --zone=us-west1-b --quiet' "$LOG")"
+unset STUB_INSTANCES
+export STUB_LB_RULES=$'u7s-e2e-1-lb-v6\nu7s-e2e-1-lb-v4\nu7s-test-allow-internal'
+run "$VPS" gc
+assert "gc deletes leftover per-run LB firewall rules, both families (a killed run leaves a rule admitting a probe address)" \
+  "$(has 'firewall-rules delete u7s-e2e-1-lb-v6 --quiet' "$LOG")$(has 'firewall-rules delete u7s-e2e-1-lb-v4 --quiet' "$LOG")"
+assert "gc lists LB rules by the u7s-e2e-*-lb-v4/v6 name pattern only and never deletes a setup rule even if the filter over-matched" \
+  "$(has "name~^u7s-e2e-.*-lb-v[46]\$" "$LOG")$(hasnt 'delete u7s-test-allow-internal' "$LOG")"
+STUB_FWDEL_FAIL=u7s-e2e-1-lb-v6 run "$VPS" gc
+assert "a firewall rule gc cannot delete is reported and fails gc (an open rule must not look swept)" \
+  "$([ "$RC" != 0 ] && echo 1 || echo 0)$(has 'failed to delete: u7s-e2e-1-lb-v6' "$OUT")$(has 'firewall-rules delete u7s-e2e-1-lb-v4 --quiet' "$LOG")"
+STUB_FWLIST_FAIL=1 run "$VPS" gc
+assert "a failing firewall list makes gc fail instead of reporting a clean sweep" "$([ "$RC" != 0 ] && echo 1 || echo 0)"
+unset STUB_LB_RULES
 
 # --- down
 run "$VPS" down t1
