@@ -19,7 +19,7 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 | [project-priority-hierarchy.md](project-priority-hierarchy.md) | Operator's bucket-ordered priority framework for bead triage and dispatch order (testing-blockers > conformance > other correctness > memory-usage > new features > o11y/perf polish) |
 | [cert-rotation-and-release-gate-state.md](cert-rotation-and-release-gate-state.md) | Release-gate state as of 2026-10-31 (main NOT release-ready: GCP e2-micro gate fails (d) because MariaDB 11.8's first-init temp server is CPU-bound in crypto and overruns the entrypoint wait; option A ~3/6; root-cause chain, memory protection #2039, harness, operator rules), cert rotation status, `w898x` memory bound, working rules |
 | [networking-l7-ingress-state.md](networking-l7-ingress-state.md) | Ingress/TLS initiative as of 2026-10-30: Traefik cleartext landed, cert-manager TLS next (1 GiB wedge first), CRD bugs, undecided phases |
-| [dual-stack-state.md](dual-stack-state.md) | Dual-stack/IPv6 epic `mayor-8w6at` as of 2026-10-31: install/manifests/beep v0.7.0/worker forwarding landed (render- and unit-tested, no runtime verify yet), remaining in dependency order, Lima v6 and GCP firewall notes |
+| [dual-stack-state.md](dual-stack-state.md) | Dual-stack/IPv6 epic `mayor-8w6at` as of 2026-11-03: dual-stack verified on GCP (v0.4.3-snapshot.2), what made it pass, GCP/Lima harness notes, open beads (IPv6-only next) |
 | [e2e-focus-conformance-image-pull-postmortem-2026-08-25.md](e2e-focus-conformance-image-pull-postmortem-2026-08-25.md) | Postmortem: `e2e-focus.yaml` CI timeouts caused by CDN edge-cache misses on infrequently-pulled conformance-image tags, not a code regression |
 
 ## Frontmatter convention
