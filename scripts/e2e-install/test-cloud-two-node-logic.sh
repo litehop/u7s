@@ -43,7 +43,7 @@ case "$*" in
     exit 0 ;;
   "compute instances describe "*natIP*)
     case "$*" in *-cp\ *) echo 34.0.0.2 ;; *-w1\ *) echo 34.0.0.3 ;; *-probe\ *) echo "${STUB_PROBE_V4-203.0.113.9}" ;; *) echo 34.0.0.4 ;; esac; exit 0 ;;
-  "compute instances describe "*ipv6Address*) echo "${STUB_PROBE_V6-2600:1900::4}"; exit 0 ;;
+  "compute instances describe "*externalIpv6*) echo "${STUB_PROBE_V6-2600:1900::4}"; exit 0 ;;
   "compute firewall-rules create "*) touch "$STUB_LOG.fw"; exit 0 ;;
   "compute firewall-rules describe "*) [ -z "${STUB_FW_LEAK:-}" ] || echo "$3"; [ -n "${STUB_FW_LEAK:-}" ]; exit $? ;;
   "compute firewall-rules delete "*) [ -z "${STUB_FW_LEAK:-}" ] || exit 1; rm -f "$STUB_LOG.fw"; exit 0 ;;

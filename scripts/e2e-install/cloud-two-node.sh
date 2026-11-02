@@ -161,7 +161,7 @@ internal_ip() {
 }
 
 external_ipv6() {
-  gcloud compute instances describe "$1" --zone="$ZONE" --format='value(networkInterfaces[0].ipv6Address)'
+  gcloud compute instances describe "$1" --zone="$ZONE" --format='value(networkInterfaces[0].ipv6AccessConfigs[0].externalIpv6)'
 }
 
 external_ipv4() {
