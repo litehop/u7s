@@ -98,17 +98,21 @@ pub(crate) async fn resolve_service_addr<S: Store>(
     port: i32,
 ) -> Result<SocketAddr, ResolveError> {
     let key = crate::keys::object_key("services", namespace, name);
+    // Store, decode and DNS errors carry internal detail and reach clients inside
+    // webhook failure messages, so they are logged, not embedded in `message`.
     let stored = state.store.get(&key).await.map_err(|e| {
+        tracing::warn!(service = name, error = %e, "service resolver: store read failed");
         err(
             REASON_RESOLVE_FAILED,
-            format!("reading service \"{name}\": {e}"),
+            format!("reading service \"{name}\" failed"),
         )
     })?;
     let svc: Option<serde_json::Value> = match stored {
         Some(s) => Some(serde_json::from_slice(&s.value).map_err(|e| {
+            tracing::warn!(service = name, error = %e, "service resolver: decode failed");
             err(
                 REASON_RESOLVE_FAILED,
-                format!("decoding service \"{name}\": {e}"),
+                format!("decoding service \"{name}\" failed"),
             )
         })?),
         None => None,
@@ -124,9 +128,10 @@ pub(crate) async fn resolve_service_addr<S: Store>(
         Dial::Host(host) => tokio::net::lookup_host((host.as_str(), port_u16))
             .await
             .map_err(|e| {
+                tracing::warn!(service = name, host = %host, error = %e, "service resolver: ExternalName lookup failed");
                 err(
                     REASON_RESOLVE_FAILED,
-                    format!("resolving ExternalName \"{host}\" of service \"{name}\": {e}"),
+                    format!("resolving ExternalName \"{host}\" of service \"{name}\" failed"),
                 )
             })?
             .next()

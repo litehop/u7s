@@ -479,7 +479,7 @@ pub(crate) fn webhook_match_conditions_pass(
                     );
                     return Ok(false);
                 }
-                return Err(Status::internal(format!(
+                return Err(Status::internal_actionable(format!(
                     "admission webhook \"{webhook_name}\" matchCondition \"{}\" failed to \
                      evaluate (failurePolicy=Fail): {}: {}",
                     cond.name,
@@ -727,8 +727,22 @@ fn blocked_ipv4_range(octets: [u8; 4]) -> Option<&'static str> {
 /// normalized to dotted-quad here exactly as reqwest will normalize them, instead of silently
 /// skipping every check the way hand-splitting the raw URL string did.
 pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url)
-        .map_err(|e| format!("webhook url is not a valid URL: {url} ({e})"))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        format!("webhook url must be a valid URL: {e}; desired format: https://host[/path]")
+    })?;
+
+    // Same rejections as upstream ValidateWebhookURL. The offending values are deliberately
+    // not echoed: this error reaches clients triggering the webhook, and userinfo/query
+    // routinely carry credentials.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("webhook url: user information is not permitted in the URL".into());
+    }
+    if parsed.fragment().is_some_and(|f| !f.is_empty()) {
+        return Err("webhook url: fragments are not permitted in the URL".into());
+    }
+    if parsed.query().is_some_and(|q| !q.is_empty()) {
+        return Err("webhook url: query parameters are not permitted in the URL".into());
+    }
 
     let scheme = parsed.scheme();
     if scheme != "https" && scheme != "http" {
@@ -1539,17 +1553,44 @@ fn webhook_url_with_timeout(base_url: &str, secs: i64) -> String {
     format!("{base_url}{sep}timeout={secs}s")
 }
 
-/// Call the webhook and return the response, or `None` on network/parse error.
-/// The bool indicates whether the failure was a timeout (true) vs other error (false).
-/// Callers use this to return HTTP 504 on timeout vs HTTP 500 on other failures.
+/// Why a webhook call produced no response. `reason` is a fixed, client-safe summary: the
+/// underlying reqwest/TLS error (resolved addresses, handshake detail) is never forwarded.
+struct WebhookCallFailure {
+    /// Callers return HTTP 504 on timeout vs HTTP 500 on other failures.
+    timed_out: bool,
+    reason: &'static str,
+}
+
+fn webhook_call_failure_reason(e: &reqwest::Error) -> &'static str {
+    if e.is_connect() {
+        "failed to connect to the webhook endpoint"
+    } else if e.is_redirect() {
+        "the webhook endpoint answered with a redirect"
+    } else {
+        "the request to the webhook endpoint failed"
+    }
+}
+
+/// Upstream's failurePolicy=Fail error (`NewInternalError(ErrCallingWebhook)`): names the
+/// webhook so the operator knows which of several configured webhooks to look at.
+fn failed_calling_webhook(webhook_name: &str, call_url: &str, reason: &str) -> StatusError {
+    Status::internal_actionable(format!(
+        "failed calling webhook \"{webhook_name}\": failed to call webhook: Post \"{call_url}\": {reason}"
+    ))
+}
+
+/// Call the webhook and return the response, or why there is none.
 async fn call_webhook(
     client: &reqwest::Client,
     url: &str,
     review: &AdmissionReview,
     deadline: std::time::Duration,
-) -> (Option<AdmissionResponse>, bool) {
+) -> Result<AdmissionResponse, WebhookCallFailure> {
     let Ok(body) = serde_json::to_vec(review) else {
-        return (None, false);
+        return Err(WebhookCallFailure {
+            timed_out: false,
+            reason: "failed to encode the AdmissionReview",
+        });
     };
     let start = std::time::Instant::now();
     let send_result = send_webhook_request_with_retry(deadline, || {
@@ -1559,7 +1600,7 @@ async fn call_webhook(
             .body(body.clone())
     })
     .await;
-    let (response, timed_out) = match send_result {
+    let result = match send_result {
         Ok(mut resp) => {
             // Bounded read: treat oversized responses as a network failure so the
             // caller can apply failurePolicy (Fail or Ignore). This prevents a
@@ -1570,30 +1611,37 @@ async fn call_webhook(
                     Ok(Some(chunk)) => {
                         buf.extend_from_slice(&chunk);
                         if buf.len() > MAX_WEBHOOK_RESPONSE_BYTES {
-                            break None;
+                            break Err("the webhook response exceeded the size limit");
                         }
                     }
-                    Ok(None) => break Some(&buf),
-                    Err(_) => break None,
+                    Ok(None) => break Ok(&buf),
+                    Err(_) => break Err("the webhook response could not be read"),
                 }
             };
-            let response = read.and_then(|buf| {
+            read.and_then(|buf| {
                 serde_json::from_slice::<AdmissionReview>(buf)
                     .ok()
                     .and_then(|r| r.response)
-            });
-            (response, false)
+                    .ok_or("the webhook response is not a valid AdmissionReview")
+            })
+            .map_err(|reason| WebhookCallFailure {
+                timed_out: false,
+                reason,
+            })
         }
-        Err(e) => (None, e.is_timeout()),
+        Err(e) => Err(WebhookCallFailure {
+            timed_out: e.is_timeout(),
+            reason: webhook_call_failure_reason(&e),
+        }),
     };
     tracing::debug!(
         url = %url,
         elapsed_ms = start.elapsed().as_millis() as u64,
-        timed_out,
-        ok = response.is_some(),
+        timed_out = result.as_ref().err().is_some_and(|f| f.timed_out),
+        ok = result.is_ok(),
         "admission: webhook HTTP call completed"
     );
-    (response, timed_out)
+    result
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
@@ -1724,8 +1772,8 @@ async fn invoke_mutating_webhook<S: Store>(
                 );
                 return Ok((None, false));
             } else {
-                return Err(Status::internal(format!(
-                    "admission webhook \"{}\": {e}",
+                return Err(Status::internal_actionable(format!(
+                    "failed calling webhook \"{}\": {e}",
                     webhook.name
                 )));
             }
@@ -1755,7 +1803,7 @@ async fn invoke_mutating_webhook<S: Store>(
         &state.webhook_client.get(),
         webhook.timeout_seconds,
     );
-    let (response, timed_out) = call_webhook(
+    let response = call_webhook(
         &wh_client,
         &call_url,
         &review,
@@ -1764,7 +1812,7 @@ async fn invoke_mutating_webhook<S: Store>(
     .await;
 
     match response {
-        Some(resp) => {
+        Ok(resp) => {
             if !resp.allowed {
                 // Use message if present; fall back to reason (some webhooks set only reason);
                 // fall back to a generic message. Both fields are included in the error so the
@@ -1800,7 +1848,7 @@ async fn invoke_mutating_webhook<S: Store>(
             }
             Ok((None, false))
         }
-        None => {
+        Err(failure) => {
             // Webhook call failed (network/timeout/parse error).
             if webhook.failure_policy == "Ignore" {
                 tracing::warn!(
@@ -1808,7 +1856,7 @@ async fn invoke_mutating_webhook<S: Store>(
                     webhook.name
                 );
                 Ok((None, false))
-            } else if timed_out {
+            } else if failure.timed_out {
                 // Include the full URL (with ?timeout=Ns) so the client error message
                 // matches what the conformance test checks: the URL path + "timeout".
                 Err(Status::gateway_timeout(format!(
@@ -1816,10 +1864,11 @@ async fn invoke_mutating_webhook<S: Store>(
                      (context deadline exceeded): {call_url}"
                 )))
             } else {
-                Err(Status::internal(format!(
-                    "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
-                    webhook.name
-                )))
+                Err(failed_calling_webhook(
+                    &webhook.name,
+                    &call_url,
+                    failure.reason,
+                ))
             }
         }
     }
@@ -3016,7 +3065,7 @@ fn eval_vap_invocation(
                         policy_name,
                         expr
                     );
-                    return Err(Status::internal(format!(
+                    return Err(Status::internal_actionable(format!(
                         "ValidatingAdmissionPolicy \"{policy_name}\" matchCondition \
                              failed to evaluate (failurePolicy=Fail): {expr}: {}",
                         cel_last_error()
@@ -3293,8 +3342,8 @@ pub async fn run_validating_webhooks<S: Store>(
                     );
                         continue;
                     } else {
-                        return Err(Status::internal(format!(
-                            "admission webhook \"{}\": {e}",
+                        return Err(Status::internal_actionable(format!(
+                            "failed calling webhook \"{}\": {e}",
                             webhook.name
                         )));
                     }
@@ -3331,7 +3380,7 @@ pub async fn run_validating_webhooks<S: Store>(
                 &state.webhook_client.get(),
                 webhook.timeout_seconds,
             );
-            let (response, timed_out) = call_webhook(
+            let response = call_webhook(
                 &wh_client,
                 &call_url,
                 &review,
@@ -3340,7 +3389,7 @@ pub async fn run_validating_webhooks<S: Store>(
             .await;
 
             match response {
-                Some(resp) => {
+                Ok(resp) => {
                     if !resp.allowed {
                         let message = resp
                             .status
@@ -3360,13 +3409,13 @@ pub async fn run_validating_webhooks<S: Store>(
                         )));
                     }
                 }
-                None => {
+                Err(failure) => {
                     if webhook.failure_policy == "Ignore" {
                         tracing::warn!(
                         "admission: validating webhook \"{}\" failed, ignoring (failurePolicy=Ignore)",
                         webhook.name
                     );
-                    } else if timed_out {
+                    } else if failure.timed_out {
                         // Include the full URL (with ?timeout=Ns) so the client error message
                         // matches what the conformance test checks: the URL path + "timeout".
                         return Err(Status::gateway_timeout(format!(
@@ -3374,10 +3423,11 @@ pub async fn run_validating_webhooks<S: Store>(
                          (context deadline exceeded): {call_url}"
                         )));
                     } else {
-                        return Err(Status::internal(format!(
-                            "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
-                            webhook.name
-                        )));
+                        return Err(failed_calling_webhook(
+                            &webhook.name,
+                            &call_url,
+                            failure.reason,
+                        ));
                     }
                 }
             }
@@ -4889,9 +4939,33 @@ mod tests {
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
+        let err = result.expect_err("failurePolicy=Fail must reject when webhook is unreachable");
+        assert_webhook_failure_names_webhook(err, "fail.webhook.example.com").await;
+    }
+
+    /// The client-visible body of a failurePolicy=Fail call failure must name the webhook
+    /// (an operator with several webhooks configured cannot otherwise tell which one broke)
+    /// while the transport error (OS error text) stays server-side.
+    async fn assert_webhook_failure_names_webhook(err: StatusError, webhook_name: &str) {
+        use axum::response::IntoResponse;
+        let resp = err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let msg = v["message"].as_str().unwrap();
         assert!(
-            result.is_err(),
-            "failurePolicy=Fail must reject when webhook is unreachable"
+            msg.contains(&format!("failed calling webhook \"{webhook_name}\":")),
+            "an operator debugging a failing webhook must see which webhook failed: {msg}"
+        );
+        assert!(
+            msg.contains("failed to connect to the webhook endpoint"),
+            "the safe failure class must be summarised for the client: {msg}"
+        );
+        assert!(
+            !msg.contains("os error") && !msg.to_lowercase().contains("connection refused"),
+            "raw transport error text must not reach the client: {msg}"
         );
     }
 
@@ -5003,10 +5077,8 @@ mod tests {
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
-        assert!(
-            result.is_err(),
-            "failurePolicy=Fail must reject when webhook is unreachable"
-        );
+        let err = result.expect_err("failurePolicy=Fail must reject when webhook is unreachable");
+        assert_webhook_failure_names_webhook(err, "fail.validating.example.com").await;
     }
 
     /// A validating webhook that exceeds its configured timeout must return HTTP 504
@@ -13359,7 +13431,7 @@ quoted""" && object.b == '''x'y'''"#,
         let review = build_review("uid-proxy-test", &ctx, &obj, None);
         let webhook_url = format!("{base_url}/webhook");
 
-        let (response, _timed_out) = call_webhook(
+        let response = call_webhook(
             &client,
             &webhook_url,
             &review,
@@ -13368,7 +13440,7 @@ quoted""" && object.b == '''x'y'''"#,
         .await;
 
         assert!(
-            response.is_none(),
+            response.is_err(),
             "when proxy is applied and unreachable, the call must fail — \
              if the call succeeds (response is Some), the proxy was dropped: \
              the pre-fix bug returned a plain client without proxy when caBundle is absent, \
@@ -13433,6 +13505,41 @@ quoted""" && object.b == '''x'y'''"#,
             "https://webhook.example.com must be accepted — \
              normal production webhook URLs must not be blocked by SSRF prevention"
         );
+    }
+
+    /// Upstream ValidateWebhookURL rejects userinfo, fragments and query strings. The
+    /// call-failure message echoes the URL to clients, so accepting them leaks credentials.
+    #[test]
+    fn validate_webhook_url_rejects_userinfo_without_echoing_it() {
+        let err = validate_webhook_url("https://user:s3cret@webhook.example.com/admit")
+            .expect_err("userinfo must be rejected");
+        assert_eq!(
+            err,
+            "webhook url: user information is not permitted in the URL"
+        );
+        assert!(
+            !err.contains("s3cret"),
+            "credentials must not reach clients"
+        );
+        assert!(validate_webhook_url("https://user@webhook.example.com/").is_err());
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_query_without_echoing_it() {
+        let err = validate_webhook_url("https://webhook.example.com/admit?token=s3cret")
+            .expect_err("query must be rejected");
+        assert_eq!(
+            err,
+            "webhook url: query parameters are not permitted in the URL"
+        );
+        assert!(!err.contains("s3cret"), "tokens must not reach clients");
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_fragment() {
+        let err = validate_webhook_url("https://webhook.example.com/admit#frag")
+            .expect_err("fragment must be rejected");
+        assert_eq!(err, "webhook url: fragments are not permitted in the URL");
     }
 
     /// http://127.0.0.1 must be accepted for loopback (used by in-process test servers).

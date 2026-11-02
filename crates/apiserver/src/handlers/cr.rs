@@ -114,7 +114,7 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
             Ok(Some(chunk)) => {
                 buf.extend_from_slice(&chunk);
                 if buf.len() > MAX_CONVERSION_RESPONSE_BYTES {
-                    return Err(Status::internal(
+                    return Err(Status::internal_actionable(
                         "conversion webhook response exceeded 1 MiB size limit".into(),
                     ));
                 }
@@ -141,7 +141,7 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
         let msg = resp_val["response"]["result"]["message"]
             .as_str()
             .unwrap_or("conversion webhook returned failure");
-        return Err(Status::internal(format!(
+        return Err(Status::internal_actionable(format!(
             "conversion webhook failed: {msg}"
         )));
     }
@@ -160,7 +160,7 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
     // Err here instead makes the caller's `?` drop the still-armed guard, whose Drop impl
     // releases every claimed key — see `LeaderClaimGuard`.
     if converted.len() != requested_len {
-        return Err(Status::internal(format!(
+        return Err(Status::internal_actionable(format!(
             "conversion webhook returned {} converted objects, expected {requested_len}",
             converted.len()
         )));
@@ -723,7 +723,7 @@ async fn convert_cr_to_api_version<S: Store>(
     let mut converted = call_conversion_webhook(state, cfg, vec![obj], desired_api_version).await?;
     converted
         .pop()
-        .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))
+        .ok_or_else(|| Status::internal_actionable("conversion webhook returned no objects".into()))
 }
 
 /// Evict `state.cr_conversion_cache` entries keyed on `superseded_resource_version` (any
@@ -3289,9 +3289,9 @@ pub async fn get_cr<S: Store>(
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_deref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-            let mut converted_obj = converted
-                .pop()
-                .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            let mut converted_obj = converted.pop().ok_or_else(|| {
+                Status::internal_actionable("conversion webhook returned no objects".into())
+            })?;
             stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
             if let Some(schema) = ctx.schema.as_deref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
@@ -4306,9 +4306,9 @@ pub async fn get_cr_namespaced<S: Store>(
         if let Some(cfg) = ctx.conversion_webhook_client_config.as_deref() {
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-            let mut converted_obj = converted
-                .pop()
-                .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            let mut converted_obj = converted.pop().ok_or_else(|| {
+                Status::internal_actionable("conversion webhook returned no objects".into())
+            })?;
             stamp_cr_envelope(&mut converted_obj, &group, &version, &ctx.kind);
             if let Some(schema) = ctx.schema.as_deref() {
                 apply_crd_schema_defaults(schema, &mut converted_obj);
