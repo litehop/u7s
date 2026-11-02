@@ -6,6 +6,9 @@
 # neither runs where beep is absent nor passes when the client IP is lost.
 set -euo pipefail
 
+# An ambient value would flip the machine-type assertions.
+unset U7S_GCP_MACHINE_TYPE
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/cloud-two-node.sh"
 
@@ -64,7 +67,7 @@ case "$*" in
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
-        echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>${STUB_MINT_FAMILIES:+ --cluster-ip-families $STUB_MINT_FAMILIES}" ;;
+        echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
       *"get nodes -o wide"*)
         echo "u7s-e2e-t-w1.zone.internal Ready <none> 1m v1.37.1 10.80.0.3 <none> Ubuntu"
         case "${STUB_NODES:-one}" in
@@ -241,8 +244,8 @@ assert "--node-ip is not passed: install.sh derives both node addresses from --i
   "$(hasnt 'node-ip' "$dual_log")"
 assert "the join does not repeat the CIDRs (w1 learns them from the cluster)" \
   "$(hasnt 'cidr' "$(grep -- '--join' <<<"$dual_log")")"
-assert "the dual-stack join carries --cluster-ip-families 4,6 (a worker without it assumes IPv4 and drops its IPv6 address, so the cluster silently loses a family)" \
-  "$(has '--node-name u7s-e2e-t-w1 --cluster-ip-families 4,6' "$(grep -- '--join' <<<"$dual_log")")"
+assert "the dual-stack join passes no network flags (w1 reads the cluster's families and DNS from the cluster itself)" \
+  "$(hasnt 'cluster-ip-families' "$dual_log")$(hasnt 'cluster-dns' "$dual_log")"
 fw4="$(grep 'firewall-rules create u7s-e2e-t-lb-v4' <<<"$dual_log" || true)"
 fw6="$(grep 'firewall-rules create u7s-e2e-t-lb-v6' <<<"$dual_log" || true)"
 assert "the v4 LB firewall rule opens only the LB port, to tagged VPSes, from the probe's external /32 alone (never the in-subnet client, 0.0.0.0/0 or all ports; GCE rules cannot mix families)" \
@@ -356,11 +359,8 @@ assert "a firewall rule that cannot be deleted is reported as leaked and turns a
 run --release v0.4.0-snapshot.1 --dual-stack --keep
 assert "--keep leaves the firewall rules and the probe VM and says how to delete each" \
   "$(rc_is 0)$(hasnt 'firewall-rules delete' "$LOG")$(hasnt 'instances delete' "$LOG")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v6' "$OUT")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v4' "$OUT")$(has 'scripts/gcp/vps.sh down u7s-e2e-t-probe' "$OUT")"
-STUB_MINT_FAMILIES=6,4 run --release v0.4.0-snapshot.1 --dual-stack
-assert "the join uses the families the control plane printed rather than a guess (so ordering and future values follow the cluster)" \
-  "$(rc_is 0)$(has '--cluster-ip-families 6,4' "$(grep -- '--join' <<<"$LOG")")$(hasnt '--cluster-ip-families 4,6' "$LOG")"
 STUB_BEEP=0 run --release v0.4.0-snapshot.1
-assert "single-stack joins are unchanged: no --cluster-ip-families flag" "$(hasnt 'cluster-ip-families' "$LOG")"
+assert "single-stack joins pass no families flag either" "$(hasnt 'cluster-ip-families' "$LOG")"
 unset STUB_BEEP STUB_INGRESS
 
 # --- redaction and interrupts

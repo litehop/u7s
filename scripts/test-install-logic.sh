@@ -2605,7 +2605,7 @@ done
 assert "--cluster-ip-families is gone: a worker's families come from the cluster, and a flag that could contradict it would silently re-create the single-stack-on-dual-stack bug" \
   "$UNKNOWN_FLAG_OK"
 assert "a worker refuses --cluster-dns, --service-cidr and --cluster-cidr instead of letting them contradict the cluster's published values" \
-  "$(grep -qF 'a joining or already-joined worker reads them from the cluster' "$INSTALL" && sed -n '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/,/^else$/p' "$INSTALL" | grep -qF -- '[ -n "$CLUSTER_DNS" ]' && echo 1 || echo 0)"
+  "$(grep -qF '[ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]' "$INSTALL" && grep -qF 'a joining or already-joined worker reads them from the cluster' "$INSTALL" && echo 1 || echo 0)"
 assert "a worker validates the families it derived from the cluster, and rejects a malformed set instead of guessing" \
   "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'must be one of' && echo 1 || echo 0)"
 net_run 'cluster_families_from_cidrs "fd00:96::/108,10.96.0.0/12" "10.244.0.0/16"'
