@@ -174,6 +174,14 @@ assert "up caps lifetime at 16h (a forgotten VPS stops itself)" "$(has '--max-ru
 assert "up labels u7s-test=1 (gc and list find it by label)" "$(has '--labels=u7s-test=1' "$create")"
 assert "up joins the u7s-test network/subnet (the IAP-only firewall applies there)" "$(has '--network=u7s-test --subnet=u7s-test' "$create")"
 assert "up is e2-micro on the ubuntu-2604 family" "$(has '--machine-type=e2-micro' "$create")$(has '--image-family=ubuntu-2604-lts-amd64' "$create")"
+U7S_GCP_MACHINE_TYPE=e2-standard-2 run "$VPS" up t1
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "U7S_GCP_MACHINE_TYPE overrides the machine type (the dual-stack sonobuoy subset saturates e2-micro) and nothing else" \
+  "$(has '--machine-type=e2-standard-2' "$create")$(hasnt 'e2-micro' "$create")$(has '--provisioning-model=SPOT' "$create")"
+run "$VPS" up t1
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "up tags the VPS u7s-test-vps (a test's narrow firewall rule targets the tag, never every instance on the network)" \
+  "$(has '--tags=u7s-test-vps' "$create")"
 assert "up pins the configured zone explicitly (else gcloud may prompt for one interactively)" "$(has '--zone=us-west1-b' "$create")"
 STUB_ZONE= run "$VPS" up t1
 assert "up without a configured zone fails instead of prompting or guessing" \

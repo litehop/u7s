@@ -38,6 +38,9 @@ case "$*" in
   "compute instances create "*)
     [ -z "${STUB_LEAK:-}" ] || echo "Created [https://compute.googleapis.com/projects/fake-proj-123/zones/z/instances/x]" >&2
     exit 0 ;;
+  "compute instances describe "*ipv6Address*) echo "${STUB_CLIENT_V6-2600:1900::4}"; exit 0 ;;
+  "compute firewall-rules describe "*) [ -z "${STUB_FW_LEAK:-}" ] || echo "$3"; [ -n "${STUB_FW_LEAK:-}" ]; exit $? ;;
+  "compute firewall-rules delete "*) [ -z "${STUB_FW_LEAK:-}" ] || exit 1; exit 0 ;;
   "compute instances describe "*) echo 1; exit 0 ;;
   "compute instances delete "*) [ -z "${STUB_DELETE_FAIL:-}" ] || exit 1; exit 0 ;;
   "compute operations list "*) [ -z "${STUB_OPS_FAIL:-}" ] || { echo "ERROR: denied" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
@@ -60,6 +63,19 @@ case "$*" in
           one|dup) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
         esac
         [ "${STUB_NODES:-one}" != dup ] || echo "u7s-e2e-t-cp2.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
+      *"status.addresses"*)
+        case "$*" in *-cp.*) echo "10.80.0.2 ${STUB_NODE_V6-2600:1900::2}" ;; *) echo "10.80.0.3 ${STUB_NODE_V6-2600:1900::3}" ;; esac ;;
+      *"spec.podCIDRs"*) echo "${STUB_PODCIDRS-10.244.0.0/24 fd00:244::/64}" ;;
+      *"spec.clusterIPs"*) echo "${STUB_CLUSTERIPS-10.96.0.50 fd00:96::50}" ;;
+      *"status.podIPs"*) echo "10.244.1.2 fd00:244:0:1::2" ;;
+      *"dig +short"*)
+        case "$*" in *" AAAA "*) echo "${STUB_AAAA-fd00:96::50}" ;; *) echo "${STUB_A-10.96.0.50}" ;; esac ;;
+      *kubeletVersion*) echo v1.37.1 ;;
+      *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig status"*) echo "PLUGIN  STATUS  RESULT  COUNT"; echo "e2e     ${STUB_SB_STATUS-complete}  failed  1" ;;
+      *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig results"*)
+        printf 'Plugin: e2e\nStatus: passed\nTotal: %s\nPassed: 9\nFailed: %s\nSkipped: 0\n' "${STUB_SB_TOTAL-9}" "${STUB_SB_FAILED-0}" ;;
+      *"ip -6 -o addr"*) echo "2: ens4    inet6 2600:1900::4/128 scope global dynamic" ;;
+      *"curl -6"*) echo "${STUB_SEEN6-[2600:1900::4]}:41234" ;;
       *"get ds -o name"*)
         echo daemonset.apps/kube-proxy
         case "${STUB_BEEP:-0}" in
@@ -80,7 +96,7 @@ run() {
   : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" STUB_TOKEN="$TOKEN" STUB_HASH="$HASH" \
-    STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 \
+    STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 U7S_E2E_SONOBUOY_POLLS=3 \
     "$SCRIPT" "$@" 2>&1 </dev/null)" || RC=$?
   LOG="$(cat "$TMP/log")"
   STDIN="$(cat "$TMP/log.stdin")"
@@ -182,6 +198,101 @@ assert "only the real servicelb-controller DaemonSet counts as beep; a lookalike
 STUB_BEEP=1 STUB_FAIL_MATCH="get ds -o name" run --release v0.4.0-snapshot.1
 assert "a failed DaemonSet listing is FAIL, not a silent SKIPPED pass" \
   "$(rc_is 1)$(hasnt 'SKIPPED' "$OUT")$(has 'listing kube-system DaemonSets' "$OUT")"
+
+# --- --machine-type / default stays e2-micro with no IPv6 resources
+unset STUB_BEEP
+run --release v0.4.0-snapshot.1
+assert "the default run keeps e2-micro, IPV4_ONLY VPSes and creates no firewall rule (the release gate must not change)" \
+  "$(has 'machine-type=e2-micro' "$LOG")$(hasnt 'e2-standard' "$LOG")$(hasnt 'IPV4_IPV6' "$LOG")$(hasnt 'firewall-rules' "$LOG")$(hasnt 'cluster-cidr' "$LOG")"
+run --release v0.4.0-snapshot.1 --machine-type e2-small
+assert "--machine-type reaches every VPS create (a bigger node for a heavier suite)" \
+  "$(rc_is 0)$([ "$(grep -c 'machine-type=e2-small' <<<"$LOG")" = 2 ] && echo 1 || echo 0)"
+run --release v0.4.0-snapshot.1 --machine-type 'e2-micro;rm'
+assert "a machine type that is not a plain name exits 2 before creating VPSes" "$(rc_is 2)$(hasnt 'instances create' "$LOG")"
+run --release v0.4.0-snapshot.1 --machine-type
+assert "--machine-type without a value exits 2" "$(rc_is 2)"
+
+# --- --dual-stack
+DS_INGRESS="10.80.0.2 10.80.0.3 2600:1900::2 2600:1900::3"
+export STUB_BEEP=1 STUB_INGRESS="$DS_INGRESS"
+run --release v0.4.0-snapshot.1 --dual-stack
+dual_out="$OUT"; dual_log="$LOG"; dual_stdin="$STDIN"
+fw="$(grep 'firewall-rules create' <<<"$dual_log" || true)"
+assert "--dual-stack passes on a healthy dual-stack stub cluster" "$(rc_is 0)$(has 'RESULT: PASS' "$dual_out")"
+assert "every VPS (cp, w1, client) is IPV4_IPV6 with a premium external v6 address (a v4-only VPS cannot carry the v6 path)" \
+  "$([ "$(grep -c 'stack-type=IPV4_IPV6' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)$([ "$(grep -c 'ipv6-network-tier=PREMIUM' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)"
+assert "--dual-stack defaults to e2-standard-2 (the sonobuoy subset saturates e2-micro)" \
+  "$([ "$(grep -c 'machine-type=e2-standard-2' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)$(hasnt 'e2-micro' "$dual_log")"
+run --release v0.4.0-snapshot.1 --dual-stack --machine-type e2-medium
+assert "an explicit --machine-type wins over the --dual-stack default" "$(has 'machine-type=e2-medium' "$LOG")$(hasnt 'e2-standard-2' "$LOG")"
+assert "install.sh gets both families for pods and Services (a single-stack install would pass the node asserts vacuously)" \
+  "$(has 'install.sh --cluster-cidr 10.244.0.0/16,fd00:244::/56 --service-cidr 10.96.0.0/12,fd00:96::/108' "$dual_log")"
+assert "--node-ip is not passed: install.sh derives both node addresses from --iface (GCE's NIC carries the v4 address plus the v6 /96 address on the one interface)" \
+  "$(hasnt 'node-ip' "$dual_log")"
+assert "the join does not repeat the CIDRs (w1 learns them from the cluster)" \
+  "$(hasnt 'cidr' "$(grep -- '--join' <<<"$dual_log")")"
+assert "the LB firewall rule opens only the LB port, to VPSes carrying the test tag, from the client's own /96 (never ::/0 or all ports)" \
+  "$(has 'rules=tcp:80' "$fw")$(has 'target-tags=u7s-test-vps' "$fw")$(has 'source-ranges=2600:1900::4/96' "$fw")$(hasnt '::/0' "$fw")$(hasnt '0.0.0.0/0' "$fw")$(has 'direction=INGRESS' "$fw")$(has 'u7s-e2e-t-lb-v6' "$fw")"
+assert "the LB firewall rule is deleted on a PASS (it must not outlive the run)" "$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$dual_log")"
+assert "nodes carry both InternalIP families and two podCIDRs (checked per node)" \
+  "$(has 'PASS: node u7s-e2e-t-cp.zone.internal InternalIP dual-stack' "$(cat "$TMP"/res/dual-nodes.log)")$(has 'PASS: node u7s-e2e-t-w1 podCIDRs dual-stack' "$(cat "$TMP"/res/dual-nodes.log)")"
+assert "a PreferDualStack Service and a dnsutils pod are applied" \
+  "$(has 'ipFamilyPolicy: PreferDualStack' "$dual_stdin")$(has 'jessie-dnsutils' "$dual_stdin")"
+assert "the LoadBalancer Service is PreferDualStack too (else beep never sees a v6 family)" \
+  "$([ "$(grep -c 'ipFamilyPolicy: PreferDualStack' <<<"$dual_stdin")" = 2 ] && echo 1 || echo 0)"
+assert "CoreDNS is asked for A and AAAA from a pod" "$(has 'dig +short +time=5 A ds.default' "$dual_log")$(has 'dig +short +time=5 AAAA ds.default' "$dual_log")"
+assert "pod-to-pod and pod-to-Service run per family, v6 in brackets" \
+  "$(has "connect 10.244.1.2:8080" "$dual_log")$(has "connect '[fd00:244:0:1::2]:8080'" "$dual_log")$(has "connect 10.96.0.50:80" "$dual_log")$(has "connect '[fd00:96::50]:80'" "$dual_log")"
+assert "the LB is curled from the client over IPv4 (-4) and IPv6 (-6) on every ingress address" \
+  "$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.2/clientip' "$dual_log")$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.3/clientip' "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::2]/clientip'" "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::3]/clientip'" "$dual_log")"
+assert "sonobuoy runs the upstream dual-stack focus with the node's own conformance image tag" \
+  "$(has "--e2e-focus 'IPv6DualStack|dual-stack|DualStack|ipFamilyPolicy'" "$dual_log")$(has 'registry.k8s.io/conformance:v1.37.1' "$dual_log")"
+assert "sonobuoy results are reported inline" "$(has 'Total: 9' "$dual_out")$(has 'Failed: 0' "$dual_out")"
+assert "the default (single-stack) run never reaches the dual-stack assertions" \
+  "$(hasnt 'dual-nodes' "$(STUB_BEEP=1 run --release v0.4.0-snapshot.1; echo "$OUT")")"
+
+export STUB_BEEP=1 STUB_INGRESS="$DS_INGRESS"
+STUB_NODE_V6= run --release v0.4.0-snapshot.1 --dual-stack
+assert "a node with no IPv6 InternalIP fails (an IPv4-only node would otherwise pass)" "$(rc_is 1)$(has 'lacks an IPv4 or IPv6 entry' "$(cat "$TMP"/res/dual-nodes.log)")"
+STUB_PODCIDRS=10.244.0.0/24 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a node with a single podCIDR fails (no IPv6 pod range allocated)" "$(rc_is 1)$(has 'podCIDRs' "$(cat "$TMP"/res/dual-nodes.log)")"
+STUB_CLUSTERIPS=10.96.0.50 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a PreferDualStack Service with one clusterIP fails" "$(rc_is 1)$(has 'clusterIPs' "$(cat "$TMP"/res/dual-workload.log)")"
+STUB_AAAA= run --release v0.4.0-snapshot.1 --dual-stack
+assert "an empty AAAA answer from CoreDNS fails" "$(rc_is 1)$(has 'AAAA answer' "$(cat "$TMP"/res/dual-workload.log)")"
+STUB_A=10.96.9.9 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a wrong A answer from CoreDNS fails" "$(rc_is 1)$(has 'A answer' "$(cat "$TMP"/res/dual-workload.log)")"
+STUB_FAIL_MATCH="connect '[fd00:96::50]:80'" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a Service unreachable over IPv6 fails" "$(rc_is 1)$(has 'pod-to-Service over IPv6' "$(cat "$TMP"/res/dual-workload.log)")"
+STUB_INGRESS="10.80.0.2 10.80.0.3" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a LoadBalancer with only IPv4 ingress fails (beep v6 not advertised)" "$(rc_is 1)$(has 'lacks an IPv4 or IPv6' "$OUT")"
+STUB_INGRESS="10.80.0.2 10.80.0.3 2600:1900::2" run --release v0.4.0-snapshot.1 --dual-stack
+assert "an ingress list missing a node's IPv6 fails" "$(rc_is 1)$(has 'lacks node IP 2600:1900::3' "$OUT")"
+STUB_SEEN6="[2600:1900::99]" run --release v0.4.0-snapshot.1 --dual-stack
+assert "an IPv6 LB that SNATs the client fails" "$(rc_is 1)$(has 'backend saw client 2600:1900::99' "$OUT")"
+STUB_CLIENT_V6= run --release v0.4.0-snapshot.1 --dual-stack
+assert "a client VPS without external IPv6 fails before any firewall rule is made (no source to scope it to)" \
+  "$(rc_is 1)$(hasnt 'firewall-rules create' "$LOG")"
+STUB_SB_TOTAL=0 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a sonobuoy focus that ran zero specs fails (vacuous pass)" "$(rc_is 1)$(has 'ran no specs' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
+STUB_SB_FAILED=5 run --release v0.4.0-snapshot.1 --dual-stack
+assert "failed upstream dual-stack specs fail the run" "$(rc_is 1)$(has 'has failed specs' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
+STUB_SB_STATUS=running run --release v0.4.0-snapshot.1 --dual-stack
+assert "a sonobuoy run that never completes fails" "$(rc_is 1)$(has 'never completed' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
+STUB_BEEP=0 run --release v0.4.0-snapshot.1 --dual-stack
+assert "--dual-stack on a release without beep fails instead of SKIPPED-passing the LB check" "$(rc_is 1)$(hasnt 'SKIPPED' "$OUT")"
+STUB_FAIL_MATCH="--e2e-focus" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a failing run still deletes the firewall rule and all three VPSes (nothing may keep billing or stay open)" \
+  "$(rc_is 1)$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$LOG")$(has 'instances delete u7s-e2e-t-client ' "$LOG")$(has 'instances delete u7s-e2e-t-cp ' "$LOG")"
+STUB_FAIL_MATCH="--e2e-focus" STUB_TERM_MATCH="--e2e-focus" run --release v0.4.0-snapshot.1 --dual-stack
+assert "SIGTERM mid-sonobuoy still deletes the firewall rule" "$(rc_is 143)$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$LOG")"
+STUB_FW_LEAK=1 GCP_DELETE_SLEEP=0 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a firewall rule that cannot be deleted is reported as leaked and turns a PASS into exit 4" \
+  "$(rc_is 4)$(has 'LEAKED FIREWALL RULE u7s-e2e-t-lb-v6' "$OUT")"
+run --release v0.4.0-snapshot.1 --dual-stack --keep
+assert "--keep leaves the firewall rule and says how to delete it" \
+  "$(rc_is 0)$(hasnt 'firewall-rules delete' "$LOG")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v6' "$OUT")"
+unset STUB_BEEP STUB_INGRESS
 
 # --- redaction and interrupts
 STUB_LEAK=1 STUB_FAIL_MATCH="wait --for=condition=Ready node" run --release v0.4.0-snapshot.1
