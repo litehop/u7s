@@ -1225,7 +1225,7 @@ mod tests {
         let dir = test_temp_dir("args-with");
         Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -1244,6 +1244,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -1468,7 +1469,7 @@ mod tests {
 
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -1487,6 +1488,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2156,7 +2158,7 @@ mod tests {
 
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2175,6 +2177,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2241,7 +2244,7 @@ mod tests {
         let dir = test_temp_dir("pqc-provider");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2260,6 +2263,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2307,7 +2311,7 @@ mod tests {
         let dir = test_temp_dir("kubeconfig-yaml");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2326,6 +2330,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -3018,7 +3023,7 @@ mod tests {
         let kubeconfig_path = dir.join("kubeconfig");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -3037,6 +3042,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -3076,7 +3082,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -3095,6 +3101,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],

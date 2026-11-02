@@ -510,10 +510,14 @@ async fn seeded_namespace_roles_match_upstream_except_listed_deviations() {
         ]),
         "upstream namespaced Roles dropped or newly seeded"
     );
-    // kubeadm's anonymous read of the discovery document a joining node fetches pre-credential.
+    // kubeadm's anonymous read of the discovery document a joining node fetches pre-credential,
+    // and the joiner's get-only read of kube-system/u7s-cluster-config (kubeadm-config analogue).
     assert_eq!(
         id_diff(&seeded, &upstream),
-        set(&["kube-public/kubeadm:bootstrap-signer-clusterinfo"])
+        set(&[
+            "kube-public/kubeadm:bootstrap-signer-clusterinfo",
+            "kube-system/u7s:nodes-cluster-config",
+        ])
     );
 
     for (id, up) in upstream.iter().filter(|(k, _)| seeded.contains_key(*k)) {
@@ -546,7 +550,10 @@ async fn seeded_namespace_rolebindings_match_upstream_except_listed_deviations()
     );
     assert_eq!(
         id_diff(&seeded, &upstream),
-        set(&["kube-public/kubeadm:bootstrap-signer-clusterinfo"])
+        set(&[
+            "kube-public/kubeadm:bootstrap-signer-clusterinfo",
+            "kube-system/u7s:nodes-cluster-config",
+        ])
     );
 
     for (id, up) in upstream.iter().filter(|(k, _)| seeded.contains_key(*k)) {

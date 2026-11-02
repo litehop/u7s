@@ -306,7 +306,7 @@ YAML
 }
 
 # The join token only ever travels on stdin: never in argv, a log or the results directory.
-join_w1() { printf '%s\n' "$1" | vps ssh "$W1" -- sudo bash /tmp/install.sh --join "https://$CP_IP:6443" --token - --ca-cert-hash "$2" --node-name "$W1" $IP_FAMILIES_ARGS; }
+join_w1() { printf '%s\n' "$1" | vps ssh "$W1" -- sudo bash /tmp/install.sh --join "https://$CP_IP:6443" --token - --ca-cert-hash "$2" --node-name "$W1"; }
 apply_pods() { { pod_yaml pin "$W1"; echo ---; pod_yaml peer "$CP_NODE"; } | on_cp "$KC apply -f -"; }
 webhook_smoke() {
   vps scp "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$CP:/tmp/webhook-smoke.sh" &&
@@ -335,12 +335,6 @@ step install-cp on_cp "curl -fsSL $INSTALL_URL -o /tmp/install.sh && sudo bash /
 mint="$(on_cp sudo bash /tmp/install.sh --mint-join-token)" || fail "mint-join-token on $CP"
 token="$(sed -n 's/^Join token created.*: //p' <<<"$mint")"
 ca_hash="$(grep -oE 'sha256:[0-9a-f]{64}' <<<"$mint" | head -1)" || true
-# A worker without the cluster's IP families assumes IPv4 and drops its IPv6 address, so the
-# join carries the flag the control plane printed; --dual-stack insists on it.
-families="$(grep -oE -- '--cluster-ip-families [0-9,]+' <<<"$mint" | head -1 | cut -d' ' -f2)" || true
-[ "$DUAL" = 0 ] || [ -n "$families" ] || families=4,6
-IP_FAMILIES_ARGS=
-[ -z "$families" ] || IP_FAMILIES_ARGS="--cluster-ip-families $families"
 unset mint
 [ -n "$token" ] && [ -n "$ca_hash" ] || fail "could not parse the join token and CA hash from --mint-join-token output"
 
