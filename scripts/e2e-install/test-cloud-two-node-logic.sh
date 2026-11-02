@@ -283,6 +283,8 @@ assert "the LB is curled from the client over IPv4 (-4) and IPv6 (-6) on every i
   "$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.2/clientip' "$dual_log")$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.3/clientip' "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::2]/clientip'" "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::3]/clientip'" "$dual_log")"
 assert "sonobuoy runs the upstream dual-stack focus with the node's own conformance image tag" \
   "$(has "--e2e-focus 'IPv6DualStack|dual-stack|DualStack|ipFamilyPolicy'" "$dual_log")$(has 'registry.k8s.io/conformance:v1.37.1' "$dual_log")"
+assert "sonobuoy results are fetched with a WebSocket kubectl exec, not 'sonobuoy retrieve' (SPDY exec gets 501 from the apiserver, so retrieve fails with EOF)" \
+  "$(has 'exec -n sonobuoy sonobuoy -c kube-sonobuoy -- /sonobuoy splat /tmp/sonobuoy' "$dual_log")$(hasnt 'retrieve' "$dual_log")"
 assert "sonobuoy results are reported inline" "$(has 'Total: 9' "$dual_out")$(has 'Failed: 0' "$dual_out")"
 assert "the default (single-stack) run never reaches the dual-stack assertions" \
   "$(hasnt 'dual-nodes' "$(STUB_BEEP=1 run --release v0.4.0-snapshot.1; echo "$OUT")")"
