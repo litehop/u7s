@@ -347,8 +347,9 @@ lan_v6_install() {
   limactl shell "$vm" sudo tee /etc/systemd/system/u7s-lan-v6.service >/dev/null <<'UNIT'
 [Unit]
 Description=u7s dual-stack rig: static ULA and neighbour entries on the user-v2 NIC
-After=network-online.target
+After=network-online.target systemd-networkd.service
 Wants=network-online.target
+PartOf=systemd-networkd.service
 
 [Service]
 Type=oneshot

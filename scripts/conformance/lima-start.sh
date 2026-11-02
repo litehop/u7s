@@ -550,7 +550,7 @@ KCEOF
     for peer in $(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
       [ "$peer" = "$VM_NAME" ] && continue
       lan_v6_host_for "$peer" >/dev/null || continue
-      limactl list --format '{{.Name}} {{.Status}}' | grep -qx "$peer Running" || continue
+      [ "$(limactl list --format '{{.Name}} {{.Status}}' | awk -v p="$peer" '$1 == p {print $2}')" = "Running" ] || continue
       [ "$(limactl shell "$peer" ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | sed -n 1p | cut -d. -f1-3)" = "$(echo "$LIMA_VM_IP" | cut -d. -f1-3)" ] || continue
       MESH_VMS+=("$peer")
     done

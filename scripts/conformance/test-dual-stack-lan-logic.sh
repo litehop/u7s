@@ -56,5 +56,10 @@ for f in run-all.sh add-node.sh; do
     "1" "$(grep -c -- '--dual-stack) _DUAL_STACK_ARG="--dual-stack"' "$DIR/$f")"
 done
 
+check "boot unit re-applies after a networkd restart (an apt systemd upgrade flushes the static ULA)" \
+  "1" "$(grep -cxF 'PartOf=systemd-networkd.service' "$DIR/_lib.sh")"
+check "peer discovery never pipes limactl list into grep -q (SIGPIPE under pipefail silently drops every peer)" \
+  "0" "$(grep -c 'limactl list.*| grep -q' "$START")"
+
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
