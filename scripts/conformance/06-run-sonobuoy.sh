@@ -309,6 +309,11 @@ FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {VolumeAttributesClass, Sideca
 # picks it up alongside e2e.txt/junit_01.xml.
 JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 
+# NODES lists every node in the run: its length is the e2e --num-nodes, and
+# pod-log evacuation and host-log collection loop over it.
+NODES=("$VM_NAME")
+[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
+
 # build_filter_args populates the FILTER_ARGS array with the sonobuoy argv
 # elements for this invocation. apply=1 wires in the FeatureGate allow-set
 # above plus the existing [Flaky] skip; apply=0 (the --unsafe-focus escape
@@ -330,9 +335,18 @@ JSON_REPORT_PATH="/tmp/sonobuoy/results/report.json"
 #
 # GINKGO_SUITE_TIMEOUT (e.g. "3600s"), when set, adds ginkgo's own --timeout so a
 # total hang is cut off at suite level instead of ginkgo's 24h default.
+#
+# E2E_EXTRA_ARGS (e2e.test flags) replaces the plugin manifest's own value, so
+# it repeats --progress-report-url and adds --num-nodes: under --provider=local
+# the framework's node count defaults to -1 and SkipUnlessNodeCountIsAtLeast
+# self-skips every multi-node spec. It splits on the same separator as the
+# ginkgo args.
 build_filter_args() {
   local apply="$1"
   local gt="" gt_pipe=""
+  local e2e_sep=" "
+  [ "$apply" -eq 1 ] && e2e_sep="|"
+  local e2e_args="--progress-report-url=http://localhost:8099/progress${e2e_sep}--num-nodes=${#NODES[@]}"
   if [ -n "${GINKGO_SUITE_TIMEOUT:-}" ]; then
     gt=" --timeout=${GINKGO_SUITE_TIMEOUT}"
     gt_pipe="|--timeout=${GINKGO_SUITE_TIMEOUT}"
@@ -350,6 +364,7 @@ build_filter_args() {
     FILTER_ARGS=(
       "--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS}|--label-filter=${label}|--json-report=${JSON_REPORT_PATH}${gt_pipe}"
       "--plugin-env=e2e.E2E_EXTRA_ARGS_SEP=|"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS=${e2e_args}"
       "--e2e-skip=${skip}"
     )
   else
@@ -357,7 +372,8 @@ build_filter_args() {
     # passes split on the ginkgo label instead -- complementary by construction.
     local extra=" --label-filter=!Disruptive"
     [ "$PASS" = "disruptive" ] && extra=" --label-filter=Disruptive"
-    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}")
+    FILTER_ARGS=("--plugin-env=e2e.E2E_EXTRA_GINKGO_ARGS=--procs=${PROCS} --json-report=${JSON_REPORT_PATH}${gt}${extra}"
+      "--plugin-env=e2e.E2E_EXTRA_ARGS=${e2e_args}")
   fi
 }
 
@@ -469,11 +485,6 @@ if [ "$SONOBUOY_EXIT" -ne 0 ]; then
   echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
 fi
 
-# NODES lists every node in the run (computed here, before evacuation, so
-# both this step and the tarball search below use the same list).
-NODES=("$VM_NAME")
-[ -n "$EXTRA_NODE" ] && NODES+=("$EXTRA_NODE")
-
 # Evacuate pod logs immediately — before namespace GC removes them.
 # sonobuoy --wait returns after the e2e binary exits but before namespace teardown,
 # so /var/log/pods/ still has the container logs at this point. Looped over every
@@ -494,113 +505,36 @@ for NODE in "${NODES[@]}"; do
 done
 
 echo "Retrieving results..."
-# sonobuoy retrieve used port-forward when this was written; it later used SPDY
-# exec, which u7s now passes through to the kubelet, so `sonobuoy retrieve` would
-# work. The rig still reads the tarball from pod logs + the kubelet emptyDir on the
-# VM, which needs no aggregator round-trip.
-#
-# Live incident 2026-08-04: sonobuoy's own scheduler placed the aggregator
-# pod on the extra node instead of the primary, and every blocking call
-# below had no timeout -- the script hung with zero output and no error,
-# even though it has explicit "tarball not found" exit paths, because those
-# paths only fire if a call actually RETURNS. NODES (computed above, for log
-# evacuation) lists every node in the run so the tarball search isn't
-# hardcoded to the primary; run_with_timeout below bounds every blocking
-# call so a stall surfaces loudly instead.
-CALL_TIMEOUT=30
-
-# run_with_timeout <label> <secs> <suppress_stderr:0|1> <cmd...>
-# Kills <cmd...> if it hasn't finished within <secs> seconds and prints a
-# specific "'<label>' timed out" message so a stalled call is diagnosable
-# instead of hanging the whole script forever with no output. No
-# 'timeout'/'gtimeout' binary is assumed present on the macOS host running
-# this script (confirmed absent even with Homebrew coreutils uninstalled),
-# so the deadline is enforced by polling with 'kill -0' rather than a second
-# backgrounded 'wait' -- the latter was tried first and, under this script's
-# own 'set -e', hung indefinitely in bash 3.2 (macOS's shipped /bin/bash)
-# waiting on a SIGKILL-terminated background job; polling avoids that
-# entirely. suppress_stderr redirects only <cmd...>'s own stderr (e.g.
-# find's benign "No such file or directory" on nodes without the pod) -- it
-# must NOT swallow this function's own timeout message below, so it is
-# applied directly to the "$@" command, never to the whole function's output.
-run_with_timeout() {
-  local label="$1" secs="$2" suppress_stderr="$3"
-  shift 3
-  if [ "$suppress_stderr" = "1" ]; then
-    "$@" 2>/dev/null &
-  else
-    "$@" &
+# sonobuoy retrieve runs in-VM against the aggregator (SPDY exec, passed through
+# by the u7s apiserver), so it finds the tarball whichever node the aggregator
+# pod landed on. A run killed before the aggregator finished leaves nothing to
+# retrieve. retrieve is the one unbounded network call here (a stalled SPDY
+# stream hung the 2026-08-04 run with no output), so it runs under an in-VM
+# timeout; the rest are local file operations.
+SONOBUOY_RETRIEVE_TIMEOUT_SECONDS=120
+limactl shell "$VM_NAME" sudo rm -rf /tmp/sonobuoy-retrieve /tmp/sonobuoy-results.tar.gz
+limactl shell "$VM_NAME" sudo mkdir -p /tmp/sonobuoy-retrieve
+RETRIEVE_OK=1
+RETRIEVE_RC=0
+limactl shell "$VM_NAME" sudo timeout "$SONOBUOY_RETRIEVE_TIMEOUT_SECONDS" \
+  sonobuoy retrieve /tmp/sonobuoy-retrieve \
+  --kubeconfig /tmp/sonobuoy-kubeconfig || RETRIEVE_RC=$?
+if [ "$RETRIEVE_RC" -ne 0 ]; then
+  RETRIEVE_OK=0
+  if [ "$RETRIEVE_RC" -eq 124 ]; then
+    echo "error: 'sonobuoy retrieve' timed out after ${SONOBUOY_RETRIEVE_TIMEOUT_SECONDS}s (aggregator or apiserver exec path stalled)" >&2
   fi
-  local cmd_pid=$! waited=0
-  while kill -0 "$cmd_pid" 2>/dev/null; do
-    if [ "$waited" -ge "$secs" ]; then
-      # pkill -P before kill -9: $cmd_pid's own children (a stalled
-      # kubectl/limactl call can itself fork, e.g. an ssh multiplexer) are
-      # only findable by PPID while $cmd_pid is still alive -- killing
-      # $cmd_pid first would reparent them to init before pkill -P got a
-      # chance to look them up, leaving them running as untracked orphans.
-      pkill -9 -P "$cmd_pid" 2>/dev/null || true
-      kill -9 "$cmd_pid" 2>/dev/null
-      wait "$cmd_pid" 2>/dev/null || true
-      echo "error: '$label' timed out after ${secs}s" >&2
-      return 124
-    fi
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  local status=0
-  wait "$cmd_pid" || status=$?
-  return "$status"
-}
-
-# Find tarball name from aggregator logs (host-side kubectl, no SPDY needed).
-TARBALL_NAME=$(run_with_timeout "kubectl logs -n sonobuoy sonobuoy" "$CALL_TIMEOUT" 1 \
-    kubectl --kubeconfig="$KUBECONFIG" logs -n sonobuoy sonobuoy \
-  | grep "Results available at" \
-  | tail -1 \
-  | grep -oE '[^ /]+\.tar\.gz') || true
-
-if [ -z "$TARBALL_NAME" ]; then
+fi
+if [ "$RETRIEVE_OK" -eq 1 ]; then
+  limactl shell "$VM_NAME" sudo sh -c \
+    'mv /tmp/sonobuoy-retrieve/*.tar.gz /tmp/sonobuoy-results.tar.gz' || RETRIEVE_OK=0
+fi
+if [ "$RETRIEVE_OK" -eq 0 ]; then
   if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
-    echo "warning: no results tarball found in sonobuoy logs (run was killed before completion)" >&2
+    echo "warning: sonobuoy retrieve produced no results tarball (run was killed before completion)" >&2
     exit "${SONOBUOY_EXIT}"
   fi
-  echo "error: could not find results tarball name in sonobuoy logs" >&2; exit 1
-fi
-
-# Get the aggregator pod UID to locate its emptyDir on the VM.
-POD_UID=$(run_with_timeout "kubectl get pod -n sonobuoy sonobuoy" "$CALL_TIMEOUT" 0 \
-    kubectl --kubeconfig="$KUBECONFIG" get pod \
-    -n sonobuoy sonobuoy \
-    -o jsonpath='{.metadata.uid}') || true
-
-# Search every node in the run -- sonobuoy's own scheduler can (and did,
-# live) place the aggregator pod on the extra node, not just $VM_NAME.
-HOST_PATH=""
-FOUND_NODE=""
-for NODE in "${NODES[@]}"; do
-  CANDIDATE=$(run_with_timeout "limactl shell $NODE sudo find (results tarball)" "$CALL_TIMEOUT" 1 \
-      limactl shell "$NODE" sudo find \
-      "/var/lib/kubelet/pods/${POD_UID}/volumes/kubernetes.io~empty-dir" \
-      -name "$TARBALL_NAME" | head -1) || true
-  if [ -n "$CANDIDATE" ]; then
-    HOST_PATH="$CANDIDATE"
-    FOUND_NODE="$NODE"
-    break
-  fi
-done
-
-if [ -z "$HOST_PATH" ]; then
-  if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
-    echo "warning: results tarball not found under kubelet pod volume on any node (${NODES[*]}) (run was killed before completion)" >&2
-    exit "${SONOBUOY_EXIT}"
-  fi
-  echo "error: tarball not found under kubelet pod volume for uid=${POD_UID} on any node (${NODES[*]})" >&2; exit 1
-fi
-
-if ! run_with_timeout "limactl shell $FOUND_NODE sudo cp (stage results tarball)" "$CALL_TIMEOUT" 0 \
-    limactl shell "$FOUND_NODE" sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz; then
-  echo "error: failed to stage results tarball on $FOUND_NODE" >&2; exit 1
+  echo "error: sonobuoy retrieve produced no results tarball" >&2; exit 1
 fi
 
 TIMESTAMP=$(date -u +%m%d-%H%M)
@@ -622,9 +556,8 @@ FOCUS_SLUG="${FOCUS_SLUG:0:100}"
 if [ "$PASS" = "disruptive" ]; then FOCUS_SLUG="${FOCUS_SLUG}-disruptive"; fi
 OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$WORKDIR/../e2e"
-if ! run_with_timeout "limactl copy results tarball from $FOUND_NODE" "$CALL_TIMEOUT" 0 \
-    limactl copy "${FOUND_NODE}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"; then
-  echo "error: failed to copy results tarball from $FOUND_NODE to host" >&2; exit 1
+if ! limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"; then
+  echo "error: failed to copy results tarball from $VM_NAME to host" >&2; exit 1
 fi
 echo "Results: $OUTFILE"
 
@@ -644,7 +577,6 @@ mkdir -p "$HOST_LOGS_DIR"
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
 [ -f "$WORKDIR/scheduler.log" ]              && cp "$WORKDIR/scheduler.log"   "$HOST_LOGS_DIR/scheduler.log"
 [ -f "$WORKDIR/konnectivity-server.log" ]    && cp "$WORKDIR/konnectivity-server.log" "$HOST_LOGS_DIR/konnectivity-server.log"
-# NODES was already computed above for the tarball search; reused here.
 for NODE in "${NODES[@]}"; do
   SUFFIX=""
   [ "$NODE" != "$VM_NAME" ] && SUFFIX="-${NODE}"
