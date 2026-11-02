@@ -175,21 +175,29 @@ fn preferred_address<S: Store>(state: &AppState<S>) -> Option<&str> {
         .map(|s| s.as_str())
 }
 
+/// Upstream's `--kubelet-preferred-address-types` default order, except `Hostname` is last:
+/// the apiserver host usually cannot resolve a node's hostname, so it is a last resort here.
+const KUBELET_ADDRESS_TYPE_ORDER: [&str; 5] = [
+    "InternalDNS",
+    "InternalIP",
+    "ExternalDNS",
+    "ExternalIP",
+    "Hostname",
+];
+
+/// Mirrors upstream `GetPreferredNodeAddress`: the first address of the first type in
+/// `KUBELET_ADDRESS_TYPE_ORDER` that the node reports. Within a type the order of
+/// `status.addresses` decides, so a dual-stack node's family is whichever the kubelet listed
+/// first.
 pub fn node_address(node: &serde_json::Value) -> Option<String> {
     let addresses = node["status"]["addresses"].as_array()?;
-    // Prefer InternalIP — it's guaranteed routable inside the cluster.
-    if let Some(addr) = addresses
-        .iter()
-        .find(|a| a["type"].as_str() == Some("InternalIP"))
-    {
-        return addr["address"].as_str().map(str::to_owned);
-    }
-    // Fall back to Hostname if InternalIP is absent.
-    addresses
-        .iter()
-        .find(|a| a["type"].as_str() == Some("Hostname"))
-        .and_then(|a| a["address"].as_str())
-        .map(str::to_owned)
+    KUBELET_ADDRESS_TYPE_ORDER.iter().find_map(|want| {
+        addresses
+            .iter()
+            .find(|a| a["type"].as_str() == Some(want))
+            .and_then(|a| a["address"].as_str())
+            .map(str::to_owned)
+    })
 }
 
 /// Resolve the host-side kubelet port to dial for `node_name`.
@@ -3391,10 +3399,9 @@ async fn endpoint_backed_by_pod<S: Store>(
         return false;
     };
     let status = &pod["status"];
-    match status["podIPs"].as_array().filter(|a| !a.is_empty()) {
-        Some(ips) => ips.iter().any(|p| p["ip"].as_str() == Some(addr)),
-        None => status["podIP"].as_str() == Some(addr),
-    }
+    status["podIPs"]
+        .as_array()
+        .is_some_and(|ips| ips.iter().any(|p| p["ip"].as_str() == Some(addr)))
 }
 
 pub async fn resolve_service_proxy_target<S: Store>(
@@ -6906,6 +6913,52 @@ mod tests {
             node_address(&node).as_deref(),
             Some("node1.example.com"),
             "Hostname must be used when InternalIP is absent"
+        );
+    }
+
+    /// Upstream `GetPreferredNodeAddress` walks the preferred TYPES in order and takes the
+    /// first address of the first type present, so a dual-stack node's family is the one the
+    /// kubelet listed first, not whichever the proxy happens to see last; a DNS name is
+    /// preferred over an IP of the same scope.
+    #[test]
+    fn node_address_follows_type_order_then_list_order() {
+        let pick = |addrs: serde_json::Value| {
+            node_address(&serde_json::json!({"status": {"addresses": addrs}}))
+        };
+        assert_eq!(
+            pick(serde_json::json!([
+                {"type": "InternalIP", "address": "fd00::5"},
+                {"type": "InternalIP", "address": "10.0.0.5"},
+            ]))
+            .as_deref(),
+            Some("fd00::5"),
+            "a v6-primary node must be dialed over v6"
+        );
+        assert_eq!(
+            pick(serde_json::json!([
+                {"type": "InternalIP", "address": "10.0.0.5"},
+                {"type": "InternalIP", "address": "fd00::5"},
+            ]))
+            .as_deref(),
+            Some("10.0.0.5")
+        );
+        assert_eq!(
+            pick(serde_json::json!([
+                {"type": "ExternalIP", "address": "203.0.113.9"},
+                {"type": "InternalIP", "address": "10.0.0.5"},
+                {"type": "InternalDNS", "address": "n1.internal"},
+            ]))
+            .as_deref(),
+            Some("n1.internal")
+        );
+        assert_eq!(
+            pick(serde_json::json!([
+                {"type": "Hostname", "address": "n1"},
+                {"type": "ExternalIP", "address": "203.0.113.9"},
+            ]))
+            .as_deref(),
+            Some("203.0.113.9"),
+            "ExternalIP must be used before the unresolvable Hostname"
         );
     }
 
@@ -13046,6 +13099,36 @@ mod tests {
                 .await
                 .is_err(),
             "a targetRef outside the request namespace must be rejected"
+        );
+    }
+
+    /// Upstream reads `status.podIPs` only; honouring the legacy `status.podIP` would let a
+    /// pod status that was never normalised vouch for an address upstream would refuse.
+    #[tokio::test]
+    async fn service_proxy_refuses_pod_with_only_legacy_pod_ip() {
+        let state = make_state();
+        let ep = endpoint_for_pod(&state, "10.7.7.7").await;
+        let name = ep["targetRef"]["name"].as_str().unwrap();
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "resourceVersion": "2"},
+            "status": {"podIP": "10.7.7.7"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", name),
+                bytes::Bytes::from(pod.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+        seed_svc_with_slice(&state, serde_json::json!([ep]), unnamed_port()).await;
+        assert!(
+            resolve_service_proxy_target(&state, "default", "svc")
+                .await
+                .is_err(),
+            "a pod without podIPs must not back an endpoint"
         );
     }
 
