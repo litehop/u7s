@@ -5958,6 +5958,84 @@ mod admission_tests {
         );
     }
 
+    /// A mutating webhook that turns the CRD into something undecodable is the webhook
+    /// author's bug; the client must be told why, not get the generic redacted 500.
+    #[tokio::test]
+    async fn create_crd_reports_admission_mutated_crd_invalid_to_the_client() {
+        use axum::response::IntoResponse;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "replace", "path": "/spec/names", "value": "not-an-object"}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (url, _handle) = start_mock_webhook(router).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "break-crd"},
+            "webhooks": [{
+                "name": "break.webhook.io",
+                "clientConfig": {"url": format!("{url}/mutate")},
+                "rules": [{"apiGroups": ["apiextensions.k8s.io"], "apiVersions": ["v1"], "resources": ["customresourcedefinitions"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/break-crd",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = create_crd(
+            axum::extract::State(state),
+            test_user(),
+            HeaderMap::new(),
+            crd_body("foos.example.com"),
+        )
+        .await
+        .err()
+        .expect("an undecodable mutated CRD must be rejected");
+
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("admission mutated CRD is invalid"),
+            "the client must see why its CRD was rejected, not a redacted 500: {v}"
+        );
+    }
+
     /// replace_crd must invoke the validating admission pipeline.
     /// A validating webhook that denies must cause replace_crd to return an error.
     #[tokio::test]
