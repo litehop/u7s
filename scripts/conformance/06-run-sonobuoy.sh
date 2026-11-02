@@ -494,8 +494,9 @@ for NODE in "${NODES[@]}"; do
 done
 
 echo "Retrieving results..."
-# sonobuoy retrieve uses port-forward which produces an EOF against u7s.
-# Instead, locate the tarball from pod logs + kubelet emptyDir on the VM.
+# sonobuoy retrieve used port-forward when this was written (same SPDY problem);
+# today it uses SPDY exec, which u7s does not serve, so it fails with EOF
+# (docs/decisions/no-spdy-streaming-unlike-upstream.md). Instead, locate the tarball from pod logs + kubelet emptyDir on the VM.
 #
 # Live incident 2026-08-04: sonobuoy's own scheduler placed the aggregator
 # pod on the extra node instead of the primary, and every blocking call

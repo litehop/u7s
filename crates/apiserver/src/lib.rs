@@ -1178,7 +1178,8 @@ fn build_routes(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/pods/{name}/log",
             get(handlers::proxy::pod_log),
         )
-        // Pods — exec/attach/portforward: 501 stubs until SPDY/WebSocket is implemented.
+        // Pods — exec/attach/portforward: GET serves WebSocket; the POST (SPDY upgrade)
+        // legs of exec/attach return 501 by design (docs/decisions/no-spdy-streaming-unlike-upstream.md).
         //
         // exec/attach's POST legs run the same pre-upgrade checks (pod lookup +
         // admission) as their GET/WebSocket siblings before returning 501 — see
