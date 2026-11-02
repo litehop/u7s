@@ -494,8 +494,10 @@ for NODE in "${NODES[@]}"; do
 done
 
 echo "Retrieving results..."
-# sonobuoy retrieve uses port-forward which produces an EOF against u7s.
-# Instead, locate the tarball from pod logs + kubelet emptyDir on the VM.
+# sonobuoy retrieve used port-forward when this was written; it later used SPDY
+# exec, which u7s now passes through to the kubelet, so `sonobuoy retrieve` would
+# work. The rig still reads the tarball from pod logs + the kubelet emptyDir on the
+# VM, which needs no aggregator round-trip.
 #
 # Live incident 2026-08-04: sonobuoy's own scheduler placed the aggregator
 # pod on the extra node instead of the primary, and every blocking call
