@@ -854,7 +854,7 @@ mod tests {
 
         let args = crate::Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -873,6 +873,7 @@ mod tests {
             apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
