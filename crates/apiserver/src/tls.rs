@@ -584,13 +584,16 @@ fn build_server_sans(
         SanType::DnsName("kubernetes.default.svc.cluster.local".try_into()?),
     ];
     if let Some(host) = advertise_host_str {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            sans.push(SanType::IpAddress(ip));
-        } else {
-            sans.push(SanType::DnsName(host.try_into()?));
-        }
+        sans.push(host_san(host)?);
     }
     Ok(sans)
+}
+
+fn host_san(host: &str) -> anyhow::Result<SanType> {
+    Ok(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SanType::IpAddress(ip),
+        Err(_) => SanType::DnsName(host.try_into()?),
+    })
 }
 
 /// Serving config presenting the leaf and its signing intermediate (never the root: the root
@@ -721,10 +724,16 @@ fn generate_tls_with(
 
     // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
     // plus the advertise-address host if provided.
-    let sans = build_server_sans(
+    let mut sans = build_server_sans(
         advertise_host(args.advertise_address.as_deref())?.as_deref(),
         &args.service_cluster_ip_range,
     )?;
+    for host in &args.apiserver_cert_extra_sans {
+        let san = host_san(host)?;
+        if !sans.contains(&san) {
+            sans.push(san);
+        }
+    }
     let plans = vec![
         LeafPlan {
             name: SERVING_LEAF,
@@ -1232,6 +1241,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: advertise_address.map(str::to_owned),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -1474,6 +1484,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -2161,6 +2172,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -2245,6 +2257,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -2310,6 +2323,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -2956,6 +2970,35 @@ mod tests {
         client.expect("client must validate the server cert for IPv6 literal fd00::1");
     }
 
+    /// A dual-stack node advertises its IPv4 address but is also dialled on its IPv6 one;
+    /// the extra SAN must make that handshake verify, not just the advertised address.
+    #[tokio::test]
+    async fn tls_handshake_succeeds_on_extra_san_address_not_advertised() {
+        let mut args = args_with(Some("https://10.0.0.5:6443"));
+        args.apiserver_cert_extra_sans = vec!["fd00::5".into()];
+        let tls = generate_tls(&args).expect("generate_tls");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                tls.ca_cert_der.clone(),
+            ))
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.get());
+
+        let (c, s) = tokio::io::duplex(16 * 1024);
+        let name = rustls::pki_types::ServerName::IpAddress(
+            "fd00::5".parse::<std::net::Ipv6Addr>().unwrap().into(),
+        );
+        let (client, server) = tokio::join!(connector.connect(name, c), acceptor.accept(s));
+        server.expect("server handshake");
+        client.expect("client must validate the cert for the extra IPv6 SAN fd00::5");
+    }
+
     /// advertise_host must strip a bare port suffix even when no scheme is present.
     /// Operators may supply just "host:6443" without a scheme prefix.
     #[test]
@@ -2991,6 +3034,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,
@@ -3048,6 +3092,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
             kubelet_preferred_address: None,

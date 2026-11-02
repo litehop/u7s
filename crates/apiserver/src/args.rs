@@ -64,6 +64,12 @@ pub struct Args {
     #[arg(long)]
     pub(crate) advertise_address: Option<String>,
 
+    /// Extra IPs or DNS names for the serving certificate's SANs, comma-separated (kubeadm's
+    /// `--apiserver-cert-extra-sans`). Carries the node's non-primary addresses (e.g. its
+    /// IPv6 address on a dual-stack node) so clients can verify the cert on any of them.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) apiserver_cert_extra_sans: Vec<String>,
+
     /// CIDR range(s) from which clusterIPs are auto-allocated for Services: one CIDR, or two
     /// comma-separated CIDRs of different IP families (e.g. "10.96.0.0/12,fd00:96::/108");
     /// the first is the primary family. No range-size bound is enforced. Matches kubeadm's
