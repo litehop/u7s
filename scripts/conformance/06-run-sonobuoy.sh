@@ -508,12 +508,23 @@ echo "Retrieving results..."
 # sonobuoy retrieve runs in-VM against the aggregator (SPDY exec, passed through
 # by the u7s apiserver), so it finds the tarball whichever node the aggregator
 # pod landed on. A run killed before the aggregator finished leaves nothing to
-# retrieve.
+# retrieve. retrieve is the one unbounded network call here (a stalled SPDY
+# stream hung the 2026-08-04 run with no output), so it runs under an in-VM
+# timeout; the rest are local file operations.
+SONOBUOY_RETRIEVE_TIMEOUT_SECONDS=120
 limactl shell "$VM_NAME" sudo rm -rf /tmp/sonobuoy-retrieve /tmp/sonobuoy-results.tar.gz
 limactl shell "$VM_NAME" sudo mkdir -p /tmp/sonobuoy-retrieve
 RETRIEVE_OK=1
-limactl shell "$VM_NAME" sudo sonobuoy retrieve /tmp/sonobuoy-retrieve \
-  --kubeconfig /tmp/sonobuoy-kubeconfig || RETRIEVE_OK=0
+RETRIEVE_RC=0
+limactl shell "$VM_NAME" sudo timeout "$SONOBUOY_RETRIEVE_TIMEOUT_SECONDS" \
+  sonobuoy retrieve /tmp/sonobuoy-retrieve \
+  --kubeconfig /tmp/sonobuoy-kubeconfig || RETRIEVE_RC=$?
+if [ "$RETRIEVE_RC" -ne 0 ]; then
+  RETRIEVE_OK=0
+  if [ "$RETRIEVE_RC" -eq 124 ]; then
+    echo "error: 'sonobuoy retrieve' timed out after ${SONOBUOY_RETRIEVE_TIMEOUT_SECONDS}s (aggregator or apiserver exec path stalled)" >&2
+  fi
+fi
 if [ "$RETRIEVE_OK" -eq 1 ]; then
   limactl shell "$VM_NAME" sudo sh -c \
     'mv /tmp/sonobuoy-retrieve/*.tar.gz /tmp/sonobuoy-results.tar.gz' || RETRIEVE_OK=0
