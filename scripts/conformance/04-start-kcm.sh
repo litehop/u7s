@@ -15,8 +15,12 @@ _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 KCM_V=""
 SIGNING_DURATION="8760h"
+DUAL_STACK=0
+# shellcheck source=scripts/conformance/_lib.sh
+source "$REPO/scripts/conformance/_lib.sh"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --dual-stack) DUAL_STACK=1; shift ;;
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
@@ -26,6 +30,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
+KCM_CIDR_FLAGS="$(rig_kcm_cidr_flags "$DUAL_STACK")"
 
 _VM="${U7S_VM_NAME:-lima-node}"
 VM_NAME="$_VM"
@@ -173,9 +178,8 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-duration="${SIGNING_DURATION}" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\
-  --cluster-cidr=10.244.0.0/16 \\
+  $KCM_CIDR_FLAGS \\
   --allocate-node-cidrs=true \\
-  --node-cidr-mask-size=24 \\
   --concurrent-gc-syncs=5 \\
   --use-service-account-credentials=true \\
   --leader-elect=false \\

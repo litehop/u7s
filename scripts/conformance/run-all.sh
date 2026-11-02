@@ -119,6 +119,13 @@
 #             Omitting this on a --reset of a VM previously isolated
 #             onto its own network (e.g. lima-node -> user-v2-mayor) silently
 #             reprovisions it back onto the shared default network.
+#   --dual-stack  Opt-in: give each VM a static ULA in one shared /64 plus static
+#             neighbour entries (and use it as the kubelet's 2nd --node-ip), so
+#             VM<->VM IPv6 works on Lima's user-v2 network. Also makes the cluster
+#             dual-stack (pod/Service CIDRs, KCM, flannel, kube-proxy, CoreDNS).
+#             Forwarded to lima-start.sh, 04-start-kcm.sh and add-node.sh.
+#             Default rig is unchanged. See
+#             ai/prompts/vm-operations.md.
 #   --ip      Host IP for the apiserver and konnectivity-server to bind to
 #             (default: 127.0.0.1). Set to a loopback alias (e.g. 127.0.0.2) to
 #             run multiple workers in parallel without port collisions. Exports
@@ -227,6 +234,7 @@ KONNECTIVITY_SERVER_PORT=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
 NETWORK=""
+_DUAL_STACK_ARG=""
 PROFILE=0
 DHAT_DEPTH=""
 PKI_TEST_LIFETIME=""
@@ -255,6 +263,7 @@ while [[ $# -gt 0 ]]; do
     --kubelet-port) KUBELET_PORT="$2"; shift 2 ;;
     --konnectivity-server-port) KONNECTIVITY_SERVER_PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
+    --dual-stack) _DUAL_STACK_ARG="--dual-stack"; shift ;;
     --stack-only) STACK_ONLY=1; shift ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
@@ -441,6 +450,11 @@ _K8S_VERSION_ARG=""
 _EMBEDDED_SCHEDULER_ARG=""
 [ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
 _SERVICE_CIDR_ARG=""
+if [ -n "$_DUAL_STACK_ARG" ]; then
+  # shellcheck source=scripts/conformance/_lib.sh
+  source "$DIR/_lib.sh"
+  [ -n "$SERVICE_CIDR" ] || SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"
+fi
 [ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
 if [ "$RESET" -eq 1 ]; then
@@ -529,12 +543,12 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
+bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG}
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG} ${_DUAL_STACK_ARG}
 
 # Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
 # true already made the apiserver itself schedule: starting both would
@@ -559,7 +573,7 @@ if [ -n "$EXTRA_NODE" ]; then
   # so it can't leak into any later step (sonobuoy, etc.) -- same reasoning as
   # U7S_DHAT_BACKTRACE_DEPTH above.
   # shellcheck disable=SC2086
-  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}
+  U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG}
 fi
 
 # Node podCIDRs only exist once KCM runs, so a cni0 left over from a prior
