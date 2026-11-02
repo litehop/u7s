@@ -8,6 +8,8 @@ GCP_REGION=us-west1
 GCP_SUBNET_RANGE=10.80.0.0/24
 GCP_IAP_RANGE=35.235.240.0/20
 GCP_LABEL=u7s-test=1
+# Network tag on every test VPS: lets a test scope its own firewall rule to these VPSes.
+GCP_VPS_TAG=u7s-test-vps
 
 # A stray CLOUDSDK_* variable (project, zone, config dir, impersonation...) would silently
 # override the named configuration.
@@ -28,17 +30,18 @@ gcp_require_config() {
 }
 
 # gcp_vps_create NAME ZONE [STACK_TYPE]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6.
+# U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro, what the release gate runs on).
 gcp_vps_create() {
   local stack="${3:-IPV4_ONLY}"
   case "$stack" in IPV4_ONLY|IPV4_IPV6) ;; *) gcp_die "unsupported stack type: $stack" ;; esac
   local v6=()
   [ "$stack" = IPV4_IPV6 ] && v6=(--ipv6-network-tier=PREMIUM)
   gcloud compute instances create "$1" --zone="$2" \
-    --machine-type=e2-micro \
+    --machine-type="${U7S_GCP_MACHINE_TYPE:-e2-micro}" \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
     --boot-disk-size=10GB --boot-disk-type=pd-standard \
     --network="$GCP_NETWORK" --subnet="$GCP_NETWORK" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
-    --labels="$GCP_LABEL" \
+    --labels="$GCP_LABEL" --tags="$GCP_VPS_TAG" \
     --provisioning-model=SPOT --instance-termination-action=STOP --max-run-duration=16h
 }
 
