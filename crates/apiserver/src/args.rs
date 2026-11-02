@@ -10,8 +10,11 @@ pub struct Args {
     #[arg(long, default_value = "./state.db")]
     pub(crate) db: String,
 
-    #[arg(long, default_value = "0.0.0.0:6443")]
-    pub(crate) listen: String,
+    /// Socket address(es) to serve on, comma-separated (e.g. `10.0.0.5:6443,[fd00::5]:6443`).
+    /// One listener per entry; the first is the primary and is what the advertised-address
+    /// fallbacks derive from.
+    #[arg(long, default_value = "0.0.0.0:6443", value_delimiter = ',')]
+    pub(crate) listen: Vec<String>,
 
     /// Output path for the generated kubeconfig. Write-only on first run —
     /// not a read fixture. Generated fresh from TLS material each startup.
@@ -175,10 +178,37 @@ pub struct Args {
     pub(crate) admission_control_config_file: Option<String>,
 }
 
+impl Args {
+    pub(crate) fn primary_listen(&self) -> &str {
+        self.listen.first().map_or("0.0.0.0:6443", String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Args;
     use clap::Parser;
+
+    /// A dual-stack node advertises both families in its cert and kubelet `--node-ip`; if
+    /// `--listen` kept only one address the other family would be dialable by nobody.
+    #[test]
+    fn listen_takes_every_node_address_as_one_comma_separated_flag() {
+        let args =
+            Args::try_parse_from(["u7s-apiserver", "--listen", "10.0.0.5:6443,[fd00::5]:6443"])
+                .expect("--listen must accept a comma-separated list");
+        assert_eq!(args.listen, ["10.0.0.5:6443", "[fd00::5]:6443"]);
+        assert_eq!(
+            args.primary_listen(),
+            "10.0.0.5:6443",
+            "the first entry is the primary the advertised-address fallbacks derive from"
+        );
+    }
+
+    #[test]
+    fn listen_defaults_to_the_single_wildcard_address() {
+        let args = Args::try_parse_from(["u7s-apiserver"]).unwrap();
+        assert_eq!(args.listen, ["0.0.0.0:6443"]);
+    }
 
     /// `run()` passes `args.manifest_dir` straight through to
     /// `bootstrap_apply::apply_well_known_manifest_dir` as the directory it scans — if the

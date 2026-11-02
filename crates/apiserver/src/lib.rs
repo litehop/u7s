@@ -152,6 +152,31 @@ fn bind_listener(addr: &str) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into())?)
 }
 
+/// Binds every address in `addrs`; any failure aborts, so a node address that cannot be
+/// served is a startup error rather than a silently unreachable family.
+fn bind_listeners(addrs: &[String]) -> anyhow::Result<Vec<TcpListener>> {
+    addrs
+        .iter()
+        .map(|a| bind_listener(a).map_err(|e| e.context(format!("binding --listen {a}"))))
+        .collect()
+}
+
+/// Serves `app` on every listener; returns when the first one stops.
+async fn serve_all(
+    listeners: Vec<TcpListener>,
+    app: Router,
+    server_config: pki::Swap<Arc<rustls::ServerConfig>>,
+) -> anyhow::Result<()> {
+    let mut set = tokio::task::JoinSet::new();
+    for listener in listeners {
+        set.spawn(serve_tls(listener, app.clone(), server_config.clone()));
+    }
+    match set.join_next().await {
+        Some(res) => res?,
+        None => Ok(()),
+    }
+}
+
 /// Best-effort read of the OS's accept-queue ceiling (Linux: `/proc/sys/net/core/somaxconn`;
 /// macOS: `kern.ipc.somaxconn`), so [`bind_listener`] can warn when it silently truncates
 /// [`LISTEN_BACKLOG`]. `None` on read failure or an unrecognized platform — treated as
@@ -221,11 +246,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let server_address_early = match args.advertise_address.as_deref() {
         Some(addr) => addr.to_owned(),
         None => {
-            if args.listen.starts_with("0.0.0.0:") {
-                let port = &args.listen["0.0.0.0:".len()..];
+            if args.primary_listen().starts_with("0.0.0.0:") {
+                let port = &args.primary_listen()["0.0.0.0:".len()..];
                 format!("https://127.0.0.1:{port}")
             } else {
-                format!("https://{}", args.listen)
+                format!("https://{}", args.primary_listen())
             }
         }
     };
@@ -343,11 +368,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(addr) => addr,
         None => {
             // When listening on 0.0.0.0, default to loopback so local kubectl works.
-            if args.listen.starts_with("0.0.0.0:") {
-                let port = &args.listen["0.0.0.0:".len()..];
+            if args.primary_listen().starts_with("0.0.0.0:") {
+                let port = &args.primary_listen()["0.0.0.0:".len()..];
                 format!("https://127.0.0.1:{port}")
             } else {
-                format!("https://{}", args.listen)
+                format!("https://{}", args.primary_listen())
             }
         }
     };
@@ -628,19 +653,18 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         tokio::sync::watch::channel(false);
     {
         let approver_state = state.clone();
-        let apiserver_ips: Vec<std::net::IpAddr> = [
-            tls::parse_advertise(&state.server_address)
-                .ok()
-                .flatten()
-                .and_then(|(h, _)| h.parse().ok()),
-            args.listen
-                .parse::<std::net::SocketAddr>()
-                .ok()
-                .map(|a| a.ip()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let apiserver_ips: Vec<std::net::IpAddr> = tls::parse_advertise(&state.server_address)
+            .ok()
+            .flatten()
+            .and_then(|(h, _)| h.parse().ok())
+            .into_iter()
+            .chain(
+                args.listen
+                    .iter()
+                    .filter_map(|l| l.parse::<std::net::SocketAddr>().ok())
+                    .map(|a| a.ip()),
+            )
+            .collect();
         let local_node_name = args.local_node_name.clone();
         tokio::spawn(async move {
             loop {
@@ -794,7 +818,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // 12. Bind TLS listener and serve. Uses bind_listener (socket2) rather than
     //     TcpListener::bind so we can set an explicit accept-queue backlog — see
     //     LISTEN_BACKLOG's doc comment for why the OS default isn't enough headroom.
-    let listener = bind_listener(&args.listen)?;
+    let listeners = bind_listeners(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound,
     // authenticating as system:bootstrap-installer: SSA-apply every manifest under
@@ -869,7 +893,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     });
 
     tokio::select! {
-        result = serve_tls(listener, app, tls_material.server_config) => result?,
+        result = serve_all(listeners, app, tls_material.server_config) => result?,
         Ok(Err(e)) = well_known_manifest_rx => {
             tracing::error!(
                 "fatal: boot-time apply of {} failed: {e:#}",
@@ -4464,6 +4488,31 @@ mod tests {
             .await
             .expect("accept task must not panic")
             .expect("listener must successfully accept the pending connection");
+    }
+
+    /// A dual-stack node must be reachable on every address it advertises; each `--listen`
+    /// entry has to become its own accepting socket, and one bad entry must fail startup.
+    #[tokio::test]
+    async fn bind_listeners_binds_every_address_and_fails_on_a_bad_one() {
+        let listeners = bind_listeners(&["127.0.0.1:0".into(), "127.0.0.1:0".into()])
+            .expect("every address must bind");
+        assert_eq!(listeners.len(), 2);
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+        assert_ne!(ports[0], ports[1]);
+        for l in listeners {
+            let addr = l.local_addr().unwrap();
+            let accept = tokio::spawn(async move { l.accept().await });
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("each listener must accept connections");
+            accept.await.unwrap().unwrap();
+        }
+        let err = bind_listeners(&["127.0.0.1:0".into(), "not-an-addr".into()])
+            .expect_err("an unbindable entry must abort startup");
+        assert!(format!("{err:#}").contains("not-an-addr"));
     }
 
     #[tokio::test]
@@ -12907,7 +12956,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -13725,7 +13774,7 @@ mod tests {
 
         let args = Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -13927,7 +13976,7 @@ mod tests {
         };
         let args = Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
