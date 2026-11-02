@@ -333,7 +333,7 @@ lan_v6_script() {
 }
 
 lan_v6_vm_iface() {
-  limactl shell "$1" ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | head -1
+  limactl shell "$1" ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sed -n 1p
 }
 
 # Installs the boot unit on <vm> and applies it now. Idempotent: rewrites both
