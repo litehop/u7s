@@ -101,7 +101,8 @@ fi
 # The default and --join modes need a tarball, from --tarball <path>,
 # --tarball-url <url>, or DEFAULT_TARBALL_URL below. It must contain the
 # binaries the mode needs (u7s-apiserver, u7s-scheduler, kubelet,
-# kube-controller-manager; kubelet alone for --join), findable anywhere in
+# kube-controller-manager; kubelet alone for --join, plus u7s-apiserver to build
+# the node identity CSR), findable anywhere in
 # its extracted tree.
 set -euo pipefail
 
@@ -1203,6 +1204,19 @@ read_join_token() {
   printf '%s' "$token"
 }
 
+# Writes the node identity key (0600) and CSR (CN=system:node:<name>,
+# O=system:nodes) via the tarball's u7s-apiserver. The openssl CSR tool caps
+# CN at 64 bytes, so node names over 52 chars would not fit.
+generate_node_csr() {
+  local tool
+  tool="$(find "$STAGE_DIR" -type f -name u7s-apiserver | head -n1)"
+  if [ -z "$tool" ] || [ ! -x "$tool" ]; then
+    echo "error: tarball is missing an executable u7s-apiserver (needed to generate the node identity CSR)" >&2
+    exit 1
+  fi
+  "$tool" node-csr --node-name "$NODE_NAME" --key-out "$1" --csr-out "$2"
+}
+
 # --join: run on a fresh node. Verifies the cluster CA via cluster-info and the
 # pinned hash, then builds a PKCS#10 CSR shaped exactly as upstream
 # csrapproving's isNodeClientCert recognizer requires (CN=system:node:<name>,
@@ -1216,15 +1230,11 @@ read_join_token() {
 join_cluster() {
   local bootstrap_token="$JOIN_BOOTSTRAP_TOKEN"
 
-  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
-  chmod 600 "$STATE_DIR/kubelet-client.key"
-  openssl req -new -key "$STATE_DIR/kubelet-client.key" \
-    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
-    -out "$STATE_DIR/kubelet-client.csr"
+  generate_node_csr "$STATE_DIR/kubelet-client.key" "$STATE_DIR/kubelet-client.csr"
 
   local csr_b64 csr_name csr_body
   csr_b64="$(base64 -w0 "$STATE_DIR/kubelet-client.csr")"
-  csr_name="join-${NODE_NAME}-$(date +%s)"
+  csr_name="join-$(date +%s)-$(openssl rand -hex 4)"
   csr_body="$(jq -n -c \
     --arg name "$csr_name" \
     --arg request "$csr_b64" \
@@ -1332,14 +1342,10 @@ issue_cp_kubelet_identity() {
   local server
   server="$("${admin[@]}" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
-  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
-  chmod 600 "$STATE_DIR/kubelet-client.key"
-  openssl req -new -key "$STATE_DIR/kubelet-client.key" \
-    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
-    -out "$STATE_DIR/kubelet-client.csr"
+  generate_node_csr "$STATE_DIR/kubelet-client.key" "$STATE_DIR/kubelet-client.csr"
 
   local csr_name
-  csr_name="kubelet-${NODE_NAME}-$(date +%s)"
+  csr_name="kubelet-$(date +%s)-$(openssl rand -hex 4)"
   jq -n -c \
     --arg name "$csr_name" \
     --arg request "$(base64 -w0 < "$STATE_DIR/kubelet-client.csr")" \
@@ -1852,13 +1858,6 @@ if [ -z "$NODE_NAME" ]; then
 fi
 if [ -z "$NODE_NAME" ]; then
   echo "error: refusing to continue: empty node name (hostname is empty; pass --node-name)" >&2
-  exit 1
-fi
-# openssl req rejects a Subject CN over X.509
-# ub-common-name (64) when building the identity CSR, after packages and state
-# are already laid down. "system:node:" is 12 of those 64.
-if [ "${#NODE_NAME}" -gt 52 ]; then
-  echo "error: node name '$NODE_NAME' is ${#NODE_NAME} chars; the node identity certificate CN 'system:node:<name>' would exceed the X.509 64-char limit that openssl enforces (max node name: 52). Pass a shorter --node-name (e.g. the short hostname instead of the FQDN)." >&2
   exit 1
 fi
 

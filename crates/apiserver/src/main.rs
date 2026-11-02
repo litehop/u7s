@@ -155,8 +155,18 @@ fn configure_runtime() -> tokio::runtime::Builder {
     builder
 }
 
+/// `u7s-apiserver node-csr ...` is a one-shot helper for install.sh, not the server.
+fn node_csr_requested() -> bool {
+    std::env::args().nth(1).as_deref() == Some("node-csr")
+}
+
 #[cfg(feature = "dhat")]
 fn main() -> anyhow::Result<()> {
+    if node_csr_requested() {
+        return u7s_apiserver::node_csr::run(u7s_apiserver::node_csr::NodeCsrArgs::parse_from(
+            std::env::args().skip(1),
+        ));
+    }
     bound_glibc_malloc_arenas();
     configure_runtime().build()?.block_on(dhat_main())
 }
@@ -196,6 +206,11 @@ async fn dhat_main() -> anyhow::Result<()> {
 
 #[cfg(not(feature = "dhat"))]
 fn main() -> anyhow::Result<()> {
+    if node_csr_requested() {
+        return u7s_apiserver::node_csr::run(u7s_apiserver::node_csr::NodeCsrArgs::parse_from(
+            std::env::args().skip(1),
+        ));
+    }
     bound_glibc_malloc_arenas();
     configure_runtime().build()?.block_on(async {
         let args = Args::parse();
