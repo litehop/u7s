@@ -638,9 +638,7 @@ pub async fn resolve_attach_target<S: Store>(
 
     // Build kubelet attach URL.
     //   Kubelet attach endpoint: wss://<node-ip>:10250/attach/<ns>/<pod>/<container>
-    let mut params = vec![format!("container={container}")];
-    params.extend(kubelet_stream_params(stdin, stdout, stderr, tty));
-    let qs = params.join("&");
+    let qs = kubelet_stream_params(stdin, stdout, stderr, tty).join("&");
     let kp = kubelet_port_for_node(node_name, &state.node_kubelet_ports, state.kubelet_port);
     validate_container_name(&container)?;
     let kubelet_ws_url = kubelet_endpoint_url(
@@ -2625,10 +2623,15 @@ fn split_host_port(authority: &str) -> Result<(String, u16), String> {
     let port: u16 = port_str
         .parse()
         .map_err(|e| format!("invalid port '{port_str}' in {authority}: {e}"))?;
-    let host = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(bracketed) => bracketed,
+        None if host.contains(':') => {
+            return Err(format!(
+                "address {authority:?}: IPv6 host must be bracketed as [v6]:port"
+            ));
+        }
+        None => host,
+    };
     Ok((host.to_owned(), port))
 }
 
@@ -4331,6 +4334,29 @@ mod tests {
         assert!(split_host_port("[fd00::1]").is_err());
     }
 
+    /// `fd00::1:8132` is ambiguous (host fd00::1 port 8132, or host fd00::1:8132 with no
+    /// port); guessing could tunnel to the wrong endpoint, so it must be refused.
+    #[test]
+    fn split_host_port_rejects_unbracketed_ipv6() {
+        for bad in ["fd00::1:8132", "::1:8132", "fd00::1"] {
+            let err = split_host_port(bad).unwrap_err();
+            assert!(err.contains("[v6]:port"), "{bad}: got {err}");
+        }
+    }
+
+    /// A node whose status address carries a zone ID must answer 400 with the zone-ID
+    /// message rather than an opaque 500 or a dial attempt.
+    #[tokio::test]
+    async fn node_proxy_resolver_rejects_zone_id_node_address() {
+        let state = make_state();
+        seed_node_with_address(&state, "fe80::1%eth0").await;
+        let err = resolve_node_proxy_target(&state, "n", "healthz")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.as_u16(), 400);
+        assert!(err.1.message.contains("zone IDs"), "{}", err.1.message);
+    }
+
     #[test]
     fn connect_line_and_host_header_bracket_ipv6_pod_ip() {
         assert_eq!(
@@ -5206,21 +5232,9 @@ mod tests {
 
         let t = |b: bool| Some(if b { "true" } else { "false" }.to_owned());
         for (stdin, stdout, stderr, tty, want) in [
-            (false, true, true, false, "container=app&output=1&error=1"),
-            (
-                true,
-                true,
-                true,
-                false,
-                "container=app&input=1&output=1&error=1",
-            ),
-            (
-                true,
-                true,
-                false,
-                true,
-                "container=app&input=1&output=1&tty=1",
-            ),
+            (false, true, true, false, "output=1&error=1"),
+            (true, true, true, false, "input=1&output=1&error=1"),
+            (true, true, false, true, "input=1&output=1&tty=1"),
         ] {
             let query = AttachQuery {
                 container: Some("app".into()),
