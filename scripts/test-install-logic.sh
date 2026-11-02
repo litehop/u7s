@@ -1260,42 +1260,55 @@ assert "a persisted UPPERCASE node name is lowercased on re-run with no flag (ot
 recover_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "$LOWER_HOST" 1 2>&1 || true)"
 assert "a lowercase --node-name does not conflict with the persisted uppercase spelling of the same name (operator can recover by passing the fix explicitly)" \
   "$(printf '%s' "$recover_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
-for csr_fmt in 'join-%s-1' 'kubelet-%s-1'; do
-  # shellcheck disable=SC2059
-  csr_name="$(printf "$csr_fmt" "$(printf '%s' "$upper_default_out" | sed -n 's/^NODE_NAME=//p')")"
-  assert "the CSR name $csr_name built from a capitalised host is a valid DNS-1123 name (apiserver rejects uppercase)" \
-    "$(printf '%s' "$csr_name" | grep -Eq '^[a-z0-9.-]+$' && echo 1 || echo 0)"
-done
-assert_true "the join CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
-  grep -qF 'csr_name="join-${NODE_NAME}-$(date +%s)"' "$INSTALL"
-assert_true "the control-plane kubelet CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
-  grep -qF 'csr_name="kubelet-${NODE_NAME}-$(date +%s)"' "$INSTALL"
-assert_true "the CSR subject CN uses NODE_NAME, so it is the lowercase system:node:<name> the node authorizer expects" \
-  grep -qF -- '-subj "/O=system:nodes/CN=system:node:$NODE_NAME"' "$INSTALL"
+assert_false "the join/kubelet CSR names no longer embed NODE_NAME: a 253-char node name would push 'join-<name>-<ts>' past the 253-char object-name limit and the CSR create would be rejected" \
+  grep -qE 'csr_name="(join|kubelet)-\$\{NODE_NAME\}' "$INSTALL"
+assert_true "the join CSR name is a short unique DNS-1123 name" \
+  grep -qF 'csr_name="join-$(date +%s)-$(openssl rand -hex 4)"' "$INSTALL"
+assert_true "the control-plane kubelet CSR name is a short unique DNS-1123 name" \
+  grep -qF 'csr_name="kubelet-$(date +%s)-$(openssl rand -hex 4)"' "$INSTALL"
+assert_false "(regression guard) install.sh no longer builds the node identity CSR with 'openssl req', whose 64-byte CN cap rejects node names over 52 chars" \
+  grep -qE 'openssl req ' "$INSTALL"
+assert "both CSR sites (join and control-plane self-join) go through generate_node_csr, which passes NODE_NAME to 'u7s-apiserver node-csr'" \
+  "$([ "$(grep -c '^  generate_node_csr "\$STATE_DIR/kubelet-client.key" "\$STATE_DIR/kubelet-client.csr"$' "$INSTALL")" = 2 ] && grep -qF '"$tool" node-csr --node-name "$NODE_NAME"' "$INSTALL" && echo 1 || echo 0)"
 
 # Case 6a: a GCP FQDN hostname (<name>.c.<project>.internal) can push the
-# identity CN past X.509's 64 chars, which openssl req refuses mid-install.
-# install.sh must refuse up front, at the node-name default, with a clear error.
+# identity CN past X.509's 64 chars. Upstream accepts names up to 253 chars, so
+# install.sh must not refuse any of them -- via --node-name, via the hostname
+# default, or when persisted by an earlier install.
 long_runner="$PERSIST_WORK/long-name.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  echo 'NODE_NAME="$1"; IFACE=eth0'
+  echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL="${3:-0}"'
+  echo 'NODE_NAME="$2"; IFACE=eth0'
+  echo 'hostname() { echo "$LONG_HOST"; }'
+  awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$INSTALL"
   awk '/^# --- Defaults: node name/{f=1} f&&/^if \[ -z "\$IFACE" \]/{exit} f{print}' "$INSTALL"
   echo 'echo "NODE_NAME=$NODE_NAME"'
 } > "$long_runner"
-LONG_NAME="$(printf 'a%.0s' $(seq 1 53))"
-OK_NAME="$(printf 'a%.0s' $(seq 1 52))"
-long_rc=0
-long_out="$(bash "$long_runner" "$LONG_NAME" 2>&1)" || long_rc=$?
-assert "a 53-char node name (CN 65 chars) is refused with a message naming the 64-char limit, instead of failing later inside openssl req" \
-  "$([ "$long_rc" -ne 0 ] && printf '%s' "$long_out" | grep -q '64-char' && echo 1 || echo 0)"
-ok_out="$(bash "$long_runner" "$OK_NAME" 2>&1 || true)"
-assert "a 52-char node name (CN exactly 64 chars) is accepted -- the guard must not reject names openssl can sign" \
-  "$(printf '%s' "$ok_out" | grep -qx "NODE_NAME=$OK_NAME" && echo 1 || echo 0)"
-cn_ok="$(openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout /dev/null -subj "/O=system:nodes/CN=system:node:$OK_NAME" 2>&1 >/dev/null || true)"
-assert "openssl really signs a 64-char CN (so the 52-char bound is not needlessly strict)" \
-  "$(printf '%s' "$cn_ok" | grep -q 'too long' && echo 0 || echo 1)"
+mkdir -p "$PERSIST_WORK/long"
+for len in 52 53 63 64 253; do
+  long_name="$(printf 'a%.0s' $(seq 1 "$len"))"
+  rc=0
+  out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long" "$long_name" 2>&1)" || rc=$?
+  assert "a $len-char --node-name is accepted (upstream joins nodes up to 253 chars)" \
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+  rc=0
+  out="$(LONG_HOST="$(printf '%s' "$long_name" | tr a A)" bash "$long_runner" "$PERSIST_WORK/long" "" 2>&1)" || rc=$?
+  assert "a $len-char hostname becomes the (lowercased) node name via the real derivation path" \
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+done
+persisted_long="$(printf 'b%.0s' $(seq 1 100))"
+mkdir -p "$PERSIST_WORK/long-persisted"
+printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$persisted_long" > "$PERSIST_WORK/long-persisted/config"
+rc=0
+out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "" 1 2>&1)" || rc=$?
+assert "a persisted long node name is reused on re-run with no flag (a host from a failed earlier install must not dead-end)" \
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
+rc=0
+out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "$persisted_long" 1 2>&1)" || rc=$?
+assert "re-running with the persisted long name as --node-name is not refused" \
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
 
 # Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
 # (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
@@ -1435,7 +1448,7 @@ write_join_runner() {
     echo 'ensure_jq() { :; }'
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns cluster_families_from_cidrs issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns cluster_families_from_cidrs generate_node_csr issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1540,6 +1553,14 @@ touch "$CPID_DIR/kubeconfig"
 CPID_RUNNER="$JOIN_WORK/cpid.sh"
 write_join_runner "$CPID_RUNNER" '
 NODE_NAME=cp1
+STAGE_DIR="$STATE_DIR/stage"; mkdir -p "$STAGE_DIR"
+cat > "$STAGE_DIR/u7s-apiserver" <<'"'"'STUB'"'"'
+#!/usr/bin/env bash
+[ "$1" = node-csr ] && [ "$2" = --node-name ] && [ "$4" = --key-out ] && [ "$6" = --csr-out ] || exit 2
+openssl ecparam -name prime256v1 -genkey -noout -out "$5"
+openssl req -new -key "$5" -subj "/O=system:nodes/CN=system:node:$3" -out "$7"
+STUB
+chmod +x "$STAGE_DIR/u7s-apiserver"
 kubectl() {
   printf "%s\n" "$*" >> "$STATE_DIR/kubectl-argv"
   case "$*" in
