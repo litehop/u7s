@@ -38,9 +38,12 @@ case "$*" in
   "compute instances create "*)
     [ -z "${STUB_LEAK:-}" ] || echo "Created [https://compute.googleapis.com/projects/fake-proj-123/zones/z/instances/x]" >&2
     exit 0 ;;
-  "compute instances describe "*ipv6Address*) echo "${STUB_CLIENT_V6-2600:1900::4}"; exit 0 ;;
+  "compute instances describe "*natIP*)
+    case "$*" in *-cp\ *) echo 34.0.0.2 ;; *-w1\ *) echo 34.0.0.3 ;; *-probe\ *) echo "${STUB_PROBE_V4-203.0.113.9}" ;; *) echo 34.0.0.4 ;; esac; exit 0 ;;
+  "compute instances describe "*ipv6Address*) echo "${STUB_PROBE_V6-2600:1900::4}"; exit 0 ;;
+  "compute firewall-rules create "*) touch "$STUB_LOG.fw"; exit 0 ;;
   "compute firewall-rules describe "*) [ -z "${STUB_FW_LEAK:-}" ] || echo "$3"; [ -n "${STUB_FW_LEAK:-}" ]; exit $? ;;
-  "compute firewall-rules delete "*) [ -z "${STUB_FW_LEAK:-}" ] || exit 1; exit 0 ;;
+  "compute firewall-rules delete "*) [ -z "${STUB_FW_LEAK:-}" ] || exit 1; rm -f "$STUB_LOG.fw"; exit 0 ;;
   "compute instances describe "*) echo 1; exit 0 ;;
   "compute instances delete "*) [ -z "${STUB_DELETE_FAIL:-}" ] || exit 1; exit 0 ;;
   "compute operations list "*) [ -z "${STUB_OPS_FAIL:-}" ] || { echo "ERROR: denied" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
@@ -52,11 +55,16 @@ case "$*" in
         [ -z "${STUB_LEAK:-}" ] || echo "ERROR: https://compute.googleapis.com/projects/fake-proj-123/zones/z failed" >&2
         exit 1 ;;
     esac
+    # The probe is an outsider: it reaches the LB only while a firewall rule admits it, like GCE.
+    admitted=0; { [ -e "$STUB_LOG.fw" ] || [ -n "${STUB_PROBE_OPEN:-}" ]; } && admitted=1
     case "$*" in
+      *"ssh u7s-e2e-t-probe "*"curl-rc="*) [ "$admitted" = 1 ] && echo curl-rc=0 || echo "curl-rc=${STUB_PROBE_RC-28}" ;;
+      *"ssh u7s-e2e-t-probe "*"curl -6"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN6-[2600:1900::4]}:41234" ;;
+      *"ssh u7s-e2e-t-probe "*"curl -4"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN4-203.0.113.9}:41234" ;;
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
-        echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
+        echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>${STUB_MINT_FAMILIES:+ --cluster-ip-families $STUB_MINT_FAMILIES}" ;;
       *"get nodes -o wide"*)
         echo "u7s-e2e-t-w1.zone.internal Ready <none> 1m v1.37.1 10.80.0.3 <none> Ubuntu"
         case "${STUB_NODES:-one}" in
@@ -93,7 +101,7 @@ chmod +x "$TMP/bin/gcloud"
 
 # run args... -> OUT, RC, LOG (gcloud argv), STDIN (everything piped into ssh), RES (results dir contents)
 run() {
-  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res"
+  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res" "$TMP/log.fw"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" STUB_TOKEN="$TOKEN" STUB_HASH="$HASH" \
     STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 U7S_E2E_SONOBUOY_POLLS=3 \
@@ -219,10 +227,12 @@ run --release v0.4.0-snapshot.1 --dual-stack
 dual_out="$OUT"; dual_log="$LOG"; dual_stdin="$STDIN"
 fw="$(grep 'firewall-rules create' <<<"$dual_log" || true)"
 assert "--dual-stack passes on a healthy dual-stack stub cluster" "$(rc_is 0)$(has 'RESULT: PASS' "$dual_out")"
-assert "every VPS (cp, w1, client) is IPV4_IPV6 with a premium external v6 address (a v4-only VPS cannot carry the v6 path)" \
-  "$([ "$(grep -c 'stack-type=IPV4_IPV6' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)$([ "$(grep -c 'ipv6-network-tier=PREMIUM' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)"
-assert "--dual-stack defaults to e2-standard-2 (the sonobuoy subset saturates e2-micro)" \
-  "$([ "$(grep -c 'machine-type=e2-standard-2' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)$(hasnt 'e2-micro' "$dual_log")"
+assert "every VPS (cp, w1, client, probe) is IPV4_IPV6 with a premium external v6 address (a v4-only VPS cannot carry the v6 path)" \
+  "$([ "$(grep -c 'stack-type=IPV4_IPV6' <<<"$dual_log")" = 4 ] && echo 1 || echo 0)$([ "$(grep -c 'ipv6-network-tier=PREMIUM' <<<"$dual_log")" = 4 ] && echo 1 || echo 0)"
+assert "--dual-stack defaults the cluster VPSes to e2-standard-2 (the sonobuoy subset saturates e2-micro) while the curl-only probe stays e2-micro" \
+  "$([ "$(grep -c 'machine-type=e2-standard-2' <<<"$dual_log")" = 3 ] && echo 1 || echo 0)$([ "$(grep -c 'machine-type=e2-micro' <<<"$dual_log")" = 1 ] && echo 1 || echo 0)$(has 'machine-type=e2-micro' "$(grep 'create u7s-e2e-t-probe' <<<"$dual_log")")"
+assert "the probe is created in the u7s-probe VPC, the cluster VPSes in u7s-test (an in-VPC probe would prove nothing about external reachability)" \
+  "$(has 'network=u7s-probe --subnet=u7s-probe' "$(grep 'create u7s-e2e-t-probe' <<<"$dual_log")")$([ "$(grep 'instances create' <<<"$dual_log" | grep -c 'network=u7s-test ')" = 3 ] && echo 1 || echo 0)"
 run --release v0.4.0-snapshot.1 --dual-stack --machine-type e2-medium
 assert "an explicit --machine-type wins over the --dual-stack default" "$(has 'machine-type=e2-medium' "$LOG")$(hasnt 'e2-standard-2' "$LOG")"
 assert "install.sh gets both families for pods and Services (a single-stack install would pass the node asserts vacuously)" \
@@ -231,9 +241,32 @@ assert "--node-ip is not passed: install.sh derives both node addresses from --i
   "$(hasnt 'node-ip' "$dual_log")"
 assert "the join does not repeat the CIDRs (w1 learns them from the cluster)" \
   "$(hasnt 'cidr' "$(grep -- '--join' <<<"$dual_log")")"
-assert "the LB firewall rule opens only the LB port, to VPSes carrying the test tag, from the client's own /96 (never ::/0 or all ports)" \
-  "$(has 'rules=tcp:80' "$fw")$(has 'target-tags=u7s-test-vps' "$fw")$(has 'source-ranges=2600:1900::4/96' "$fw")$(hasnt '::/0' "$fw")$(hasnt '0.0.0.0/0' "$fw")$(has 'direction=INGRESS' "$fw")$(has 'u7s-e2e-t-lb-v6' "$fw")"
-assert "the LB firewall rule is deleted on a PASS (it must not outlive the run)" "$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$dual_log")"
+assert "the dual-stack join carries --cluster-ip-families 4,6 (a worker without it assumes IPv4 and drops its IPv6 address, so the cluster silently loses a family)" \
+  "$(has '--node-name u7s-e2e-t-w1 --cluster-ip-families 4,6' "$(grep -- '--join' <<<"$dual_log")")"
+fw4="$(grep 'firewall-rules create u7s-e2e-t-lb-v4' <<<"$dual_log" || true)"
+fw6="$(grep 'firewall-rules create u7s-e2e-t-lb-v6' <<<"$dual_log" || true)"
+assert "the v4 LB firewall rule opens only the LB port, to tagged VPSes, from the probe's external /32 alone (never the in-subnet client, 0.0.0.0/0 or all ports; GCE rules cannot mix families)" \
+  "$(has 'rules=tcp:80' "$fw4")$(has 'target-tags=u7s-test-vps' "$fw4")$(has 'source-ranges=203.0.113.9/32 ' "$fw4 ")$(hasnt '0.0.0.0/0' "$fw4")$(hasnt '10.80.0.4' "$fw4")$(has 'direction=INGRESS' "$fw4")$(has 'network=u7s-test' "$fw4")"
+assert "the v6 LB firewall rule opens only the LB port, to tagged VPSes, from the probe's own /96 alone (never the client's, ::/0 or all ports)" \
+  "$(has 'rules=tcp:80' "$fw6")$(has 'target-tags=u7s-test-vps' "$fw6")$(has 'source-ranges=2600:1900::4/96 ' "$fw6 ")$(hasnt '::/0' "$fw6")$(has 'direction=INGRESS' "$fw6")"
+assert "exactly the two LB firewall rules are created (nothing else is opened)" \
+  "$([ "$(grep -c 'firewall-rules create' <<<"$dual_log")" = 2 ] && echo 1 || echo 0)"
+assert "both LB firewall rules and the probe VM are deleted on a PASS (the rules admit a public address, the probe bills)" \
+  "$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$dual_log")$(has 'firewall-rules delete u7s-e2e-t-lb-v4' "$dual_log")$(has 'instances delete u7s-e2e-t-probe ' "$dual_log")"
+neg_first="$(grep -n 'curl-rc=' <<<"$dual_log" | head -1 | cut -d: -f1)"
+neg_last="$(grep -n 'curl-rc=' <<<"$dual_log" | tail -1 | cut -d: -f1)"
+fw_first="$(grep -n 'firewall-rules create' <<<"$dual_log" | head -1 | cut -d: -f1)"
+pos_first="$(grep -n 'ssh u7s-e2e-t-probe .*-fsS' <<<"$dual_log" | head -1 | cut -d: -f1)"
+assert "the probe is refused (negative) strictly before any LB rule exists and admitted only after both rules: otherwise the pass cannot show the rule is what admits outside traffic" \
+  "$([ -n "$neg_first" ] && [ -n "$pos_first" ] && [ "$neg_last" -lt "$fw_first" ] && [ "$fw_first" -lt "$pos_first" ] && echo 1 || echo 0)"
+probe_log="$(grep 'ssh u7s-e2e-t-probe' <<<"$dual_log")"
+assert "the probe curls the nodes' external IPv4 and the v6 ingress with -4/-6, never the internal 10.80.x addresses another VPC cannot reach" \
+  "$(has 'curl -4 -g -fsS --max-time 15 http://34.0.0.2/clientip' "$probe_log")$(has 'curl -4 -g -fsS --max-time 15 http://34.0.0.3/clientip' "$probe_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::2]/clientip'" "$probe_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::3]/clientip'" "$probe_log")$(hasnt 'http://10.80' "$probe_log")"
+assert "the probe sends the negative curls over both families too (a v4-only refusal would not cover v6)" \
+  "$(has 'curl -4 -g -sS --max-time 10 http://34.0.0.2/clientip' "$probe_log")$(has "curl -6 -g -sS --max-time 10 'http://[2600:1900::2]/clientip'" "$probe_log")"
+assert "the probe results are reported" "$(has 'PASS: probe refused by 34.0.0.2 before the LB rule' "$(cat "$TMP"/res/probe-refused-without-rule.log)")$(has 'PASS: probe in u7s-probe reached 34.0.0.2 over IPv4' "$(cat "$TMP"/res/probe-reaches-lb.log)")"
+assert "the in-subnet client checks still run alongside the probe" \
+  "$(has 'ssh u7s-e2e-t-client' "$dual_log")$(has 'PASS: lb 10.80.0.2 answered over IPv4' "$dual_out")$(has 'PASS: lb 2600:1900::2 answered over IPv6' "$dual_out")"
 assert "nodes carry both InternalIP families and two podCIDRs (checked per node)" \
   "$(has 'PASS: node u7s-e2e-t-cp.zone.internal InternalIP dual-stack' "$(cat "$TMP"/res/dual-nodes.log)")$(has 'PASS: node u7s-e2e-t-w1 podCIDRs dual-stack' "$(cat "$TMP"/res/dual-nodes.log)")"
 assert "a PreferDualStack Service and a dnsutils pod are applied" \
@@ -270,9 +303,40 @@ STUB_INGRESS="10.80.0.2 10.80.0.3 2600:1900::2" run --release v0.4.0-snapshot.1 
 assert "an ingress list missing a node's IPv6 fails" "$(rc_is 1)$(has 'lacks node IP 2600:1900::3' "$OUT")"
 STUB_SEEN6="[2600:1900::99]" run --release v0.4.0-snapshot.1 --dual-stack
 assert "an IPv6 LB that SNATs the client fails" "$(rc_is 1)$(has 'backend saw client 2600:1900::99' "$OUT")"
-STUB_CLIENT_V6= run --release v0.4.0-snapshot.1 --dual-stack
-assert "a client VPS without external IPv6 fails before any firewall rule is made (no source to scope it to)" \
+STUB_PROBE_V6= run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe VPS without external IPv6 fails before any firewall rule is made (no source to scope it to)" \
+  "$(rc_is 1)$(hasnt 'firewall-rules create' "$LOG")$(has 'instances delete u7s-e2e-t-probe ' "$LOG")"
+STUB_PROBE_V4= run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe VPS without external IPv4 fails before any firewall rule is made" \
   "$(rc_is 1)$(hasnt 'firewall-rules create' "$LOG")"
+STUB_PROBE_OPEN=1 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe that reaches the LB with no rule fails (outside traffic admitted without the rule means the positive check proves nothing) and no rule is ever created" \
+  "$(rc_is 1)$(has 'with no LB firewall rule' "$(cat "$TMP"/res/probe-refused-without-rule.log)")$(hasnt 'firewall-rules create' "$LOG")"
+STUB_FAIL_MATCH="curl-rc=" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a dead IAP tunnel during the negative check is a FAIL, never read as the LB refusing the probe" \
+  "$(rc_is 1)$(has 'tunnel failure' "$(cat "$TMP"/res/probe-refused-without-rule.log)")$(hasnt 'firewall-rules create' "$LOG")"
+STUB_PROBE_RC= run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe that returns no curl exit status fails rather than counting as refused" \
+  "$(rc_is 1)$(has 'no curl exit status' "$(cat "$TMP"/res/probe-refused-without-rule.log)")"
+STUB_PROBE_SEEN4=10.80.0.9 run --release v0.4.0-snapshot.1 --dual-stack
+assert "an LB that SNATs the probe's IPv4 fails: the probe must be seen as its own external address" \
+  "$(rc_is 1)$(has 'backend saw probe as 10.80.0.9' "$(cat "$TMP"/res/probe-reaches-lb.log)")"
+STUB_PROBE_SEEN6="[2600:1900::99]" run --release v0.4.0-snapshot.1 --dual-stack
+assert "an LB that SNATs the probe's IPv6 fails" "$(rc_is 1)$(has 'backend saw probe as 2600:1900::99' "$(cat "$TMP"/res/probe-reaches-lb.log)")"
+STUB_FAIL_MATCH="ssh u7s-e2e-t-probe" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe whose ssh never comes up fails and still deletes the probe and creates no firewall rule" \
+  "$(rc_is 1)$(has 'u7s-e2e-t-probe never became reachable' "$OUT")$(has 'instances delete u7s-e2e-t-probe ' "$LOG")$(hasnt 'firewall-rules create' "$LOG")"
+STUB_FAIL_MATCH="--e2e-focus" run --release v0.4.0-snapshot.1 --dual-stack
+assert "a FAIL after the probe check deletes the probe too" "$(rc_is 1)$(has 'instances delete u7s-e2e-t-probe ' "$LOG")"
+STUB_TERM_MATCH="ssh u7s-e2e-t-probe --tunnel-through-iap -- curl -4 -g -fsS" run --release v0.4.0-snapshot.1 --dual-stack
+assert "SIGTERM mid-probe still deletes the probe VM and both firewall rules" \
+  "$(rc_is 143)$(has 'instances delete u7s-e2e-t-probe ' "$LOG")$(has 'firewall-rules delete u7s-e2e-t-lb-v4' "$LOG")$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$LOG")"
+GCP_DELETE_SLEEP=0 GCP_DELETE_TRIES=2 STUB_DELETE_FAIL=1 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a probe VM that cannot be deleted is listed as leaked and turns a PASS into exit 4" \
+  "$(rc_is 4)$(has 'u7s-e2e-t-probe' "$(cat "$TMP"/res/leaked-vps.txt)")"
+STUB_BEEP=1 STUB_INGRESS="10.80.0.2 10.80.0.3" run --release v0.4.0-snapshot.1
+assert "the single-stack run creates no probe and no firewall rule (the release gate must not change)" \
+  "$(rc_is 0)$(hasnt 'probe' "$LOG")$(hasnt 'firewall-rules' "$LOG")"
 STUB_SB_TOTAL=0 run --release v0.4.0-snapshot.1 --dual-stack
 assert "a sonobuoy focus that ran zero specs fails (vacuous pass)" "$(rc_is 1)$(has 'ran no specs' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
 STUB_SB_FAILED=5 run --release v0.4.0-snapshot.1 --dual-stack
@@ -282,7 +346,7 @@ assert "a sonobuoy run that never completes fails" "$(rc_is 1)$(has 'never compl
 STUB_BEEP=0 run --release v0.4.0-snapshot.1 --dual-stack
 assert "--dual-stack on a release without beep fails instead of SKIPPED-passing the LB check" "$(rc_is 1)$(hasnt 'SKIPPED' "$OUT")"
 STUB_FAIL_MATCH="--e2e-focus" run --release v0.4.0-snapshot.1 --dual-stack
-assert "a failing run still deletes the firewall rule and all three VPSes (nothing may keep billing or stay open)" \
+assert "a failing run still deletes the firewall rule and all the VPSes (nothing may keep billing or stay open)" \
   "$(rc_is 1)$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$LOG")$(has 'instances delete u7s-e2e-t-client ' "$LOG")$(has 'instances delete u7s-e2e-t-cp ' "$LOG")"
 STUB_FAIL_MATCH="--e2e-focus" STUB_TERM_MATCH="--e2e-focus" run --release v0.4.0-snapshot.1 --dual-stack
 assert "SIGTERM mid-sonobuoy still deletes the firewall rule" "$(rc_is 143)$(has 'firewall-rules delete u7s-e2e-t-lb-v6' "$LOG")"
@@ -290,8 +354,13 @@ STUB_FW_LEAK=1 GCP_DELETE_SLEEP=0 run --release v0.4.0-snapshot.1 --dual-stack
 assert "a firewall rule that cannot be deleted is reported as leaked and turns a PASS into exit 4" \
   "$(rc_is 4)$(has 'LEAKED FIREWALL RULE u7s-e2e-t-lb-v6' "$OUT")"
 run --release v0.4.0-snapshot.1 --dual-stack --keep
-assert "--keep leaves the firewall rule and says how to delete it" \
-  "$(rc_is 0)$(hasnt 'firewall-rules delete' "$LOG")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v6' "$OUT")"
+assert "--keep leaves the firewall rules and the probe VM and says how to delete each" \
+  "$(rc_is 0)$(hasnt 'firewall-rules delete' "$LOG")$(hasnt 'instances delete' "$LOG")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v6' "$OUT")$(has 'gcloud compute firewall-rules delete u7s-e2e-t-lb-v4' "$OUT")$(has 'scripts/gcp/vps.sh down u7s-e2e-t-probe' "$OUT")"
+STUB_MINT_FAMILIES=6,4 run --release v0.4.0-snapshot.1 --dual-stack
+assert "the join uses the families the control plane printed rather than a guess (so ordering and future values follow the cluster)" \
+  "$(rc_is 0)$(has '--cluster-ip-families 6,4' "$(grep -- '--join' <<<"$LOG")")$(hasnt '--cluster-ip-families 4,6' "$LOG")"
+STUB_BEEP=0 run --release v0.4.0-snapshot.1
+assert "single-stack joins are unchanged: no --cluster-ip-families flag" "$(hasnt 'cluster-ip-families' "$LOG")"
 unset STUB_BEEP STUB_INGRESS
 
 # --- redaction and interrupts
