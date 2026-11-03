@@ -1519,13 +1519,16 @@ worker_enable_ipv6_forwarding() {
 # after the kubelet registered -- never requested up front.
 wait_for_joined_node() {
   local node_auth=(--cacert "$STATE_DIR/ca.pem" --cert "$STATE_DIR/kubelet-client.crt" --key "$STATE_DIR/kubelet-client.key")
-  local ready="" serving="" resp
+  local ready="" serving="" podcidrs="" resp
   echo "Waiting up to 5 min for node $NODE_NAME to be Ready with an issued kubelet serving certificate..."
   for _ in $(seq 1 150); do
-    if [ -z "$ready" ]; then
+    # Keep reading the Node until it has podCIDRs too: Ready does not imply
+    # node-ipam has allocated them, and forwarding is decided from them.
+    if [ -z "$ready" ] || [ -z "$podcidrs" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
       worker_enable_ipv6_forwarding "$resp"
       ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
+      podcidrs="$(printf '%s' "$resp" | jq -r 'select((.spec.podCIDRs // []) | length > 0) | "yes"' 2>/dev/null || true)"
     fi
     if [ -z "$serving" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
@@ -1533,13 +1536,13 @@ wait_for_joined_node() {
       serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
     fi
-    if [ -n "$ready" ] && [ -n "$serving" ]; then
+    if [ -n "$ready" ] && [ -n "$serving" ] && [ -n "$podcidrs" ]; then
       echo "Node $NODE_NAME is Ready and its kubelet serving certificate was approved and issued."
       return 0
     fi
     sleep 2
   done
-  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no) and its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
+  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no), its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no) and podCIDRs allocated=$([ -n "$podcidrs" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
   return 1
 }
 
@@ -1593,6 +1596,22 @@ worker_api_get() {
   [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
   server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
   curl --proto '=https' --tlsv1.2 -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
+}
+
+# Upgrade-path IPv6 forwarding check. Failing to read the Node must not abort
+# the kubelet upgrade, but it must not be silent either: the worker would keep
+# routing no IPv6 without anyone knowing why.
+worker_upgrade_ipv6_forwarding() {
+  local json err errf
+  errf="$(mktemp)"
+  if json="$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>"$errf")" && printf '%s' "$json" | jq -e . >/dev/null 2>"$errf"; then
+    rm -f "$errf"
+    worker_enable_ipv6_forwarding "$json"
+    return 0
+  fi
+  err="$(tr '\n' ' ' < "$errf")"
+  rm -f "$errf"
+  echo "warning: could not read node $NODE_NAME to decide on IPv6 forwarding (${err:-no error output}); the IPv6 forwarding sysctl was NOT checked. If this is a dual-stack cluster, re-run install.sh once the API server is reachable, or set net.ipv6.conf.all.forwarding=1 by hand." >&2
 }
 
 # lastHeartbeatTime (epoch seconds) of the Node's Ready condition as served by
@@ -2156,7 +2175,7 @@ if [ "$WORKER_MODE" -eq 1 ]; then
       exit 1
     fi
     FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
-    worker_enable_ipv6_forwarding "$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+    worker_upgrade_ipv6_forwarding
   fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF
