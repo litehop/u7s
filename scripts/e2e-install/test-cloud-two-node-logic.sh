@@ -50,8 +50,11 @@ case "$*" in
   "compute instances describe "*) echo 1; exit 0 ;;
   "compute instances delete "*) [ -z "${STUB_DELETE_FAIL:-}" ] || exit 1; exit 0 ;;
   "compute operations list "*) [ -z "${STUB_OPS_FAIL:-}" ] || { echo "ERROR: denied" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
+  "compute scp "*":/tmp/beep-ev.tgz "*) tar -czf "${@: -1}" -C "$STUB_EVIDENCE" .; exit 0 ;;
   "compute ssh "*)
-    cat >>"$STUB_LOG.stdin"
+    in="$(cat)"
+    [ -z "$in" ] || printf '%s\n' "$in" >>"$STUB_LOG.stdin"
+    case "$in" in *"externalTrafficPolicy: Local"*) touch "$STUB_LOG.local" ;; esac
     [ -z "${STUB_TERM_MATCH:-}" ] || case "$*" in *"$STUB_TERM_MATCH"*) kill -TERM "$(ps -axo pid=,command= | grep -F "bash $STUB_SCRIPT" | sort -n | awk 'NR==1{print $1}')" ;; esac
     [ -z "${STUB_FAIL_MATCH:-}" ] || case "$*" in
       *"$STUB_FAIL_MATCH"*)
@@ -60,10 +63,23 @@ case "$*" in
     esac
     # The probe is an outsider: it reaches the LB only while a firewall rule admits it, like GCE.
     admitted=0; { [ -e "$STUB_LOG.fw" ] || [ -n "${STUB_PROBE_OPEN:-}" ]; } && admitted=1
+    # curl -w @%{local_port} appends the client's source port.
+    sfx=; case "$*" in *"-w @"*) sfx="@${STUB_CPORT-51234}" ;; esac
     case "$*" in
       *"ssh u7s-e2e-t-probe "*"curl-rc="*) [ "$admitted" = 1 ] && echo curl-rc=0 || echo "curl-rc=${STUB_PROBE_RC-28}" ;;
-      *"ssh u7s-e2e-t-probe "*"curl -6"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN6-[2600:1900::4]}:41234" ;;
-      *"ssh u7s-e2e-t-probe "*"curl -4"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN4-203.0.113.9}:41234" ;;
+      # Beep with only the v4 --pod-cidr drops v6 to the pod.
+      *"ssh u7s-e2e-t-client "*"curl-rc="*) { [ -e "$STUB_LOG.v4only" ] && [ -z "${STUB_V6_LEAK:-}" ]; } && echo curl-rc=28 || echo curl-rc=0 ;;
+      *"/hostname"*) case "$*" in *"ssh u7s-e2e-t-probe "*) [ "$admitted" = 1 ] || exit 28 ;; esac; echo "${STUB_HOSTNAME-lb-backend}" ;;
+      *"ssh u7s-e2e-t-probe "*"curl -6"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN6-[2600:1900::4]}:41234$sfx" ;;
+      *"ssh u7s-e2e-t-probe "*"curl -4"*) [ "$admitted" = 1 ] || exit 28; echo "${STUB_PROBE_SEEN4-203.0.113.9}:41234$sfx" ;;
+      *"real-cloud-evidence.sh after"*) case "$*" in *"${STUB_AFTER_FAIL_MATCH:-<none>}"*) exit 1 ;; esac ;;
+      *"patch svc lb"*) case "$*" in *Local*) touch "$STUB_LOG.local" ;; *) rm -f "$STUB_LOG.local" ;; esac ;;
+      *"get ds servicelb-controller -o json"*"select("*) touch "$STUB_LOG.v4only" ;;
+      *"get ds servicelb-controller -o json"*"+= ["*) rm -f "$STUB_LOG.v4only" ;;
+      *"logs -l app.kubernetes.io/name=servicelb-controller"*) echo "${STUB_CTRL_LOG-servicelb-controller-x WARN endpoint fd00:244:0:1::2 rejected: outside every --pod-cidr}" ;;
+      *"exec bulk -- sha256sum"*) echo "${STUB_BULK_SHA-$(printf 'ab%.0s' $(seq 1 32))}  /www/f" ;;
+      *"ip -d link show"*) echo "2: ens4: <BROADCAST,UP> mtu 1460 qdisc mq"; echo "ens4: mtu 1460"; echo "geneve0: mtu 1410" ;;
+      *"/tmp/bulk"*) echo "port=${STUB_CPORT-51234}"; echo "${STUB_GOT_SHA-$(printf 'ab%.0s' $(seq 1 32))}  /tmp/bulk"; echo "cubic wscale:7,7 rto:204 retrans:0/3 bytes_retrans:4200" ;;
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
@@ -86,15 +102,16 @@ case "$*" in
       *"sudo sonobuoy results"*)
         printf 'Plugin: e2e\nStatus: passed\nTotal: %s\nPassed: 9\nFailed: %s\nSkipped: 0\n' "${STUB_SB_TOTAL-9}" "${STUB_SB_FAILED-0}" ;;
       *"ip -6 -o addr"*) echo "2: ens4    inet6 2600:1900::4/128 scope global dynamic" ;;
-      *"curl -6"*) echo "${STUB_SEEN6-[2600:1900::4]}:41234" ;;
+      *"curl -6"*) echo "${STUB_SEEN6-[2600:1900::4]}:41234$sfx" ;;
       *"get ds -o name"*)
         echo daemonset.apps/kube-proxy
         case "${STUB_BEEP:-0}" in
           1) echo daemonset.apps/servicelb-controller ;;
           decoy) echo daemonset.apps/beep-exporter ;;
         esac ;;
-      *loadBalancer.ingress*) echo "${STUB_INGRESS-10.80.0.2 10.80.0.3}" ;;
-      *"/clientip"*) echo "${STUB_SEEN-10.80.0.4}:41234" ;;
+      *"get svc bulk"*loadBalancer.ingress*) echo "${STUB_INGRESS-10.80.0.2 10.80.0.3}" ;;
+      *loadBalancer.ingress*) if [ -e "$STUB_LOG.local" ]; then echo "${STUB_INGRESS_LOCAL-10.80.0.3}"; else echo "${STUB_INGRESS-10.80.0.2 10.80.0.3}"; fi ;;
+      *"/clientip"*) echo "${STUB_SEEN-10.80.0.4}:41234$sfx" ;;
     esac
     exit 0 ;;
 esac
@@ -104,7 +121,7 @@ chmod +x "$TMP/bin/gcloud"
 
 # run args... -> OUT, RC, LOG (gcloud argv), STDIN (everything piped into ssh), RES (results dir contents)
 run() {
-  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res" "$TMP/log.fw"
+  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res" "$TMP/log.fw" "$TMP/log.local" "$TMP/log.v4only"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" STUB_TOKEN="$TOKEN" STUB_HASH="$HASH" \
     STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 U7S_E2E_SONOBUOY_POLLS=3 \
@@ -195,7 +212,7 @@ assert "the client VPS is cleaned up too" "$(has 'instances delete u7s-e2e-t-cli
 assert "SKIPPED is not printed when the LB check ran" "$(hasnt 'SKIPPED' "$OUT")"
 STUB_BEEP=1 STUB_SEEN=10.80.0.3 run --release v0.4.0-snapshot.1
 assert "an LB that SNATs the client (backend sees another IP) fails: client IP preservation is the point" \
-  "$(rc_is 1)$(has 'backend saw client 10.80.0.3' "$OUT")"
+  "$(rc_is 1)$(has 'backend saw client as 10.80.0.3' "$OUT")"
 STUB_BEEP=1 STUB_INGRESS="" run --release v0.4.0-snapshot.1
 assert "a Service that never gets an ingress IP fails instead of passing vacuously" \
   "$(rc_is 1)$(has 'never got a LoadBalancer ingress IP' "$OUT")"
@@ -307,7 +324,7 @@ assert "a LoadBalancer with only IPv4 ingress fails (beep v6 not advertised)" "$
 STUB_INGRESS="10.80.0.2 10.80.0.3 2600:1900::2" run --release v0.4.0-snapshot.1 --dual-stack
 assert "an ingress list missing a node's IPv6 fails" "$(rc_is 1)$(has 'lacks node IP 2600:1900::3' "$OUT")"
 STUB_SEEN6="[2600:1900::99]" run --release v0.4.0-snapshot.1 --dual-stack
-assert "an IPv6 LB that SNATs the client fails" "$(rc_is 1)$(has 'backend saw client 2600:1900::99' "$OUT")"
+assert "an IPv6 LB that SNATs the client fails" "$(rc_is 1)$(has 'backend saw client as 2600:1900::99' "$OUT")"
 STUB_PROBE_V6= run --release v0.4.0-snapshot.1 --dual-stack
 assert "a probe VPS without external IPv6 fails before any firewall rule is made (no source to scope it to)" \
   "$(rc_is 1)$(hasnt 'firewall-rules create' "$LOG")$(has 'instances delete u7s-e2e-t-probe ' "$LOG")"
@@ -364,6 +381,100 @@ assert "--keep leaves the firewall rules and the probe VM and says how to delete
 STUB_BEEP=0 run --release v0.4.0-snapshot.1
 assert "single-stack joins pass no families flag either" "$(hasnt 'cluster-ip-families' "$LOG")"
 unset STUB_BEEP STUB_INGRESS
+
+# --- --w1-subnet
+run --release v0.4.0-snapshot.1 --w1-subnet u7s-test-b
+assert "--w1-subnet u7s-test-b puts w1 alone on the second subnet (cp and w1 on one subnet never cross a routed node-to-node path)" \
+  "$(rc_is 0)$(has 'subnet=u7s-test-b' "$(grep 'create u7s-e2e-t-w1' <<<"$LOG")")$(has 'subnet=u7s-test ' "$(grep 'create u7s-e2e-t-cp' <<<"$LOG") ")"
+run --release v0.4.0-snapshot.1 --w1-subnet evil
+assert "an unknown --w1-subnet exits 2 before creating VPSes" "$(rc_is 2)$(hasnt 'instances create' "$LOG")"
+
+# --- --external-traffic-policy
+run --release v0.4.0-snapshot.1 --external-traffic-policy Sideways
+assert "an unknown --external-traffic-policy exits 2 before creating VPSes" "$(rc_is 2)$(hasnt 'instances create' "$LOG")"
+STUB_BEEP=1 run --release v0.4.0-snapshot.1
+assert "without --external-traffic-policy the Service carries no policy field (the release gate's Service must not change)" \
+  "$(rc_is 0)$(hasnt 'externalTrafficPolicy' "$STDIN")$(hasnt 'patch svc lb' "$LOG")"
+STUB_BEEP=1 STUB_HOSTNAME=other-pod run --release v0.4.0-snapshot.1
+assert "an LB answered by anything but the backend pod fails (a reachable port alone does not prove beep reached the pod)" \
+  "$(rc_is 1)$(has "Hostname 'other-pod', not the backend pod lb-backend" "$OUT")"
+STUB_BEEP=1 run --release v0.4.0-snapshot.1 --external-traffic-policy Cluster,Local
+assert "Cluster,Local applies Cluster, then patches the Service to Local in place and checks only w1 is published" \
+  "$(rc_is 0)$(has 'externalTrafficPolicy: Cluster' "$STDIN")$(has 'patch svc lb --type=merge' "$LOG")$(has 'ingress IPs (Local): 10.80.0.3;' "$OUT")$(has 'PASS: lb 10.80.0.3 answered over IPv4 as lb-backend and saw client 10.80.0.4 (Local)' "$OUT")"
+STUB_BEEP=1 STUB_INGRESS_LOCAL="10.80.0.2 10.80.0.3" run --release v0.4.0-snapshot.1 --external-traffic-policy Local
+assert "under Local a published node without a local endpoint fails (beep must withdraw cp's address)" \
+  "$(rc_is 1)$(has 'lists 10.80.0.2, a node without a local endpoint' "$OUT")$(has 'externalTrafficPolicy: Local' "$STDIN")"
+
+# --- --beep-evidence
+run --release v0.4.0-snapshot.1 --beep-evidence "$TMP/nonexistent.sh"
+assert "--beep-evidence with no readable collector exits 2 before creating VPSes" "$(rc_is 2)$(hasnt 'instances create' "$LOG")"
+
+# FLOW_TABLE fixtures as bpftool dumps them: key = client ip[16] + front ip[16] + client port +
+# front port (network order) + proto + direction, v4 as ::ffff:a.b.c.d.
+V4P='"0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0xff","0xff"'
+V6P='"0x26","0x00","0x19","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00","0x00"'
+CLIENTS="$V4P,\"0x0a\",\"0x50\",\"0x00\",\"0x04\" $V4P,\"0xcb\",\"0x00\",\"0x71\",\"0x09\" $V6P,\"0x04\""
+FRONTS="$V4P,\"0x0a\",\"0x50\",\"0x00\",\"0x02\" $V4P,\"0x0a\",\"0x50\",\"0x00\",\"0x03\" $V6P,\"0x02\" $V6P,\"0x03\""
+flow_fixture() { # dir client-port-bytes
+  local c f p sep=
+  mkdir -p "$1/after"
+  { printf '['
+    for c in $CLIENTS; do for f in $FRONTS; do for p in '"0x00","0x50"' '"0x1f","0x91"'; do
+      printf '%s{"key":[%s,%s,%s,%s,"0x06","0x00"],"value":["0x00"]}' "$sep" "$c" "$f" "$2" "$p"; sep=,
+    done; done; done
+    printf ']'; } >"$1/after/flow_table.json"
+}
+flow_fixture "$TMP/ev-good" '"0xc8","0x22"'
+flow_fixture "$TMP/ev-otherport" '"0xc8","0x23"'
+mkdir -p "$TMP/ev-empty/after"; echo '[]' >"$TMP/ev-empty/after/flow_table.json"
+echo '#!/bin/sh' >"$TMP/collector.sh"
+EV_ARGS=(--release v0.4.0-snapshot.1 --dual-stack --w1-subnet u7s-test-b --external-traffic-policy Cluster,Local --beep-evidence "$TMP/collector.sh" --skip-sonobuoy)
+export STUB_BEEP=1 STUB_INGRESS="$DS_INGRESS" STUB_INGRESS_LOCAL="10.80.0.3 2600:1900::3" STUB_EVIDENCE="$TMP/ev-good"
+run "${EV_ARGS[@]}"
+ev_log="$LOG"
+assert "the run-1 evidence invocation passes on a healthy stub cluster" "$(rc_is 0)$(has 'RESULT: PASS' "$OUT")"
+assert "both nodes get bpftool (linux-tools for the running kernel), tcpdump and jq, and the collector (it fails loud without them)" \
+  "$([ "$(grep -c 'apt-get install -y -qq "linux-tools-$(uname -r)" tcpdump jq' <<<"$ev_log")" = 2 ] && echo 1 || echo 0)$(has "scp --tunnel-through-iap $TMP/collector.sh u7s-e2e-t-cp:/tmp/real-cloud-evidence.sh" "$ev_log")$(has "scp --tunnel-through-iap $TMP/collector.sh u7s-e2e-t-w1:/tmp/real-cloud-evidence.sh" "$ev_log")"
+assert "each item's evidence is archived per node under <item>/<cp|w1>/ (the beep sign-off reads it from there)" \
+  "$(for d in a-disjoint-cluster-v4 a-disjoint-cluster-v6 b-external-cluster-v4 b-external-cluster-v6 b-external-local-v4 b-external-local-v6 e-mtu-v4 e-mtu-v6; do for n in cp w1; do [ -s "$TMP/res/$d/$n/after/flow_table.json" ] && echo 1 || echo 0; done; done | tr -d '\n')"
+assert "the collector brackets each request with before + pcap-start and pcap-stop + after on both nodes" \
+  "$(for n in cp w1; do for ph in before pcap-start pcap-stop after; do has "ssh u7s-e2e-t-$n --tunnel-through-iap -- sudo bash /tmp/real-cloud-evidence.sh $ph /tmp/beep-evidence/a-disjoint-cluster-v4" "$ev_log"; done; done | tr -d "\n")"
+assert "the 100 MiB MTU transfer runs without a pcap (it would be as large as the transfer) and checks the sha256" \
+  "$(hasnt 'pcap-start /tmp/beep-evidence/e-mtu' "$ev_log")$(has 'PASS: 100 MiB through 10.80.0.2 matches sha256' "$(cat "$TMP/res/e-mtu-v4.log")")$(has 'last retransmit sample: retrans:0/3' "$(cat "$TMP/res/e-mtu-v4.log")")$(has 'mtu' "$(cat "$TMP/res/e-mtu-table.log")")"
+assert "the in-subnet client's request to cp is found by its exact 5-tuple in cp's FLOW_TABLE" \
+  "$(has 'PASS: a-disjoint-cluster-v4: cp FLOW_TABLE holds TCP 10.80.0.4:51234 -> 10.80.0.2:80; geneve0 grew on cp,w1' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")"
+assert "the outside probe goes to cp's external v4 but is keyed on cp's internal address (GCE NATs it), and under Local to w1 with no Geneve expected" \
+  "$(has "curl -4 -g -fsS --max-time 15 http://34.0.0.2/clientip" "$ev_log")$(has 'PASS: b-external-cluster-v4: cp FLOW_TABLE holds TCP 203.0.113.9:51234 -> 10.80.0.2:80' "$(cat "$TMP/res/b-external-cluster-v4.log")")$(has 'PASS: b-external-local-v6: w1 FLOW_TABLE holds TCP 2600:1900::4:51234 -> 2600:1900::3:80' "$(cat "$TMP/res/b-external-local-v6.log")")$(hasnt 'geneve0 grew' "$(cat "$TMP/res/b-external-local-v6.log")")"
+drop="$(grep -n 'get ds servicelb-controller -o json.*select(' <<<"$ev_log" | head -1 | cut -d: -f1)"
+neg="$(grep -n 'ssh u7s-e2e-t-client .*curl-rc=' <<<"$ev_log" | head -1 | cut -d: -f1)"
+restore="$(grep -n 'get ds servicelb-controller -o json.*+= \[' <<<"$ev_log" | head -1 | cut -d: -f1)"
+v6ok="$(grep -n "ssh u7s-e2e-t-client .*curl -6 -g -fsS" <<<"$ev_log" | head -1 | cut -d: -f1)"
+assert "the v4-only --pod-cidr goes in before the v6 refusal check and the v6 --pod-cidr is restored only after it, before any v6 success is checked (else the control proves nothing)" \
+  "$([ -n "$drop" ] && [ -n "$neg" ] && [ -n "$restore" ] && [ -n "$v6ok" ] && [ "$drop" -lt "$neg" ] && [ "$neg" -lt "$restore" ] && [ "$restore" -lt "$v6ok" ] && echo 1 || echo 0)"
+assert "the negative control requires the controller's rejection log naming the pod's v6 address" \
+  "$(has 'PASS: v6 via 2600:1900::2 refused' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+assert "--skip-sonobuoy skips the sonobuoy focus and says so" "$(hasnt '--e2e-focus' "$ev_log")$(has 'SKIPPED: sonobuoy-dual' "$OUT")"
+STUB_V6_LEAK=1 run "${EV_ARGS[@]}"
+assert "v6 reaching the pod with only the v4 --pod-cidr fails the negative control" \
+  "$(rc_is 1)$(has 'the admission gate is not what admits it' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+STUB_CTRL_LOG="all quiet" run "${EV_ARGS[@]}"
+assert "a v6 refusal without the controller's rejection log fails (the drop could have another cause)" \
+  "$(rc_is 1)$(has 'no controller log rejecting' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+STUB_EVIDENCE="$TMP/ev-empty" run "${EV_ARGS[@]}"
+assert "an empty ingress FLOW_TABLE fails: a 200 that beep did not track proves nothing about beep" \
+  "$(rc_is 1)$(has 'cp FLOW_TABLE has no TCP flow 10.80.0.4:51234 -> 10.80.0.2:80' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")"
+STUB_EVIDENCE="$TMP/ev-otherport" run "${EV_ARGS[@]}"
+assert "a flow between the right addresses but another client port fails (the check is the request's 5-tuple, not any flow)" \
+  "$(rc_is 1)$(has 'FLOW_TABLE has no TCP flow' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")"
+STUB_AFTER_FAIL_MATCH=a-disjoint-cluster-v4 run "${EV_ARGS[@]}"
+assert "no geneve0 growth on a node the flow crosses fails, after the evidence is archived" \
+  "$(rc_is 1)$(has 'geneve0 rx/tx did not grow on u7s-e2e-t-cp u7s-e2e-t-w1' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")$([ -s "$TMP/res/a-disjoint-cluster-v4/cp/after/flow_table.json" ] && echo 1 || echo 0)"
+STUB_AFTER_FAIL_MATCH=b-external-local run "${EV_ARGS[@]}"
+assert "no geneve0 growth under Local (the pod is on the ingress node) is expected and passes" "$(rc_is 0)"
+STUB_GOT_SHA=0000 run "${EV_ARGS[@]}"
+assert "a bulk download whose sha256 differs from the served file fails (MTU trouble can corrupt or truncate silently)" \
+  "$(rc_is 1)$(has "has sha256 '0000'" "$(cat "$TMP/res/e-mtu-v4.log")")"
+unset STUB_BEEP STUB_INGRESS STUB_INGRESS_LOCAL STUB_EVIDENCE
 
 # --- redaction and interrupts
 STUB_LEAK=1 STUB_FAIL_MATCH="wait --for=condition=Ready node" run --release v0.4.0-snapshot.1

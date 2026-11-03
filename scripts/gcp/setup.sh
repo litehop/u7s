@@ -117,7 +117,7 @@ else
     --direction=INGRESS --allow=tcp:22 --source-ranges="$GCP_IAP_RANGE"
 fi
 
-sorted_ranges() { tr ';,' '\n\n' <<<"$1" | sort | paste -sd, -; }
+sorted_ranges() { tr ';' ',' <<<"$1" | tr ',' '\n' | sort | paste -sd, -; }
 # ensure_internal_rule NAME RANGES: all ingress from exactly RANGES (comma-separated), both subnets'.
 ensure_internal_rule() {
   local have
