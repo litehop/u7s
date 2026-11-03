@@ -6,6 +6,10 @@
 GCP_NETWORK=u7s-test
 GCP_REGION=us-west1
 GCP_SUBNET_RANGE=10.80.0.0/24
+# A second subnet of u7s-test in the same region: nodes split across the two talk over a
+# disjoint-subnet (routed, not on-link) path.
+GCP_SUBNET_B=u7s-test-b
+GCP_SUBNET_B_RANGE=10.82.0.0/24
 GCP_IAP_RANGE=35.235.240.0/20
 # A second VPC (network and subnet share the name) that holds only the outside-VPC probe VM:
 # traffic from it to a test VPC's external addresses is external ingress, unlike in-subnet traffic.
@@ -33,20 +37,26 @@ gcp_require_config() {
     || gcp_die "gcloud configuration '$CLOUDSDK_ACTIVE_CONFIG_NAME' has no project; see docs/dev-setup.md (GCP test VPSes)"
 }
 
-# gcp_vps_create NAME ZONE [STACK_TYPE [NETWORK]]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6;
-# NETWORK is u7s-test (default) or the probe VPC.
+# gcp_vps_create NAME ZONE [STACK_TYPE [NETWORK [SUBNET]]]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6;
+# NETWORK is u7s-test (default) or the probe VPC; SUBNET defaults to the network's namesake, and
+# u7s-test also has u7s-test-b.
 # U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro, what the release gate runs on).
 gcp_vps_create() {
   local stack="${3:-IPV4_ONLY}" net="${4:-$GCP_NETWORK}"
+  local subnet="${5:-$net}"
   case "$stack" in IPV4_ONLY|IPV4_IPV6) ;; *) gcp_die "unsupported stack type: $stack" ;; esac
   case "$net" in "$GCP_NETWORK"|"$GCP_PROBE_NETWORK") ;; *) gcp_die "unsupported network: $net" ;; esac
+  case "$net/$subnet" in
+    "$GCP_NETWORK/$GCP_NETWORK"|"$GCP_NETWORK/$GCP_SUBNET_B"|"$GCP_PROBE_NETWORK/$GCP_PROBE_NETWORK") ;;
+    *) gcp_die "unsupported subnet $subnet in network $net" ;;
+  esac
   local v6=()
   [ "$stack" = IPV4_IPV6 ] && v6=(--ipv6-network-tier=PREMIUM)
   gcloud compute instances create "$1" --zone="$2" \
     --machine-type="${U7S_GCP_MACHINE_TYPE:-e2-micro}" \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
     --boot-disk-size=10GB --boot-disk-type=pd-standard \
-    --network="$net" --subnet="$net" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
+    --network="$net" --subnet="$subnet" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
     --labels="$GCP_LABEL" --tags="$GCP_VPS_TAG" \
     --provisioning-model=SPOT --instance-termination-action=STOP --max-run-duration=16h
 }
