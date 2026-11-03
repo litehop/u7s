@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Spot e2-micro test VPSes on the u7s-test VPC (run scripts/gcp/setup.sh once first).
 #
-# Usage: vps.sh up [--stack-type IPV4_ONLY|IPV4_IPV6] [--network u7s-test|u7s-probe] NAME | ssh NAME [-- cmd...] | scp SRC... NAME:DST | down NAME | list | gc
+# Usage: vps.sh up [--stack-type IPV4_ONLY|IPV4_IPV6] [--network u7s-test|u7s-probe] [--subnet u7s-test|u7s-test-b] NAME | ssh NAME [-- cmd...] | scp SRC... NAME:DST | down NAME | list | gc
 #   up    create a Spot VPS (termination action STOP, max run 16h, label u7s-test=1)
 #         (default IPV4_ONLY; IPV4_IPV6 adds an external IPv6 address;
-#         u7s-probe is the outside-VPC probe VPC)
+#         u7s-probe is the outside-VPC probe VPC; --subnet defaults to the network's namesake)
 #   list  every u7s-test=1 VPS with state and age; STOPPED ones still bill for disk
 #   gc    delete every u7s-test=1 VPS (probes included), stopped included, and leftover
 #         u7s-e2e-*-lb-v4/v6 firewall rules (mayor/operator only)
@@ -24,15 +24,17 @@ case "$cmd" in
   up)
     stack=IPV4_ONLY
     net="$GCP_NETWORK"
+    subnet=
     while [ $# -gt 1 ]; do
       case "$1" in
         --stack-type) stack="$2" ;;
         --network) net="$2" ;;
+        --subnet) subnet="$2" ;;
         *) usage ;;
       esac
       shift 2
     done
-    [ $# -eq 1 ] || usage; zone="$(gcp_zone)"; gcp_vps_create "$1" "$zone" "$stack" "$net" ;;
+    [ $# -eq 1 ] || usage; zone="$(gcp_zone)"; gcp_vps_create "$1" "$zone" "$stack" "$net" "${subnet:-$net}" ;;
   ssh)  [ $# -ge 1 ] || usage; gcp_vps_ssh "$@" ;;
   scp)  [ $# -ge 2 ] || usage; gcp_vps_scp "$@" ;;
   down) [ $# -eq 1 ] || usage; zone="$(gcp_zone)"; GCP_DELETE_MISSING_RC=1 gcp_vps_delete "$1" "$zone" ;;
