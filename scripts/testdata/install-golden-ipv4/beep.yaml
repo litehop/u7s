@@ -1,4 +1,4 @@
-# Vendored from litehop/beep v0.7.0 (deploy/base, rendered -- no kustomize at install time),
+# Vendored from litehop/beep v0.7.1 (deploy/base, rendered -- no kustomize at install time),
 # u7s's default Service type=LoadBalancer provider (the k3s klipper-lb role), applied via the
 # well-known-manifest-folder mechanism (docs/decisions/well-known-manifest-folder.md).
 #
@@ -224,7 +224,7 @@ spec:
         # the geneve0 rp_filter=0 write (persisted in the host's /etc/sysctl.d/60-beep.conf)
         # must happen before the unprivileged controller starts.
         - name: node-prep
-          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
+          image: docker.io/valerauko/beep-lb@sha256:4d1342c54b4ce7cdb8f2d2daaa23fc4213a043965102734df9810b184031027a
           securityContext:
             privileged: true
           args:
@@ -234,7 +234,7 @@ spec:
               mountPath: /etc/sysctl.d/60-beep.conf
       containers:
         - name: servicelb-controller
-          image: docker.io/valerauko/beep-lb@sha256:e389096812f9631756fa7669694fc054c693a7541fb5d9c3d54abe97719e7721
+          image: docker.io/valerauko/beep-lb@sha256:4d1342c54b4ce7cdb8f2d2daaa23fc4213a043965102734df9810b184031027a
           resources:
             requests:
               cpu: 25m
