@@ -229,9 +229,9 @@ curl_rc() {
 lb_request() {
   local who="${1##*-}" out seen port host
   probe_target "$2"
-  out="$(vps ssh "$1" -- curl "$PROBE_FAM" -g -fsS --max-time 15 "$PROBE_URL" -w '@%{local_port}')" \
+  out="$(vps ssh "$1" -- curl "$PROBE_FAM" -g -fsS --max-time 15 "$PROBE_URL" -w ',%{local_port}')" \
     || fail "curl $PROBE_FAM $PROBE_URL from $1"
-  port="${out##*@}"; seen="${out%@*}"; seen="${seen%:*}"; seen="${seen#[}"; seen="${seen%]}"
+  port="${out##*,}"; seen="${out%,*}"; seen="${seen%:*}"; seen="${seen#[}"; seen="${seen%]}"
   case " $3 " in
     *" $seen "*) ;;
     *) fail "backend saw $who as $seen via $2, expected one of: $3" ;;

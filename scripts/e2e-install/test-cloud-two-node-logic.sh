@@ -63,8 +63,8 @@ case "$*" in
     esac
     # The probe is an outsider: it reaches the LB only while a firewall rule admits it, like GCE.
     admitted=0; { [ -e "$STUB_LOG.fw" ] || [ -n "${STUB_PROBE_OPEN:-}" ]; } && admitted=1
-    # curl -w @%{local_port} appends the client's source port.
-    sfx=; case "$*" in *"-w @"*) sfx="@${STUB_CPORT-51234}" ;; esac
+    # curl -w ,%{local_port} appends the client's source port.
+    sfx=; case "$*" in *"-w ,"*) sfx=",${STUB_CPORT-51234}" ;; esac
     case "$*" in
       *"ssh u7s-e2e-t-probe "*"curl-rc="*) [ "$admitted" = 1 ] && echo curl-rc=0 || echo "curl-rc=${STUB_PROBE_RC-28}" ;;
       # Beep with only the v4 --pod-cidr drops v6 to the pod.
