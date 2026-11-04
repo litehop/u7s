@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Spot e2-micro test VPSes on the u7s-test VPC (run scripts/gcp/setup.sh once first).
+# Spot test VPSes (e2-micro by default) on the u7s-test VPC (run scripts/gcp/setup.sh once first).
 #
-# Usage: vps.sh up [--stack-type IPV4_ONLY|IPV4_IPV6] [--network u7s-test|u7s-probe] [--subnet u7s-test|u7s-test-b] NAME | ssh NAME [-- cmd...] | scp SRC... NAME:DST | down NAME | list | gc
+# Usage: vps.sh up [--stack-type IPV4_ONLY|IPV4_IPV6] [--network u7s-test|u7s-probe] [--subnet u7s-test|u7s-test-b] [--machine-type TYPE] NAME | ssh NAME [-- cmd...] | scp SRC... NAME:DST | down NAME | list | gc
 #   up    create a Spot VPS (termination action STOP, max run 16h, label u7s-test=1)
 #         (default IPV4_ONLY; IPV4_IPV6 adds an external IPv6 address;
-#         u7s-probe is the outside-VPC probe VPC; --subnet defaults to the network's namesake)
+#         u7s-probe is the outside-VPC probe VPC; --subnet defaults to the network's namesake;
+#         --machine-type defaults to e2-micro, the release gate uses e2-custom-medium-1024)
 #   list  every u7s-test=1 VPS with state and age; STOPPED ones still bill for disk
 #   gc    delete every u7s-test=1 VPS (probes included), stopped included, and leftover
 #         u7s-e2e-*-lb-v4/v6 firewall rules (mayor/operator only)
@@ -30,6 +31,7 @@ case "$cmd" in
         --stack-type) stack="$2" ;;
         --network) net="$2" ;;
         --subnet) subnet="$2" ;;
+        --machine-type) export U7S_GCP_MACHINE_TYPE="$2" ;;
         *) usage ;;
       esac
       shift 2
