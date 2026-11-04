@@ -10,7 +10,7 @@
 # Covers the four areas the extraction from mayor-bootstrap.md is load-bearing
 # for:
 #   1. STEP A orphan detection (find_orphans / proc_type_from_psline /
-#      extract_worktree_path_from_psline / kill_pattern_for) against
+#      extract_worktree_path_from_psline) against
 #      synthetic `ps aux` output -- a regression here either leaves a real
 #      orphan process squatting on a VM slot's ports (never detected) or
 #      kills a live worker's process (false positive on a live worktree).
@@ -94,15 +94,6 @@ assert "exactly three orphans are found, not more (no false positives from the l
 
 assert "an empty ps scan (no matching processes at all) yields no orphans" \
   "$([ -z "$(call find_orphans '' "$LIVE_WORKTREES")" ] && echo 1 || echo 0)"
-
-assert "kill_pattern_for builds the apiserver pattern anchored on the dead worktree's kubeconfig path" \
-  "$([ "$(call kill_pattern_for apiserver /dead)" = 'u7s-apiserver.*[ =]/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
-assert "kill_pattern_for builds the scheduler pattern anchored on the dead worktree's kubeconfig path" \
-  "$([ "$(call kill_pattern_for scheduler /dead)" = 'u7s-scheduler.*[ =]/dead/temp/u7s/kubeconfig' ] && echo 1 || echo 0)"
-assert "kill_pattern_for builds the konnectivity-server pattern anchored on the dead worktree's workdir (no /kubeconfig suffix)" \
-  "$([ "$(call kill_pattern_for konnectivity-server /dead)" = 'konnectivity-server.*[ =]/dead/temp/u7s([/ ]|$)' ] && echo 1 || echo 0)"
-assert "kill_pattern_for builds the sample-run-metrics.sh pattern anchored on the dead worktree's workdir (no /kubeconfig suffix -- it has no cert to serve, just polls the VM)" \
-  "$([ "$(call kill_pattern_for sample-run-metrics /dead)" = 'sample-run-metrics.sh.*[ =]/dead/temp/u7s([/ ]|$)' ] && echo 1 || echo 0)"
 
 assert "proc_type_from_psline classifies a sample-run-metrics.sh line as its own type (must not be silently ignored as an unmatched process)" \
   "$([ "$(call proc_type_from_psline 'bash scripts/conformance/sample-run-metrics.sh start --workdir /x/temp/u7s')" = 'sample-run-metrics' ] && echo 1 || echo 0)"
@@ -279,17 +270,67 @@ SA_API_DEAD=$(mk_api 5006 6447 "$SA_DEAD_SUFFIX")
 SA_API_LIVE=$(mk_api 5007 6443 "$SA_REAL")
 SA_KILLS=$(step_a_dry "$SA_API_LIVE
 $SA_API_DEAD")
-SA_PAT="${SA_KILLS#*pkill -f }"
-assert "STEP A suffix collision: exactly one pkill is issued, for the dead worktree" \
-  "$([ "$(printf '%s\n' "$SA_KILLS" | grep -c 'would run: pkill -f ')" = 1 ] && echo 1 || echo 0)"
-assert "STEP A suffix collision: the pattern matches the dead worktree's process" \
-  "$(printf '%s\n' "$SA_API_DEAD" | grep -qE -- "$SA_PAT" && echo 1 || echo 0)"
-assert "STEP A suffix collision: the pattern does NOT match the live worktree's process whose path ends with the dead path" \
-  "$(! printf '%s\n' "$SA_API_LIVE" | grep -qE -- "$SA_PAT" && echo 1 || echo 0)"
-assert "kill_pattern_for escapes regex metacharacters: /a.b must not match /aXb" \
-  "$(! echo 'u7s-apiserver --kubeconfig /aXb/temp/u7s/kubeconfig' | grep -qE -- "$(call kill_pattern_for apiserver /a.b)" && echo 1 || echo 0)"
-assert "kill_pattern_for ends /temp/u7s at a separator: /temp/u7s2 is another workdir" \
-  "$(! echo 'konnectivity-server --server-cert=/dead/temp/u7s2/x.crt' | grep -qE -- "$(call kill_pattern_for konnectivity-server /dead)" && echo 1 || echo 0)"
+assert "STEP A suffix collision: only the dead worktree's pid is killed, never the live stack whose path ends with the dead path" \
+  "$([ "$SA_KILLS" = "[dry-run] would run: kill 5006" ] && echo 1 || echo 0)"
+
+# 1f. Relative workdirs (run-all.sh passes `--workdir ./temp/u7s`), resolved
+# against the process cwd via stubbed ps/lsof. A relative path matches no
+# worktree, so unresolved it reads as orphaned and a LIVE worker's process dies.
+RW_BIN="$SANDBOX_ROOT/rw-bin"
+mkdir -p "$RW_BIN"
+cat > "$RW_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$STUB_PS"
+STUB
+cat > "$RW_BIN/lsof" <<'STUB'
+#!/usr/bin/env bash
+pid="${@: -2:1}"
+var="STUB_CWD_${pid}"
+[ -n "${!var:-}" ] || exit 1
+printf 'p%s\nfcwd\nn%s\n' "$pid" "${!var}"
+STUB
+chmod +x "$RW_BIN/ps" "$RW_BIN/lsof"
+git -C "$SA_REAL" commit -q --allow-empty -m init
+git -C "$SA_REAL" worktree add -q -b rw-wt "$SANDBOX_ROOT/rw-live"
+RW_LIVE=$(cd -P "$SANDBOX_ROOT/rw-live" && pwd)
+RW_DEAD="$SANDBOX_ROOT/rw-dead-gone"
+mk_sampler() {  # pid workdir-arg
+  echo "alice  $1   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 bash scripts/conformance/sample-run-metrics.sh start --workdir $2 --port 6443"
+}
+step_a_stub() {  # ps lines [NAME=VALUE lsof stub env...] -> STEP A dry-run output
+  local ps_lines="$1"
+  shift
+  (
+    export DRY_RUN=1 HYGIENE_RESCAN_GRACE_S=0 WORKTREE_HYGIENE_REPO_ROOT="$SA_REAL" STUB_PS="$ps_lines"
+    export PATH="$RW_BIN:$PATH"
+    for kv in "$@"; do export "$kv"; done
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+    LIVE_AGENTS="liveid9"
+    step_a_orphaned_processes 2>&1
+  )
+}
+RW_S=$(mk_sampler 6001 ./temp/u7s)
+assert "a live worker's sampler started with a relative workdir must survive hygiene (regression: '.' matched no worktree and was killed)" \
+  "$([ -z "$(step_a_stub "$RW_S" "STUB_CWD_6001=$RW_LIVE")" ] && echo 1 || echo 0)"
+assert "a relative-workdir sampler whose cwd is a deleted worktree is still reaped, by pid" \
+  "$([ "$(step_a_stub "$RW_S" "STUB_CWD_6001=$RW_DEAD" | grep 'would run')" = '[dry-run] would run: kill 6001' ] && echo 1 || echo 0)"
+RW_OUT=$(step_a_stub "$RW_S")
+assert "a sampler whose cwd cannot be read is never killed (no provable owner)" \
+  "$(! printf '%s\n' "$RW_OUT" | grep -q 'would run' && echo 1 || echo 0)"
+assert "an unresolvable workdir is logged loudly as orphan-skip with type, pid and args" \
+  "$(printf '%s\n' "$RW_OUT" | grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001 args=' && echo 1 || echo 0)"
+assert "a '..' relative workdir whose cwd is gone cannot be resolved, so it is skipped, not killed" \
+  "$([ -z "$(step_a_stub "$(mk_sampler 6001 ../x/temp/u7s)" "STUB_CWD_6001=$RW_DEAD" | grep 'would run')" ] && echo 1 || echo 0)"
+RW_TWO="$(mk_sampler 6001 ./temp/u7s)
+$(mk_sampler 6002 ./temp/u7s)"
+assert "two samplers with the same relative workdir in different cwds: only the stale one dies" \
+  "$([ "$(step_a_stub "$RW_TWO" "STUB_CWD_6001=$RW_LIVE" "STUB_CWD_6002=$RW_DEAD" | grep 'would run')" = '[dry-run] would run: kill 6002' ] && echo 1 || echo 0)"
+RW_API="alice  6003   0.0  0.1  123456  1234 s001  S    10:00AM   0:00.05 /repo/target/release/u7s-apiserver --listen 127.0.0.1:6443 --kubeconfig ./temp/u7s/kubeconfig"
+assert "a live worker's relative-workdir apiserver survives too (every process type shares the classification point)" \
+  "$([ -z "$(step_a_stub "$RW_API" "STUB_CWD_6003=$RW_LIVE")" ] && echo 1 || echo 0)"
+assert "an absolute-path orphan is killed by pid without consulting cwd" \
+  "$([ "$(step_a_stub "$(mk_sampler 6004 /gone/dead/temp/u7s)" | grep 'would run')" = '[dry-run] would run: kill 6004' ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. STEP C -- in-flight guard.
