@@ -62,6 +62,9 @@ Verdicts (2026-11-04):
   evidence, and a never-Ready mariadb-0 leaves no describe/logs.
 - Publish needs operator approval on the Release environment; snapshot cuts are
   operator-only.
+- Operator rules (2026-10-30, recorded in ad0692f8): no pre-pull or sequencing
+  in the gate (users just `kubectl apply`); pd-standard stays; do not publish
+  unmerged code.
 - Gate VPSes are `u7s-rg-<MMDDHHMMSS>-<n>` (`mayor-ddhlo`); check for strays by
   that pattern; node name <= 52 chars. A preemption mid-run yields no verdict.
 - Burst gate: `scripts/release-gate/burst-gate.sh --confirm` (~1-2 h). On Lima,
@@ -96,3 +99,5 @@ archive/mayor-w898x-findings`.
 - `cargo audit` is non-blocking for PRs (operator decision).
 - The tick queues a PR on LGTM and removes its worktree on merge: convert to
   draft before follow-ups; never leave commits unpushed in a queued worktree.
+- The tick discards the regenerated `.beads/issues.jsonl` before each pull; run
+  `bd export -o .beads/issues.jsonl` and land it in the wrap PR.
