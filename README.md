@@ -331,9 +331,6 @@ the other family is refused.
    sudo grep -E '^(SERVICE_CIDR|POD_CLUSTER_CIDR)=' /var/lib/u7s/config
    ```
 
-   If the file or these lines are missing, the install predates recorded
-   ranges and runs the defaults, `10.96.0.0/12` and `10.244.0.0/16`.
-
 3. On the control plane, re-run `install.sh` of the same release with each
    existing range followed by a range of the other family. This example
    upgrades a default install:
