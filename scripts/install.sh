@@ -2074,32 +2074,22 @@ else
   stage_binaries u7s-apiserver u7s-scheduler kubelet kube-controller-manager
 fi
 
-# --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
-#
-# kubectl is not in the release tarball, but a zero-argument install has to
-# end at a working `kubectl get nodes`. Pinned to kubelet's own minor version
-# for client/server skew safety.
-#
-# kubernetes-cni supplies the /opt/cni/bin/ plugins (bridge, host-local, ...)
-# that CRI-O's 10-crio-bridge.conflist references. CRI-O only Recommends a
-# CNI-plugins package and cloud-image apt disables recommends, so without this
-# every node sits NotReady forever with "failed to find plugin \"bridge\"".
+# kubectl goes on PATH: the install and operators call it unqualified.
+BIN_DIR=/usr/local/bin stage_binaries kubectl
+
+# CNI plugins come from the tarball: CRI-O only Recommends a CNI-plugins
+# package and cloud-image apt disables recommends, so without them every node
+# sits NotReady forever with "failed to find plugin \"bridge\"". (flannel
+# installs its own /opt/cni/bin/flannel from its init container.)
+install -d -m 0755 /opt/cni/bin
+BIN_DIR=/opt/cni/bin stage_binaries bridge host-local loopback portmap
+
 KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p)"
 if [ -z "$KUBE_VERSION" ]; then
   echo "error: could not determine kubelet version from '$BIN_DIR/kubelet --version'" >&2
   exit 1
 fi
 KUBE_MINOR="${KUBE_VERSION%.*}"
-
-# Pinned fingerprint of the isv:kubernetes OBS project key, identical for the
-# v1.35-v1.37 repos (fetched 2026-10-20; expires 2026-12-29, so expect to
-# update this pin when the vendor rotates it).
-install_apt_key "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
-  DE15B14486CD377B9E876E1A234654DA9A296436 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/ /" \
-  > /etc/apt/sources.list.d/kubernetes.list
-apt-get update -qq
-apt-get install -y kubectl kubernetes-cni
 
 # apiserver's relative default paths (./state.db, ./kubeconfig, ./ca.key,
 # ./ca.crt, ./sa.key, ./sa.pub) resolve here via WorkingDirectory=. 0700

@@ -78,7 +78,7 @@ STAGE_NAME="u7s-vTEST-x86_64-unknown-linux-gnu"
 WORK_DIR="$WORK/work"
 STAGE_DIR="$WORK_DIR/$STAGE_NAME"
 mkdir -p "$STAGE_DIR" "$OUT_DIR"
-for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
   printf 'fake %s binary\n' "$f" > "$STAGE_DIR/$f"
 done
 
@@ -120,7 +120,7 @@ cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$EMPTY_ROOT_FIXTURE/"
 EMPTY_STAGE_NAME="${STAGE_NAME}-empty"
 EMPTY_STAGE_DIR="$WORK_DIR/$EMPTY_STAGE_NAME"
 mkdir -p "$EMPTY_STAGE_DIR"
-for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
   printf 'fake %s binary\n' "$f" > "$EMPTY_STAGE_DIR/$f"
 done
 
@@ -146,7 +146,7 @@ else
   MUTATED_STAGE_NAME="${STAGE_NAME}-mutated"
   MUTATED_STAGE_DIR="$WORK_DIR/$MUTATED_STAGE_NAME"
   mkdir -p "$MUTATED_STAGE_DIR"
-  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
     printf 'fake %s binary\n' "$f" > "$MUTATED_STAGE_DIR/$f"
   done
 
