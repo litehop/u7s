@@ -24,8 +24,8 @@
 # bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
 # RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
 #
-# --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real 1-vCPU shared-core
-# Spot e2-micro (x86_64, 1 GiB, no swap) on GCP (docs/dev-setup.md, "GCP test VPSes"), installing
+# --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real dedicated-core (1 dedicated vCPU, 1 GiB; kubelet allocatable cpu=1; more generous than a typical shared 1-vCPU VPS, so a PASS is slightly optimistic for shared hosts)
+# Spot custom N1 (n1-custom-1-1024: x86_64, no swap) on GCP (docs/dev-setup.md, "GCP test VPSes"), installing
 # <tag> from the mirror https://u7s.dekiru.tech/<tag>/install.sh; nothing is built locally. The
 # phases, collectors and verdict are the same as on Lima (lib.sh); the Lima arm64 run is an
 # advisory pre-check. Contention mapping: on GCP the guest is the host, so the Lima host-side
@@ -139,7 +139,7 @@ case "$BACKEND" in
     [ -z "$RELEASE" ] || { echo "--release is only for --backend gcp (lima builds the tarball from this checkout)" >&2; exit 2; } ;;
   gcp)
     [ -n "$EXP_TARBALL" ] || [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "--backend gcp needs --release <tag> (e.g. v0.4.1-snapshot.1), got '$RELEASE'" >&2; exit 2; }
-    [ -z "$MEMORY" ] || { echo "--memory is not supported with --backend gcp (the e2-micro is fixed at 1 GiB)" >&2; exit 2; }
+    [ -z "$MEMORY" ] || { echo "--memory is not supported with --backend gcp (the gate VM is fixed at 1 GiB)" >&2; exit 2; }
     [ -z "$TARBALL_DIR" ] || { echo "--tarball-dir is not supported with --backend gcp (the release is installed from the mirror)" >&2; exit 2; }
     # shellcheck source=../gcp/lib.sh
     . "$ROOT/scripts/gcp/lib.sh"
@@ -376,11 +376,11 @@ elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED
 elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
 else verdict=PASS; rc=0; fi
 if [ -n "$EXP_TAG" ]; then
-  echo "backend=gcp experiment=yes machine=e2-micro arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
+  echo "backend=gcp experiment=yes machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
   verdict="EXPERIMENT $verdict [$EXP_TAG]"
 elif [ "$BACKEND" = gcp ]; then
-  echo "backend=gcp release=$RELEASE machine=e2-micro arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
-  verdict="$verdict [release-authoritative: x86_64 GCP e2-micro Spot, mirror release $RELEASE]"
+  echo "backend=gcp release=$RELEASE machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
+  verdict="$verdict [release-authoritative: x86_64 GCP $GCP_GATE_MACHINE_TYPE Spot, mirror release $RELEASE]"
 fi
 if [ -s "$OUT/leaked-vps.txt" ]; then
   echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"

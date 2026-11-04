@@ -18,6 +18,8 @@ GCP_PROBE_SUBNET_RANGE=10.81.0.0/24
 GCP_LABEL=u7s-test=1
 # Network tag on every test VPS: lets a test scope its own firewall rule to these VPSes.
 GCP_VPS_TAG=u7s-test-vps
+# Release-gate VM shape: custom N1, 1 dedicated vCPU, 1 GiB (e2-micro is 0.25 sustained; e2 custom shared-core is 2 vCPUs at 50% each).
+GCP_GATE_MACHINE_TYPE=n1-custom-1-1024
 
 # A stray CLOUDSDK_* variable (project, zone, config dir, impersonation...) would silently
 # override the named configuration.
@@ -40,7 +42,7 @@ gcp_require_config() {
 # gcp_vps_create NAME ZONE [STACK_TYPE [NETWORK [SUBNET]]]: STACK_TYPE is IPV4_ONLY (default) or IPV4_IPV6;
 # NETWORK is u7s-test (default) or the probe VPC; SUBNET defaults to the network's namesake, and
 # u7s-test also has u7s-test-b.
-# U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro, what the release gate runs on).
+# U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro).
 gcp_vps_create() {
   local stack="${3:-IPV4_ONLY}" net="${4:-$GCP_NETWORK}"
   local subnet="${5:-$net}"

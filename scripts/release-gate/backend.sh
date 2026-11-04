@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VM backends for burst-gate.sh (sourced, not executed): lima (arm64, local) and gcp (x86_64
-# Spot e2-micro, installed from the release mirror). Needs BACKEND and, for lima, HERE and
+# Spot custom n1 1 GiB, installed from the release mirror). Needs BACKEND and, for lima, HERE and
 # MEMORY; for gcp, scripts/gcp/lib.sh sourced and gcp_require_config passed.
 #
 # vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable
@@ -22,7 +22,7 @@ vm_create() {
       limactl create "${args[@]}" "$HERE/u7s-vps-1g.yaml" >"$logdir/lima-create.log" 2>&1 \
         && limactl start "$name" >"$logdir/lima-start.log" 2>&1 ;;
     gcp)
-      gcp_vps_create "$name" "$(gcp_zone)" 2>&1 | gcp_redact >"$logdir/gcp-create.log" || return 1
+      U7S_GCP_MACHINE_TYPE="$GCP_GATE_MACHINE_TYPE" gcp_vps_create "$name" "$(gcp_zone)" 2>&1 | gcp_redact >"$logdir/gcp-create.log" || return 1
       for i in $(seq 1 "$GCP_SSH_TRIES"); do
         vm_shell "$name" true >/dev/null 2>&1 && return 0
         sleep "$GCP_SSH_SLEEP"
