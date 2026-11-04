@@ -31,6 +31,7 @@ run_one() {
   rc=$?
   # One printf per block keeps concurrent workers from interleaving.
   printf -- '--- %s (%s, %ss) ---\n%s\n' "$t" "$([ "$rc" -eq 0 ] && echo ok || echo "FAILED rc=$rc")" "$((SECONDS - start))" "$(cat "$log")"
+  [ "$rc" -eq 0 ] || echo "$t" >> "$out_dir/failed"
   return "$rc"
 }
 export -f run_one
@@ -39,6 +40,6 @@ export -f run_one
 tr '\n' '\0' < "$out_dir/list" | xargs -0 -n1 -P "$jobs" bash -c 'run_one "$1"' _
 rc=$?
 if [ "$rc" -ne 0 ]; then
-  echo "script-tests: at least one script failed (xargs rc=$rc)" >&2
+  echo "script-tests: at least one script failed (xargs rc=$rc): $(sort "$out_dir/failed" 2>/dev/null | tr '\n' ' ')" >&2
   exit 1
 fi
