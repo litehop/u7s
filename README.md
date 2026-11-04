@@ -89,7 +89,7 @@ u7s does not ship metrics-server. The `scale` subresource is implemented, so
 apply upstream's release manifest:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
 ## Dual-stack install
