@@ -15,6 +15,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$DIR/.." && pwd)"
 SCRIPT="$DIR/build-release-tarball.sh"
+LIB="$DIR/lib/release-fetch.sh"
 WORKFLOW="$ROOT_DIR/.github/workflows/release-tarball.yaml"
 
 PASS=0
@@ -41,8 +42,8 @@ RUNNER="$WORK/runner.sh"
   # curl stub: create whatever -o names, like a successful download.
   echo 'curl() { while [ $# -gt 0 ]; do [ "$1" = -o ] && : > "$2"; shift; done; }'
   echo 'cosign() { echo "$*" >> "$COSIGN_LOG"; return "$COSIGN_RC"; }'
-  awk '/^K8S_COSIGN_IDENTITY=/,/^K8S_COSIGN_ISSUER=/' "$SCRIPT"
-  awk '/^verify_k8s_signature\(\) \{/,/^\}/' "$SCRIPT"
+  awk '/^K8S_COSIGN_IDENTITY=/,/^K8S_COSIGN_ISSUER=/' "$LIB"
+  awk '/^verify_k8s_signature\(\) \{/,/^\}/' "$LIB"
   echo 'verify_k8s_signature "$1" "https://dl.k8s.io/x/kubelet"'
   echo 'echo VERIFIED'
 } > "$RUNNER"
@@ -64,10 +65,11 @@ COSIGN_LOG="$WORK/bad.log" COSIGN_RC=1 bash "$RUNNER" "$BIN" > "$WORK/bad.out" 2
 assert "a signature cosign rejects aborts the build before the unverified binary is packaged" \
   "$([ "$bad_status" -ne 0 ] && ! grep -q VERIFIED "$WORK/bad.out" && grep -q 'cosign signature verification failed for kubelet' "$WORK/bad.out" && echo 1 || echo 0)"
 
-# The function is useless unless the fetch loop calls it for each binary.
+# The function is useless unless every fetched binary goes through it.
 loop_body="$(awk '/^for bin in kubelet kube-controller-manager kubectl; do/,/^done/' "$SCRIPT")"
-assert "the kubelet/kube-controller-manager/kubectl fetch loop calls verify_k8s_signature" \
-  "$(printf '%s' "$loop_body" | grep -qF 'verify_k8s_signature "$STAGE_DIR/$bin" "$url"' && echo 1 || echo 0)"
+fetch_body="$(awk '/^fetch_k8s_binary\(\) \{/,/^\}/' "$LIB")"
+assert "the kubelet/kube-controller-manager/kubectl fetch loop goes through fetch_k8s_binary, which calls verify_k8s_signature" \
+  "$(printf '%s' "$loop_body" | grep -qF 'fetch_k8s_binary "$STAGE_DIR" "$K8S_ARCH" "$bin"' && printf '%s' "$fetch_body" | grep -qF 'verify_k8s_signature "$dest/$bin" "$url"' && echo 1 || echo 0)"
 assert "the release workflow installs a pinned cosign before the tarball build" \
   "$(grep -qE 'uses: sigstore/cosign-installer@[0-9a-f]{40} ' "$WORKFLOW" && grep -qE 'cosign-release: v[0-9]+\.[0-9]+\.[0-9]+$' "$WORKFLOW" && echo 1 || echo 0)"
 
