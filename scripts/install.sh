@@ -358,22 +358,24 @@ wait_for_authentication_configmap() {
 remove_stale_k8s_apt_source() {
   local list=/etc/apt/sources.list.d/kubernetes.list
   local key=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  local had_list=0 pkg stale=()
-  [ -e "$list" ] && had_list=1
-  if [ "$had_list" -eq 1 ] || [ -e "$key" ]; then
-    rm -f "$list" "$key"
-    echo "removed stale pkgs.k8s.io apt source (kubectl and CNI plugins now come from the verified tarball)"
-  fi
-  if [ "$had_list" -eq 1 ]; then
+  local pkg stale=()
+  if [ -e "$list" ]; then
     for pkg in kubectl kubernetes-cni; do
       if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed'; then
         stale+=("$pkg")
       fi
     done
-    if [ "${#stale[@]}" -gt 0 ]; then
-      apt-get remove -y "${stale[@]}"
+    # The list file is the marker that a re-run needs this cleanup, so it is
+    # deleted only after the packages are gone.
+    if [ "${#stale[@]}" -gt 0 ] && ! apt-get remove -y "${stale[@]}"; then
+      echo "failed to remove stale apt packages ${stale[*]}; wait for the dpkg lock to clear, then re-run install.sh" >&2
+      return 1
     fi
+  elif [ ! -e "$key" ]; then
+    return 0
   fi
+  rm -f "$list" "$key"
+  echo "removed stale pkgs.k8s.io apt source (kubectl and CNI plugins now come from the verified tarball)"
 }
 
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
