@@ -104,6 +104,7 @@ assert "host process classified by cgroup even if comm is unknown (e.g. renamed 
 # Experiment-flag parsing, with a stub limactl that fails every call so no VM is ever created;
 # gate.env is staged before the first VM and shows what the VM would receive.
 mkdir -p "$TMP/tb" "$TMP/bin"
+: > "$TMP/tb/u7s-gate-test.tar.gz"
 printf '#!/bin/sh\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"; chmod +x "$TMP/bin/limactl"
 printf '#!/bin/sh\necho 100\n' > "$TMP/bin/idle100"; chmod +x "$TMP/bin/idle100"
 export RG_IDLE_PROBE="$TMP/bin/idle100" QUIET_RECHECK_SECS=1 RG_RETRY_WAIT_SECS=0
@@ -118,6 +119,14 @@ for bad in abc -5 1.5 ""; do
   rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" --zram-mib "$bad" 2>&1 >/dev/null)" || rc=$?
   assert "--zram-mib '$bad' rejected on the host with exit 2 before any VM exists (a bad size must not look like 'zram did not help')" \
     "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
+done
+
+for n in 0 2; do
+  rm -rf "$TMP/tb$n" "$TMP/out-tb$n"; mkdir -p "$TMP/tb$n"
+  i=0; while [ "$i" -lt "$n" ]; do i=$((i + 1)); : > "$TMP/tb$n/u7s-gate-$i.tar.gz"; done
+  rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb$n" --out "$TMP/out-tb$n" 2>&1 >/dev/null)" || rc=$?
+  assert "$n staged gate tarballs -> exit 2 naming the stage dir and count (an ambiguous or missing gate tarball must stop the run, not install the wrong build)" \
+    "$([ "$rc" = 2 ] && echo "$err" | grep -q "exactly one u7s-gate-\*.tar.gz in $TMP/out-tb$n/stage, found $n" && echo 1 || echo 0)"
 done
 
 # --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
