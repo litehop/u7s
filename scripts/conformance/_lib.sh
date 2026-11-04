@@ -291,6 +291,59 @@ apply_pod_recreating_on_args_change() {
   }
 }
 
+# Restarts the kubelet in <vm> so Lima's port-forward watcher sees guest port
+# 10250 go away and come back as two separate events. A plain `systemctl
+# restart` unbinds and rebinds inside one scan; the hostagent then handles the
+# "removed" after the "added" and closes the host listener it just opened,
+# leaving the kubelet's host port dead while the node still reports Ready.
+restart_kubelet_spaced() {
+  local vm="$1" i
+  limactl shell "$vm" sudo systemctl stop kubelet
+  for i in $(seq 1 15); do
+    limactl shell "$vm" sh -c 'ss -Hltn "sport = :10250" | grep -q .' || break
+    sleep 1
+  done
+  sleep "${KUBELET_PORT_SETTLE_SECS:-6}"
+  limactl shell "$vm" sudo systemctl start kubelet
+}
+
+# Probes the real apiserver->kubelet path (apiserver -> host kubelet port ->
+# Lima forward -> kubelet) for <node>. Node Ready does not prove it: the
+# kubelet reports to the apiserver over the other direction.
+kubelet_path_ok() {
+  local kubeconfig="$1" node="$2" i
+  for i in $(seq 1 "${3:-30}"); do
+    kubectl --kubeconfig="$kubeconfig" get --raw "/api/v1/nodes/${node}/proxy/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Args: <kubeconfig> <node=hostport>... Fails loud, naming node and host port,
+# when any node's kubelet path stays dead after one spaced kubelet restart
+# (which makes Lima re-create the host forward). Node name equals VM name.
+verify_kubelet_paths() {
+  local kubeconfig="$1" pair node port rc=0
+  shift
+  for pair in "$@"; do
+    node="${pair%%=*}"
+    port="${pair#*=}"
+    if kubelet_path_ok "$kubeconfig" "$node"; then
+      echo "kubelet path OK: apiserver -> $node (host port $port)"
+      continue
+    fi
+    echo "WARNING: apiserver cannot reach kubelet on $node via host port $port; restarting the kubelet so Lima re-creates the forward." >&2
+    restart_kubelet_spaced "$node" || true
+    if kubelet_path_ok "$kubeconfig" "$node" 60; then
+      echo "kubelet path OK after re-establishing the forward: apiserver -> $node (host port $port)"
+    else
+      echo "ERROR: apiserver->kubelet path to node $node is dead (host port 127.0.0.1:$port); logs/exec/attach would fail with 502. Check 'lsof -nP -iTCP:$port -sTCP:LISTEN' and the VM's ha.stderr.log." >&2
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
 # --- Opt-in dual-stack rig (--dual-stack) -----------------------------------
 # Lima's user-v2 switch forwards IPv6 unicast between VMs but hands out no
 # routable v6 address (no RA/DHCPv6) and drops the multicast NDP that would
