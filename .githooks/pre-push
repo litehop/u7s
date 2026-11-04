@@ -1,7 +1,38 @@
 #!/bin/sh
 set -e
-cargo test --workspace --quiet
-cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
+
+ZERO_OID=0000000000000000000000000000000000000000
+
+# git feeds the pushed refs on stdin exactly once; buffer for the gate and the
+# summary loop below.
+refs_tmp=$(mktemp)
+trap 'rm -f "$refs_tmp"' EXIT
+cat >"$refs_tmp"
+
+# Run the workspace gate only if some pushed ref carries a commit not already on
+# origin/main. Release tags cut from an unchanged main and remote branch
+# deletes add no code, so they must not pay (or be blocked by) a full test run.
+# An unresolvable origin/main fails safe to running the gate.
+need_gate=0
+skipped_refs=""
+if git rev-parse --verify --quiet origin/main >/dev/null; then
+  while read -r local_ref local_oid remote_ref remote_oid; do
+    if [ "$local_oid" = "$ZERO_OID" ] || git merge-base --is-ancestor "$local_oid" origin/main 2>/dev/null; then
+      skipped_refs="$skipped_refs $remote_ref"
+    else
+      need_gate=1
+    fi
+  done <"$refs_tmp"
+else
+  need_gate=1
+fi
+
+if [ "$need_gate" -eq 1 ]; then
+  cargo test --workspace --quiet
+  cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
+else
+  echo "[pre-push] skipping cargo test/clippy: no pushed commit is new to origin/main (refs:$skipped_refs)"
+fi
 
 # --- Test-file-change visibility (non-blocking) ---
 #
@@ -15,7 +46,6 @@ cargo clippy --workspace --tests --quiet --no-deps -- -D warnings
 # to CI: the sensitive-e2e-guard job in .github/workflows/e2e-focus.yaml runs
 # it on a Lima-free runner. See bd memory `conformance-pr-merge-gate`.
 
-ZERO_OID=0000000000000000000000000000000000000000
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
 # Prints a prominent, NON-BLOCKING summary of test-file changes in diff range
@@ -118,4 +148,4 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 
   print_test_change_summary "$range"
-done
+done <"$refs_tmp"
