@@ -131,6 +131,152 @@ dual-stack install by writing `/etc/sysctl.d/u7s-ipv6-forwarding.conf`.
 A joining worker reads the ranges from the cluster, so it needs no CIDR
 flags, only an address of each family.
 
+## Add a worker
+
+A worker runs only kubelet and joins an existing control plane with a
+single-use token. Use the saved `install.sh`, not `curl | sudo bash`: the script reads the token from a
+terminal prompt or from piped stdin, and stdin is the script itself in the
+one-liner.
+
+1. On the control plane, mint a token. The script is the one you installed
+   with (see Quick start, "Verify before running"):
+
+   ```bash
+   sudo bash install.sh --mint-join-token
+   ```
+
+   The output holds a token that expires after 24 hours and works once, the
+   API server URL, and the CA certificate hash (`sha256:...`).
+
+2. On the worker, download `install.sh` of the same release tag:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+   ```
+
+3. On the worker, join. The release copy of `install.sh` downloads the
+   release tarball by itself, so omit the `--tarball <path>` that step 1
+   prints. Choose a `--node-name` other than the control plane's, then paste
+   the token at the prompt (echo is off):
+
+   ```bash
+   sudo bash install.sh --join https://<control-plane-ip>:6443 \
+     --ca-cert-hash sha256:<hash> --node-name <worker-name>
+   ```
+
+   To pass the token without a prompt, pipe it in and add `--token -`.
+
+4. On the control plane, check that the worker is Ready:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
+   ```
+
+The worker learns the Service and pod ranges from the cluster, so it takes no
+CIDR flags. A token whose join failed after the certificate was issued is
+consumed; mint a new one.
+
+## Expose a Service with a LoadBalancer
+
+u7s applies beep as its LoadBalancer provider by default, so a Service of
+`type: LoadBalancer` gets an external address with no extra install. beep
+needs kernel >= 6.6, and `install.sh` refuses to run on an older kernel.
+
+1. Create the Service. Add `ipFamilyPolicy: PreferDualStack` on a dual-stack
+   cluster to get an address of each family:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig apply -f - <<'EOF'
+   apiVersion: v1
+   kind: Service
+   metadata:
+     name: web
+   spec:
+     type: LoadBalancer
+     selector:
+       app: web
+     ports:
+     - port: 80
+       targetPort: 8080
+   EOF
+   ```
+
+2. Read the address from the Service status:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get svc web -o jsonpath='{.status.loadBalancer.ingress[*].ip}'
+   ```
+
+   The addresses are node addresses: every node under the default
+   `externalTrafficPolicy: Cluster`, and only nodes with a local ready
+   endpoint under `Local`.
+
+Differences from upstream Kubernetes:
+
+- `externalTrafficPolicy: Local`: a node with no local ready endpoint forwards
+  to ready endpoints on other nodes, with the client IP preserved, instead of
+  dropping the traffic.
+- `sessionAffinity: ClientIP` is honoured. `timeoutSeconds` is not.
+
+## Logs and exec
+
+`kubectl logs` and `kubectl exec` work on the control plane and on joined
+workers:
+
+```bash
+kubectl --kubeconfig=/var/lib/u7s/kubeconfig logs <pod>
+kubectl --kubeconfig=/var/lib/u7s/kubeconfig exec -it <pod> -- sh
+```
+
+They fail when the API server reaches a node's kubelet through a `127.0.0.1`
+port forward, for example a Mac host in front of Lima VMs: the kubelet
+serving certificate cannot be verified against that address. Real installs
+reach the node's InternalIP.
+
+## Files, logs and reinstalling
+
+| What | Where |
+|---|---|
+| State: CA, keys, state store, kubeconfig | `/var/lib/u7s/` |
+| Install settings read by re-runs | `/var/lib/u7s/config` |
+| Binaries | `/opt/u7s/bin/` |
+| Vendored manifests applied at every apiserver boot | `/etc/u7s/manifests/` (`--manifest-output-dir`) |
+| Static pods | `/etc/u7s/static-pods/` |
+| CRI-O memory settings | `/etc/crio/crio.conf.d/10-memory.conf` |
+| Kernel settings | `/etc/sysctl.d/u7s-*.conf`, `/etc/modules-load.d/u7s-br-netfilter.conf` |
+| Systemd units | `u7s-apiserver`, `u7s-kcm`, `kubelet` (a worker has `kubelet` only) |
+
+Read a service's log with `journalctl`:
+
+```bash
+sudo journalctl -u u7s-apiserver
+sudo journalctl -u kubelet
+```
+
+There is no uninstaller. To start a node over, stop its services, delete the
+state directory, and re-run `install.sh`:
+
+1. Stop the services (on a worker, `kubelet` only):
+
+   ```bash
+   sudo systemctl stop kubelet u7s-kcm u7s-apiserver
+   ```
+
+2. Delete the state directory. This deletes the cluster's CA and state
+   store on a control plane:
+
+   ```bash
+   sudo rm -rf /var/lib/u7s
+   ```
+
+3. Run `install.sh` again. A worker must be joined again with a new token;
+   see "Add a worker". Delete its Node object on the control plane first
+   (`kubectl delete node <worker-name>`).
+
+This leaves CRI-O, its apt sources, the systemd unit files, the binaries in
+`/opt/u7s/bin`, and the sysctl and module files in place. Remove them by hand
+if you need a clean host.
+
 ## Upgrading
 
 Upgrade in place by re-running the install script of the newer release on each
