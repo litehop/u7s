@@ -2144,7 +2144,7 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
-    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0; POD_CIDR_UPGRADE=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
     echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
     cat "$NET_WORK/fns.sh"
@@ -2379,6 +2379,18 @@ assert "a fresh dual-stack install is not reported as an upgrade (the node-podCI
 net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$DUAL_STACK_UPGRADE"'
 assert "a bare re-run of an already dual-stack install is not an upgrade" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining only a service-cidr secondary is accepted but does not trigger the podCIDR drain/re-register recipe: no Node podCIDRs change, so the recipe would make an operator delete Nodes for nothing" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 0" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining a cluster-cidr secondary triggers the podCIDR recipe: existing Nodes keep single-stack podCIDRs until re-created" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 1" ] && echo 1 || echo 0)"
+assert_true "the printed podCIDR recipe is gated on the cluster-cidr upgrade flag, not the generic dual-stack one" \
+  grep -qF 'if [ "$POD_CIDR_UPGRADE" -eq 1 ]' "$INSTALL"
+assert_true "the printed recipe tells the operator the Node delete drops the control-plane label and how to restore it (install.sh re-run re-applies it via label_control_plane_node)" \
+  grep -qF 'drops its node-role.kubernetes.io/control-plane label' "$INSTALL"
 net_bad "making the IPv6 range primary on a single-stack IPv4 install is refused with a primary-change message: the primary family fixes the kubernetes Service VIP and every existing ClusterIP" \
   'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; resolve' "changes the primary range"
 net_bad "a different primary range with a secondary added is refused with the primary-change message (existing Services hold addresses from the old primary)" \

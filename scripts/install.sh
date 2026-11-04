@@ -762,6 +762,7 @@ reconcile_network_flag() {
         return 1
       fi
       DUAL_STACK_UPGRADE=1
+      [ "$flag" = --cluster-cidr ] && POD_CIDR_UPGRADE=1
       printf -v "$var" '%s' "$given"
       return 0
     fi
@@ -1724,6 +1725,7 @@ fi
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0
 DUAL_STACK_UPGRADE=0
+POD_CIDR_UPGRADE=0
 if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   EXISTING_INSTALL=1
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
@@ -2519,7 +2521,9 @@ wait_for_cluster_ready || exit 1
 
 if [ "$DUAL_STACK_UPGRADE" -eq 1 ]; then
   echo "upgraded to dual-stack (cluster IP families: $CLUSTER_FAMILIES). New Services can request ipFamilyPolicy PreferDualStack/RequireDualStack; existing Services keep their single ClusterIP." >&2
-  echo "warning: existing Nodes keep their single-stack spec.podCIDRs. Upstream makes Node.spec.podCIDRs immutable once set and node-ipam only allocates for a Node without one, so pods on such a Node get no pod IP of the new family until the Node object is re-created: kubectl --kubeconfig=$STATE_DIR/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data; kubectl --kubeconfig=$STATE_DIR/kubeconfig delete node <node>; then 'systemctl restart kubelet' on that node. This control-plane node: $NODE_NAME. A joined worker must also be re-joined (its families are learned at join): stop kubelet, rm -rf its $STATE_DIR, and run install.sh --join with a new token." >&2
+fi
+if [ "$POD_CIDR_UPGRADE" -eq 1 ]; then
+  echo "warning: existing Nodes keep their single-stack spec.podCIDRs. Upstream makes Node.spec.podCIDRs immutable once set and node-ipam only allocates for a Node without one, so pods on such a Node get no pod IP of the new family until the Node object is re-created: kubectl --kubeconfig=$STATE_DIR/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data; kubectl --kubeconfig=$STATE_DIR/kubeconfig delete node <node>; then 'systemctl restart kubelet' on that node. Deleting the Node drops its node-role.kubernetes.io/control-plane label: for this control-plane node ($NODE_NAME), once it has re-registered, re-run install.sh (it re-applies the label) or kubectl --kubeconfig=$STATE_DIR/kubeconfig label node $NODE_NAME node-role.kubernetes.io/control-plane=. A joined worker must also be re-joined (its families are learned at join): stop kubelet, rm -rf its $STATE_DIR, and run install.sh --join with a new token." >&2
 fi
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
