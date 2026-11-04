@@ -1483,6 +1483,10 @@ mint_custom_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
 assert "the join command carries no network flags even for a non-default dual-stack cluster: the worker reads DNS and families from the cluster, so a forgotten or stale flag cannot make it single-stack" \
   "$(printf '%s%s' "$mint_out" "$mint_custom_out" | grep -qE -- '--cluster-dns|--cluster-ip-families' && echo 0 || echo 1)"
 
+mint_release_out="$(DEFAULT_TARBALL_URL=https://example.invalid/u7s.tar.gz bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
+assert "the join hint asks for --tarball only when the script has no baked release URL (a release copy fetches its own tarball, so a worker told to supply one follows the wrong recipe)" \
+  "$(printf '%s' "$mint_out" | grep -qF -- '--tarball <path>' && ! printf '%s' "$mint_release_out" | grep -qF -- '--tarball' && echo 1 || echo 0)"
+
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
 assert "mint enables authentication AND signing usage -- without signing the joiner cannot verify cluster-info, without authentication the token is rejected" \

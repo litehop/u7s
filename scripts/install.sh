@@ -1073,7 +1073,7 @@ mint_join_token() {
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
   local tarball_hint=" --tarball <path>"
-  [ -n "$DEFAULT_TARBALL_URL" ] && tarball_hint=""
+  [ -n "${DEFAULT_TARBALL_URL:-}" ] && tarball_hint=""
   echo "    --ca-cert-hash sha256:$ca_hash$tarball_hint --node-name <name> [--iface <iface>]"
 }
 
