@@ -676,6 +676,10 @@ assert "--install-only reaches the VM and an install-only experiment is judged o
 unset GCLOUD_SSH_OK GCLOUD_RESULTS
 assert "release path unchanged: gate.env of a --release run installs zero-arg (no INSTALL_TARBALL)" \
   "$(grep -q '^INSTALL_TARBALL=$' "$TMP/out-gpass/stage/gate.env" && echo 1 || echo 0)"
+mkdir -p "$TMP/tbl"; : > "$TMP/tbl/u7s-gate-testarch.tar.gz"; : > "$TMP/tbl/u7s-gate-testarch.tar.gz.sha256"; : > "$TMP/tbl/install.sh"
+"$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tbl" --out "$TMP/out-lima-tb" >/dev/null 2>&1 || true
+assert "the Lima gate installs its locally built, unsigned tarball by the staged file's name, or every Lima run fails at install on the signature check" \
+  "$(grep -qx 'INSTALL_TARBALL=/var/tmp/rg/u7s-gate-testarch.tar.gz' "$TMP/out-lima-tb/stage/gate.env" && echo 1 || echo 0)"
 
 # --- vm-gate sampler lifecycle ---
 VG="$TMP/vg"; mkdir -p "$VG/out"

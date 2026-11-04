@@ -216,7 +216,7 @@ if [ -n "$EXP_TARBALL" ]; then
   INSTALL_TARBALL="/var/tmp/rg/$(basename "$EXP_TARBALL")"
 fi
 # The locally built arm64 tarball is unsigned, so install.sh's signature check cannot pass.
-[ "$BACKEND" != lima ] || INSTALL_TARBALL="/var/tmp/rg/u7s-gate-aarch64-unknown-linux-gnu.tar.gz"
+[ "$BACKEND" != lima ] || INSTALL_TARBALL="/var/tmp/rg/$(basename "$(ls "$STAGE"/u7s-gate-*.tar.gz)")"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
 printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\n' \
   "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" "$INSTALL_TARBALL" "$INSTALL_ONLY" > "$STAGE/gate.env"
