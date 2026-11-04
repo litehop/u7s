@@ -613,6 +613,11 @@ if [ "$NETPOL_READY" -eq 0 ]; then
 fi
 echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
 
+banner "Verify apiserver -> kubelet path for every node"
+_kubelet_paths=("${U7S_VM_NAME:-lima-node}=${KUBELET_PORT:-10250}")
+[ -z "$EXTRA_NODE" ] || _kubelet_paths+=("$EXTRA_NODE=$EXTRA_KUBELET_PORT")
+verify_kubelet_paths "$KUBECONFIG" "${_kubelet_paths[@]}" || exit 1
+
 # Start the run-metrics sampler (host+VM RSS, ring-gauge trajectory, an
 # initial /metrics snapshot) now that the final node topology is known — see
 # sample-run-metrics.sh for the three artifacts it produces and for why

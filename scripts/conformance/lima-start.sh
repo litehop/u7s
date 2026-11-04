@@ -630,7 +630,7 @@ fi
 
 # Restart kubelet so it picks up the new kubeconfig/cert/CA.
 echo "Starting kubelet inside VM..."
-limactl shell "$VM_NAME" sudo systemctl restart kubelet
+restart_kubelet_spaced "$VM_NAME"
 
 # Generate a dedicated client cert for the konnectivity-agent (mTLS with server).
 # The server trusts certs signed by the cluster CA; the CA key is only on the Mac host.
