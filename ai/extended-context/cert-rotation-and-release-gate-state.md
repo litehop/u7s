@@ -35,13 +35,16 @@ apiserver. Knee: <=20 pods with WordPress+MariaDB, 50-60 without. Findings:
 
 Open:
 - `mayor-hjwdo`: product mitigation, operator decision pending.
-- `mayor-9ygmh`: A/B of #2039 (control-plane memory protection: MemoryLow,
-  kubelet reserved, `enforceNodeAllocatable=pods`) on the Lima ramp. No
-  verdict yet.
-- `mayor-adwea`: the ~100 MiB idle-headroom loss since October. Interim
-  result: no u7s release lost it (GCP MemAvailable flat v0.3.0 to
-  v0.4.3-snapshot.4); 10 ssh observers cost 79 MiB, a Lima direct test is
-  pending under `mayor-9ygmh`.
+- `mayor-9ygmh` (verdict): #2039's control-plane memory protection measured
+  WORSE than main on the Lima ramp (knee 20 vs 20-50; MemAvailable min 153-161
+  vs 195-256 MiB; mem PSI 79-84% vs 41-64%; one OOM of CoreDNS+MariaDB),
+  consistent with the 1 GiB node being capacity-bound. #2039 stays a draft
+  pending an operator decision. The observer-light knee is unknown.
+- `mayor-adwea` (verdict): no release regression; idle headroom is flat
+  v0.3.0 to v0.4.3-snapshot.4 on GCP N1. The "~100 MiB" was observer load (~79
+  MiB from streaming ssh sessions), so the kutwm knee is pessimistic; GCP's
+  unstreamed gate still fails at 40/50. Findings: `git show
+  archive/mayor-adwea-findings`.
 
 ## Harness
 
@@ -52,8 +55,7 @@ Open:
   `scripts/release-gate/build-experiment-tarball.sh <ref>`; verdicts are tagged
   EXPERIMENT.
 - Open gap `mayor-hxuqo`: a run that wedges mid-burst loses its verdict
-  evidence, and a never-Ready mariadb-0 leaves no describe/logs (also
-  `mayor-jvcxv`).
+  evidence, and a never-Ready mariadb-0 leaves no describe/logs.
 - Publish needs operator approval on the Release environment; snapshot cuts are
   operator-only.
 - Operator rules (2026-10-30): no pre-pull or sequencing in the gate (users
