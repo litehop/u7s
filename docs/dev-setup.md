@@ -102,7 +102,7 @@ Needs `limactl` (vz), `cargo-zigbuild` + `zig`, and a quiet host (no other VM wo
 
 ## GCP test VPSes
 
-Real-VPC, x86_64 test hosts on GCP: Spot hosts installed from the mirror (the `vps.sh up` default is `e2-micro`, 0.25 sustained vCPU; `--machine-type` picks another; the release gate uses the custom shared-core `e2-custom-medium-1024`, 1 sustained shared vCPU and 1 GiB, set once as `GCP_GATE_MACHINE_TYPE` in `scripts/gcp/lib.sh`) (`https://u7s.dekiru.tech/<tag>/install.sh`), never from a local build. Helpers live in `scripts/gcp/`; the account, project and zone live only in a local gcloud named configuration, never in git.
+Real-VPC, x86_64 test hosts on GCP: Spot hosts installed from the mirror (`https://u7s.dekiru.tech/<tag>/install.sh`), never from a local build. `vps.sh up` defaults to `e2-micro` (0.25 sustained vCPU) and `--machine-type` picks another. The release gate uses the custom shared-core `e2-custom-medium-1024` (1 GiB; the guest sees 2 vCPUs at 50% sustained each, 1 vCPU total, so kubelet allocatable cpu=2), set once as `GCP_GATE_MACHINE_TYPE` in `scripts/gcp/lib.sh` and forced over an ambient `U7S_GCP_MACHINE_TYPE`. Helpers live in `scripts/gcp/`; the account, project and zone live only in a local gcloud named configuration, never in git.
 
 **One-time config** (per machine):
 

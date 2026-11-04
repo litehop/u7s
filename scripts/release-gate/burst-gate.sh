@@ -24,7 +24,7 @@
 # bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
 # RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
 #
-# --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real 1-vCPU shared-core
+# --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real shared-core (the guest sees 2 vCPUs at 50% sustained each, 1 vCPU total, so kubelet allocatable cpu=2)
 # Spot custom e2-medium (e2-custom-medium-1024: x86_64, 1 GiB, no swap) on GCP (docs/dev-setup.md, "GCP test VPSes"), installing
 # <tag> from the mirror https://u7s.dekiru.tech/<tag>/install.sh; nothing is built locally. The
 # phases, collectors and verdict are the same as on Lima (lib.sh); the Lima arm64 run is an
