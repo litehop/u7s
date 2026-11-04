@@ -194,16 +194,7 @@ mkdir -p "$WORKDIR" "$MANIFEST_DIR"
 # `git pull` picking up a newer vendored coredns.yaml is applied without an
 # explicit --reset -- see this file's header comment for why only CoreDNS,
 # not flannel/kube-proxy, is copied here.
-COREDNS_DUAL=0
-case "$SERVICE_CIDR" in
-  *,*)
-    if [ "$SERVICE_CIDR" != "$RIG_SERVICE_CIDR_DUAL" ]; then
-      echo "error: a dual-stack --service-cidr must be $RIG_SERVICE_CIDR_DUAL (CoreDNS's second VIP is derived from it)" >&2
-      exit 1
-    fi
-    COREDNS_DUAL=1 ;;
-esac
-rig_render_coredns "$COREDNS_DUAL" < "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml"
+rig_render_coredns "$SERVICE_CIDR" < "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml" || exit 1
 
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_PROXY_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
