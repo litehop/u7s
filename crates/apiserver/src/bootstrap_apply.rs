@@ -854,7 +854,7 @@ mod tests {
 
         let args = crate::Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -870,8 +870,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -1701,5 +1703,60 @@ mod tests {
             protocols.contains(&"TCP"),
             "TCP port 53 must survive a second apply, got protocols {protocols:?}"
         );
+    }
+
+    /// Unrequested kube-system pods are BestEffort and the first evicted on a 1 GiB node, and
+    /// without a priorityClassName they rank with user pods; DNS and the Service data path must
+    /// not be reclaimed before tenants.
+    #[test]
+    fn kube_system_workloads_declare_priority_class_and_requests() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../manifests/");
+        for (file, workload, class, container) in [
+            (
+                "kube-proxy.yaml",
+                "kube-proxy",
+                "system-node-critical",
+                "kube-proxy",
+            ),
+            (
+                "beep.yaml",
+                "servicelb-controller",
+                "system-node-critical",
+                "servicelb-controller",
+            ),
+            (
+                "coredns.yaml",
+                "coredns",
+                "system-cluster-critical",
+                "coredns",
+            ),
+        ] {
+            let text = std::fs::read_to_string(format!("{dir}{file}")).expect("read manifest");
+            let doc = split_yaml_documents(&text)
+                .into_iter()
+                .filter_map(|d| {
+                    yaml_rust2::YamlLoader::load_from_str(&d)
+                        .ok()?
+                        .into_iter()
+                        .next()
+                })
+                .find(|y| {
+                    matches!(y["kind"].as_str(), Some("DaemonSet" | "Deployment"))
+                        && y["metadata"]["name"].as_str() == Some(workload)
+                })
+                .unwrap_or_else(|| panic!("{file}: workload {workload} not found"));
+            let pod = &doc["spec"]["template"]["spec"];
+            assert_eq!(pod["priorityClassName"].as_str(), Some(class), "{file}");
+            let c = pod["containers"]
+                .as_vec()
+                .and_then(|cs| cs.iter().find(|c| c["name"].as_str() == Some(container)))
+                .unwrap_or_else(|| panic!("{file}: container {container} not found"));
+            for r in ["cpu", "memory"] {
+                assert!(
+                    c["resources"]["requests"][r].as_str().is_some(),
+                    "{file}: {container} must request {r}"
+                );
+            }
+        }
     }
 }

@@ -64,6 +64,11 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("storage.k8s.io", "storageclasses") = (group, plural) {
         default_storageclass(obj);
     }
+    if let ("scheduling.k8s.io", "priorityclasses") = (group, plural) {
+        if obj["preemptionPolicy"].is_null() {
+            obj["preemptionPolicy"] = PREEMPT_LOWER_PRIORITY.into();
+        }
+    }
     if let ("", "namespaces") = (group, plural) {
         default_namespace(obj);
     }
@@ -1119,6 +1124,80 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     Ok(())
 }
 
+const HIGHEST_USER_DEFINABLE_PRIORITY: i64 = 1_000_000_000;
+const PREEMPT_LOWER_PRIORITY: &str = "PreemptLowerPriority";
+
+/// Upstream `ValidatePriorityClass`, create only: `system-` names are reserved for the two
+/// built-in classes (exact value, not globalDefault); every other class is capped at one
+/// billion so user classes can never outrank system-critical pods. `preemptionPolicy` must be
+/// a known policy.
+pub(crate) fn validate_priority_class(obj: &serde_json::Value) -> Result<(), String> {
+    let name = obj["metadata"]["name"].as_str().unwrap_or_default();
+    let value = obj["value"].as_i64().unwrap_or(0);
+    if name.starts_with("system-") {
+        let expected = match name {
+            "system-node-critical" => super::pods::SYSTEM_NODE_CRITICAL_VALUE,
+            "system-cluster-critical" => super::pods::SYSTEM_CLUSTER_CRITICAL_VALUE,
+            _ => {
+                return Err(format!(
+                    "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                     reserved for system use only. error: {name} is not a known system priority class"
+                ))
+            }
+        };
+        if value != i64::from(expected) {
+            return Err(format!(
+                "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                 reserved for system use only. error: value of {name} PriorityClass must be {expected}"
+            ));
+        }
+        if obj["globalDefault"].as_bool() == Some(true) {
+            return Err(format!(
+                "metadata.name: Forbidden: priority class names with 'system-' prefix are \
+                 reserved for system use only. error: globalDefault of {name} PriorityClass must be false"
+            ));
+        }
+    } else if value > HIGHEST_USER_DEFINABLE_PRIORITY {
+        return Err(format!(
+            "value: Forbidden: maximum allowed value of a user defined priority is {HIGHEST_USER_DEFINABLE_PRIORITY}"
+        ));
+    }
+    match obj["preemptionPolicy"].as_str() {
+        None | Some(PREEMPT_LOWER_PRIORITY | "Never") => {}
+        Some("") => return Err("preemptionPolicy: Required value".to_string()),
+        Some(other) => {
+            return Err(format!(
+                "preemptionPolicy: Unsupported value: \"{other}\": supported values: \"{PREEMPT_LOWER_PRIORITY}\", \"Never\""
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Upstream `ValidatePriorityClassUpdate`: only `value` and `preemptionPolicy` are checked, and
+/// both are immutable. A stored class without `preemptionPolicy` counts as the default.
+pub(crate) fn validate_priority_class_update(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), String> {
+    if new["value"].as_i64().unwrap_or(0) != old["value"].as_i64().unwrap_or(0) {
+        return Err("value: Forbidden: may not be changed in an update.".to_string());
+    }
+    let policy = |o: &serde_json::Value| -> String {
+        o["preemptionPolicy"]
+            .as_str()
+            .unwrap_or(PREEMPT_LOWER_PRIORITY)
+            .to_string()
+    };
+    let new_policy = policy(new);
+    if new_policy != policy(old) {
+        return Err(format!(
+            "preemptionPolicy: Invalid value: \"{new_policy}\": field is immutable"
+        ));
+    }
+    Ok(())
+}
+
 /// Validates CronJob `spec.timeZone` resolves to a real IANA time zone at admission.
 ///
 /// Upstream (`pkg/apis/batch/validation/validation.go`'s `validateCronJobSpec`) rejects
@@ -1735,6 +1814,59 @@ fn default_exact_device_request_counts(requests: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tenant who could mint `system-*` or >1e9 classes could outrank kube-system pods and
+    /// preempt them; only the two exact built-ins may use the reserved range.
+    #[test]
+    fn priority_class_reserved_names_and_values_follow_upstream() {
+        let pc = |name: &str, value: i64, gd: bool| serde_json::json!({"metadata": {"name": name}, "value": value, "globalDefault": gd});
+        let check = |o| validate_priority_class(&o);
+        assert!(check(pc("system-node-critical", 2_000_001_000, false)).is_ok());
+        assert!(check(pc("system-cluster-critical", 2_000_000_000, false)).is_ok());
+        assert!(
+            check(pc("system-mine", 5, false)).is_err(),
+            "unknown system- name"
+        );
+        assert!(
+            check(pc("system-node-critical", 5, false)).is_err(),
+            "wrong value"
+        );
+        assert!(check(pc("system-node-critical", 2_000_001_000, true)).is_err());
+        assert!(
+            check(pc("mine", 1_000_000_001, false)).is_err(),
+            "above user max"
+        );
+        assert!(check(pc("mine", 1_000_000_000, false)).is_ok());
+    }
+
+    /// Update validates only the two immutables: re-running the create-only `system-`/1e9 rules
+    /// would block editing a class on a field upstream leaves writable, and a stored class
+    /// without preemptionPolicy must not look "changed" once the default is filled in.
+    #[test]
+    fn priority_class_update_checks_only_value_and_preemption_policy() {
+        let old = serde_json::json!({"metadata": {"name": "system-node-critical"}, "value": 2_000_001_000_i64});
+        let mut new = old.clone();
+        new["globalDefault"] = true.into();
+        new["preemptionPolicy"] = PREEMPT_LOWER_PRIORITY.into();
+        assert!(validate_priority_class_update(&old, &new).is_ok());
+        new["preemptionPolicy"] = "Never".into();
+        assert!(validate_priority_class_update(&old, &new).is_err());
+        new["preemptionPolicy"] = PREEMPT_LOWER_PRIORITY.into();
+        new["value"] = 1.into();
+        assert!(validate_priority_class_update(&old, &new).is_err());
+    }
+
+    #[test]
+    fn priority_class_create_rejects_unknown_preemption_policy() {
+        let pc = |p: &str| serde_json::json!({"metadata": {"name": "x"}, "value": 1, "preemptionPolicy": p});
+        assert!(validate_priority_class(&pc("Never")).is_ok());
+        assert!(validate_priority_class(&pc("PreemptLowerPriority")).is_ok());
+        assert!(validate_priority_class(&pc("Foo")).is_err());
+        assert_eq!(
+            validate_priority_class(&pc("")).unwrap_err(),
+            "preemptionPolicy: Required value"
+        );
+    }
 
     /// Adding an externalIP is denied, but keeping or removing stored ones is allowed so a
     /// Service that predates the plugin stays editable (upstream isSubset semantics).

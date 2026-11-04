@@ -6,7 +6,7 @@
 # zero-argument install path.
 #
 # Usage: build-arm64-tarball.sh <out-dir>
-# Requires: cargo-zigbuild + zig, rustup target aarch64-unknown-linux-gnu, curl, shasum.
+# Requires: cargo-zigbuild + zig, rustup target aarch64-unknown-linux-gnu, curl, shasum, cosign.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -14,6 +14,8 @@ OUT="${1:?usage: $0 <out-dir>}"
 TARGET="aarch64-unknown-linux-gnu"
 K8S_VERSION="$(grep -m1 '^K8S_VERSION=' "$ROOT_DIR/scripts/build-release-tarball.sh" | cut -d'"' -f2)"
 CACHE="${U7S_GATE_CACHE:-$HOME/.cache/u7s/release-gate}/k8s-$K8S_VERSION-arm64"
+# shellcheck source=../lib/release-fetch.sh
+. "$ROOT_DIR/scripts/lib/release-fetch.sh"
 TARBALL_NAME="u7s-gate-$TARGET.tar.gz"
 GUEST_DIR="/var/tmp/rg"
 
@@ -40,6 +42,13 @@ for bin in kubelet kube-controller-manager; do
   fi
   cp "$CACHE/$bin" "$STAGE/"
 done
+
+command -v cosign >/dev/null 2>&1 || { echo "error: cosign not found on PATH -- it verifies kubectl" >&2; exit 1; }
+echo "==> fetching kubectl v$K8S_VERSION (sha256 + cosign, verified on every build)" >&2
+fetch_k8s_binary "$STAGE" arm64 kubectl
+
+echo "==> fetching CNI plugins v$CNI_PLUGINS_VERSION (pinned sha256)" >&2
+fetch_cni_plugins_for_arch "$STAGE/cni-plugins" arm64
 
 cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$STAGE/"
 cp "$ROOT_DIR"/manifests/*.yaml "$STAGE/manifests/"

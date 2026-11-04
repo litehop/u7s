@@ -21,8 +21,16 @@ KCM_BINARY="$1"
 KCM_LOG="$2"
 shift 2
 
-CRASH_LOG="/tmp/kcm-crashes.log"
-CRASH_MARKER="/tmp/kcm-crashed.marker"
+CRASH_LOG="${KCM_CRASH_LOG:-/tmp/kcm-crashes.log}"
+CRASH_MARKER="${KCM_CRASH_MARKER:-/tmp/kcm-crashed.marker}"
+# Test seams: executables replacing 'sleep' and the epoch-seconds clock so
+# tests can assert the backoff schedule without wall-clock waits.
+SLEEP_CMD="${KCM_SUPERVISOR_SLEEP:-sleep}"
+NOW_CMD="${KCM_SUPERVISOR_NOW:-}"
+
+now() {
+  if [ -n "$NOW_CMD" ]; then "$NOW_CMD"; else date +%s; fi
+}
 BACKOFF_BASE="${KCM_BACKOFF_BASE_SECS:-10}"
 BACKOFF_MAX="${KCM_BACKOFF_MAX_SECS:-160}"
 STABLE_UPTIME="${KCM_STABLE_UPTIME_SECS:-60}"
@@ -37,12 +45,12 @@ rm -f "$CRASH_MARKER"
 crash_count=0
 
 while true; do
-  start_ts=$(date +%s)
+  start_ts=$(now)
   "$KCM_BINARY" "$@" > "$KCM_LOG" 2>&1 &
   kcm_pid=$!
   exit_code=0
   wait "$kcm_pid" || exit_code=$?
-  end_ts=$(date +%s)
+  end_ts=$(now)
   uptime=$(( end_ts - start_ts ))
 
   # Reset the streak on sustained uptime rather than checking a sliding
@@ -93,5 +101,5 @@ while true; do
     backoff="$BACKOFF_MAX"
   fi
   echo "restarting kube-controller-manager in ${backoff}s (crash ${crash_count}/${BURST_LIMIT})" >&2
-  sleep "$backoff"
+  "$SLEEP_CMD" "$backoff"
 done

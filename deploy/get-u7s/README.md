@@ -32,5 +32,5 @@ Footgun: `$upstream_http_location` reads empty if used directly in the next hop'
 
 ## Open items
 
-- `/install.sh` 404s until a non-prerelease `v*` tag is pushed -- both existing releases are prereleases.
+- `/install.sh` 404s until a non-prerelease `v*` tag is pushed -- every release so far is a prerelease.
 - `@follow_hop3` has no `error_page`, so a fourth GitHub hop would reach the client instead of failing loudly.

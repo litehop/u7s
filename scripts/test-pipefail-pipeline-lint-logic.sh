@@ -30,6 +30,8 @@ lint_file() {
         if (match(seg, /\|[ \t]*(grep[ \t]+(-[a-zA-Z]*[qm][0-9]*|--quiet|--max-count)|head)([ \t]|$)/)) {
           pre = substr(seg, 1, RSTART - 1)
           if (pre ~ /\|/) return 1
+          # tar flushes per entry, so even a single-stage listing dies of SIGPIPE
+          if (pre ~ /(^|[ \t(])tar[ \t]+-?[a-zA-Z]*t[a-zA-Z]*[ \t]/) return 1
         }
       }
       return 0
@@ -73,6 +75,10 @@ assert_true "pipeline split across a trailing backslash is still seen" \
   flags $'a | b \\\n  | grep -q x'
 assert_true "single-stage producer | grep -q is allowed (policy is multi-stage)" \
   clean 'printf "%s" "$x" | grep -q y'
+assert_true "a single-stage tar listing into grep -q is rejected (tar dies of SIGPIPE once grep exits on the first hit)" \
+  flags 'ok="$(tar tzf "$T" 2>/dev/null | grep -q x && echo 1 || echo 0)"'
+assert_true "capturing the tar listing before matching is clean" \
+  clean 'l="$(tar tzf "$T")"; grep -q x <<<"$l"'
 assert_true "two independent single-stage pipelines joined by && are not one multi-stage pipeline" \
   clean 'printf a | grep -q a && printf b | grep -q b'
 assert_true "pipeline guarded with || true cannot propagate the failure" \

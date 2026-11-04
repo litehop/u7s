@@ -142,12 +142,52 @@ pub(crate) fn make_state() -> AppState {
 /// Same as [`make_state`], but takes a caller-provided store so tests can
 /// seed data into it before the `AppState` that will serve it is built.
 pub(crate) fn make_state_with_store(store: Arc<SqliteStore>) -> AppState {
-    AppState::new(
+    let state = AppState::new(
         store,
         None,
         std::collections::HashMap::new(),
         "https://localhost:6443".into(),
-    )
+    );
+    grant_create_everywhere(&state.rbac_index);
+    state
+}
+
+/// Grant user `admin` and the `system:masters`/`system:nodes` groups the `create` verb on everything, so handler
+/// tests that PUT/apply-create objects clear the create-on-update authorization without gaining
+/// any other verb (sign/bind/escalate tests must still see a real denial).
+pub(crate) fn grant_create_everywhere(rbac: &crate::rbac::RbacIndex) {
+    grant_create_to(
+        rbac,
+        "test-creator",
+        &serde_json::json!([
+            {"kind": "User", "name": "admin"},
+            {"kind": "Group", "name": "system:masters"},
+            {"kind": "Group", "name": "system:nodes"}
+        ]),
+    );
+}
+
+/// Grant a single user the `create` verb on everything (see [`grant_create_everywhere`]).
+pub(crate) fn grant_create_to_user(rbac: &crate::rbac::RbacIndex, username: &str) {
+    grant_create_to(
+        rbac,
+        &format!("test-creator-{username}"),
+        &serde_json::json!([{"kind": "User", "name": username}]),
+    );
+}
+
+fn grant_create_to(rbac: &crate::rbac::RbacIndex, binding: &str, subjects: &serde_json::Value) {
+    rbac.apply_object(
+        "/apis/rbac.authorization.k8s.io/v1/clusterroles/test-creator",
+        &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["create"]}]}),
+    );
+    rbac.apply_object(
+        &format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{binding}"),
+        &serde_json::json!({
+            "subjects": subjects,
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "test-creator"}
+        }),
+    );
 }
 
 /// Install a minimal single-version (storage) namespaced CRD so CR requests resolve

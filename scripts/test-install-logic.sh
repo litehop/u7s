@@ -264,8 +264,38 @@ assert_false "(regression guard) install.sh's default --iface detection uses no 
 # it, and this assertion is what stops a silent revert from reintroducing it
 # without another full VM run to catch it again.
 # ---------------------------------------------------------------------------
-assert_true "install.sh installs kubernetes-cni (the actual /opt/cni/bin/ plugin binaries CRI-O's bridge config references) alongside kubectl, not just kubectl alone" \
-  grep -qF 'apt-get install -y kubectl kubernetes-cni' "$INSTALL"
+assert_true "install.sh installs the CNI plugins CRI-O's bridge config and flannel's chain reference (bridge host-local loopback portmap) into /opt/cni/bin from the tarball, or nodes sit NotReady with 'failed to find plugin'" \
+  grep -qF 'BIN_DIR=/opt/cni/bin stage_binaries bridge host-local loopback portmap' "$INSTALL"
+assert_true "kubectl is staged from the tarball into /usr/local/bin (on PATH, unconditionally for control-plane and worker): install.sh and operators call it unqualified, and /opt/u7s/bin is not on PATH" \
+  grep -qxF 'BIN_DIR=/usr/local/bin stage_binaries kubectl' "$INSTALL"
+assert_false "install.sh adds no pkgs.k8s.io apt repo or key: its signing key expires and the tarball already carries verified kubectl and CNI plugins" \
+  grep -qE 'pkgs\.k8s\.io|signed-by=[^ ]*kubernetes|apt-get install -y kubectl' "$INSTALL"
+
+# Behavioural: run the real stage_binaries against a tarball-shaped tree.
+STAGE_WORK="$(mktemp -d)"
+mkdir -p "$STAGE_WORK/stage/cni-plugins" "$STAGE_WORK/cni"
+for f in bridge host-local loopback portmap; do
+  printf '#!/bin/sh\n' > "$STAGE_WORK/stage/cni-plugins/$f"
+  chmod 0755 "$STAGE_WORK/stage/cni-plugins/$f"
+done
+{
+  echo 'set -euo pipefail'
+  awk '/^stage_binaries\(\) \{/,/^\}/' "$INSTALL"
+  echo 'STAGE_DIR="$1"; BIN_DIR="$2" stage_binaries bridge host-local loopback portmap'
+} > "$STAGE_WORK/run.sh"
+bash "$STAGE_WORK/run.sh" "$STAGE_WORK/stage" "$STAGE_WORK/cni"
+modes_ok=1
+for f in bridge host-local loopback portmap; do
+  [ -x "$STAGE_WORK/cni/$f" ] || modes_ok=0
+  [ "$(stat -c %a "$STAGE_WORK/cni/$f" 2>/dev/null || stat -f %Lp "$STAGE_WORK/cni/$f")" = 755 ] || modes_ok=0
+done
+assert "CNI plugins found in the tarball's cni-plugins/ directory land in the target dir mode 0755 (kubelet/CRI-O execute them as root; a non-executable plugin means NotReady nodes)" "$modes_ok"
+rm "$STAGE_WORK/stage/cni-plugins/portmap" "$STAGE_WORK/cni/portmap"
+missing_status=0
+bash "$STAGE_WORK/run.sh" "$STAGE_WORK/stage" "$STAGE_WORK/cni" >/dev/null 2>&1 || missing_status=$?
+assert "a tarball missing a required CNI plugin aborts the install instead of leaving the node NotReady later" \
+  "$([ "$missing_status" -ne 0 ] && echo 1 || echo 0)"
+rm -rf "$STAGE_WORK"
 
 # ---------------------------------------------------------------------------
 # Regression guard: apiserver-to-kubelet proxy (kubectl logs/exec) BadGateway
@@ -435,8 +465,8 @@ assert_true "manifests/flannel.yaml deploys Flannel's DaemonSet (kube-flannel-ds
 assert_true "manifests/flannel.yaml's --iface is a __IFACE__ placeholder scripts/install.sh substitutes at install time, not a value hardcoded to whichever node it was vendored from" \
   grep -qF -- '--iface=__IFACE__' "$FLANNEL_MANIFEST"
 
-assert_true "manifests/flannel.yaml's net-conf.json Network is a __POD_CLUSTER_CIDR__ placeholder scripts/install.sh substitutes, so it can never drift from kube-controller-manager's own --cluster-cidr" \
-  grep -qF '"Network": "__POD_CLUSTER_CIDR__"' "$FLANNEL_MANIFEST"
+assert_true "manifests/flannel.yaml's net-conf.json Network is a __POD_CLUSTER_CIDR_IPV4__ placeholder scripts/install.sh substitutes, so it can never drift from kube-controller-manager's own --cluster-cidr" \
+  grep -qF '"Network": "__POD_CLUSTER_CIDR_IPV4__"' "$FLANNEL_MANIFEST"
 
 assert_true "install.sh disables CRI-O's own default bridge CNI conflist(s) once Flannel supplies the real one -- CRI-O picks whichever CNI config file sorts first alphabetically, so leaving 10-crio-bridge.conflist active would silently keep winning over Flannel's 10-flannel.conflist" \
   grep -qF 'mv "$CNI_DIR/$f" "$CNI_DIR/$f.disabled"' "$INSTALL"
@@ -471,10 +501,11 @@ assert_true "br_netfilter is persisted via modules-load.d so it survives a reboo
 # workload against a Service.
 # ---------------------------------------------------------------------------
 br_netfilter_runner() {
-  local install_script="$1" runner="$2" workdir="$3"
+  local install_script="$1" runner="$2" workdir="$3" svc6="${4:-}" pod6="${5:-}"
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
+    echo "SERVICE_CIDR_IPV6='$svc6'; POD_CLUSTER_CIDR_IPV6='$pod6'"
     echo "modprobe() { echo \"\$*\" >> \"$workdir/modprobe.log\"; }"
     echo 'sysctl() { :; }'
     awk '/^modprobe br_netfilter$/,/^sysctl --system >\/dev\/null$/' "$install_script" \
@@ -496,7 +527,42 @@ assert_true "the sysctl.d config install.sh writes sets net.bridge.bridge-nf-cal
   grep -qxF 'net.bridge.bridge-nf-call-iptables = 1' "$BR_NETFILTER_SYSCTL_CONF"
 assert_true "the sysctl.d config install.sh writes also sets the ip6tables counterpart, so IPv6 Service traffic gets the same bridged-netfilter treatment as IPv4" \
   grep -qxF 'net.bridge.bridge-nf-call-ip6tables = 1' "$BR_NETFILTER_SYSCTL_CONF"
+assert_false "a single-stack IPv4 install writes no IPv6 forwarding sysctl (its sysctl output stays unchanged)" \
+  test -e "$BR_NETFILTER_WORK/sysctl.d/u7s-ipv6-forwarding.conf"
 rm -rf "$BR_NETFILTER_WORK"
+BR_NETFILTER_WORK="$(mktemp -d)"
+mkdir -p "$BR_NETFILTER_WORK/modules-load.d" "$BR_NETFILTER_WORK/sysctl.d"
+br_netfilter_runner "$INSTALL" "$BR_NETFILTER_WORK/r.sh" "$BR_NETFILTER_WORK" 'fd00:96::/108' 'fd00:244::/56'
+bash "$BR_NETFILTER_WORK/r.sh"
+assert_true "a dual-stack install enables net.ipv6.conf.all.forwarding: without it the node drops routed IPv6 pod/Service packets" \
+  grep -qxF 'net.ipv6.conf.all.forwarding = 1' "$BR_NETFILTER_WORK/sysctl.d/u7s-ipv6-forwarding.conf"
+assert_true "every node writes net.ipv4.ip_forward=1 to sysctl.d: relying on the CNI bridge plugin leaves a node that has not yet run a pod sandbox (or uses another CNI) unable to route pod traffic" \
+  grep -qxF 'net.ipv4.ip_forward = 1' "$BR_NETFILTER_WORK/sysctl.d/u7s-ip-forward.conf"
+rm -rf "$BR_NETFILTER_WORK"
+
+# A joining worker never sees --cluster-cidr; it learns the families from its
+# own Node's spec.podCIDRs. Runs the real function with sysctl stubbed.
+worker_ipv6_forwarding_run() {
+  local workdir="$1" node_json="$2"
+  {
+    echo 'set -euo pipefail'
+    echo 'sysctl() { echo "$*" >> "'"$workdir"'/sysctl.log"; }'
+    awk '/^worker_enable_ipv6_forwarding\(\) \{$/,/^\}$/' "$INSTALL" | sed "s#/etc/sysctl.d#$workdir/sysctl.d#g"
+    echo "worker_enable_ipv6_forwarding '$node_json'"
+  } > "$workdir/r.sh"
+  bash "$workdir/r.sh"
+}
+WORKER_V6_WORK="$(mktemp -d)"
+mkdir -p "$WORKER_V6_WORK/sysctl.d"
+worker_ipv6_forwarding_run "$WORKER_V6_WORK" '{"spec":{"podCIDRs":["10.244.1.0/24"]}}'
+assert_false "a worker in a single-stack IPv4 cluster writes no IPv6 forwarding sysctl and reloads nothing (its sysctl state stays unchanged)" \
+  test -e "$WORKER_V6_WORK/sysctl.d/u7s-ipv6-forwarding.conf" -o -e "$WORKER_V6_WORK/sysctl.log"
+worker_ipv6_forwarding_run "$WORKER_V6_WORK" '{"spec":{"podCIDRs":["10.244.1.0/24","fd00:244:0:1::/64"]}}'
+assert_true "a worker whose Node carries an IPv6 podCIDR writes net.ipv6.conf.all.forwarding=1: without it its pods get no routed IPv6" \
+  grep -qxF 'net.ipv6.conf.all.forwarding = 1' "$WORKER_V6_WORK/sysctl.d/u7s-ipv6-forwarding.conf"
+assert_true "the worker applies the new sysctl immediately (sysctl --system), not only at next boot" \
+  grep -qxF -- '--system' "$WORKER_V6_WORK/sysctl.log"
+rm -rf "$WORKER_V6_WORK"
 
 # ---------------------------------------------------------------------------
 # Regression guard: 'systemctl enable --now UNIT' is enable+
@@ -858,6 +924,8 @@ write_manifest_copy_runner() {
     echo 'KUBE_VERSION="${6:-1.37.1}"'
     echo 'IFACE_IP="${7:-10.0.0.1}"'
     echo 'CLUSTER_DNS="${8:-10.96.0.10}"'
+    echo 'SERVICE_CIDR=10.96.0.0/12; SERVICE_CIDR_IPV4=$SERVICE_CIDR; SERVICE_CIDR_IPV6=""'
+    echo 'POD_CLUSTER_CIDR_IPV4=$POD_CLUSTER_CIDR; POD_CLUSTER_CIDR_IPV6=""'
     awk '/^render_vendored_manifests\(\) \{$/,/^\}$/' "$install_script"
     awk '/^if \[ "\$WORKER_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
   } > "$runner"
@@ -1069,6 +1137,7 @@ write_persist_config_write_runner() {
     echo 'CONFIG_FILE="$STATE_DIR/config"'
     echo 'NODE_NAME="$2"'
     echo 'IFACE="$3"'
+    echo 'NODE_IP="${4:-}"; NODE_IPS_EXPLICIT=0; [ -z "$NODE_IP" ] || NODE_IPS_EXPLICIT=1'
     echo 'WORKER_MODE=0; CLUSTER_DNS=10.96.0.10; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
     awk 'prev == "{" && /NODE_NAME=/ {p=1; print prev} p {print} p && /^} > "\$CONFIG_FILE"$/ {exit} {prev=$0}' "$install_script"
   } > "$runner"
@@ -1084,9 +1153,11 @@ write_persist_config_check_runner() {
     echo 'EXISTING_INSTALL="$2"'
     echo 'NODE_NAME="$3"'
     echo 'IFACE="$4"'
+    echo 'NODE_IP="${5:-}"'
     awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$install_script"
     echo 'echo "NODE_NAME=$NODE_NAME"'
     echo 'echo "IFACE=$IFACE"'
+    echo 'echo "NODE_IP=$NODE_IP"'
   } > "$runner"
 }
 
@@ -1215,42 +1286,55 @@ assert "a persisted UPPERCASE node name is lowercased on re-run with no flag (ot
 recover_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "$LOWER_HOST" 1 2>&1 || true)"
 assert "a lowercase --node-name does not conflict with the persisted uppercase spelling of the same name (operator can recover by passing the fix explicitly)" \
   "$(printf '%s' "$recover_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
-for csr_fmt in 'join-%s-1' 'kubelet-%s-1'; do
-  # shellcheck disable=SC2059
-  csr_name="$(printf "$csr_fmt" "$(printf '%s' "$upper_default_out" | sed -n 's/^NODE_NAME=//p')")"
-  assert "the CSR name $csr_name built from a capitalised host is a valid DNS-1123 name (apiserver rejects uppercase)" \
-    "$(printf '%s' "$csr_name" | grep -Eq '^[a-z0-9.-]+$' && echo 1 || echo 0)"
-done
-assert_true "the join CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
-  grep -qF 'csr_name="join-${NODE_NAME}-$(date +%s)"' "$INSTALL"
-assert_true "the control-plane kubelet CSR name is built from NODE_NAME (so the lowercasing reaches it)" \
-  grep -qF 'csr_name="kubelet-${NODE_NAME}-$(date +%s)"' "$INSTALL"
-assert_true "the CSR subject CN uses NODE_NAME, so it is the lowercase system:node:<name> the node authorizer expects" \
-  grep -qF -- '-subj "/O=system:nodes/CN=system:node:$NODE_NAME"' "$INSTALL"
+assert_false "the join/kubelet CSR names no longer embed NODE_NAME: a 253-char node name would push 'join-<name>-<ts>' past the 253-char object-name limit and the CSR create would be rejected" \
+  grep -qE 'csr_name="(join|kubelet)-\$\{NODE_NAME\}' "$INSTALL"
+assert_true "the join CSR name is a short unique DNS-1123 name" \
+  grep -qF 'csr_name="join-$(date +%s)-$(openssl rand -hex 4)"' "$INSTALL"
+assert_true "the control-plane kubelet CSR name is a short unique DNS-1123 name" \
+  grep -qF 'csr_name="kubelet-$(date +%s)-$(openssl rand -hex 4)"' "$INSTALL"
+assert_false "(regression guard) install.sh no longer builds the node identity CSR with 'openssl req', whose 64-byte CN cap rejects node names over 52 chars" \
+  grep -qE 'openssl req ' "$INSTALL"
+assert "both CSR sites (join and control-plane self-join) go through generate_node_csr, which passes NODE_NAME to 'u7s-apiserver node-csr'" \
+  "$([ "$(grep -c '^  generate_node_csr "\$STATE_DIR/kubelet-client.key" "\$STATE_DIR/kubelet-client.csr"$' "$INSTALL")" = 2 ] && grep -qF '"$tool" node-csr --node-name "$NODE_NAME"' "$INSTALL" && echo 1 || echo 0)"
 
 # Case 6a: a GCP FQDN hostname (<name>.c.<project>.internal) can push the
-# identity CN past X.509's 64 chars, which openssl req refuses mid-install.
-# install.sh must refuse up front, at the node-name default, with a clear error.
+# identity CN past X.509's 64 chars. Upstream accepts names up to 253 chars, so
+# install.sh must not refuse any of them -- via --node-name, via the hostname
+# default, or when persisted by an earlier install.
 long_runner="$PERSIST_WORK/long-name.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  echo 'NODE_NAME="$1"; IFACE=eth0'
+  echo 'STATE_DIR="$1"; CONFIG_FILE="$STATE_DIR/config"; EXISTING_INSTALL="${3:-0}"'
+  echo 'NODE_NAME="$2"; IFACE=eth0'
+  echo 'hostname() { echo "$LONG_HOST"; }'
+  awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$INSTALL"
   awk '/^# --- Defaults: node name/{f=1} f&&/^if \[ -z "\$IFACE" \]/{exit} f{print}' "$INSTALL"
   echo 'echo "NODE_NAME=$NODE_NAME"'
 } > "$long_runner"
-LONG_NAME="$(printf 'a%.0s' $(seq 1 53))"
-OK_NAME="$(printf 'a%.0s' $(seq 1 52))"
-long_rc=0
-long_out="$(bash "$long_runner" "$LONG_NAME" 2>&1)" || long_rc=$?
-assert "a 53-char node name (CN 65 chars) is refused with a message naming the 64-char limit, instead of failing later inside openssl req" \
-  "$([ "$long_rc" -ne 0 ] && printf '%s' "$long_out" | grep -q '64-char' && echo 1 || echo 0)"
-ok_out="$(bash "$long_runner" "$OK_NAME" 2>&1 || true)"
-assert "a 52-char node name (CN exactly 64 chars) is accepted -- the guard must not reject names openssl can sign" \
-  "$(printf '%s' "$ok_out" | grep -qx "NODE_NAME=$OK_NAME" && echo 1 || echo 0)"
-cn_ok="$(openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout /dev/null -subj "/O=system:nodes/CN=system:node:$OK_NAME" 2>&1 >/dev/null || true)"
-assert "openssl really signs a 64-char CN (so the 52-char bound is not needlessly strict)" \
-  "$(printf '%s' "$cn_ok" | grep -q 'too long' && echo 0 || echo 1)"
+mkdir -p "$PERSIST_WORK/long"
+for len in 52 53 63 64 253; do
+  long_name="$(printf 'a%.0s' $(seq 1 "$len"))"
+  rc=0
+  out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long" "$long_name" 2>&1)" || rc=$?
+  assert "a $len-char --node-name is accepted (upstream joins nodes up to 253 chars)" \
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+  rc=0
+  out="$(LONG_HOST="$(printf '%s' "$long_name" | tr a A)" bash "$long_runner" "$PERSIST_WORK/long" "" 2>&1)" || rc=$?
+  assert "a $len-char hostname becomes the (lowercased) node name via the real derivation path" \
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+done
+persisted_long="$(printf 'b%.0s' $(seq 1 100))"
+mkdir -p "$PERSIST_WORK/long-persisted"
+printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$persisted_long" > "$PERSIST_WORK/long-persisted/config"
+rc=0
+out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "" 1 2>&1)" || rc=$?
+assert "a persisted long node name is reused on re-run with no flag (a host from a failed earlier install must not dead-end)" \
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
+rc=0
+out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "$persisted_long" 1 2>&1)" || rc=$?
+assert "re-running with the persisted long name as --node-name is not refused" \
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
 
 # Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
 # (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
@@ -1390,7 +1474,7 @@ write_join_runner() {
     echo 'ensure_jq() { :; }'
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     grep '^JOIN_TOKEN_TTL_SECONDS=' "$INSTALL"
-    for fn in ipv4_to_int int_to_ipv4 parse_cidr default_cluster_dns issue_cp_kubelet_identity current_client_cert wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
+    for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns cluster_families_from_cidrs generate_node_csr issue_cp_kubelet_identity current_client_cert worker_enable_ipv6_forwarding wait_for_joined_node b64url hmac_pad hmac_sha256 discover_cluster_ca read_join_token mint_join_token; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1422,14 +1506,16 @@ mint_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR" 2>&1)" || {
 SECRET_JSON="$JOIN_CA_DIR/created-secret.json"
 mint_field() { jq -r ".stringData[\"$1\"]" "$SECRET_JSON"; }
 
-assert "a default-DNS cluster's join command carries no --cluster-dns" \
-  "$(printf '%s' "$mint_out" | grep -qF -- '--cluster-dns' && echo 0 || echo 1)"
-JOIN_CA_DIR_K3S="$JOIN_WORK/cp-state-k3s"
-cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_K3S"
-echo 'CLUSTER_DNS="10.43.0.10"' > "$JOIN_CA_DIR_K3S/config"
-mint_k3s_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_K3S" 2>&1)"
-assert "a non-default-DNS cluster's join command carries --cluster-dns, else the worker's kubelet would resolve via the default VIP and pods on it lose DNS" \
-  "$(printf '%s' "$mint_k3s_out" | grep -qF -- '--cluster-dns 10.43.0.10' && echo 1 || echo 0)"
+JOIN_CA_DIR_CUSTOM="$JOIN_WORK/cp-state-custom"
+cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_CUSTOM"
+printf 'CLUSTER_DNS="fd00:96::a"\nSERVICE_CIDR="fd00:96::/108,10.96.0.0/12"\n' > "$JOIN_CA_DIR_CUSTOM/config"
+mint_custom_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
+assert "the join command carries no network flags even for a non-default dual-stack cluster: the worker reads DNS and families from the cluster, so a forgotten or stale flag cannot make it single-stack" \
+  "$(printf '%s%s' "$mint_out" "$mint_custom_out" | grep -qE -- '--cluster-dns|--cluster-ip-families' && echo 0 || echo 1)"
+
+mint_release_out="$(DEFAULT_TARBALL_URL=https://example.invalid/u7s.tar.gz bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
+assert "the join hint asks for --tarball only when the script has no baked release URL (a release copy fetches its own tarball, so a worker told to supply one follows the wrong recipe)" \
+  "$(printf '%s' "$mint_out" | grep -qF -- '--tarball <path>' && ! printf '%s' "$mint_release_out" | grep -qF -- '--tarball' && echo 1 || echo 0)"
 
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
@@ -1497,6 +1583,14 @@ touch "$CPID_DIR/kubeconfig"
 CPID_RUNNER="$JOIN_WORK/cpid.sh"
 write_join_runner "$CPID_RUNNER" '
 NODE_NAME=cp1
+STAGE_DIR="$STATE_DIR/stage"; mkdir -p "$STAGE_DIR"
+cat > "$STAGE_DIR/u7s-apiserver" <<'"'"'STUB'"'"'
+#!/usr/bin/env bash
+[ "$1" = node-csr ] && [ "$2" = --node-name ] && [ "$4" = --key-out ] && [ "$6" = --csr-out ] || exit 2
+openssl ecparam -name prime256v1 -genkey -noout -out "$5"
+openssl req -new -key "$5" -subj "/O=system:nodes/CN=system:node:$3" -out "$7"
+STUB
+chmod +x "$STAGE_DIR/u7s-apiserver"
 kubectl() {
   printf "%s\n" "$*" >> "$STATE_DIR/kubectl-argv"
   case "$*" in
@@ -1544,22 +1638,35 @@ WAIT_RUNNER="$JOIN_WORK/wait.sh"
 write_join_runner "$WAIT_RUNNER" '
 NODE_NAME=n1; JOIN_STARTED_AT=2026-10-16T10:00:00Z
 sleep() { :; }
+worker_enable_ipv6_forwarding() { printf "%s\n" "$1" >> "$STATE_DIR/fwd.log"; }
 curl() {
   case "$*" in
-    *"/api/v1/nodes/n1"*) printf "%s" "$NODE_JSON" ;;
+    *"/api/v1/nodes/n1"*)
+      n=$(( $(cat "$STATE_DIR/node-gets" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE_DIR/node-gets"
+      if [ "$n" -ge 4 ] && [ -n "${NODE_JSON_LATE:-}" ]; then printf "%s" "$NODE_JSON_LATE"; else printf "%s" "$NODE_JSON"; fi ;;
     *certificatesigningrequests*) printf "%s" "$CSR_JSON" ;;
   esac
 }
 wait_for_joined_node'
-READY_NODE='{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_NODE='{"spec":{"podCIDRs":["10.244.1.0/24"]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_NO_CIDR_NODE='{"spec":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_DUAL_NODE='{"spec":{"podCIDRs":["10.244.1.0/24","fd00:244:0:1::/64"]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 NOTREADY_NODE='{"status":{"conditions":[{"type":"Ready","status":"False"}]}}'
 ISSUED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
 PENDING_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{}}]}'
 CLIENT_ONLY_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kube-apiserver-client-kubelet","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
-run_wait() { NODE_JSON="$1" CSR_JSON="$2" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
+run_wait() { rm -f "$JOIN_WORK/node-gets" "$JOIN_WORK/fwd.log"; NODE_JSON="$1" CSR_JSON="$2" NODE_JSON_LATE="${3:-}" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
 ok_status=0; run_wait "$READY_NODE" "$ISSUED_CSR" >/dev/null || ok_status=$?
 assert "join succeeds when the Node is Ready and its kubelet-serving CSR is approved and issued" \
   "$([ "$ok_status" -eq 0 ] && echo 1 || echo 0)"
+assert "the join poll hands the Node it fetched to the IPv6-forwarding check (a worker joined to a dual-stack cluster otherwise routes no IPv6)" \
+  "$([ "$(head -n1 "$JOIN_WORK/fwd.log" 2>/dev/null)" = "$READY_NODE" ] && echo 1 || echo 0)"
+nocidr_status=0; run_wait "$READY_NO_CIDR_NODE" "$ISSUED_CSR" >/dev/null || nocidr_status=$?
+assert "join does not report success while the Node has no podCIDRs, even if Ready and the serving cert is issued (its forwarding would be decided from an incomplete Node)" \
+  "$([ "$nocidr_status" -ne 0 ] && echo 1 || echo 0)"
+late_status=0; run_wait "$READY_NO_CIDR_NODE" "$ISSUED_CSR" "$READY_DUAL_NODE" >/dev/null || late_status=$?
+assert "the join poll keeps reading the Node after Ready until podCIDRs appear, and forwards on the later v6 podCIDR (stopping at Ready would skip IPv6 forwarding permanently)" \
+  "$([ "$late_status" -eq 0 ] && tail -n1 "$JOIN_WORK/fwd.log" | grep -qF 'fd00:244:0:1::/64' && echo 1 || echo 0)"
 pend_status=0; pend_out="$(run_wait "$READY_NODE" "$PENDING_CSR")" || pend_status=$?
 assert "join fails loud with recovery text when the serving CSR stays Pending (logs/exec would be broken on a node reported as joined)" \
   "$([ "$pend_status" -ne 0 ] && printf '%s' "$pend_out" | grep -q 'mint a new token' && echo 1 || echo 0)"
@@ -1677,7 +1784,7 @@ write_upgrade_runner() {
     echo 'set -euo pipefail'
     echo 'STATE_DIR="$1"; NODE_NAME=n1'
     echo 'sleep() { :; }'
-    for fn in current_client_cert verify_worker_identity worker_api_get worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
+    for fn in current_client_cert verify_worker_identity worker_api_get worker_upgrade_ipv6_forwarding worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1779,13 +1886,15 @@ write_worker_branch_runner() {
   {
     echo '#!/usr/bin/env bash'
     echo 'set -euo pipefail'
-    echo 'STATE_DIR="$1"; JOIN_MODE="$2"; BIN_DIR=/opt/u7s/bin; NODE_NAME=n1; IFACE_IP=10.0.0.2; KUBELET_ROUND2_FLAGS=""'
+    echo 'STATE_DIR="$1"; JOIN_MODE="$2"; BIN_DIR=/opt/u7s/bin; NODE_NAME=n1; IFACE_IP=10.0.0.2; NODE_IPS=10.0.0.2; KUBELET_ROUND2_FLAGS=""'
     echo 'join_cluster() { echo join_cluster >> "$STATE_DIR/calls"; }'
     echo 'read_join_token() { echo read_join_token >> "$STATE_DIR/calls"; return 1; }'
     echo 'ensure_jq() { :; }'
     grep -E '^MEMLOW_KUBELET_MIB=' "$INSTALL"
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
+    echo 'worker_api_get() { echo "{}"; }'
+    echo 'worker_upgrade_ipv6_forwarding() { echo worker_upgrade_ipv6_forwarding >> "$STATE_DIR/calls"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
     echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
@@ -1816,6 +1925,27 @@ jn_dir="$UPG_WORK/join-branch"; mkdir -p "$jn_dir"
 jn_status=0; bash "$BRANCH_RUNNER" "$jn_dir" 1 >/dev/null 2>&1 || jn_status=$?
 assert "a fresh --join still runs join_cluster and the join wait (the tokenless path must not swallow real joins)" \
   "$([ "$jn_status" -eq 0 ] && grep -qx join_cluster "$jn_dir/calls" && grep -qx wait_for_joined_node "$jn_dir/calls" && ! grep -q '^wait_for_upgraded_worker' "$jn_dir/calls" && echo 1 || echo 0)"
+assert "an in-place worker upgrade runs the IPv6 forwarding check, so workers joined before the check existed get forwarding" \
+  "$(grep -qx worker_upgrade_ipv6_forwarding "$up_dir/calls" && echo 1 || echo 0)"
+assert "a fresh join leaves the forwarding check to the join poll, not the upgrade path (the Node has no podCIDRs yet at that point)" \
+  "$(! grep -qx worker_upgrade_ipv6_forwarding "$jn_dir/calls" && echo 1 || echo 0)"
+
+# The upgrade-path forwarding check: a failed Node read must be loud.
+FWD_RUNNER="$UPG_WORK/fwd.sh"
+write_upgrade_runner "$FWD_RUNNER" '
+worker_enable_ipv6_forwarding() { printf "%s\n" "$1" >> "$STATE_DIR/fwd.log"; }
+worker_api_get() { if [ "${GET_FAIL:-0}" = 1 ]; then echo "curl: (7) connection refused" >&2; return 7; fi; printf "%s" "$GET_BODY"; }
+worker_upgrade_ipv6_forwarding'
+run_fwd() { rm -f "$UPG_WORK/fwd.log"; GET_FAIL="$1" GET_BODY="$2" bash "$FWD_RUNNER" "$UPG_WORK" 2>&1; }
+fwd_ok_status=0; fwd_ok_out="$(run_fwd 0 '{"spec":{"podCIDRs":["fd00::/64"]}}')" || fwd_ok_status=$?
+assert "the upgrade path passes the Node it read to the forwarding check without warning" \
+  "$([ "$fwd_ok_status" -eq 0 ] && [ "$(cat "$UPG_WORK/fwd.log")" = '{"spec":{"podCIDRs":["fd00::/64"]}}' ] && ! printf '%s' "$fwd_ok_out" | grep -q warning && echo 1 || echo 0)"
+fwd_get_status=0; fwd_get_out="$(run_fwd 1 '')" || fwd_get_status=$?
+assert "a failed Node GET on upgrade warns naming the node and the curl error, and does not abort the kubelet upgrade (silently skipping leaves a dual-stack worker without IPv6 forwarding)" \
+  "$([ "$fwd_get_status" -eq 0 ] && printf '%s' "$fwd_get_out" | grep -q 'warning: could not read node n1' && printf '%s' "$fwd_get_out" | grep -q 'connection refused' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
+fwd_jq_status=0; fwd_jq_out="$(run_fwd 0 'not json')" || fwd_jq_status=$?
+assert "a Node GET that returns unparseable JSON also warns instead of passing garbage to the forwarding check" \
+  "$([ "$fwd_jq_status" -eq 0 ] && printf '%s' "$fwd_jq_out" | grep -q 'warning: could not read node n1' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
 
 # Post-restart verification.
 HB_RUNNER="$UPG_WORK/hb.sh"
@@ -1965,7 +2095,7 @@ for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( tota
   trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
   [ "$trunc_status" -ne 0 ] || trunc_ok=0
   printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
-  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file' || trunc_ok=0
+  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file|unexpected EOF' || trunc_ok=0
 done
 rm -rf "$TRUNC_WORK"
 assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
@@ -2020,8 +2150,8 @@ run_key_install "$KEY_WORK/both.asc" "$good_fpr"
 assert "a key file carrying the pinned key plus an attacker key is refused, since signed-by would trust both" \
   "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && echo 1 || echo 0)"
 
-assert "both apt keys are installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
-  "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 2 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
+assert "the apt key is installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
+  "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 1 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
 rm -rf "$KEY_WORK"
 
 # ---------------------------------------------------------------------------
@@ -2035,13 +2165,13 @@ rm -rf "$KEY_WORK"
 NET_WORK="$(mktemp -d)"
 trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
 {
-  for fn in ipv4_to_int int_to_ipv4 parse_cidr default_cluster_dns validate_network_config \
+  for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs fetch_cluster_config \
     reconcile_network_flag check_node_ip_outside_ranges render_vendored_manifests write_kubelet_config_yaml; do
     awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
   done
 } > "$NET_WORK/fns.sh"
 assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
-  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 9 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 22 ] && echo 1 || echo 0)"
 
 # net_run <scenario>: runs <scenario> after the extracted functions with the
 # production defaults loaded; sets NET_STATUS/NET_OUT.
@@ -2049,8 +2179,9 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
-    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; EXISTING_INSTALL=0'
-    echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0; POD_CIDR_UPGRADE=0'
+    echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
+    echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
     cat "$NET_WORK/fns.sh"
     echo "$1"
   } > "$NET_WORK/scenario.sh"
@@ -2090,8 +2221,13 @@ net_bad "an octet above 255 is refused -- bash arithmetic would otherwise silent
   'SERVICE_CIDR=10.300.0.0/16; resolve' "not a valid IPv4 CIDR"
 net_bad "a CIDR with host bits set is refused, since components disagree on which network it names" \
   'SERVICE_CIDR=10.43.1.0/16; resolve' "host bits set"
-net_bad "a service range wider than /12 is refused, as upstream's apiserver refuses it" \
-  'SERVICE_CIDR=10.0.0.0/8; resolve' "must be between /12 and /28"
+net_run "$RESOLVE"'SERVICE_CIDR=10.0.0.0/8; POD_CLUSTER_CIDR=172.16.0.0/16; resolve && echo ok'
+assert "an IPv4 service range wider than /12 is accepted: upstream 1.37 and the u7s apiserver bound no range size, so refusing it would block valid clusters" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_bad "a /0 service range is refused: it spans the whole address space and always overlaps the node and pod networks" \
+  'SERVICE_CIDR=0.0.0.0/0; resolve' "must be between /1 and /28"
+net_bad "a /29 IPv4 service range is refused: kube-dns is the tenth host" \
+  'SERVICE_CIDR=10.96.0.0/29; resolve' "must be between /1 and /28"
 net_bad "overlapping service and pod ranges are refused: a Service VIP would equal a pod IP" \
   'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.43.128.0/17; resolve' "overlap"
 net_bad "a pod range narrower than the /24 per-node mask is refused instead of leaving KCM unable to allocate a node CIDR" \
@@ -2109,7 +2245,7 @@ net_run "$RESOLVE$K3S"'; CLUSTER_DNS=10.43.0.53; resolve && echo "$CLUSTER_DNS"'
 assert "an explicit --cluster-dns inside the range is honoured, not overwritten by the derived tenth host" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.43.0.53" ] && echo 1 || echo 0)"
 
-net_run 'CLUSTER_DNS=10.43.0.10; validate_network_config 1 && echo ok'
+net_run 'CLUSTER_DNS=10.43.0.10; CLUSTER_FAMILIES=4; validate_network_config 1 && echo ok'
 assert "a worker validates only --cluster-dns syntax (it has no service range to check against)" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
 
@@ -2144,6 +2280,7 @@ NET_DEST="$NET_WORK/rendered"
 mkdir -p "$NET_DEST"
 cp "$ROOT_DIR"/manifests/*.yaml "$NET_DEST/"
 net_run "$K3S"'; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+validate_network_config 0
 render_vendored_manifests "'"$NET_DEST"'" && echo rendered
 STATE_DIR="'"$NET_WORK"'"; systemctl() { return 1; }
 write_kubelet_config_yaml 0 && echo kubelet'
@@ -2172,15 +2309,433 @@ assert "a CoreDNS manifest whose clusterIP line changed shape fails the install 
 
 # Units and persistence: structural, like the KCM assertions above.
 assert_true "u7s-apiserver.service passes --service-cluster-ip-range and --kube-dns-cluster-ip from the resolved values (the apiserver derives the kubernetes Service VIP and ServiceCIDR from the range)" \
-  grep -qF -- '--service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS' "$INSTALL"
+  grep -qF -- '--service-cluster-ip-range $SERVICE_CIDR --cluster-cidr $POD_CLUSTER_CIDR --kube-dns-cluster-ip $CLUSTER_DNS' "$INSTALL"
 assert_true "u7s-kcm.service passes --service-cluster-ip-range=\$SERVICE_CIDR next to --cluster-cidr" \
   grep -qF -- '--cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR' "$INSTALL"
 assert_true "the config file persists all three values so a re-run can detect a conflict" \
   grep -qF 'printf '"'"'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n'"'" "$INSTALL"
-assert_true "--mint-join-token prints --cluster-dns for a non-default cluster so a joining worker's kubelet gets the right DNS" \
-  grep -qF 'dns_flag=" --cluster-dns $persisted_dns"' "$INSTALL"
 assert_false "no hardcoded 10.96.0.10 / 10.244.0.0/16 assignment is left outside the defaults block" \
   grep -nE '^\s*(POD_CLUSTER_CIDR|CLUSTER_DNS)="?10\.' "$INSTALL"
+
+# ---------------------------------------------------------------------------
+# Dual-stack --service-cidr/--cluster-cidr: two comma-separated ranges of
+# different families, validated per family. A range KCM or the apiserver
+# rejects must fail here, not as a crash loop after packages are installed.
+# ---------------------------------------------------------------------------
+DUAL='SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56'
+net_run "$RESOLVE$DUAL"'; resolve && echo "$CLUSTER_DNS|$SERVICE_CIDR_IPV4|$SERVICE_CIDR_IPV6|$POD_CLUSTER_CIDR_IPV4|$POD_CLUSTER_CIDR_IPV6"'
+assert "dual-stack ranges validate and split per family, and kube-dns is the first family's tenth host (10.96.0.10)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.10|10.96.0.0/12|fd00:96::/108|10.244.0.0/16|fd00:244::/56" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve && echo "$CLUSTER_DNS"'
+assert "an IPv6-primary dual-stack install derives kube-dns as the tenth host of the IPv6 range (fd00:96::a), the apiserver's primary family" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::a" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'SERVICE_CIDR=fd00:96::/108; POD_CLUSTER_CIDR=fd00:244::/56; resolve && echo "$CLUSTER_DNS"'
+assert "a single IPv6 range pair is accepted (upstream allows single-stack IPv6)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::a" ] && echo 1 || echo 0)"
+net_run "$RESOLVE$DUAL"'; CLUSTER_DNS=fd00:96::53; resolve && echo "$CLUSTER_DNS"'
+assert "an explicit IPv6 --cluster-dns inside the IPv6 service range is honoured on a dual-stack install" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::53" ] && echo 1 || echo 0)"
+
+net_bad "two service ranges of the same family are refused with upstream's wording, as the apiserver would crash-loop on them" \
+  'SERVICE_CIDR=10.96.0.0/12,10.100.0.0/16; resolve' "--service-cidr[0] and --service-cidr[1] must be of different IP family"
+net_bad "two cluster ranges of the same family are refused: KCM allows one per family" \
+  'POD_CLUSTER_CIDR=10.244.0.0/16,10.245.0.0/16; resolve' "--cluster-cidr[0] and --cluster-cidr[1] must be of different IP family"
+net_bad "more than two ranges are refused: upstream's limit is one per family" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:96::/108,fd00:97::/108; resolve' "must not contain more than two entries"
+net_bad "an empty second entry is refused instead of being read as single-stack" \
+  'SERVICE_CIDR=10.96.0.0/12,; resolve' "not a CIDR"
+net_run "$RESOLVE"'SERVICE_CIDR=10.96.0.0/12,fd00:96::/64; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve && echo ok'
+assert "an IPv6 service range wider than /108 is accepted: upstream 1.37 and the u7s apiserver bound no range size" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_bad "an IPv6 service range narrower than /124 is refused: kube-dns is the tenth host" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:96::/125; resolve' "must be between /1 and /124"
+net_bad "an IPv6 pod range wider than the 16-bit gap to the /64 node mask is refused" \
+  'POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/40; resolve' "must be between /48 and /64"
+net_bad "an IPv6 pod range narrower than the /64 node mask is refused" \
+  'POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/80; resolve' "must be between /48 and /64"
+net_bad "an IPv6 CIDR with host bits set is refused and names the network address" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:96::1/108; resolve' "the network address is fd00:96::/108"
+net_bad "a malformed IPv6 CIDR is refused by name" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:zz::/108; resolve' "not a valid IPv6 CIDR"
+net_bad "an IPv6 zone ID is refused: the apiserver cannot parse it" \
+  'SERVICE_CIDR=10.96.0.0/12,fe80::1%eth0/108; resolve' "not a valid IPv6 CIDR"
+net_bad "overlapping IPv6 service and pod ranges are refused even when the IPv4 pair is disjoint" \
+  'SERVICE_CIDR=10.96.0.0/12,fd00:244::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve' "overlap"
+net_bad "an IPv6 --cluster-dns with no IPv6 service range is refused: no ServiceCIDR could hold it" \
+  'CLUSTER_DNS=fd00:96::a; resolve' "has no IPv6 range"
+net_bad "an IPv6 --cluster-dns outside the IPv6 service range is refused" \
+  "$DUAL; CLUSTER_DNS=fd00:97::a; resolve" "not an allocatable host"
+net_bad "an IPv6 --cluster-dns equal to the kubernetes Service VIP is refused" \
+  "$DUAL; CLUSTER_DNS=fd00:96::1; resolve" "not an allocatable host"
+net_bad "an IPv6 --cluster-dns equal to the network address is refused" \
+  "$DUAL; CLUSTER_DNS=fd00:96::; resolve" "not an allocatable host"
+net_run "$RESOLVE"'SERVICE_CIDR=10.96.0.0/12,fd00:96::/124; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; CLUSTER_DNS=fd00:96::f; validate_network_config 0 && echo ok'
+assert "the last address of a /124 IPv6 service range is allocatable (IPv6 has no broadcast), unlike IPv4's" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+net_run 'CLUSTER_DNS=fd00:96::a; CLUSTER_FAMILIES=6,4; validate_network_config 1 && echo ok'
+assert "a worker accepts an IPv6 --cluster-dns (the DNS VIP of an IPv6-primary cluster)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+
+net_run "$DUAL"'; check_node_ip_outside_ranges fd00:244:0:5::1'
+assert "an IPv6 node address inside the IPv6 pod range is refused" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside fd00:244::/56' && echo 1 || echo 0)"
+net_run "$DUAL"'; check_node_ip_outside_ranges 10.244.3.3'
+assert "an IPv4 node address inside the IPv4 pod range of a dual-stack install is refused" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside 10.244.0.0/16' && echo 1 || echo 0)"
+net_run "$DUAL"'; check_node_ip_outside_ranges 192.168.1.5 && check_node_ip_outside_ranges 2001:db8::5 && echo ok'
+assert "node addresses outside every range of both families pass" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
+
+net_run 'for a in 0:0:0:0:0:0:0:0 2001:db8:0:0:1:0:0:1 FD00:0096:0:0:0:0:0:000A 1:0:0:0:0:0:0:0 0:0:0:0:0:0:0:1 1:2:3:4:5:6:7:8; do ip6_hex_to_str "$(ip6_to_hex "$a")"; done | paste -sd" " -'
+assert "IPv6 text is canonicalised per RFC 5952 (longest zero run compressed, lowercase, no leading zeros), so the DNS VIP written to kubelet and CoreDNS matches what the apiserver prints" \
+  "$([ "$NET_OUT" = ":: 2001:db8::1:0:0:1 fd00:96::a 1:: ::1 1:2:3:4:5:6:7:8" ] && echo 1 || echo 0)"
+
+# Re-install: both lists are persisted and compared as written.
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10
+'"$DUAL"'; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR"'
+assert "re-running with the same dual-stack flags is idempotent" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR"'
+assert "a bare re-run keeps the persisted dual-stack lists instead of reverting to the single-stack defaults" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56" ] && echo 1 || echo 0)"
+net_bad "swapping the family order of a persisted dual-stack list is refused: the primary family determines the kubernetes Service VIP" \
+  'EXISTING_INSTALL=1; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve' "--cluster-cidr"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+'"$DUAL"'; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR $CLUSTER_DNS $DUAL_STACK_UPGRADE"'
+assert "a single-stack install re-run with the dual-stack ranges (primary kept, secondary added) is accepted and flagged as an upgrade, with the persisted DNS VIP untouched (moving it would break every running pod's resolv.conf)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56 10.96.0.10 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=fd00:96::/108; PERSISTED_POD=fd00:244::/56; PERSISTED_DNS=fd00:96::a
+SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve && echo "$SERVICE_CIDR $DUAL_STACK_UPGRADE"'
+assert "an IPv6-primary single-stack install can gain an IPv4 secondary: the upgrade is not tied to IPv4 being primary" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::/108,10.96.0.0/12 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE$DUAL"'; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a fresh dual-stack install is not reported as an upgrade (the node-podCIDR warning would mislead)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a bare re-run of an already dual-stack install is not an upgrade" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining only a service-cidr secondary is accepted but does not trigger the podCIDR drain/re-register recipe: no Node podCIDRs change, so the recipe would make an operator delete Nodes for nothing" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 0" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining a cluster-cidr secondary triggers the podCIDR recipe: existing Nodes keep single-stack podCIDRs until re-created" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 1" ] && echo 1 || echo 0)"
+assert_true "the printed podCIDR recipe is gated on the cluster-cidr upgrade flag, not the generic dual-stack one" \
+  grep -qF 'if [ "$POD_CIDR_UPGRADE" -eq 1 ]' "$INSTALL"
+assert_true "the printed podCIDR recipe restarts flannel: it reads the Node's podCIDRs only at start, so without it new pods keep IPv4-only IPs after the Node is re-created" \
+  grep -qF 'kube-flannel delete pod -l app=flannel' "$INSTALL"
+assert_true "the printed recipe tells the operator the Node delete drops the control-plane label and how to restore it (install.sh re-run re-applies it via label_control_plane_node)" \
+  grep -qF 'drops its node-role.kubernetes.io/control-plane label' "$INSTALL"
+net_bad "making the IPv6 range primary on a single-stack IPv4 install is refused with a primary-change message: the primary family fixes the kubernetes Service VIP and every existing ClusterIP" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; resolve' "changes the primary range"
+net_bad "a different primary range with a secondary added is refused with the primary-change message (existing Services hold addresses from the old primary)" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.100.0.0/16,fd00:96::/108; resolve' "changes the primary range"
+net_bad "a same-family secondary is refused: a dual-stack cluster has one range per family" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,10.97.0.0/16; resolve' "not a single secondary range of the other IP family"
+net_bad "adding two ranges at once is refused: only a pure single-secondary addition is supported" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108,fd00:97::/108; resolve' "not a single secondary range of the other IP family"
+net_bad "changing a single-stack range to another single range is refused and points at the only supported in-place change" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.43.0.0/16; resolve' "Only a single-stack cluster gaining a secondary range"
+net_bad "dropping a family from a dual-stack install is refused: existing dual ClusterIPs and podCIDRs would be stranded" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; SERVICE_CIDR=10.96.0.0/12; resolve' "conflicts with the value in effect"
+
+# KCM: upstream rejects --node-cidr-mask-size with two cluster CIDRs.
+net_run 'POD_CLUSTER_CIDR=10.244.0.0/16; kcm_node_cidr_mask_flags'
+assert "single-stack IPv4 keeps the legacy --node-cidr-mask-size=24 and nothing else" \
+  "$([ "$NET_OUT" = "--node-cidr-mask-size=24" ] && echo 1 || echo 0)"
+net_run 'POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; kcm_node_cidr_mask_flags'
+assert "dual-stack passes per-family masks (/24 IPv4, /64 IPv6) and never the bare flag, which KCM rejects with two cluster CIDRs" \
+  "$([ "$NET_OUT" = "--node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64" ] && echo 1 || echo 0)"
+net_run 'POD_CLUSTER_CIDR=fd00:244::/56; kcm_node_cidr_mask_flags'
+assert "single-stack IPv6 uses a /64 node mask (a /24 mask would exceed the 128-bit address)" \
+  "$([ "$NET_OUT" = "--node-cidr-mask-size=64" ] && echo 1 || echo 0)"
+assert_true "u7s-kcm.service takes its mask flags from kcm_node_cidr_mask_flags, next to the full cluster and service lists" \
+  grep -qF -- '--cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR $KCM_NODE_CIDR_MASK_FLAGS --use-service' "$INSTALL"
+assert_true "--service-cidr and --cluster-cidr values are whitespace-stripped before persisting, so 'a, b' and 'a,b' are one value" \
+  grep -qF 'POD_CLUSTER_CIDR="${POD_CLUSTER_CIDR//[[:space:]]/}"' "$INSTALL"
+
+# Manifest placeholders: the full lists and each family are available; the
+# legacy __POD_CLUSTER_CIDR__ stays one valid CIDR (the primary).
+mkdir -p "$NET_WORK/ph"
+printf 'a: __POD_CLUSTER_CIDR__\nb: __POD_CLUSTER_CIDRS__\nc: __POD_CLUSTER_CIDR_IPV4__\nd: __POD_CLUSTER_CIDR_IPV6__\ne: __SERVICE_CIDRS__\nf: __SERVICE_CIDR_IPV4__\ng: __SERVICE_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
+net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/ph"'" && echo rendered'
+assert "rendering a dual-stack install succeeds" "$([ "$NET_STATUS" -eq 0 ] && echo 1 || echo 0)"
+assert "dual-stack placeholders expose the primary CIDR, both full lists and each family; a pre-dual-stack manifest keeps a single valid CIDR" \
+  "$([ "$(paste -sd'|' "$NET_WORK/ph/flannel.yaml")" = 'a: 10.244.0.0/16|b: 10.244.0.0/16,fd00:244::/56|c: 10.244.0.0/16|d: fd00:244::/56|e: 10.96.0.0/12,fd00:96::/108|f: 10.96.0.0/12|g: fd00:96::/108' ] && echo 1 || echo 0)"
+printf 'a: __POD_CLUSTER_CIDR__\nc: __POD_CLUSTER_CIDR_IPV4__\nd: __POD_CLUSTER_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
+net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; IFACE=eth0; validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/ph"'" && echo rendered'
+assert "single-stack leaves the IPv6 placeholders empty rather than inventing a value" \
+  "$([ "$(paste -sd'|' "$NET_WORK/ph/flannel.yaml")" = 'a: 10.244.0.0/16|c: 10.244.0.0/16|d: ' ] && echo 1 || echo 0)"
+
+# Dual-stack render of the REAL vendored manifests: each consumer must learn
+# both families, or one family silently breaks (pods unroutable, Service VIPs
+# unproxied, LoadBalancer backends rejected, DNS unreachable over IPv6).
+DUAL_DEST="$NET_WORK/rendered-dual"
+mkdir -p "$DUAL_DEST"
+cp "$ROOT_DIR"/manifests/*.yaml "$DUAL_DEST/"
+net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+validate_network_config 0 && render_vendored_manifests "'"$DUAL_DEST"'" && echo rendered'
+assert "rendering the real vendored manifests for a dual-stack install succeeds" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = rendered ] && echo 1 || echo 0)"
+assert_true "flannel enables IPv6 with the IPv6 pod range (without it v6 pod traffic is never routed over the overlay)" \
+  grep -qF '"EnableIPv6": true, "IPv6Network": "fd00:244::/56"' "$DUAL_DEST/flannel.yaml"
+assert_true "flannel's IPv4 Network stays the IPv4 entry on a dual-stack install" \
+  grep -qF '"Network": "10.244.0.0/16"' "$DUAL_DEST/flannel.yaml"
+assert_true "kube-proxy's clusterCIDR lists both families so it masquerades both" \
+  grep -qx '    clusterCIDR: 10.244.0.0/16,fd00:244::/56' "$DUAL_DEST/kube-proxy.yaml"
+assert_true "beep gets an IPv4 --pod-cidr: it admits a pod IP only against its own family's CIDR" \
+  grep -qxF '            - --pod-cidr=10.244.0.0/16' "$DUAL_DEST/beep.yaml"
+assert_true "beep gets an IPv6 --pod-cidr, or every IPv6 pod backend is rejected and LoadBalancer breaks for that family" \
+  grep -qxF '            - --pod-cidr=fd00:244::/56' "$DUAL_DEST/beep.yaml"
+assert "beep has exactly two --pod-cidr flags on a dual-stack install" \
+  "$([ "$(grep -c -- '--pod-cidr=' "$DUAL_DEST/beep.yaml")" -eq 2 ] && echo 1 || echo 0)"
+assert "CoreDNS Service is PreferDualStack with one kube-dns VIP per family, primary first" \
+  "$(grep -A4 '^  clusterIP: ' "$DUAL_DEST/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack' && echo 1 || echo 0)"
+assert_false "no dual-stack rendered manifest keeps an unresolved __PLACEHOLDER__" \
+  grep -qE '__[A-Z_]+__' "$DUAL_DEST/flannel.yaml" "$DUAL_DEST/kube-proxy.yaml" "$DUAL_DEST/beep.yaml"
+net_run 'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+mkdir -p "'"$NET_WORK/dual6"'" && cp "'"$ROOT_DIR"'"/manifests/coredns.yaml "'"$NET_WORK/dual6/"'"
+validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/dual6"'" && echo rendered'
+assert "an IPv6-primary dual-stack CoreDNS lists its IPv6 VIP first and the IPv4 VIP second" \
+  "$(grep -A2 '^  clusterIPs:' "$NET_WORK/dual6/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIPs:|  - fd00:96::a|  - 10.96.0.10' && echo 1 || echo 0)"
+mkdir -p "$NET_WORK/v6url"
+cp "$ROOT_DIR"/manifests/kube-proxy.yaml "$NET_WORK/v6url/"
+net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; IFACE=eth0; IFACE_IP=fd00::5; KUBE_VERSION=1.37.1
+render_vendored_manifests "'"$NET_WORK/v6url"'" && echo rendered'
+assert_true "an IPv6 node address is bracketed in kube-proxy's apiserver URL (https://fd00::5:6443 does not parse)" \
+  grep -qx '        server: https://\[fd00::5\]:6443' "$NET_WORK/v6url/kube-proxy.yaml"
+
+# Golden: single-stack IPv4 output must stay byte-identical to what the
+# installer wrote before dual-stack support (apiserver/KCM ExecStart lines and
+# the rendered vendored manifests), for both --allow-service-external-ips states.
+GOLDEN_DIR="$DIR/testdata/install-golden-ipv4"
+GOLDEN_OUT="$NET_WORK/golden"
+mkdir -p "$GOLDEN_OUT" "$NET_WORK/golden-man"
+cp "$ROOT_DIR"/manifests/*.yaml "$NET_WORK/golden-man/"
+golden_scenario='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10
+BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; APISERVER_LISTEN=192.168.1.5:6443; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.1
+validate_network_config 0 || exit 1
+KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
+'
+for allow in 0 1; do
+  golden_scenario+="ALLOW_SERVICE_EXTERNAL_IPS=$allow
+"
+  for unit in apiserver kcm; do
+    golden_scenario+="eval \"cat <<EOF
+$(awk -v u="$unit" '$0 == "cat > /etc/systemd/system/u7s-" u ".service <<EOF" {p=1; next} p && /^EOF$/ {exit} p && /^ExecStart=/ {print}' "$INSTALL")
+EOF\" > \"$GOLDEN_OUT/u7s-$unit.allow$allow.ExecStart\"
+"
+  done
+done
+golden_scenario+="render_vendored_manifests \"$NET_WORK/golden-man\" || exit 1
+cp \"$NET_WORK\"/golden-man/{flannel,kube-proxy,beep,coredns}.yaml \"$GOLDEN_OUT\"/
+"
+net_run "$golden_scenario"
+assert "the golden scenario ran (if this fails the byte-identity checks below test nothing)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$(ls "$GOLDEN_OUT" | wc -l)" -eq 8 ] && echo 1 || echo 0)"
+for gold in "$GOLDEN_DIR"/*; do
+  assert "single-stack IPv4 $(basename "$gold") is byte-identical to the pre-dual-stack installer output, so upgrading an existing cluster rewrites nothing" \
+    "$(cmp -s "$gold" "$GOLDEN_OUT/$(basename "$gold")" && echo 1 || echo 0)"
+done
+
+# ---------------------------------------------------------------------------
+# Node address list: --iface yields every global-scope family, --node-ip
+# overrides, the list reaches kubelet/apiserver/SANs, mismatches with the
+# cluster ranges fail loud.
+# ---------------------------------------------------------------------------
+IP_STUB='
+ip() {
+  cat <<IPOUT
+2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global dynamic eth0\       valid_lft 100sec preferred_lft 100sec
+2: eth0    inet 10.0.0.9/24 scope global secondary eth0\       valid_lft forever preferred_lft forever
+2: eth0    inet 169.254.1.2/16 scope link eth0\       valid_lft forever preferred_lft forever
+2: eth0    inet6 2001:db8::tmp/64 scope global temporary dynamic \       valid_lft 100sec preferred_lft 50sec
+2: eth0    inet6 2001:db8::dep/64 scope global deprecated \       valid_lft 100sec preferred_lft 0sec
+2: eth0    inet6 2001:db8::ten/64 scope global tentative \       valid_lft forever preferred_lft forever
+2: eth0    inet6 2001:db8::5/64 scope global dynamic mngtmpaddr \       valid_lft 100sec preferred_lft 50sec
+2: eth0    inet6 fe80::1/64 scope link \       valid_lft forever preferred_lft forever
+IPOUT
+}
+'
+net_run "$IP_STUB"'iface_global_addrs eth0 | paste -sd, -'
+assert "--iface yields the first global IPv4 then the stable global IPv6, skipping link-local/temporary/deprecated/tentative and secondary addresses (a rotating or unusable address as node identity breaks the node on rotation)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.0.0.5,2001:db8::5" ] && echo 1 || echo 0)"
+net_run 'ip() { echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\       valid_lft forever preferred_lft forever"; }
+iface_global_addrs eth0 | paste -sd, -'
+assert "a single-stack IPv4 interface yields exactly its one IPv4 address, as before" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.0.0.5" ] && echo 1 || echo 0)"
+
+net_run 'parse_node_ip_list "10.0.0.5,fd00::5" && echo "$NODE_IPS"'
+assert "--node-ip <v4>,<v6> is accepted verbatim, primary first" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.0.0.5,fd00::5" ] && echo 1 || echo 0)"
+net_run 'parse_node_ip_list "fd00::5,10.0.0.5" && echo "$NODE_IPS"'
+assert "--node-ip keeps the operator's order, so an IPv6-primary cluster is expressible" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00::5,10.0.0.5" ] && echo 1 || echo 0)"
+net_run 'parse_node_ip_list "10.0.0.5,10.0.0.6"'
+assert "--node-ip with two addresses of one family is rejected (kubelet takes at most one per family)" \
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'two IPv4' && echo 1 || echo 0)"
+net_run 'parse_node_ip_list "eth0"'
+assert "--node-ip rejects a non-IP such as an interface name instead of baking it into unit files" \
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'not a literal' && echo 1 || echo 0)"
+net_run 'parse_node_ip_list "10.0.0.5,"'
+assert "--node-ip rejects an empty list entry" \
+  "$([ "$NET_STATUS" -ne 0 ] && echo 1 || echo 0)"
+
+# The real derivation block and the real unit ExecStart lines, run with a
+# dual-stack and an IPv6-primary node.
+NODE_DERIVE="$(awk '/^if \[ -n "\$NODE_IP" \]; then$/,/^\[ "\$NODE_IPS" = "\$IFACE_IP" \]/' "$INSTALL")"
+NODE_UNITS="$(grep -E '^ExecStart=.*(--node-ip=|u7s-apiserver)' "$INSTALL")"
+node_scenario() {
+  printf '%s\nWORKER_MODE=0; IFACE=eth0; NODE_NAME=n1; BIN_DIR=/b; STATE_DIR=/s; KUBELET_ROUND2_FLAGS=""; ALLOW_SERVICE_EXTERNAL_IPS=0; CLUSTER_DNS=%s\n%s\nvalidate_network_config 0 || exit 1\nCLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"\n%s\neval "cat <<EOF\n%s\nEOF"\n' \
+    "$IP_STUB" "$3" "$1" "$NODE_DERIVE" "$NODE_UNITS"
+  : "$2"
+}
+DUAL_RANGES='NODE_IP=""; NODE_IPS_EXPLICIT=0; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56'
+net_run "$(node_scenario "$DUAL_RANGES" "" 10.96.0.10)"
+assert "a dual-stack interface puts both families in kubelet --node-ip (control plane and worker units)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$(echo "$NET_OUT" | grep -c -- '--node-ip=10.0.0.5,2001:db8::5 ')" -eq 2 ] && echo 1 || echo 0)"
+assert "the apiserver advertises the primary IPv4 address and carries the IPv6 address in the serving-cert SANs (a client dialling the node's IPv6 address would otherwise fail TLS verification)" \
+  "$(echo "$NET_OUT" | grep -q -- '--advertise-address https://10.0.0.5:6443 --apiserver-cert-extra-sans 2001:db8::5 ' && echo 1 || echo 0)"
+V6_PRIMARY='NODE_IP="fd00::5,10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16'
+net_run "$(node_scenario "$V6_PRIMARY" "" fd00:96::a)"
+assert "an IPv6 primary address is bracketed in --listen and --advertise-address (an unbracketed v6 host:port does not parse)" \
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--listen \[fd00::5\]:6443,10.0.0.5:6443 --advertise-address https://\[fd00::5\]:6443 --apiserver-cert-extra-sans 10.0.0.5 ' && echo 1 || echo 0)"
+SINGLE='NODE_IP="10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
+net_run "$(node_scenario "$SINGLE" "" 10.96.0.10)"
+assert "a single-stack --node-ip yields a single --node-ip address, one --listen address and no extra-SANs flag (single-stack unit output is unchanged)" \
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--node-ip=10.0.0.5 ' && echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q 'extra-sans' && echo 1 || echo 0)"
+net_run "$(node_scenario "$DUAL_RANGES" "" 10.96.0.10)"
+assert "a dual-stack node's apiserver listens on every node address, not only the primary (the cert and kubelet advertise both, so an unbound family is unreachable), and never on a wildcard" \
+  "$(echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443,\[2001:db8::5\]:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q -- '--listen 0.0.0.0\|--listen \[::\]' && echo 1 || echo 0)"
+net_run "$(node_scenario "$DUAL_RANGES"$'\nip() { echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\\\       valid_lft forever preferred_lft forever"; }' "" 10.96.0.10)"
+assert "dual-stack ranges on a single-family interface abort the install flow itself (not just the helper)" \
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv6 address' && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Node-address x cluster-family matrix, through the real derivation block for
+# both roles. A control plane learns the families from its ranges; a worker
+# from the published u7s-cluster-config. Both must end in a --node-ip whose first address
+# has the cluster's primary family, or a clear error.
+# ---------------------------------------------------------------------------
+V4A=10.0.0.5; V6A=2001:db8::5
+# The u7s-cluster-config ConfigMap a control plane with these families
+# publishes (same values the apiserver's cluster_config_data tests pin).
+cluster_config_json() {
+  local svc pod dns
+  case "$1" in
+    4) svc=10.96.0.0/12; pod=10.244.0.0/16; dns=10.96.0.10 ;;
+    4,6) svc=10.96.0.0/12,fd00:96::/108; pod=10.244.0.0/16,fd00:244::/56; dns=10.96.0.10,fd00:96::a ;;
+    6,4) svc=fd00:96::/108,10.96.0.0/12; pod=fd00:244::/56,10.244.0.0/16; dns=fd00:96::a,10.96.0.10 ;;
+    6) svc=fd00:96::/108; pod=fd00:244::/56; dns=fd00:96::a ;;
+  esac
+  jq -n -c --arg s "$svc" --arg p "$pod" --arg d "$dns" '{data: {serviceCIDRs: $s, podCIDRs: $p, clusterDNS: $d}}'
+}
+cell_scenario() {
+  local role="$1" iface="$2" mode="$3" fams="$4" node_ip="" ranges
+  case "$mode:$iface" in
+    a:*) ;;
+    e:v4) node_ip="$V4A" ;;
+    e:v6) node_ip="$V6A" ;;
+    e:d46) node_ip="$V4A,$V6A" ;;
+    e:d64) node_ip="$V6A,$V4A" ;;
+  esac
+  printf 'ip() {\n'
+  case "$iface" in v4|d46|d64) printf '  echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\\\       valid_lft forever preferred_lft forever"\n' ;; esac
+  case "$iface" in v6|d46|d64) printf '  echo "2: eth0    inet6 2001:db8::5/64 scope global eth0\\\\       valid_lft forever preferred_lft forever"\n' ;; esac
+  printf '}\nIFACE=eth0; NODE_IP="%s"; NODE_IPS_EXPLICIT=0; BIN_DIR=/b\n' "$node_ip"
+  if [ "$role" = cp ]; then
+    case "$fams" in
+      4) ranges='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10' ;;
+      4,6) ranges='SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; CLUSTER_DNS=10.96.0.10' ;;
+      6,4) ranges='SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a' ;;
+      6) ranges='SERVICE_CIDR=fd00:96::/108; POD_CLUSTER_CIDR=fd00:244::/56; CLUSTER_DNS=fd00:96::a' ;;
+    esac
+    printf 'WORKER_MODE=0; %s\nvalidate_network_config 0 || exit 1\nCLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"\n' "$ranges"
+  else
+    printf 'WORKER_MODE=1\ncurl() { printf "%%s" %q; }\nfetch_cluster_config abcdef.0123456789abcdef || exit 1\nvalidate_network_config 1 || exit 1\n' "$(cluster_config_json "$fams")"
+  fi
+  printf '%s\necho "RESULT:$NODE_IPS"\n' "$NODE_DERIVE"
+}
+# iface mode families expected (an ERR:<text> row must fail with <text>)
+MATRIX_ROWS="
+v4 a 4 $V4A
+v4 a 4,6 ERR:no IPv6 address
+v4 a 6,4 ERR:no IPv6 address
+v4 a 6 ERR:no IPv6 address
+v6 a 4 ERR:no IPv4 address
+v6 a 4,6 ERR:no IPv4 address
+v6 a 6,4 ERR:no IPv4 address
+v6 a 6 $V6A
+d46 a 4 $V4A
+d46 a 4,6 $V4A,$V6A
+d46 a 6,4 $V6A,$V4A
+d46 a 6 $V6A
+v4 e 4 $V4A
+v4 e 4,6 ERR:no IPv6 address
+v4 e 6,4 ERR:no IPv6 address
+v6 e 4 ERR:no IPv4 address
+v6 e 4,6 ERR:no IPv4 address
+v6 e 6,4 ERR:no IPv4 address
+v6 e 6 $V6A
+d46 e 4 ERR:no IPv6 range
+d46 e 4,6 $V4A,$V6A
+d46 e 6,4 ERR:lists an IPv4 address first
+d46 e 6 ERR:no IPv4 range
+d64 e 4 ERR:no IPv6 range
+d64 e 4,6 ERR:lists an IPv6 address first
+d64 e 6,4 $V6A,$V4A
+d64 e 6 ERR:no IPv4 range
+"
+MATRIX_TOTAL=0; MATRIX_OK=0
+for role in cp worker; do
+  while read -r m_iface m_mode m_fams m_expect_rest; do
+    [ -n "$m_iface" ] || continue
+    MATRIX_TOTAL=$(( MATRIX_TOTAL + 1 ))
+    net_run "$(cell_scenario "$role" "$m_iface" "$m_mode" "$m_fams")"
+    m_ok=0
+    case "$m_expect_rest" in
+      ERR:*) [ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- "${m_expect_rest#ERR:}" && m_ok=1 ;;
+      *) [ "$NET_STATUS" -eq 0 ] && [ "$(printf '%s' "$NET_OUT" | grep '^RESULT:')" = "RESULT:$m_expect_rest" ] && m_ok=1 ;;
+    esac
+    [ "$m_ok" -eq 1 ] && MATRIX_OK=$(( MATRIX_OK + 1 ))
+    assert "$role, iface=$m_iface, node-ip mode=$m_mode, cluster families=$m_fams -> $m_expect_rest (a node whose first address is not the cluster's primary family, or which lacks/has a surplus family, must be rebuilt or refused, never registered as-is)" "$m_ok"
+  done <<< "$MATRIX_ROWS"
+done
+echo "cells: $MATRIX_OK/$MATRIX_TOTAL"
+
+for fail_code in 403 404; do
+  net_run 'curl() { echo "curl: (22) The requested URL returned error: '"$fail_code"'" >&2; return 22; }
+CLUSTER_FAMILIES=untouched; fetch_cluster_config abcdef.0123456789abcdef; echo "STATUS:$? FAMILIES:$CLUSTER_FAMILIES"'
+  assert "a $fail_code reading u7s-cluster-config fails the join naming the ConfigMap (never a silent default to IPv4, which would leave a dual-stack node single-stack)" \
+    "$(printf '%s' "$NET_OUT" | grep -qF 'kube-system/u7s-cluster-config' && printf '%s' "$NET_OUT" | grep -qF "returned error: $fail_code" && printf '%s' "$NET_OUT" | grep -qF 'STATUS:1 FAMILIES:untouched' && echo 1 || echo 0)"
+done
+net_run 'curl() { printf "%s" "{\"data\":{\"podCIDRs\":\"10.244.0.0/16\"}}"; }
+fetch_cluster_config abcdef.0123456789abcdef'
+assert "a ConfigMap without serviceCIDRs/clusterDNS fails the join instead of guessing families" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'refusing to guess' && echo 1 || echo 0)"
+net_run 'curl() { printf "%s\n" "$@" > "$STATE_DIR_ARGV"; printf "%s" "{\"data\":{\"serviceCIDRs\":\"10.96.0.0/12\",\"clusterDNS\":\"10.96.0.10\"}}"; }
+STATE_DIR_ARGV='"$NET_WORK"'/argv; fetch_cluster_config abcdef.0123456789abcdef; cat "$STATE_DIR_ARGV"; echo "FAM:$CLUSTER_FAMILIES DNS:$CLUSTER_DNS"'
+assert "the ConfigMap is read over TLS pinned to the discovered CA and with the token off argv (an unverified or argv-visible read would leak the join token to a MITM or ps)" \
+  "$(printf '%s' "$NET_OUT" | grep -qxF -- '--cacert' && printf '%s' "$NET_OUT" | grep -qF "/var/lib/u7s/ca.pem" && ! printf '%s' "$NET_OUT" | grep -qE -- '^-[a-zA-Z]*k$|^--insecure$|abcdef\.0123456789abcdef' && printf '%s' "$NET_OUT" | grep -qF 'https://cp.example:6443/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config' && echo 1 || echo 0)"
+UNKNOWN_FLAG_OK=1
+for removed in --cluster-ip-families; do
+  removed_out="$(bash "$INSTALL" "$removed" 4 2>&1)" || true
+  printf '%s' "$removed_out" | grep -qF "unknown argument: $removed" || UNKNOWN_FLAG_OK=0
+done
+assert "--cluster-ip-families is gone: a worker's families come from the cluster, and a flag that could contradict it would silently re-create the single-stack-on-dual-stack bug" \
+  "$UNKNOWN_FLAG_OK"
+assert "a worker refuses --cluster-dns, --service-cidr and --cluster-cidr instead of letting them contradict the cluster's published values" \
+  "$(grep -qF '[ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]' "$INSTALL" && grep -qF 'a joining or already-joined worker reads them from the cluster' "$INSTALL" && echo 1 || echo 0)"
+assert "a worker validates the families it derived from the cluster, and rejects a malformed set instead of guessing" \
+  "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'must be one of' && echo 1 || echo 0)"
+net_run 'cluster_families_from_cidrs "fd00:96::/108,10.96.0.0/12" "10.244.0.0/16"'
+assert "families are the Service ranges' families in order (the primary Service range decides the node's primary family)" \
+  "$([ "$NET_OUT" = "6,4" ] && echo 1 || echo 0)"
+net_run 'cluster_families_from_cidrs "10.96.0.0/12" "10.244.0.0/16,fd00:244::/56"'
+assert "a family only the pod ranges use still counts, after the Service families (pods need a node address of it)" \
+  "$([ "$NET_OUT" = "4,6" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # wait_for_cluster_ready: install must not exit 0 while the node or a

@@ -34,8 +34,44 @@ impl std::fmt::Debug for StatusError {
     }
 }
 
+/// Private marker in `details`, set only by `Status::internal_actionable` and stripped
+/// before the response is serialized.
+const ACTIONABLE_KEY: &str = "u7sActionable";
+
+fn is_actionable(status: &Status) -> bool {
+    status
+        .details
+        .as_ref()
+        .is_some_and(|d| d.get(ACTIONABLE_KEY).is_some())
+}
+
+/// Generic client-facing body for a 500/502 `Status`, or `None` when the status carries a
+/// message meant for the client. Internal errors embed store keys, sqlite and TLS/dial
+/// errors with internal addresses; those go to the server log, never the response.
+/// Only a 500 built by `Status::internal_actionable` (which sets `ACTIONABLE_KEY`) is exempt.
+fn redacted_message(status: &Status) -> Option<&'static str> {
+    match (status.code, status.reason) {
+        (500, "InternalError") if is_actionable(status) => None,
+        (500, "InternalError") => Some("Internal error occurred"),
+        (502, "BadGateway") => Some("Bad Gateway"),
+        _ => None,
+    }
+}
+
 impl IntoResponse for StatusError {
-    fn into_response(self) -> Response {
+    fn into_response(mut self) -> Response {
+        if let Some(generic) = redacted_message(&self.1) {
+            // Logged inside the request span, so `request_id` (echoed as x-request-id) is attached.
+            tracing::error!(
+                code = self.1.code,
+                reason = self.1.reason,
+                detail = %self.1.message,
+                "request failed with a server error"
+            );
+            self.1.message = generic.to_owned();
+        } else if let Some(d) = self.1.details.as_mut().and_then(|d| d.as_object_mut()) {
+            d.remove(ACTIONABLE_KEY);
+        }
         let retry_after = self
             .1
             .details
@@ -286,6 +322,19 @@ impl Status {
         )
     }
 
+    /// Upstream `NewInternalError` shape (`Internal error occurred: <cause>` plus
+    /// `details.causes`) whose message reaches the client unredacted. Only for text that is
+    /// actionable and built from user-supplied config (webhook name, CRD content), never from
+    /// store, sqlite, TLS or dial errors.
+    pub fn internal_actionable(cause: String) -> StatusError {
+        let mut err = Status::internal(format!("Internal error occurred: {cause}"));
+        err.1.details = Some(Box::new(serde_json::json!({
+            "causes": [{"message": cause}],
+            ACTIONABLE_KEY: true
+        })));
+        err
+    }
+
     pub fn request_entity_too_large(message: String) -> StatusError {
         StatusError(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -467,6 +516,118 @@ impl Status {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    async fn body_message(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["message"].as_str().unwrap().to_owned()
+    }
+
+    // A 500 built from a store/sqlite error must not reach the client (key layout, SQL
+    // messages) but must reach the server log, or operators cannot diagnose it.
+    #[tokio::test]
+    async fn internal_error_body_is_generic_and_detail_is_logged() {
+        crate::test_utils::tracing_capture::install_global_test_subscriber();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = crate::test_utils::tracing_capture::TestBufferGuard::new(buf.clone());
+
+        let resp = {
+            let span = tracing::info_span!("request", request_id = "req-redact-1");
+            let _entered = span.enter();
+            Status::internal(
+                "sqlite error: no such table; key not found: /registry/secrets/x".into(),
+            )
+            .into_response()
+        };
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let msg = body_message(resp).await;
+        assert_eq!(msg, "Internal error occurred");
+
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("sqlite error: no such table; key not found: /registry/secrets/x"),
+            "the redacted detail must be logged server-side: {log}"
+        );
+        assert!(
+            log.contains("request_id=\"req-redact-1\""),
+            "the log line must carry the request_id echoed as x-request-id, or an operator \
+             cannot find the detail behind a client-reported failure: {log}"
+        );
+    }
+
+    // An operator debugging a failing failurePolicy=Fail webhook must see which webhook
+    // failed; the generic body would leave them guessing across every configured webhook.
+    #[tokio::test]
+    async fn internal_actionable_keeps_message_and_causes_for_the_client() {
+        let resp = Status::internal_actionable(
+            "failed calling webhook \"deny.example.com\": failed to call webhook".into(),
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["reason"], "InternalError",
+            "clients match IsInternalError"
+        );
+        assert_eq!(
+            v["message"],
+            "Internal error occurred: failed calling webhook \"deny.example.com\": failed to call webhook"
+        );
+        assert_eq!(
+            v["details"]["causes"][0]["message"],
+            "failed calling webhook \"deny.example.com\": failed to call webhook"
+        );
+        assert!(
+            v["details"].get(ACTIONABLE_KEY).is_none(),
+            "the internal marker must not leak into the response"
+        );
+    }
+
+    // A future 500 that merely carries details.causes (e.g. built from a store error) must
+    // stay redacted; only the explicit constructor opts out.
+    #[tokio::test]
+    async fn internal_error_with_causes_built_otherwise_stays_redacted() {
+        let mut err = Status::internal("sqlite: disk I/O error at /var/lib/u7s/db".into());
+        err.1.details = Some(Box::new(serde_json::json!({
+            "causes": [{"message": "sqlite: disk I/O error at /var/lib/u7s/db"}]
+        })));
+        assert_eq!(
+            body_message(err.into_response()).await,
+            "Internal error occurred"
+        );
+    }
+
+    // The pod-log proxy's 502 embeds the kubelet dial/TLS error with internal addresses.
+    #[tokio::test]
+    async fn bad_gateway_body_is_generic() {
+        let resp = StatusError(
+            StatusCode::BAD_GATEWAY,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message: "kubelet request failed: tls handshake with 10.0.0.7:10250".into(),
+                reason: "BadGateway",
+                code: 502,
+                metadata: None,
+                details: None,
+            },
+        )
+        .into_response();
+        assert_eq!(body_message(resp).await, "Bad Gateway");
+    }
+
+    // 4xx messages are for the client (validation errors etc.) and must stay intact.
+    #[tokio::test]
+    async fn client_error_messages_are_not_redacted() {
+        let resp = Status::bad_request("spec.replicas: Invalid value".into()).into_response();
+        assert_eq!(body_message(resp).await, "spec.replicas: Invalid value");
+    }
 
     // Upstream's NotFound carries details{name, group, kind=lowercase plural resource};
     // clients (kubectl, client-go retries keyed on the missing object) read them instead of

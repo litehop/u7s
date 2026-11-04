@@ -5,7 +5,7 @@ This file is bundled inside every u7s release tarball (see
 alongside `u7s-apiserver` and `u7s-scheduler`, independent of whatever license
 u7s itself ultimately adopts.
 
-## Kubernetes (`kubelet`, `kube-controller-manager`)
+## Kubernetes (`kubelet`, `kube-controller-manager`, `kubectl`)
 
 - Project: [kubernetes/kubernetes](https://github.com/kubernetes/kubernetes)
 - License: Apache License, Version 2.0
@@ -19,6 +19,18 @@ u7s itself ultimately adopts.
   the license text itself.
 
 No changes were made to these binaries; they are redistributed as-is.
+
+## CNI plugins (`bridge`, `host-local`, `loopback`, `portmap`)
+
+- Project: [containernetworking/plugins](https://github.com/containernetworking/plugins)
+- License: Apache License, Version 2.0
+- Bundled unmodified from the upstream release tarball
+  `cni-plugins-linux-amd64-v<CNI_PLUGINS_VERSION>.tgz`, at the version and
+  SHA-256 pinned in `scripts/build-release-tarball.sh`. Only the four plugins
+  above are included.
+- The repository ships a `LICENSE` file (the text reproduced below) and no
+  `NOTICE` file, so no additional attribution notice is required under
+  Apache-2.0 section 4(d).
 
 ## Apache License, Version 2.0
 

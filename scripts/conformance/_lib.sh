@@ -290,3 +290,295 @@ apply_pod_recreating_on_args_change() {
     return 1
   }
 }
+
+# Restarts the kubelet in <vm> so Lima's port-forward watcher sees guest port
+# 10250 go away and come back as two separate events. A plain `systemctl
+# restart` unbinds and rebinds inside one scan; the hostagent then handles the
+# "removed" after the "added" and closes the host listener it just opened,
+# leaving the kubelet's host port dead while the node still reports Ready.
+restart_kubelet_spaced() {
+  local vm="$1" i
+  limactl shell "$vm" sudo systemctl stop kubelet
+  for i in $(seq 1 15); do
+    limactl shell "$vm" sh -c 'ss -Hltn "sport = :10250" | grep -q .' || break
+    sleep 1
+  done
+  sleep "${KUBELET_PORT_SETTLE_SECS:-6}"
+  limactl shell "$vm" sudo systemctl start kubelet
+}
+
+# Probes the real apiserver->kubelet path (apiserver -> host kubelet port ->
+# Lima forward -> kubelet) for <node>. Node Ready does not prove it: the
+# kubelet reports to the apiserver over the other direction.
+kubelet_path_ok() {
+  local kubeconfig="$1" node="$2" i
+  for i in $(seq 1 "${3:-30}"); do
+    kubectl --kubeconfig="$kubeconfig" get --raw "/api/v1/nodes/${node}/proxy/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Args: <kubeconfig> <node=hostport>... Fails loud, naming node and host port,
+# when any node's kubelet path stays dead after one spaced kubelet restart
+# (which makes Lima re-create the host forward). Node name equals VM name.
+verify_kubelet_paths() {
+  local kubeconfig="$1" pair node port rc=0
+  shift
+  for pair in "$@"; do
+    node="${pair%%=*}"
+    port="${pair#*=}"
+    if kubelet_path_ok "$kubeconfig" "$node"; then
+      echo "kubelet path OK: apiserver -> $node (host port $port)"
+      continue
+    fi
+    echo "WARNING: apiserver cannot reach kubelet on $node via host port $port; restarting the kubelet so Lima re-creates the forward." >&2
+    restart_kubelet_spaced "$node" || true
+    if kubelet_path_ok "$kubeconfig" "$node" 60; then
+      echo "kubelet path OK after re-establishing the forward: apiserver -> $node (host port $port)"
+    else
+      echo "ERROR: apiserver->kubelet path to node $node is dead (host port 127.0.0.1:$port); logs/exec/attach would fail with 502. Check 'lsof -nP -iTCP:$port -sTCP:LISTEN' and the VM's ha.stderr.log." >&2
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# --- Opt-in dual-stack rig (--dual-stack) -----------------------------------
+# Lima's user-v2 switch forwards IPv6 unicast between VMs but hands out no
+# routable v6 address (no RA/DHCPv6) and drops the multicast NDP that would
+# resolve neighbours. So every VM gets a static ULA out of ONE shared /64 plus
+# a permanent neighbour entry per peer, re-applied at boot by a oneshot unit.
+
+LAN_V6_PREFIX="fd85:0:0:1"
+
+# Host id inside the shared /64, unique per rig VM name. Fails (non-zero) for
+# names it cannot place so two VMs never silently share an address.
+lan_v6_host_for() {
+  case "$1" in
+    lima-node) echo 1 ;;
+    lima-node-smoke) echo 100 ;;
+    lima-node-[0-9]*)
+      local n="${1#lima-node-}"
+      case "$n" in *[!0-9]*) return 1 ;; esac
+      echo "$n" ;;
+    *) return 1 ;;
+  esac
+}
+
+lan_v6_addr_for() {
+  local host
+  host=$(lan_v6_host_for "$1") || return 1
+  echo "${LAN_V6_PREFIX}::${host}"
+}
+
+# Script body run at boot: own address plus one permanent neighbour per peer.
+# Args: <iface> <self-addr> [<peer-addr> <peer-mac>]...
+lan_v6_script() {
+  local iface="$1" self="$2" svc_v6
+  shift 2
+  svc_v6=$(rig_service_cidr_v6) || return 1
+  echo "#!/bin/sh"
+  echo "ip -6 addr replace ${self}/64 dev ${iface} nodad"
+  # Lima VMs have no default v6 route (no RA), so locally originated traffic to
+  # a v6 ClusterIP dies with ENETUNREACH before kube-proxy's OUTPUT DNAT runs.
+  echo "ip -6 route replace ${svc_v6} dev lo"
+  while [ "$#" -ge 2 ]; do
+    echo "ip -6 neigh replace $1 lladdr $2 dev ${iface} nud permanent"
+    shift 2
+  done
+}
+
+lan_v6_vm_iface() {
+  limactl shell "$1" ip -4 -o addr show scope global 2>/dev/null | awk '{print $2}' | sed -n 1p
+}
+
+# Installs the boot unit on <vm> and applies it now. Idempotent: rewrites both
+# files and restarts the unit, so a re-run converges on the given peer set.
+# Args: <vm> <iface> <self-addr> [<peer-addr> <peer-mac>]...
+lan_v6_install() {
+  local vm="$1"
+  shift
+  lan_v6_script "$@" | limactl shell "$vm" sudo tee /usr/local/sbin/u7s-lan-v6 >/dev/null
+  limactl shell "$vm" sudo chmod 0755 /usr/local/sbin/u7s-lan-v6
+  limactl shell "$vm" sudo tee /etc/systemd/system/u7s-lan-v6.service >/dev/null <<'UNIT'
+[Unit]
+Description=u7s dual-stack rig: static ULA and neighbour entries on the user-v2 NIC
+After=network-online.target systemd-networkd.service
+Wants=network-online.target
+PartOf=systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/u7s-lan-v6
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  limactl shell "$vm" sudo systemctl daemon-reload
+  limactl shell "$vm" sudo systemctl enable u7s-lan-v6.service >/dev/null 2>&1
+  limactl shell "$vm" sudo systemctl restart u7s-lan-v6.service
+}
+
+# Full-mesh seeding across the given running VMs (all on one Lima network).
+lan_v6_seed_mesh() {
+  local vms=("$@") ifaces=() macs=() addrs=() i j args
+  for i in "${!vms[@]}"; do
+    ifaces[i]=$(lan_v6_vm_iface "${vms[$i]}")
+    [ -n "${ifaces[$i]}" ] || { echo "error: no global IPv4 NIC on ${vms[$i]}" >&2; return 1; }
+    addrs[i]=$(lan_v6_addr_for "${vms[$i]}") || { echo "error: no dual-stack host id for ${vms[$i]}" >&2; return 1; }
+    macs[i]=$(limactl shell "${vms[$i]}" cat "/sys/class/net/${ifaces[$i]}/address")
+  done
+  for i in "${!vms[@]}"; do
+    args=("${vms[$i]}" "${ifaces[$i]}" "${addrs[$i]}")
+    for j in "${!vms[@]}"; do
+      [ "$i" = "$j" ] && continue
+      args+=("${addrs[$j]}" "${macs[$j]}")
+    done
+    lan_v6_install "${args[@]}"
+  done
+}
+
+# Dual-stack pod/Service ranges, as scripts/install.sh documents them
+# (--cluster-cidr 10.244.0.0/16,fd00:244::/56, --service-cidr
+# 10.96.0.0/12,fd00:96::/108; kube-dns is the tenth host of each range).
+# Single-stack rigs keep the IPv4 values.
+RIG_POD_CIDR_V4="10.244.0.0/16"
+RIG_POD_CIDR_V6="fd00:244::/56"
+RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
+RIG_SERVICE_CIDR_V4="10.96.0.0/12"
+
+# The Service CIDR(s) the apiserver actually runs with, as run-all.sh exports
+# them so lima-start.sh/add-node.sh see a custom --service-cidr. Arg: 1 for
+# dual-stack.
+rig_effective_service_cidr() {
+  if [ "$1" -eq 1 ]; then echo "${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_DUAL}"; else echo "${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_V4}"; fi
+}
+
+# Prints the IPv6 member of a comma-separated Service CIDR list (either order).
+# Args: [<cidr-list>] (default $RIG_SERVICE_CIDR, else the dual default).
+# Fails when there is none.
+rig_service_cidr_v6() {
+  local part list="${1:-${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_DUAL}}"
+  local IFS=,
+  for part in $list; do
+    case "$part" in *:*) echo "$part"; return 0 ;; esac
+  done
+  echo "error: --dual-stack needs an IPv6 Service CIDR, got '$list'" >&2
+  return 1
+}
+
+# Prints the tenth host of a CIDR (kube-dns's VIP: upstream/kubeadm
+# convention, and what the apiserver derives when --kube-dns-cluster-ip is
+# unset). Fails when the range has fewer than 4 host bits, so the tenth host
+# would not be allocatable. Arg: <cidr>.
+rig_cidr_tenth_host() {
+  local cidr="$1" addr="${1%/*}" plen="${1#*/}"
+  if [ "$addr" = "$cidr" ] || ! [[ "$plen" =~ ^[0-9]+$ ]]; then
+    echo "error: '$cidr' is not a CIDR" >&2; return 1
+  fi
+  case "$addr" in
+    *:*)
+      [ "$plen" -le 124 ] || { echo "error: Service CIDR '$cidr' is too small to contain a tenth host" >&2; return 1; }
+      local IFS=: h i x nt=0
+      local -a w=()
+      if [[ "$addr" == *::* ]]; then
+        for x in ${addr%%::*}; do w+=("$x"); done
+        for x in ${addr#*::}; do nt=$((nt + 1)); done
+        while [ "${#w[@]}" -lt $((8 - nt)) ]; do w+=(0); done
+        for x in ${addr#*::}; do w+=("$x"); done
+      else
+        for x in $addr; do w+=("$x"); done
+      fi
+      [ "${#w[@]}" -eq 8 ] || { echo "error: '$cidr' is not a valid IPv6 CIDR" >&2; return 1; }
+      local -a out=()
+      for i in 0 1 2 3 4 5 6 7; do
+        h=$((16#${w[$i]:-0} & 0xffff))
+        local fixed=$((plen - 16 * i)); [ "$fixed" -gt 0 ] || fixed=0; [ "$fixed" -lt 16 ] || fixed=16
+        out+=($((h & (0xffff << (16 - fixed) & 0xffff))))
+      done
+      out[7]=$((out[7] + 10))
+      # RFC 5952: compress the longest run (>=2) of zero hextets, leftmost on a tie.
+      local best=-1 bestlen=1 run=0 start=0
+      for i in 0 1 2 3 4 5 6 7; do
+        if [ "${out[$i]}" -eq 0 ]; then
+          [ "$run" -gt 0 ] || start=$i
+          run=$((run + 1))
+          if [ "$run" -gt "$bestlen" ]; then best=$start; bestlen=$run; fi
+        else
+          run=0
+        fi
+      done
+      local s="" sep=""
+      for i in 0 1 2 3 4 5 6 7; do
+        if [ "$i" -eq "$best" ]; then s+="::"; sep=""; continue; fi
+        if [ "$best" -ge 0 ] && [ "$i" -gt "$best" ] && [ "$i" -lt $((best + bestlen)) ]; then continue; fi
+        s+="$sep$(printf '%x' "${out[$i]}")"; sep=":"
+      done
+      echo "$s" ;;
+    *)
+      [ "$plen" -le 28 ] || { echo "error: Service CIDR '$cidr' is too small to contain a tenth host" >&2; return 1; }
+      local a b c d
+      IFS=. read -r a b c d <<< "$addr"
+      local n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+      n=$(( (n & ((0xffffffff << (32 - plen)) & 0xffffffff)) + 10 ))
+      echo "$(( n >> 24 & 255 )).$(( n >> 16 & 255 )).$(( n >> 8 & 255 )).$(( n & 255 ))" ;;
+  esac
+}
+
+# Prints the kube-dns VIP of every family in a comma-separated Service CIDR
+# list, one per line, in list order (the first is the Service's clusterIP and
+# the kubelet's first clusterDNS). Arg: <cidr-list>.
+rig_kube_dns_ips() {
+  local part ip
+  local IFS=,
+  for part in $1; do
+    ip=$(rig_cidr_tenth_host "$part") || return 1
+    echo "$ip"
+  done
+}
+
+# KCM pod-CIDR flags. Upstream rejects --node-cidr-mask-size with two cluster
+# CIDRs and wants one flag per family (install.sh kcm_node_cidr_mask_flags).
+# Arg: 1 for dual-stack.
+rig_kcm_cidr_flags() {
+  if [ "$1" -eq 1 ]; then
+    echo "--cluster-cidr=${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6} --node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64"
+  else
+    echo "--cluster-cidr=${RIG_POD_CIDR_V4} --node-cidr-mask-size=24"
+  fi
+}
+
+# kube-proxy clusterCIDR value. Arg: 1 for dual-stack.
+rig_kube_proxy_cluster_cidr() {
+  if [ "$1" -eq 1 ]; then echo "${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6}"; else echo "${RIG_POD_CIDR_V4}"; fi
+}
+
+# Renders manifests/flannel.yaml (stdin to stdout) like install.sh: the
+# IPv6Network line survives only on dual-stack. Args: <iface> <1 if dual-stack>.
+rig_render_flannel() {
+  local v6=(-e '/"IPv6Network"/d')
+  [ "$2" -eq 1 ] && v6=(-e "s#__POD_CLUSTER_CIDR_IPV6__#${RIG_POD_CIDR_V6}#g")
+  sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" "${v6[@]}"
+}
+
+# Renders manifests/coredns.yaml (stdin to stdout): the Service's clusterIP is
+# the first family's kube-dns VIP, and a dual-stack Service lists one VIP per
+# family with PreferDualStack, as install.sh does. Arg: <service-cidr-list>.
+rig_render_coredns() {
+  local -a ips
+  local lines vip
+  lines=$(rig_kube_dns_ips "$1") || return 1
+  while IFS= read -r vip; do ips+=("$vip"); done <<< "$lines"
+  local repl="  clusterIP: ${ips[0]}"
+  if [ "${#ips[@]}" -gt 1 ]; then
+    repl+="\\
+  clusterIPs:"
+    for vip in "${ips[@]}"; do repl+="\\
+  - ${vip}"; done
+    repl+="\\
+  ipFamilyPolicy: PreferDualStack"
+  fi
+  sed -e "s#^  clusterIP: 10.96.0.10\$#${repl}#"
+}

@@ -136,7 +136,7 @@ async fn delete_sentinel<S: Store>(store: &S, key: &str) {
     }
 }
 
-fn spec_ips(spec: &Value) -> BTreeSet<String> {
+pub(crate) fn spec_ips(spec: &Value) -> BTreeSet<String> {
     let mut ips = BTreeSet::new();
     let single = spec["clusterIP"].as_str().into_iter();
     let list = spec["clusterIPs"]
@@ -269,7 +269,7 @@ impl<S: Store> Reserver<'_, S> {
                 return Ok(port);
             }
         }
-        Err(Status::internal(
+        Err(Status::internal_actionable(
             "failed to allocate a nodePort: range is full".to_string(),
         ))
     }

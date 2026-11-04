@@ -438,7 +438,7 @@ pub async fn proxy_to_backend<S: Store>(
             .into_response();
         }
         Err(e) => {
-            return Status::internal(format!(
+            return Status::internal_actionable(format!(
                 "apiservice \"{version}.{group}\" has an invalid spec.service: {e}"
             ))
             .into_response();
@@ -539,7 +539,7 @@ pub async fn proxy_middleware<S: Store>(
             // spec.service is present but invalid (e.g. a crafted namespace/name breaking
             // out of the URL authority) -- reject outright, before reading the request body
             // or ever attempting to build/dial a URL from it.
-            return Status::internal(format!(
+            return Status::internal_actionable(format!(
                 "apiservice \"{version}.{group}\" has an invalid spec.service: {e}"
             ))
             .into_response();

@@ -37,6 +37,8 @@ fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io
         .truncate(true)
         .mode(0o600)
         .open(path)?;
+    // `mode` applies only on creation; tighten a pre-existing file before writing secrets.
+    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -557,7 +559,7 @@ fn advertise_host(advertise_address: Option<&str>) -> anyhow::Result<Option<Stri
 }
 
 /// Build the full SAN list for the server certificate.
-/// Always includes localhost, 127.0.0.1, host.lima.internal, and the kubernetes
+/// Always includes localhost, 127.0.0.1, ::1, host.lima.internal, and the kubernetes
 /// Service's ClusterIP derived from `--service-cluster-ip-range` (first host —
 /// same offset `bootstrap_service_ips` uses to seed the `default/kubernetes`
 /// Service, e.g. 10.96.0.1 for the default 10.96.0.0/12 range). In-cluster
@@ -573,6 +575,7 @@ fn build_server_sans(
     let mut sans: Vec<SanType> = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
         SanType::IpAddress(kubernetes_ip),
         SanType::DnsName("kubernetes".try_into()?),
@@ -581,13 +584,16 @@ fn build_server_sans(
         SanType::DnsName("kubernetes.default.svc.cluster.local".try_into()?),
     ];
     if let Some(host) = advertise_host_str {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            sans.push(SanType::IpAddress(ip));
-        } else {
-            sans.push(SanType::DnsName(host.try_into()?));
-        }
+        sans.push(host_san(host)?);
     }
     Ok(sans)
+}
+
+fn host_san(host: &str) -> anyhow::Result<SanType> {
+    Ok(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SanType::IpAddress(ip),
+        Err(_) => SanType::DnsName(host.try_into()?),
+    })
 }
 
 /// Serving config presenting the leaf and its signing intermediate (never the root: the root
@@ -718,10 +724,16 @@ fn generate_tls_with(
 
     // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
     // plus the advertise-address host if provided.
-    let sans = build_server_sans(
+    let mut sans = build_server_sans(
         advertise_host(args.advertise_address.as_deref())?.as_deref(),
         &args.service_cluster_ip_range,
     )?;
+    for host in &args.apiserver_cert_extra_sans {
+        let san = host_san(host)?;
+        if !sans.contains(&san) {
+            sans.push(san);
+        }
+    }
     let plans = vec![
         LeafPlan {
             name: SERVING_LEAF,
@@ -1213,7 +1225,7 @@ mod tests {
         let dir = test_temp_dir("args-with");
         Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -1229,8 +1241,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: advertise_address.map(str::to_owned),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -1426,6 +1440,25 @@ mod tests {
     }
 
     #[test]
+    fn server_sans_include_ipv6_loopback_and_primary_family_cluster_ip() {
+        let loopback6 = SanType::IpAddress("::1".parse().unwrap());
+        let sans = build_server_sans(None, "10.96.0.0/12").unwrap();
+        assert!(
+            sans.contains(&loopback6),
+            "a client dialing https://[::1]:6443 fails TLS verification without the ::1 SAN"
+        );
+        let sans = build_server_sans(None, "fd00:96::/108,10.96.0.0/12").unwrap();
+        assert!(
+            sans.contains(&SanType::IpAddress("fd00:96::1".parse().unwrap())),
+            "IPv6-primary cluster: in-cluster KUBERNETES_SERVICE_HOST is the v6 ClusterIP"
+        );
+        assert!(
+            !sans.contains(&SanType::IpAddress("10.96.0.1".parse().unwrap())),
+            "kubernetes Service is single-stack on the primary family; the secondary-family IP is not a valid host"
+        );
+    }
+
+    #[test]
     fn ca_key_is_loaded_not_regenerated() {
         // Write a CA key+cert to a temp dir, call generate_tls twice with that dir,
         // and verify the CA cert DER is identical — proving the CA was loaded rather
@@ -1436,7 +1469,7 @@ mod tests {
 
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -1452,8 +1485,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2123,7 +2158,7 @@ mod tests {
 
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2139,8 +2174,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2207,7 +2244,7 @@ mod tests {
         let dir = test_temp_dir("pqc-provider");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2223,8 +2260,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2272,7 +2311,7 @@ mod tests {
         let dir = test_temp_dir("kubeconfig-yaml");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2288,8 +2327,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -2852,7 +2893,7 @@ mod tests {
     fn extra_sans(advertise: &str) -> Vec<SanType> {
         let host = advertise_host(Some(advertise)).unwrap();
         let sans = build_server_sans(host.as_deref(), "10.96.0.0/12").unwrap();
-        sans[8..].to_vec()
+        sans[9..].to_vec()
     }
 
     /// An IPv6-literal advertise URL must yield an IP SAN; the old ':' split produced
@@ -2934,6 +2975,35 @@ mod tests {
         client.expect("client must validate the server cert for IPv6 literal fd00::1");
     }
 
+    /// A dual-stack node advertises its IPv4 address but is also dialled on its IPv6 one;
+    /// the extra SAN must make that handshake verify, not just the advertised address.
+    #[tokio::test]
+    async fn tls_handshake_succeeds_on_extra_san_address_not_advertised() {
+        let mut args = args_with(Some("https://10.0.0.5:6443"));
+        args.apiserver_cert_extra_sans = vec!["fd00::5".into()];
+        let tls = generate_tls(&args).expect("generate_tls");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                tls.ca_cert_der.clone(),
+            ))
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(tls.server_config.get());
+
+        let (c, s) = tokio::io::duplex(16 * 1024);
+        let name = rustls::pki_types::ServerName::IpAddress(
+            "fd00::5".parse::<std::net::Ipv6Addr>().unwrap().into(),
+        );
+        let (client, server) = tokio::join!(connector.connect(name, c), acceptor.accept(s));
+        server.expect("server handshake");
+        client.expect("client must validate the cert for the extra IPv6 SAN fd00::5");
+    }
+
     /// advertise_host must strip a bare port suffix even when no scheme is present.
     /// Operators may supply just "host:6443" without a scheme prefix.
     #[test]
@@ -2953,7 +3023,7 @@ mod tests {
         let kubeconfig_path = dir.join("kubeconfig");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -2969,8 +3039,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -3010,7 +3082,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -3026,8 +3098,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -3070,6 +3144,33 @@ mod tests {
         assert_eq!(
             actual, expected,
             "write_private_key must write the exact bytes provided"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// A key or kubeconfig left at 0644 by an earlier install or a stale `.tmp` is rewritten on
+    /// every start; if the mode were kept, a local user could read cluster-admin credentials.
+    #[test]
+    fn private_writers_tighten_preexisting_world_readable_files_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = test_temp_dir("key-preexisting-mode");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777; // lgtm[rust/path-injection]
+
+        let key = dir.join("sa.key");
+        std::fs::write(&key, b"old").unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap(); // lgtm[rust/path-injection]
+        write_private_key(&key, b"new").unwrap();
+        assert_eq!(mode(&key), 0o600, "existing 0644 key must become 0600");
+
+        let kc = dir.join("admin.kubeconfig");
+        let stale_tmp = dir.join("admin.kubeconfig.tmp");
+        std::fs::write(&stale_tmp, b"old").unwrap(); // lgtm[rust/path-injection]
+        std::fs::set_permissions(&stale_tmp, std::fs::Permissions::from_mode(0o666)).unwrap(); // lgtm[rust/path-injection]
+        replace_file(&kc.to_string_lossy(), b"secret", true).unwrap();
+        assert_eq!(
+            mode(&kc),
+            0o600,
+            "kubeconfig via stale 0666 .tmp must be 0600"
         );
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }

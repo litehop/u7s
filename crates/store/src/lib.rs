@@ -179,6 +179,9 @@ pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
 

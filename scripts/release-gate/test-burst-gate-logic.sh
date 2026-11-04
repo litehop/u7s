@@ -104,6 +104,7 @@ assert "host process classified by cgroup even if comm is unknown (e.g. renamed 
 # Experiment-flag parsing, with a stub limactl that fails every call so no VM is ever created;
 # gate.env is staged before the first VM and shows what the VM would receive.
 mkdir -p "$TMP/tb" "$TMP/bin"
+: > "$TMP/tb/u7s-gate-test.tar.gz"
 printf '#!/bin/sh\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"; chmod +x "$TMP/bin/limactl"
 printf '#!/bin/sh\necho 100\n' > "$TMP/bin/idle100"; chmod +x "$TMP/bin/idle100"
 export RG_IDLE_PROBE="$TMP/bin/idle100" QUIET_RECHECK_SECS=1 RG_RETRY_WAIT_SECS=0
@@ -118,6 +119,14 @@ for bad in abc -5 1.5 ""; do
   rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" --zram-mib "$bad" 2>&1 >/dev/null)" || rc=$?
   assert "--zram-mib '$bad' rejected on the host with exit 2 before any VM exists (a bad size must not look like 'zram did not help')" \
     "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
+done
+
+for n in 0 2; do
+  rm -rf "$TMP/tb$n" "$TMP/out-tb$n"; mkdir -p "$TMP/tb$n"
+  i=0; while [ "$i" -lt "$n" ]; do i=$((i + 1)); : > "$TMP/tb$n/u7s-gate-$i.tar.gz"; done
+  rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb$n" --out "$TMP/out-tb$n" 2>&1 >/dev/null)" || rc=$?
+  assert "$n staged gate tarballs -> exit 2 naming the stage dir and count (an ambiguous or missing gate tarball must stop the run, not install the wrong build)" \
+    "$([ "$rc" = 2 ] && echo "$err" | grep -q "exactly one u7s-gate-\*.tar.gz in $TMP/out-tb$n/stage, found $n" && echo 1 || echo 0)"
 done
 
 # --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
@@ -469,6 +478,9 @@ printf 'usage_usec 5000000\nthrottled_usec 250\n' > "$SR/sys/fs/cgroup/system.sl
 printf '8:0 rbytes=1000 wbytes=2000 rios=3 wios=4 dbytes=0 dios=0\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/io.stat"
 printf 'usage_usec 900\nthrottled_usec 800\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/cpu.stat"
 printf 'usage_usec 42\nthrottled_usec 0\n' > "$SR/sys/fs/cgroup/init.scope/cpu.stat"
+printf 'pgfault 9\npgmajfault 77\nworkingset_refault_file 1234\nworkingset_refault_anon 55\npgscan_kswapd 600\npgscan_direct 70\npgsteal_kswapd 500\npgsteal_direct 60\nworkingset_refault 1289\n' > "$SR/proc/vmstat"
+echo 123456789 > "$SR/sys/fs/cgroup/system.slice/snapd.service/memory.current"
+echo 987654321 > "$SR/sys/fs/cgroup/kubepods.slice/memory.current"
 SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
 SO2="$TMP/sout2"; mkdir -p "$SO2"
 SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 SAMPLER_PROC_INTERVAL=100000000000 bash "$HERE/vm-sampler.sh" "$SO2" 1 >/dev/null 2>&1
@@ -485,6 +497,12 @@ assert "sampler attributes CPU to init.scope (PID 1 work is otherwise missing fr
 assert "sampler records per-process CPU ticks and read/write bytes with spaces in comm" "$(attrib_has "$(printf 'PROC\t42\tmy proc\t100\t8192\t4096')" && echo 1 || echo 0)"
 assert "per-pid walk is skipped between PROC intervals while PSI still sampled (per-pid cost must not run inside the gate's measured window every 5 s)" \
   "$(! grep -q "PROC" "$SO2/attrib.tsv" && grep -q "PSI.io" "$SO2/attrib.tsv" && echo 1 || echo 0)"
+assert "sampler records file/anon refault counters (the only way to tell page-cache thrash from pull I/O)" \
+  "$(attrib_has "$(printf 'VM\tworkingset_refault_file\t1234')" && attrib_has "$(printf 'VM\tworkingset_refault_anon\t55')" && echo 1 || echo 0)"
+assert "sampler records pgmajfault and pgscan/pgsteal per reclaimer but not unrelated vmstat counters" \
+  "$(attrib_has "$(printf 'VM\tpgmajfault\t77')" && attrib_has "$(printf 'VM\tpgscan_direct\t70')" && attrib_has "$(printf 'VM\tpgsteal_kswapd\t500')" && ! grep -qE 'VM.(pgfault|workingset_refault)	' "$SO/attrib.tsv" && echo 1 || echo 0)"
+assert "sampler records memory.current of system.slice units and kubepods.slice (who holds the memory)" \
+  "$(attrib_has "$(printf 'CGMEM\t/system.slice/snapd.service\t123456789')" && attrib_has "$(printf 'CGMEM\t/kubepods.slice\t987654321')" && echo 1 || echo 0)"
 assert "sampler still writes MemAvailable to samples.tsv (the gate verdict reads it)" "$(grep -q "MEM.500000" "$SO/samples.tsv" && echo 1 || echo 0)"
 
 # --- burst-gate.sh end to end with stubs ---
@@ -563,12 +581,18 @@ assert "gcp backend uses gcloud and never limactl or a local tarball build" \
   "$(grep -q 'instances create' "$GCLOUD_CALLS" && [ ! -s "$LIMA_CALLS" ] && [ ! -e "$TMP/out-gfail/dist" ] && echo 1 || echo 0)"
 assert "gcp VPS never reachable (stockout/quota/IAP flake) -> INVALID exit 3, retried to the cap, never FAIL (infrastructure is not a u7s verdict)" \
   "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gfail/valid")" = 0 ] && [ "$(grep -c 'instances create' "$GCLOUD_CALLS")" = 3 ] && grep -q 'GATE: 0/1 runs passed.*INVALID' "$TMP/out-gfail.out" && ! grep -q 'GATE:.*FAIL' "$TMP/out-gfail.out" && echo 1 || echo 0)"
-assert "gcp VPS is deleted at the end of the run (an e2-micro left up keeps billing)" \
+assert "gcp VPS is deleted at the end of the run (a gate VM left up keeps billing)" \
   "$(grep -q 'instances delete u7s-rg-' "$GCLOUD_CALLS" && echo 1 || echo 0)"
 assert "gcp VM names are valid GCE names (lowercase) and run-unique" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
+assert "gate VMs are the custom n1 1 vCPU 1 GiB (e2-micro has 0.25 sustained vCPU; e2 custom shared-core caps one thread at half a core)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-micro' && echo 1 || echo 0)"
+U7S_GCP_MACHINE_TYPE=e2-standard-2 gcp_gate out-gshape --runs 1
+assert "an ambient U7S_GCP_MACHINE_TYPE cannot change the release-authoritative shape" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
+gcp_gate out-gfail --runs 1
 assert "gcp verdict line says release-authoritative and names the mirror release" \
-  "$(grep -q 'release-authoritative: x86_64 GCP e2-micro Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
+  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
 assert "the gcloud project id never reaches the run logs (redacted)" \
   "$(grep -rq 'p-secret' "$TMP/out-gfail" "$TMP/out-gfail.out" && echo 0 || echo 1)"
 export GCLOUD_PREEMPTED=1
@@ -624,6 +648,75 @@ alive=0; [ -z "$hang_pid" ] || ! kill -0 "$hang_pid" 2>/dev/null || alive=1
 assert "the wall-clock watchdog kills the ssh client under the redaction pipe, so a hung run ends instead of waiting forever" \
   "$([ -n "$hang_pid" ] && [ "$alive" = 0 ] && [ "$gate_ended" = 1 ] && grep -q 'wall-clock cap 2s hit' "$TMP/out-ghang.out" && echo 1 || echo 0)"
 unset GCLOUD_SSH_OK
+
+# --- experiment mode: an unpublished tarball must never be mistaken for a release verdict ---
+XP="$TMP/xp"; mkdir -p "$XP"
+SHA40=0123456789abcdef0123456789abcdef01234567
+: > "$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz"; echo '#!/bin/sh' > "$XP/install.sh"
+echo "ref=origin/main sha=$SHA40" > "$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz.source"
+XT="$XP/u7s-gate-experiment-0123456789ab-x86_64.tar.gz"
+xp_gate() { # out-dir, extra args...; sets rc
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/$1"
+  rc=0; "$HERE/burst-gate.sh" "${@:2}" --out "$TMP/$1" >"$TMP/$1.out" 2>&1 || rc=$?
+}
+for bad in "--backend gcp --tarball $XT --release v1.0.0" "--backend lima --tarball $XT" "--backend gcp --tarball $XT --confirm" \
+           "--backend gcp --tarball $TMP/missing.tar.gz" "--backend gcp --install-only --release v1.0.0"; do
+  : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rc=0
+  # shellcheck disable=SC2086
+  "$HERE/burst-gate.sh" $bad --out "$TMP/out-xbad" >/dev/null 2>&1 || rc=$?
+  assert "'${bad//$TMP/<tmp>}' rejected with exit 2 before any VM exists (an experiment must not blur into the release gate or bill a VM)" \
+    "$([ "$rc" = 2 ] && ! grep -q 'instances create' "$GCLOUD_CALLS" && echo 1 || echo 0)"
+done
+echo "ref=origin/main sha=short" > "$XP/bad.tar.gz.source"; : > "$XP/bad.tar.gz"
+xp_gate out-xnosha --backend gcp --tarball "$XP/bad.tar.gz"
+assert "a tarball whose .source lacks a full sha is refused (an experiment must say exactly what it ran)" \
+  "$([ "$rc" = 2 ] && ! grep -q 'instances create' "$GCLOUD_CALLS" && echo 1 || echo 0)"
+export GCLOUD_SSH_OK=1 GCLOUD_RESULTS="$TMP/good.env"
+xp_gate out-xpass --backend gcp --tarball "$XT" --runs 1
+assert "experiment run installs the uploaded tarball and install.sh, not the mirror (the point is to test unpublished code)" \
+  "$(grep -q 'compute scp.*u7s-gate-experiment-0123456789ab-x86_64.tar.gz' "$GCLOUD_CALLS" && ! grep -q 'u7s.dekiru.tech' "$GCLOUD_CALLS" && grep -q '^INSTALL_TARBALL=/var/tmp/rg/u7s-gate-experiment-0123456789ab-x86_64.tar.gz$' "$TMP/out-xpass/stage/gate.env" && echo 1 || echo 0)"
+assert "every experiment artefact carries EXPERIMENT and the sha: out dir, run dir, verdict file, backend.txt, GATE line" \
+  "$([ -f "$TMP/out-xpass/EXPERIMENT.txt" ] && [ -d "$TMP/out-xpass/EXPERIMENT-run-1" ] && head -1 "$TMP/out-xpass/EXPERIMENT-run-1/verdict.txt" | grep -q '^EXPERIMENT .*sha=0123456789ab' && grep -q 'experiment=yes' "$TMP/out-xpass/backend.txt" && grep -q '^==== GATE: .*EXPERIMENT PASS' "$TMP/out-xpass.out" && echo 1 || echo 0)"
+assert "an experiment is never release-authoritative, even when it passes" \
+  "$(grep -q 'release-authoritative=no' "$TMP/out-xpass/backend.txt" && ! grep -q 'release-authoritative=yes\|release-authoritative: ' "$TMP/out-xpass/backend.txt" "$TMP/out-xpass.out" && echo 1 || echo 0)"
+xp_gate out-xdefault --backend gcp --tarball "$XT" --runs 1 --install-only
+assert "--install-only reaches the VM and an install-only experiment is judged on install alone (the smoke must not need bursts)" \
+  "$(grep -q '^INSTALL_ONLY=1$' "$TMP/out-xdefault/stage/gate.env" && [ "$rc" = 0 ] && grep -q 'install and node Ready only' "$TMP/out-xdefault/EXPERIMENT-run-1/verdict.txt" && echo 1 || echo 0)"
+unset GCLOUD_SSH_OK GCLOUD_RESULTS
+assert "release path unchanged: gate.env of a --release run installs zero-arg (no INSTALL_TARBALL)" \
+  "$(grep -q '^INSTALL_TARBALL=$' "$TMP/out-gpass/stage/gate.env" && echo 1 || echo 0)"
+mkdir -p "$TMP/tbl"; : > "$TMP/tbl/u7s-gate-testarch.tar.gz"; : > "$TMP/tbl/u7s-gate-testarch.tar.gz.sha256"; : > "$TMP/tbl/install.sh"
+"$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tbl" --out "$TMP/out-lima-tb" >/dev/null 2>&1 || true
+assert "the Lima gate installs its locally built, unsigned tarball by the staged file's name, or every Lima run fails at install on the signature check" \
+  "$(grep -qx 'INSTALL_TARBALL=/var/tmp/rg/u7s-gate-testarch.tar.gz' "$TMP/out-lima-tb/stage/gate.env" && echo 1 || echo 0)"
+
+# --- vm-gate sampler lifecycle ---
+VG="$TMP/vg"; mkdir -p "$VG/out"
+cp "$HERE/lib.sh" "$VG/lib.sh"
+echo 'RG_CAL_MIN_SAMPLES=0' > "$VG/gate.env"
+cat > "$VG/vm-sampler.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "SAMPLER_LEAK_OUT"; echo "SAMPLER_LEAK_ERR" >&2
+echo $$ > "$(dirname "$0")/sampler.pid"
+exec sleep 300
+STUB
+cat > "$VG/install.sh" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+[ -s "$(dirname "$0")/sampler.pid" ] && echo up > "$(dirname "$0")/sampler-up-at-install"
+exit 1
+STUB
+vg_t0=$SECONDS; vg_rc=0
+RG_DIR="$VG" timeout 60 bash "$HERE/vm-gate.sh" > "$TMP/vg.out" 2>&1 || vg_rc=$?
+vg_secs=$((SECONDS - vg_t0))
+sleep 0.5
+assert "sampler is already running when install.sh starts (the install-time memory spike is the thing to see)" \
+  "$([ -f "$VG/sampler-up-at-install" ] && echo 1 || echo 0)"
+assert "a failed install exits non-zero and promptly" "$([ "$vg_rc" = 1 ] && [ "$vg_secs" -lt 20 ] && echo 1 || echo 0)"
+assert "a failed install leaves no sampler running (an orphan would hold the ssh session open)" \
+  "$(kill -0 "$(cat "$VG/sampler.pid")" 2>/dev/null && echo 0 || echo 1)"
+assert "sampler stdout/stderr go to its own log, not the gate's stream (a held pipe stalls ssh/limactl)" \
+  "$(! grep -q SAMPLER_LEAK "$TMP/vg.out" && grep -q SAMPLER_LEAK_OUT "$VG/out/sampler.log" && echo 1 || echo 0)"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

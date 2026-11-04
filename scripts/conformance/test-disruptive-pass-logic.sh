@@ -48,7 +48,7 @@ filter_args() {
   (
     PASS="$pass"; PROCS="$procs"
     FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {A}'
-    JSON_REPORT_PATH=/r.json
+    JSON_REPORT_PATH=/r.json; NODES=(n)
     # shellcheck disable=SC1090
     source "$FUNC_FILE"
     build_filter_args "$apply"
@@ -93,7 +93,7 @@ timeout_filter_args() {
   (
     PASS=parallel; PROCS=16
     FEATUREGATE_LABEL_FILTER='FeatureGate: isSubsetOf {A}'
-    JSON_REPORT_PATH=/r.json
+    JSON_REPORT_PATH=/r.json; NODES=(n)
     if [ -n "$gt" ]; then GINKGO_SUITE_TIMEOUT="$gt"; fi
     # shellcheck disable=SC1090
     source "$FUNC_FILE"
@@ -131,7 +131,7 @@ mkdir -p "$STUB"
 cat > "$STUB/limactl" <<'STUBEOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$LIMA_LOG"
-case "$*" in *"sonobuoy status"*) exit 1 ;; esac
+case "$*" in *"sonobuoy status"*|*"sonobuoy retrieve"*) exit 1 ;; esac
 exit 0
 STUBEOF
 cat > "$STUB/kubectl" <<'STUBEOF'

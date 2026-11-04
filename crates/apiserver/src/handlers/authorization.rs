@@ -504,9 +504,8 @@ pub async fn subject_access_review<S: Store>(
 // LocalSubjectAccessReview
 // ---------------------------------------------------------------------------
 //
-// Identical to SubjectAccessReview but namespace-scoped.  The namespace from
-// the URL path is injected into spec.resourceAttributes.namespace when absent
-// in the request body (Kubernetes spec requirement).
+// Identical to SubjectAccessReview but namespace-scoped.  The body's
+// spec.resourceAttributes.namespace must equal the URL namespace.
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -537,7 +536,7 @@ pub async fn local_subject_access_review<S: Store>(
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let mut parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
+    let parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -554,13 +553,6 @@ pub async fn local_subject_access_review<S: Store>(
                 .into_response();
         }
     };
-
-    // Pre-fill namespace from the URL path if the body omits it.
-    if let Some(ref mut attrs) = parsed.spec.resource_attributes {
-        if attrs.namespace.is_empty() {
-            attrs.namespace = namespace.clone();
-        }
-    }
 
     // Same privilege gate as SubjectAccessReview: only system:masters or
     // callers with `create localsubjectaccessreviews` may probe other subjects.
@@ -596,13 +588,34 @@ pub async fn local_subject_access_review<S: Store>(
             .into_response();
     }
 
+    // Upstream ValidateLocalSubjectAccessReview: the body namespace must equal the URL
+    // namespace (an omitted one is a mismatch too). Evaluating a different one would let a
+    // caller scoped to one namespace probe RBAC decisions in any other.
+    if let Some(attrs) = &parsed.spec.resource_attributes {
+        if attrs.namespace != namespace {
+            let cause = format!(
+                "Invalid value: {:?}: must match metadata.namespace",
+                attrs.namespace
+            );
+            let mut e = Status::unprocessable_entity(format!(
+                "LocalSubjectAccessReview.authorization.k8s.io \"\" is invalid: \
+                 spec.resourceAttributes.namespace: {cause}"
+            ));
+            e.1.details = Some(Box::new(serde_json::json!({
+                "group": "authorization.k8s.io",
+                "kind": "LocalSubjectAccessReview",
+                "causes": [{
+                    "reason": "FieldValueInvalid",
+                    "message": cause,
+                    "field": "spec.resourceAttributes.namespace"
+                }]
+            })));
+            return e.into_response();
+        }
+    }
+
     let spec = parsed.spec;
     let allowed = if let Some(attrs) = spec.resource_attributes {
-        let ns = if attrs.namespace.is_empty() {
-            None
-        } else {
-            Some(attrs.namespace.as_str())
-        };
         let name = if attrs.name.is_empty() {
             None
         } else {
@@ -618,7 +631,7 @@ pub async fn local_subject_access_review<S: Store>(
                 api_group: &attrs.group,
                 resource,
                 subresource,
-                namespace: ns,
+                namespace: Some(&namespace),
                 name,
                 non_resource_url: None,
             },
@@ -1878,6 +1891,7 @@ mod handler_tests {
                 "user": "kube-apiserver-kubelet-client",
                 "groups": ["system:masters"],
                 "resourceAttributes": {
+                    "namespace": "default",
                     "verb": "get", "group": "", "resource": "nodes",
                     "subresource": "proxy", "name": "n1"
                 }
@@ -2227,6 +2241,7 @@ mod handler_tests {
                 "user": "alice",
                 "groups": [],
                 "resourceAttributes": {
+                    "namespace": "default",
                     "verb": "get",
                     "group": "",
                     "resource": "pods"
@@ -2261,70 +2276,78 @@ mod handler_tests {
         );
     }
 
-    /// LSAR must pre-fill namespace from the URL into spec.resourceAttributes
-    /// when the body omits it, so RBAC checks use the correct namespace scope.
-    #[tokio::test]
-    async fn lsar_prefills_namespace_from_url_when_body_omits_it() {
-        // alice can get pods in "staging" only.
-        let state = make_state();
-        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-reader";
-        state.rbac_index.apply_object(
-            role_key,
-            &serde_json::json!({
-                "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["get"] }]
-            }),
-        );
-        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-binding";
-        state.rbac_index.apply_object(
-            bind_key,
-            &serde_json::json!({
-                "subjects": [{ "kind": "User", "name": "alice" }],
-                "roleRef": {
-                    "apiGroup": "rbac.authorization.k8s.io",
-                    "kind": "ClusterRole",
-                    "name": "pod-reader"
-                }
-            }),
-        );
-
+    async fn lsar_with_body_namespace(
+        url_ns: &str,
+        body_ns: Option<&str>,
+        caller: UserInfo,
+    ) -> (StatusCode, serde_json::Value) {
         let app = Router::new()
             .route(
                 "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
                 post(local_subject_access_review),
             )
-            .with_state(state);
-
-        // Body has no namespace — handler must inject "default" from the URL.
-        let body = serde_json::json!({
-            "spec": {
-                "user": "alice",
-                "groups": [],
-                "resourceAttributes": {
-                    "verb": "get",
-                    "group": "",
-                    "resource": "pods"
-                }
-            }
-        });
+            .with_state(make_state());
+        let mut attrs = serde_json::json!({ "verb": "get", "group": "", "resource": "pods" });
+        if let Some(ns) = body_ns {
+            attrs["namespace"] = serde_json::json!(ns);
+        }
         let req = json_req(
             "POST",
-            "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
-            body,
-            user("admin", &["system:masters"]),
+            &format!("/apis/authorization.k8s.io/v1/namespaces/{url_ns}/localsubjectaccessreviews"),
+            serde_json::json!({ "spec": { "user": "dave", "resourceAttributes": attrs } }),
+            caller,
         );
-
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        // alice has a cluster-wide binding for get pods, so it should be allowed
-        // regardless of namespace.  The key assertion is that allowed is present.
-        assert!(
-            val["status"]["allowed"].is_boolean(),
-            "namespace pre-fill must produce a valid allowed field"
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A caller with `create localsubjectaccessreviews` in namespace "a" must not learn
+    /// another subject's access in namespace "b" by putting "b" in the body: upstream
+    /// rejects the mismatch with 422 Invalid.
+    #[tokio::test]
+    async fn lsar_rejects_body_namespace_differing_from_url() {
+        let (code, val) =
+            lsar_with_body_namespace("a", Some("b"), user("admin", &["system:masters"])).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(val["reason"], "Invalid");
+        assert_eq!(
+            val["message"],
+            "LocalSubjectAccessReview.authorization.k8s.io \"\" is invalid: \
+             spec.resourceAttributes.namespace: Invalid value: \"b\": must match metadata.namespace"
         );
+        assert_eq!(
+            val["details"]["causes"][0]["field"],
+            "spec.resourceAttributes.namespace"
+        );
+    }
+
+    /// Upstream compares the body namespace to the URL namespace verbatim, so an omitted
+    /// one is also Invalid; silently defaulting it would hide a client bug.
+    #[tokio::test]
+    async fn lsar_rejects_omitted_body_namespace() {
+        let (code, _) =
+            lsar_with_body_namespace("a", None, user("admin", &["system:masters"])).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A matching namespace is accepted.
+    #[tokio::test]
+    async fn lsar_accepts_matching_body_namespace() {
+        let (code, _) =
+            lsar_with_body_namespace("a", Some("a"), user("admin", &["system:masters"])).await;
+        assert_eq!(code, StatusCode::CREATED);
+    }
+
+    /// Authorization of the caller precedes body validation (as upstream's filter chain
+    /// does), so an unprivileged caller gets 403, not a 422 that confirms the endpoint.
+    #[tokio::test]
+    async fn lsar_mismatch_from_unprivileged_caller_is_403() {
+        let (code, _) = lsar_with_body_namespace("a", Some("b"), user("nobody", &[])).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
     }
 
     /// LSAR must return 403 Forbidden for an unprivileged caller — same gate

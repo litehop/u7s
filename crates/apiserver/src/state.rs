@@ -1299,7 +1299,9 @@ impl<S: Store> AppState<S> {
         cluster_ca_ders: Option<&[Vec<u8>]>,
         konnectivity_proxy_addr: Option<&str>,
     ) -> Result<reqwest::Client, String> {
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10));
 
         if let Some(ca_ders) = cluster_ca_ders {
             // tls_certs_only disables the system/Mozilla root store and trusts only
@@ -1856,14 +1858,9 @@ impl<S: Store> AppState<S> {
 
         loop {
             if tried >= alloc.size {
-                let cause = format!(
+                return Err(Status::internal_actionable(format!(
                     "failed to allocate a serviceIP for Service {service_name:?}: range is full"
-                );
-                let mut err = Status::internal(format!("Internal error occurred: {cause}"));
-                err.1.details = Some(Box::new(serde_json::json!({
-                    "causes": [{"message": cause}]
-                })));
-                return Err(err);
+                )));
             }
 
             // Skip reserved offsets.
@@ -1934,17 +1931,6 @@ fn rm(kind: &str, _namespaced: bool, has_status: bool) -> ResourceMeta {
         #[cfg(test)]
         namespaced: _namespaced,
         has_status_subresource: has_status,
-        create_or_update: false,
-    }
-}
-
-fn rm_cou(kind: &str, _namespaced: bool) -> ResourceMeta {
-    ResourceMeta {
-        kind: kind.to_string(),
-        #[cfg(test)]
-        namespaced: _namespaced,
-        has_status_subresource: false,
-        create_or_update: true,
     }
 }
 
@@ -1967,7 +1953,7 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("", "v1", "configmaps"), rm("ConfigMap", true, false));
     m.insert(rk("", "v1", "podtemplates"), rm("PodTemplate", true, false));
     m.insert(rk("", "v1", "secrets"), rm("Secret", true, false));
-    m.insert(rk("", "v1", "events"), rm_cou("Event", true));
+    m.insert(rk("", "v1", "events"), rm("Event", true, false));
     m.insert(rk("", "v1", "endpoints"), rm("Endpoints", true, false));
     m.insert(
         rk("", "v1", "persistentvolumeclaims"),
@@ -2063,7 +2049,10 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     );
 
     // events.k8s.io/v1
-    m.insert(rk("events.k8s.io", "v1", "events"), rm_cou("Event", true));
+    m.insert(
+        rk("events.k8s.io", "v1", "events"),
+        rm("Event", true, false),
+    );
 
     // admissionregistration.k8s.io/v1
     m.insert(
@@ -2141,10 +2130,9 @@ pub(crate) fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     );
 
     // storage.k8s.io/v1 — all cluster-scoped
-    // kubelet uses create-or-update (PUT) semantics for csinodes
     m.insert(
         rk("storage.k8s.io", "v1", "csinodes"),
-        rm_cou("CSINode", false),
+        rm("CSINode", false, false),
     );
     m.insert(
         rk("storage.k8s.io", "v1", "csidrivers"),
@@ -2475,18 +2463,12 @@ mod tests {
     }
 
     #[test]
-    fn csinodes_registered_as_cluster_scoped_create_or_update() {
+    fn csinodes_registered_as_cluster_scoped() {
         let registry = build_registry();
         let key = rk("storage.k8s.io", "v1", "csinodes");
         let meta = registry
             .get(&key)
             .expect("csinodes must be in build_registry");
-        // kubelet PUTs CSINode on every boot; create_or_update must be true so the
-        // handler doesn't reject the request when the object already exists.
-        assert!(
-            meta.create_or_update,
-            "csinodes must have create_or_update=true"
-        );
         assert!(!meta.namespaced, "csinodes is cluster-scoped");
     }
 
@@ -2771,6 +2753,37 @@ mod tests {
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
         let _client = AppState::<SqliteStore>::build_webhook_client(None, None)
             .expect("no-CA no-identity must produce Ok client");
+    }
+
+    /// The shared webhook client is the fallback for every webhook call; following a 307
+    /// would re-POST the AdmissionReview to a host validate_webhook_url never vetted.
+    #[tokio::test]
+    async fn build_webhook_client_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/x\r\n\
+                              Content-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        let client = AppState::<SqliteStore>::build_webhook_client(None, None).unwrap();
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .body("x")
+            .send()
+            .await
+            .expect("a 307 must surface as a response, not a followed redirect error");
+        assert_eq!(resp.status(), 307);
     }
 
     /// build_webhook_client succeeds with a konnectivity proxy addr configured.

@@ -194,7 +194,7 @@ mkdir -p "$WORKDIR" "$MANIFEST_DIR"
 # `git pull` picking up a newer vendored coredns.yaml is applied without an
 # explicit --reset -- see this file's header comment for why only CoreDNS,
 # not flannel/kube-proxy, is copied here.
-cp "$REPO/manifests/coredns.yaml" "$MANIFEST_DIR/"
+rig_render_coredns "$SERVICE_CIDR" < "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml" || exit 1
 
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_PROXY_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"

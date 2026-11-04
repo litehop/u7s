@@ -395,12 +395,18 @@ pub async fn put_resource_status<S: Store>(
         &group,
         &version,
     );
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    super::resource::require_builtin_resourceversion_on_update(
+        &group,
+        &plural,
+        expected_rv,
+        &name,
+    )?;
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &meta.kind);
         return Ok(Json(current.body));
     }
 
-    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -765,12 +771,22 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
         &group,
         &version,
     );
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    if cr_ctx.is_some() {
+        super::resource::require_cr_resourceversion_on_update(&group, &plural, expected_rv, &name)?;
+    } else {
+        super::resource::require_builtin_resourceversion_on_update(
+            &group,
+            &plural,
+            expected_rv,
+            &name,
+        )?;
+    }
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
         return Ok(Json(current.body).into_response());
     }
 
-    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let storage_obj = to_storage_object(&state, cr_ctx.as_ref(), &group, &current).await?;
     let new_rv = state
         .store
@@ -1279,7 +1295,7 @@ mod tests {
             "status": { "ready": false }
         });
         let key = "/registry/storage.k8s.io/csinodes/dry-run-node";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
@@ -1302,7 +1318,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "dry-run-node" },
+            "metadata": { "name": "dry-run-node", "resourceVersion": stored_rv.to_string() },
             "status": { "ready": true }
         });
         let result = put_resource_status(
@@ -1375,7 +1391,7 @@ mod tests {
         let null_body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "worker-3" },
+            "metadata": { "name": "worker-3", "resourceVersion": "1" },
             "status": null
         });
         let result = put_resource_status(
@@ -1793,7 +1809,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": "node-y", "namespace": "kube-node-lease" },
+            "metadata": { "name": "node-y", "namespace": "kube-node-lease", "resourceVersion": "1" },
             "status": { "phase": "Active" }
         });
         let result = put_namespaced_resource_status(
@@ -1872,7 +1888,7 @@ mod tests {
             "status": { "phase": "Active" }
         });
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease";
-        store
+        let stored_rv = store
             .put(
                 key,
                 bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
@@ -1895,7 +1911,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease", "resourceVersion": stored_rv.to_string() },
             "status": { "phase": "Expired" }
         });
         let result = put_namespaced_resource_status(
@@ -1935,6 +1951,59 @@ mod tests {
         );
     }
 
+    /// Upstream's dry-run storage path still runs the update validation, so a status PUT
+    /// without a resourceVersion on a kind that forbids unconditional updates is 422 with
+    /// dryRun=All too — otherwise `kubectl --dry-run=server` would approve a write the real
+    /// request rejects.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_dry_run_without_resource_version_is_422() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-a" }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut dry_run_headers = json_headers();
+        dry_run_headers.insert(
+            axum::http::HeaderName::from_static(crate::handlers::json_patch::DRY_RUN_HEADER),
+            axum::http::HeaderValue::from_static("true"),
+        );
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "dry-run-lease".into(),
+            )),
+            None,
+            dry_run_headers,
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("dryRun=All without resourceVersion must be rejected"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     /// put_namespaced_resource_status with null status removes the status field.
     /// Same semantics as the cluster-scoped variant — controllers can clear status.
     #[tokio::test]
@@ -1966,7 +2035,7 @@ mod tests {
         let null_body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
-            "metadata": { "name": "node-z", "namespace": "kube-node-lease" },
+            "metadata": { "name": "node-z", "namespace": "kube-node-lease", "resourceVersion": "1" },
             "status": null
         });
         let result = put_namespaced_resource_status(
@@ -3016,7 +3085,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "worker-1" },
+            "metadata": { "name": "worker-1", "resourceVersion": store.get(key).await.unwrap().unwrap().revision.to_string() },
             "status": { "allocatable": {"count": 10} }
         });
 
@@ -3603,7 +3672,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "cert-manager.io/v1",
             "kind": "Certificate",
-            "metadata": { "name": "my-cert", "namespace": "default" },
+            "metadata": { "name": "my-cert", "namespace": "default", "resourceVersion": "1" },
             "status": { "conditions": [{"type": "Ready", "status": "True"}] }
         });
         let result = put_namespaced_resource_status(
@@ -4341,7 +4410,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "policy/v1",
             "kind": "PodDisruptionBudget",
-            "metadata": { "name": "my-pdb", "namespace": "default" },
+            "metadata": { "name": "my-pdb", "namespace": "default", "resourceVersion": "1" },
             "status": {
                 "disruptedPods": { "pod-0": "2024-01-01T00:00:00Z" },
                 "disruptionsAllowed": 0,
@@ -4642,7 +4711,7 @@ mod tests {
         let body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "node-occ" },
+            "metadata": { "name": "node-occ", "resourceVersion": "1" },
             "status": { "ready": true }
         });
         let result = put_resource_status(
@@ -5277,7 +5346,7 @@ mod tests {
         let put_body = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
             "kind": "CSINode",
-            "metadata": { "name": "specguard-node", "annotations": { "x": "y" } },
+            "metadata": { "name": "specguard-node", "annotations": { "x": "y" }, "resourceVersion": "1" },
             "spec": { "drivers": [] },
             "status": { "ready": true }
         });
@@ -5411,6 +5480,7 @@ mod tests {
             "kind": "CSINode",
             "metadata": {
                 "name": "fin-node",
+                "resourceVersion": "1",
                 "finalizers": [],
                 "deletionTimestamp": "2099-12-31T00:00:00Z"
             },
@@ -5821,13 +5891,10 @@ mod tests {
         );
     }
 
-    /// put_resource_status with an absent resourceVersion in the body succeeds unconditionally.
-    ///
-    /// Clients that legitimately omit resourceVersion (e.g. single-writer bootstrapping)
-    /// must not be broken by the stale-RV fix.  parse_resource_version returns None for
-    /// absent/empty rv, and the store treats None as unconditional.
+    /// put_resource_status with an absent resourceVersion is 422 for kinds whose upstream
+    /// strategy forbids unconditional update (a blind overwrite would clobber concurrent writers).
     #[tokio::test]
-    async fn put_resource_status_absent_rv_is_unconditional_write() {
+    async fn put_resource_status_absent_rv_is_422_when_kind_forbids_unconditional_update() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let obj = serde_json::json!({
             "apiVersion": "storage.k8s.io/v1",
@@ -5871,11 +5938,12 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
         .await;
-        assert!(
-            result.is_ok(),
-            "absent resourceVersion in PUT /status body must succeed (unconditional write) — \
-             single-writer bootstrap clients must not be broken by the stale-RV fix"
+        let err = result.err().expect(
+            "CSINode's strategy forbids unconditional update, so a status PUT without \
+             resourceVersion must be rejected",
         );
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.message.contains("must be specified for an update"));
     }
 
     /// put_resource_status against an EXISTING object with an explicit `resourceVersion: "0"`
@@ -6021,12 +6089,11 @@ mod tests {
         );
     }
 
-    /// put_namespaced_resource_status with an absent resourceVersion in the body succeeds.
-    ///
-    /// Upstream k8s allows omitting resourceVersion in a subresource PUT, treating it as
-    /// an unconditional write.  The fix must not break this.
+    /// put_namespaced_resource_status with an absent resourceVersion is 422 for kinds whose
+    /// upstream strategy forbids unconditional update.
     #[tokio::test]
-    async fn put_namespaced_resource_status_absent_rv_is_unconditional_write() {
+    async fn put_namespaced_resource_status_absent_rv_is_422_when_kind_forbids_unconditional_update(
+    ) {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let pdb = serde_json::json!({
             "apiVersion": "policy/v1",
@@ -6071,11 +6138,12 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
         .await;
-        assert!(
-            result.is_ok(),
-            "absent resourceVersion in namespaced PUT /status body must succeed (unconditional) — \
-             clients that omit rv must not be broken by the stale-RV CAS fix"
+        let err = result.err().expect(
+            "PodDisruptionBudget's strategy forbids unconditional update, so a status PUT \
+             without resourceVersion must be rejected",
         );
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err.1.message.contains("must be specified for an update"));
     }
 
     fn json_patch_headers() -> axum::http::HeaderMap {

@@ -636,7 +636,7 @@ fn field_decode_rhs(
         Type::String => format!("jstr({value_var}, \"{key}\")"),
         Type::Bool => format!("jbool({value_var}, \"{key}\")"),
         Type::Int32 if repeated => format!(
-            "{value_var}.get(\"{key}\").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|n| n.as_i64()).map(|n| n as i32).collect()).unwrap_or_default()"
+            "{value_var}.get(\"{key}\").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|n| n.as_i64().and_then(|n| i32::try_from(n).ok())).collect()).unwrap_or_default()"
         ),
         Type::Int32 => format!("ji32({value_var}, \"{key}\")"),
         Type::Int64 if repeated => format!(

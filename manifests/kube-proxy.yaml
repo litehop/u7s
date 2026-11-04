@@ -6,9 +6,9 @@
 #
 # Three install-time placeholders scripts/install.sh substitutes before writing this file into
 # --manifest-output-dir:
-#   __POD_CLUSTER_CIDR__ install.sh's $POD_CLUSTER_CIDR (--cluster-cidr), the same value flannel
-#                        and KCM use: kube-proxy masquerades traffic to Services that does not
-#                        originate inside it.
+#   __POD_CLUSTER_CIDRS__ install.sh's $POD_CLUSTER_CIDR (--cluster-cidr, a comma list when
+#                        dual-stack), the same value flannel and KCM use: kube-proxy masquerades
+#                        traffic to Services that does not originate inside it.
 #   __KUBE_VERSION__    kubelet's own --version output (install.sh's $KUBE_VERSION) -- kube-proxy
 #                        must track whichever kubelet a given release actually bundles, not a
 #                        fixed tag Renovate/Dependabot would otherwise bump independently and out
@@ -20,7 +20,8 @@
 #                         iptables DNAT rules kube-proxy itself is responsible for installing --
 #                         pointing kube-proxy's own kubeconfig at it is a bootstrap deadlock
 #                         (informer never syncs, so the DNAT rules that would make the ClusterIP
-#                         reachable never get programmed).
+#                         reachable never get programmed). Bracketed in the server URL when it
+#                         is an IPv6 literal.
 #
 # --hostname-override=$(NODE_NAME) is Kubernetes' own container-command env-var substitution
 # syntax (references the NODE_NAME env var set via fieldRef below), not a shell expansion -- as a
@@ -55,7 +56,7 @@ data:
     apiVersion: kubeproxy.config.k8s.io/v1alpha1
     kind: KubeProxyConfiguration
     mode: "iptables"
-    clusterCIDR: __POD_CLUSTER_CIDR__
+    clusterCIDR: __POD_CLUSTER_CIDRS__
     clientConnection:
       kubeconfig: /var/lib/kube-proxy/kubeconfig.conf
   kubeconfig.conf: |
@@ -94,6 +95,7 @@ spec:
         k8s-app: kube-proxy
     spec:
       serviceAccountName: kube-proxy
+      priorityClassName: system-node-critical
       hostNetwork: true
       tolerations:
       - operator: Exists
@@ -104,6 +106,11 @@ spec:
         - /usr/local/bin/kube-proxy
         - --config=/var/lib/kube-proxy/config.conf
         - --hostname-override=$(NODE_NAME)
+        # Memory request from the measured ~23 MB PSS steady state, rounded up.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
         securityContext:
           privileged: true
         env:

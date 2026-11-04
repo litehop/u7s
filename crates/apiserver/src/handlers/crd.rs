@@ -795,8 +795,9 @@ async fn build_new_crd<S: Store>(
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(state, obj_val, None, &admission_ctx).await?;
         run_validating_webhooks(state, &mutated, None, &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     crd.metadata.generation = 1;
     if !crd
@@ -980,6 +981,7 @@ pub async fn replace_crd<S: Store>(
     } else {
         crd.metadata.resource_version.parse::<u64>().ok()
     };
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
 
     // Admission webhook pipeline (mutating then validating).
     {
@@ -1002,8 +1004,9 @@ pub async fn replace_crd<S: Store>(
         let mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
     record_crd_write(&headers, &existing, &mut crd)?;
@@ -1633,6 +1636,15 @@ pub async fn patch_crd<S: Store>(
     // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
     // matching upstream: those patch types have no create-on-missing semantics.
     if is_ssa && stored_opt.is_none() {
+        super::resource::authorize_create_on_write(
+            &state.rbac_index,
+            &state.node_graph,
+            &user,
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
+            None,
+            &name,
+        )?;
         let mut body_json = ssa_body_to_json(&body)?;
         crate::handlers::json_patch::strip_managed_fields(&mut body_json);
         // The URL name is authoritative for what gets created, regardless of what (if anything)
@@ -1765,8 +1777,9 @@ pub async fn patch_crd<S: Store>(
         let mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
-        crd = serde_json::from_value(mutated)
-            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+        crd = serde_json::from_value(mutated).map_err(|e| {
+            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        })?;
     }
     prepare_crd_generation_for_update(&existing, &mut crd);
     if !is_ssa {
@@ -1896,11 +1909,12 @@ pub async fn put_crd_status<S: Store>(
 
     // Dry-run: return the would-be status object without persisting — mirrors
     // put_resource_status's dry-run early-return.
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    super::resource::require_builtin_resourceversion_on_update(GROUP, PLURAL, expected_rv, &name)?;
     if is_dry_run_header(&headers) {
         return Ok(Json(current.body));
     }
 
-    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -2257,13 +2271,27 @@ mod tests {
         );
 
         let replace = |versions: serde_json::Value, generation: Option<i64>| {
-            replace_crd(
-                State(state.clone()),
-                Path(name.to_string()),
-                test_user(),
-                HeaderMap::new(),
-                crd_with_versions(name, versions, generation),
-            )
+            let state = state.clone();
+            async move {
+                let rv = state
+                    .store
+                    .get(&store_key(name))
+                    .await
+                    .unwrap()
+                    .expect("stored CRD")
+                    .revision;
+                let mut body: serde_json::Value =
+                    serde_json::from_slice(&crd_with_versions(name, versions, generation)).unwrap();
+                body["metadata"]["resourceVersion"] = rv.to_string().into();
+                replace_crd(
+                    State(state),
+                    Path(name.to_string()),
+                    test_user(),
+                    HeaderMap::new(),
+                    Bytes::from(body.to_string()),
+                )
+                .await
+            }
         };
         assert!(replace(two.clone(), None).await.is_ok());
         assert_eq!(
@@ -3772,6 +3800,55 @@ mod tests {
         );
     }
 
+    /// Apply-creating a CRD needs `create` in addition to `patch`, as upstream requires.
+    #[tokio::test]
+    async fn ssa_apply_patch_of_missing_crd_without_create_verb_is_403() {
+        let state = make_state();
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/patcher",
+            &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["patch", "update"]}]}),
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/patcher",
+            &serde_json::json!({
+                "subjects": [{"kind": "User", "name": "patcher"}],
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "patcher"}
+            }),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+        let manifest = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "gadgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget", "listKind": "GadgetList"},
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let err = patch_crd(
+            State(state.clone()),
+            Path("gadgets.example.io".to_string()),
+            Extension(UserInfo {
+                username: "patcher".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            }),
+            headers,
+            Bytes::from(serde_json::to_vec(&manifest).unwrap()),
+        )
+        .await
+        .err()
+        .expect("CRD apply-create without create must fail");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     /// SSA apply-patch on a CRD name that does not exist yet must create it — with the same
     /// Established/NamesAccepted status stamping `create_crd` gives a plain POST — instead of
     /// 404ing. Real Server-Side Apply creates the target object on first apply; before this
@@ -4174,9 +4251,16 @@ mod tests {
             .await
             .expect("create must succeed");
 
+        let rv = state
+            .store
+            .get(&store_key(name))
+            .await
+            .unwrap()
+            .expect("stored CRD")
+            .revision;
         let put_body = Bytes::from(
             serde_json::json!({
-                "metadata": { "name": name },
+                "metadata": { "name": name, "resourceVersion": rv.to_string() },
                 "status": null
             })
             .to_string(),
@@ -5031,6 +5115,32 @@ mod tests {
         );
     }
 
+    /// Without this, a rule on a map's object values (`self.n` on each value) could never be
+    /// installed, so per-value validation of map fields was unusable.
+    #[tokio::test]
+    async fn create_crd_accepts_rule_on_additional_properties_object_value() {
+        let state = make_state();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "spec": {
+                "type": "object",
+                "properties": { "m": {
+                    "type": "object",
+                    "maxProperties": 10,
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": { "n": { "type": "integer" } },
+                        "x-kubernetes-validations": [{ "rule": "self.n > 0" }]
+                    }
+                } }
+            } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+        create_crd(State(state), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("rule on map value fields must type-check");
+    }
+
     /// A rule that does not parse must be refused at install time for the same reason.
     #[tokio::test]
     async fn create_crd_rejects_validation_rule_with_syntax_error() {
@@ -5848,6 +5958,84 @@ mod admission_tests {
         );
     }
 
+    /// A mutating webhook that turns the CRD into something undecodable is the webhook
+    /// author's bug; the client must be told why, not get the generic redacted 500.
+    #[tokio::test]
+    async fn create_crd_reports_admission_mutated_crd_invalid_to_the_client() {
+        use axum::response::IntoResponse;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let router = Router::new().route(
+            "/mutate",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "replace", "path": "/spec/names", "value": "not-an-object"}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+        let (url, _handle) = start_mock_webhook(router).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "break-crd"},
+            "webhooks": [{
+                "name": "break.webhook.io",
+                "clientConfig": {"url": format!("{url}/mutate")},
+                "rules": [{"apiGroups": ["apiextensions.k8s.io"], "apiVersions": ["v1"], "resources": ["customresourcedefinitions"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/break-crd",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = create_crd(
+            axum::extract::State(state),
+            test_user(),
+            HeaderMap::new(),
+            crd_body("foos.example.com"),
+        )
+        .await
+        .err()
+        .expect("an undecodable mutated CRD must be rejected");
+
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("admission mutated CRD is invalid"),
+            "the client must see why its CRD was rejected, not a redacted 500: {v}"
+        );
+    }
+
     /// replace_crd must invoke the validating admission pipeline.
     /// A validating webhook that denies must cause replace_crd to return an error.
     #[tokio::test]
@@ -6285,6 +6473,15 @@ mod ratchet_tests {
             serde_json::from_slice(&minimal_crd_bytes_with_group(FIN_CRD, "fin.io", "widgets"))
                 .unwrap();
         body["metadata"]["finalizers"] = serde_json::json!([CLEANUP_FINALIZER]);
+        body["metadata"]["resourceVersion"] = state
+            .store
+            .get(&store_key(FIN_CRD))
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+            .to_string()
+            .into();
         replace_crd(
             State(state.clone()),
             Path(FIN_CRD.to_string()),

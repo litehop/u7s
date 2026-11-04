@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Summarises one gate run's samples.tsv (from vm-sampler.sh) as a markdown table:
-# MemAvailable min per phase, and per-component PSS/RSS (MiB) at the end of the idle
-# phase, at the end of the wordpress phase, and the peak over the whole run.
+# MemAvailable min per phase (the overall min excludes the install phase), and
+# per-component PSS/RSS (MiB) at the end of the idle phase, at the end of the wordpress phase, and the peak over the whole run.
 #
 # Usage: summarize.sh <run-out-dir>
 set -euo pipefail
@@ -12,7 +12,7 @@ awk -F'\t' '
   $3 == "MEM" {
     v = $4 / 1024
     if (!($2 in memmin) || v < memmin[$2]) memmin[$2] = v
-    if (!seen_all || v < allmin) { allmin = v; seen_all = 1 }
+    if (($2 != "install") && (!seen_all || v < allmin)) { allmin = v; seen_all = 1 }
     if (!($2 in phase_seen)) { phase_seen[$2] = 1; order[++np] = $2 }
     next
   }
@@ -24,7 +24,8 @@ awk -F'\t' '
     if (rss > peakrss[c]) peakrss[c] = rss
   }
   END {
-    printf "MemAvailable min over run: %.0f MiB\n\n", allmin
+    if (seen_all) printf "MemAvailable min over run (post-install phases; install has its own row below): %.0f MiB\n\n", allmin
+    else printf "MemAvailable min over run (post-install phases): n/a\n\n"
     printf "| phase | MemAvailable min (MiB) |\n|---|---|\n"
     for (i = 1; i <= np; i++) printf "| %s | %.0f |\n", order[i], memmin[order[i]]
     printf "\n| component | idle PSS/RSS | wordpress PSS/RSS | peak PSS | peak RSS |\n|---|---|---|---|---|\n"

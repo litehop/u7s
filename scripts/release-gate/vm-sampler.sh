@@ -7,6 +7,8 @@
 #   STAT  <user+nice> <system> <iowait> <steal>                     (jiffies, /proc/stat)
 #   DISK  <dev> <rd_ios> <rd_sectors> <wr_ios> <wr_sectors> <io_ms>
 #   CG    <cgroup> <usage_usec> <throttled_usec>                    (root, top slices+scopes, system.slice/*, kubepods.slice/*)
+#   VM    <counter> <value>   (workingset_refault_file/anon, pgmajfault, pgscan_*, pgsteal_*; pages, /proc/vmstat)
+#   CGMEM <cgroup> <memory.current bytes>   (instantaneous, not cumulative; system.slice/*, kubepods.slice)
 #   CGIO  <cgroup> <rbytes> <wbytes> <rios> <wios>
 #   PROC  <pid> <comm> <cpu_jiffies> <read_bytes> <write_bytes>     (pids with any activity, only every
 #         SAMPLER_PROC_INTERVAL=30 s: the walk reads 2 files per pid; reaped children's
@@ -36,7 +38,8 @@ sample_attrib() {
     "$cg"/[c]pu.stat "$cg"/[i]o.stat "$cg"/*.slice/cpu.stat "$cg"/*.slice/io.stat "$cg"/*.scope/cpu.stat "$cg"/*.scope/io.stat \
     "$cg"/system.slice/*/cpu.stat "$cg"/system.slice/*/io.stat \
     "$cg"/kubepods.slice/*/cpu.stat "$cg"/kubepods.slice/*/*/cpu.stat \
-    "$cg"/kubepods.slice/*/io.stat "$cg"/kubepods.slice/*/*/io.stat 2>/dev/null | awk -v ts="$ts" -v ph="$phase" -v cglen="${#cg}" '
+    "$cg"/kubepods.slice/*/io.stat "$cg"/kubepods.slice/*/*/io.stat \
+    "$R"/proc/vmstat "$cg"/system.slice/*/memory.current "$cg"/kubepods.slice/memory.current 2>/dev/null | awk -v ts="$ts" -v ph="$phase" -v cglen="${#cg}" '
     function emit(kind, rest) { printf "%s\t%s\t%s\t%s\n", ts, ph, kind, rest }
     function cgname(f, suffix,   n) {
       n = substr(f, cglen + 1)
@@ -53,6 +56,11 @@ sample_attrib() {
       next
     }
     fn ~ /\/proc\/stat$/ { if ($1 == "cpu") emit("STAT", ($2 + $3) "\t" $4 "\t" $6 "\t" $9); next }
+    fn ~ /\/proc\/vmstat$/ {
+      if ($1 ~ /^(workingset_refault_file|workingset_refault_anon|pgmajfault|pgscan_[a-z]+|pgsteal_[a-z]+)$/) vm[$1] = $2
+      next
+    }
+    fn ~ /\/memory\.current$/ { mc[fn] = $1; next }
     fn ~ /\/proc\/diskstats$/ {
       if ($3 ~ /^(sd[a-z]|vd[a-z]|nvme[0-9]+n[0-9]+)$/) emit("DISK", $3 "\t" $4 "\t" $6 "\t" $8 "\t" $10 "\t" $13)
       next
@@ -89,6 +97,8 @@ sample_attrib() {
     }
     END {
       for (n in some) emit("PSI", n "\t" some[n] "\t" (n in full ? full[n] : 0))
+      for (n in vm) emit("VM", n "\t" vm[n])
+      for (f in mc) emit("CGMEM", cgname(f, "/memory\\.current$") "\t" mc[f])
       for (f in u) emit("CG", cgname(f, "/cpu\\.stat$") "\t" u[f] "\t" t[f] + 0)
       for (f in rb) emit("CGIO", cgname(f, "/io\\.stat$") "\t" rb[f] "\t" wb[f] "\t" ri[f] "\t" wi[f])
       for (p in ticks) if (ticks[p] > 0 || prb[p] > 0 || pwb[p] > 0) emit("PROC", p "\t" comm[p] "\t" ticks[p] "\t" prb[p] + 0 "\t" pwb[p] + 0)

@@ -57,15 +57,36 @@ fi
 # (docs/decisions/install-script-ux.md):
 #   --node-name / U7S_NODE_NAME   Node identity (default: hostname).
 #   --iface     / U7S_IFACE       Cluster-traffic interface (default: first
-#                                 physical non-loopback interface).
-#   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12).
-#   --cluster-cidr / U7S_CLUSTER_CIDR   Pod CIDR (default 10.244.0.0/16).
+#                                 physical non-loopback interface). Its first
+#                                 global-scope IPv4 and IPv6 address (IPv4
+#                                 first) are the node addresses.
+#   --node-ip   / U7S_NODE_IP     Node addresses instead of the interface's:
+#                                 one IP, or one per family comma-separated
+#                                 (e.g. 10.0.0.5,fd00::5). The first is the
+#                                 primary: apiserver advertise address and
+#                                 kube-proxy's server; every address goes to
+#                                 kubelet --node-ip and the serving cert SANs.
+#                                 With dual-stack --service-cidr/--cluster-cidr
+#                                 the node needs an address of each family.
+#   --service-cidr / U7S_SERVICE_CIDR   Service ClusterIP range (default 10.96.0.0/12);
+#                                       or two comma-separated ranges of
+#                                       different IP families (dual-stack,
+#                                       e.g. 10.96.0.0/12,fd00:96::/108).
+#   --cluster-cidr / U7S_CLUSTER_CIDR   Pod CIDR (default 10.244.0.0/16); or two
+#                                       of different families (e.g.
+#                                       10.244.0.0/16,fd00:244::/56).
 #   --cluster-dns  / U7S_CLUSTER_DNS    kube-dns ClusterIP (default: tenth host
-#                                       of the service range). Persisted at
-#                                       first install; a conflicting re-run is
-#                                       refused. A migration target inherits
+#                                       of the service range). Control plane
+#                                       only (a --join node reads it from the
+#                                       cluster). Persisted at first install;
+#                                       a conflicting re-run is refused. A
+#                                       migration target inherits
 #                                       k3s with 10.43.0.0/16, 10.42.0.0/16 and
 #                                       10.43.0.10.
+#   A --join node learns the cluster's Service/pod ranges and DNS from
+#   kube-system/u7s-cluster-config, read with the join token after discovery;
+#   its --node-ip is checked against the families that implies, as a control
+#   plane's is against its own ranges. The join fails if the read fails.
 #   --manifest-output-dir / U7S_MANIFEST_OUTPUT_DIR
 #                                 Where vendored manifest YAMLs from the
 #                                 tarball land (default: /etc/u7s/manifests,
@@ -80,16 +101,17 @@ fi
 # The default and --join modes need a tarball, from --tarball <path>,
 # --tarball-url <url>, or DEFAULT_TARBALL_URL below. It must contain the
 # binaries the mode needs (u7s-apiserver, u7s-scheduler, kubelet,
-# kube-controller-manager; kubelet alone for --join), findable anywhere in
+# kube-controller-manager; kubelet alone for --join, plus u7s-apiserver to build
+# the node identity CSR), findable anywhere in
 # its extracted tree.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
-  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--cluster-dns <ip>]
+  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]]
 
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
@@ -99,14 +121,18 @@ Usage:
   --node-name <name>    Node identity (default: hostname).
   --iface <iface>       Network interface used for cluster traffic
                          (default: first non-loopback interface).
+  --node-ip <ip>[,<ip>] Node addresses instead of the interface's: one IP, or
+                         one per IP family (e.g. 10.0.0.5,fd00::5). The first
+                         is the primary. A dual-stack cluster needs one of
+                         each family. Control plane and --join.
   --service-cidr <cidr> Service ClusterIP range (default: 10.96.0.0/12). To inherit
                          a k3s cluster use 10.43.0.0/16. Fixed at first install.
   --cluster-cidr <cidr> Pod CIDR (default: 10.244.0.0/16); k3s uses 10.42.0.0/16.
                          Disjoint from --service-cidr. Fixed at first install.
   --cluster-dns <ip>    ClusterIP of kube-dns, inside --service-cidr (default:
                          its tenth host, e.g. 10.96.0.10; k3s: 10.43.0.10).
-                         --join nodes must pass the control plane's value
-                         (--mint-join-token prints it when non-default).
+                         Control plane only; --join nodes read it from the
+                         cluster.
   --manifest-output-dir <path>
                          Where vendored manifest YAMLs from the tarball land
                          (default: /etc/u7s/manifests, the apiserver's
@@ -142,6 +168,12 @@ DEFAULT_TARBALL_URL=""
 
 NODE_NAME="${U7S_NODE_NAME:-}"
 IFACE="${U7S_IFACE:-}"
+# Operator-supplied node addresses (comma-separated, at most one per family);
+# empty = use the interface's global-scope addresses. NODE_IPS is the resolved
+# list either way, the primary (first) address being IFACE_IP.
+NODE_IP="${U7S_NODE_IP:-}"
+NODE_IPS=""
+NODE_IPS_EXPLICIT=0
 # Empty = not passed; the defaults below apply after the persisted config is
 # consulted (an unset flag on a re-run keeps what the first install chose).
 DEFAULT_SERVICE_CIDR="10.96.0.0/12"
@@ -149,6 +181,13 @@ DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"
 SERVICE_CIDR="${U7S_SERVICE_CIDR:-}"
 POD_CLUSTER_CIDR="${U7S_CLUSTER_CIDR:-}"
 CLUSTER_DNS="${U7S_CLUSTER_DNS:-}"
+# The cluster's IP families, primary first ("4", "6,4"). A control plane derives
+# it from its ranges; a worker derives it from the cluster's published ranges
+# (fetch_cluster_config) before it picks its --node-ip.
+CLUSTER_FAMILIES=""
+# Per-family entries of the two lists, set by validate_network_config.
+SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""
+POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""
 MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"
 TARBALL=""
 TARBALL_URL="$DEFAULT_TARBALL_URL"
@@ -164,6 +203,8 @@ JOIN_TOKEN=""
 CA_CERT_HASH=""
 # Set by join_cluster to the server-side creationTimestamp of this join's client CSR.
 JOIN_STARTED_AT=""
+# Set by join_discover: the validated join token, for join_cluster.
+JOIN_BOOTSTRAP_TOKEN=""
 
 # Everything below runs inside main(), invoked on the last line: bash must
 # parse the whole function before executing any of it, so a truncated
@@ -174,6 +215,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --node-name) NODE_NAME="$2"; shift 2 ;;
     --iface) IFACE="$2"; shift 2 ;;
+    --node-ip) NODE_IP="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --cluster-cidr) POD_CLUSTER_CIDR="$2"; shift 2 ;;
     --cluster-dns) CLUSTER_DNS="$2"; shift 2 ;;
@@ -189,6 +231,10 @@ while [ $# -gt 0 ]; do
     *) echo "error: unknown argument: $1" >&2; usage; exit 1 ;;
   esac
 done
+# "a, b" and "a,b" are one dual-stack value: persist and compare one form.
+SERVICE_CIDR="${SERVICE_CIDR//[[:space:]]/}"
+POD_CLUSTER_CIDR="${POD_CLUSTER_CIDR//[[:space:]]/}"
+NODE_IP="${NODE_IP//[[:space:]]/}"
 
 if [ -n "$TARBALL" ] && [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; then
   echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
@@ -325,8 +371,7 @@ mktemp_disk_dir() {
 
 # Ed25519 release-signing public key (PEM). The matching private key lives only
 # in the protected `release` GitHub Environment; the same key is published in
-# README.md. PLACEHOLDER: empty until the operator generates the key, and the
-# release workflow refuses to publish while it is empty.
+# README.md.
 RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
 -----END PUBLIC KEY-----"
@@ -472,52 +517,222 @@ int_to_ipv4() {
   echo "$(( $1 >> 24 & 255 )).$(( $1 >> 16 & 255 )).$(( $1 >> 8 & 255 )).$(( $1 & 255 ))"
 }
 
-# Parses <cidr> (flag <label>) into CIDR_START/CIDR_END, requiring the
-# canonical network address and a prefix in [min,max].
+# IPv6 address -> 32 lowercase hex digits; fails (no output) on anything else
+# (zone IDs and embedded IPv4 forms are not accepted).
+ip6_to_hex() {
+  local a="$1" left right g out="" i nz
+  local -a L R
+  [[ "$a" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  case "$a" in *:::*) return 1 ;; esac
+  L=(); R=()
+  if [[ "$a" == *::* ]]; then
+    left="${a%%::*}"; right="${a#*::}"
+    case "$right" in *::*) return 1 ;; esac
+    IFS=: read -ra L <<< "$left"
+    IFS=: read -ra R <<< "$right"
+    nz=$(( 8 - ${#L[@]} - ${#R[@]} ))
+    [ "$nz" -ge 1 ] || return 1
+  else
+    IFS=: read -ra L <<< "$a"
+    [ "${#L[@]}" -eq 8 ] || return 1
+    nz=0
+  fi
+  for (( i = 0; i < ${#L[@]}; i++ )); do
+    g="${L[i]}"; [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$(printf '%04x' "$(( 16#$g ))")"
+  done
+  for (( i = 0; i < nz; i++ )); do out="${out}0000"; done
+  for (( i = 0; i < ${#R[@]}; i++ )); do
+    g="${R[i]}"; [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    out+="$(printf '%04x' "$(( 16#$g ))")"
+  done
+  echo "$out"
+}
+
+# 32 hex digits -> RFC 5952 text (longest zero run of 2+ groups compressed).
+ip6_hex_to_str() {
+  local h="$1" i s="" best_start=-1 best_len=0 cur_start=-1 cur_len=0
+  local -a G
+  for (( i = 0; i < 8; i++ )); do
+    G[i]="$(printf '%x' "$(( 16#${h:i*4:4} ))")"
+    if [ "${G[i]}" = 0 ]; then
+      [ "$cur_start" -ge 0 ] || { cur_start=$i; cur_len=0; }
+      cur_len=$(( cur_len + 1 ))
+      if [ "$cur_len" -gt "$best_len" ]; then best_start=$cur_start; best_len=$cur_len; fi
+    else
+      cur_start=-1; cur_len=0
+    fi
+  done
+  [ "$best_len" -ge 2 ] || best_start=-1
+  i=0
+  while [ "$i" -lt 8 ]; do
+    if [ "$i" -eq "$best_start" ]; then s+="::"; i=$(( i + best_len )); continue; fi
+    case "$s" in ""|*:) ;; *) s+=: ;; esac
+    s+="${G[i]}"; i=$(( i + 1 ))
+  done
+  echo "$s"
+}
+
+# Keeps the first <bits> bits of the 32-digit hex address, zeroing the rest.
+ip6_mask_hex() {
+  local h="$1" bits="$2" q r out n
+  q=$(( bits / 4 )); r=$(( bits % 4 ))
+  out="${h:0:q}"
+  if [ "$q" -lt 32 ]; then
+    n=$(( 16#${h:q:1} & ((15 << (4 - r)) & 15) ))
+    out+="$(printf '%x' "$n")"
+  fi
+  while [ "${#out}" -lt 32 ]; do out="${out}0"; done
+  echo "${out:0:32}"
+}
+
+# True when two 32-digit hex addresses agree on their first <bits> bits.
+ip6_prefix_equal() {
+  [ "$(ip6_mask_hex "$1" "$3")" = "$(ip6_mask_hex "$2" "$3")" ]
+}
+
+# Adds a small <n> to the low 32 bits.
+ip6_add_hex() {
+  printf '%s%08x\n' "${1:0:24}" "$(( 16#${1:24:8} + $2 ))"
+}
+
+# Parses <cidr> (flag <label>), IPv4 or IPv6 by its address, requiring the
+# canonical network address and a prefix in [min4,max4] / [min6,max6]. Sets
+# CIDR_FAMILY (4|6), CIDR_PREFIX and CIDR_START/CIDR_END (IPv4 integers) or
+# CIDR_HEX (IPv6 network).
 parse_cidr() {
-  local label="$1" cidr="$2" min="$3" max="$4" addr prefix start size
-  case "$cidr" in */*) ;; *) echo "error: $label '$cidr' is not a CIDR (expected a.b.c.d/n)" >&2; return 1 ;; esac
+  local label="$1" cidr="$2" min4="$3" max4="$4" min6="$5" max6="$6" addr prefix start size hex net min max
+  case "$cidr" in */*) ;; *) echo "error: $label '$cidr' is not a CIDR (expected a.b.c.d/n or an IPv6 address/n)" >&2; return 1 ;; esac
   addr="${cidr%/*}"; prefix="${cidr#*/}"
-  if ! start="$(ipv4_to_int "$addr")" || ! [[ "$prefix" =~ ^[0-9]{1,2}$ ]]; then
-    echo "error: $label '$cidr' is not a valid IPv4 CIDR" >&2; return 1
+  if [[ "$addr" == *:* ]]; then
+    CIDR_FAMILY=6; min=$min6; max=$max6
+    if ! hex="$(ip6_to_hex "$addr")" || ! [[ "$prefix" =~ ^(0|[1-9][0-9]{0,2})$ ]]; then
+      echo "error: $label '$cidr' is not a valid IPv6 CIDR" >&2; return 1
+    fi
+  else
+    CIDR_FAMILY=4; min=$min4; max=$max4
+    if ! start="$(ipv4_to_int "$addr")" || ! [[ "$prefix" =~ ^(0|[1-9][0-9]?)$ ]]; then
+      echo "error: $label '$cidr' is not a valid IPv4 CIDR" >&2; return 1
+    fi
   fi
   if [ "$prefix" -lt "$min" ] || [ "$prefix" -gt "$max" ]; then
     echo "error: $label '$cidr' has prefix /$prefix; it must be between /$min and /$max" >&2; return 1
   fi
-  size=$(( 1 << (32 - prefix) ))
-  if [ $(( start & (size - 1) )) -ne 0 ]; then
-    echo "error: $label '$cidr' has host bits set; the network address is $(int_to_ipv4 $(( start & ~(size - 1) )))/$prefix" >&2; return 1
+  if [ "$CIDR_FAMILY" = 6 ]; then
+    net="$(ip6_mask_hex "$hex" "$prefix")"
+    if [ "$net" != "$hex" ]; then
+      echo "error: $label '$cidr' has host bits set; the network address is $(ip6_hex_to_str "$net")/$prefix" >&2; return 1
+    fi
+    CIDR_HEX=$net
+  else
+    size=$(( 1 << (32 - prefix) ))
+    if [ $(( start & (size - 1) )) -ne 0 ]; then
+      echo "error: $label '$cidr' has host bits set; the network address is $(int_to_ipv4 $(( start & ~(size - 1) )))/$prefix" >&2; return 1
+    fi
+    CIDR_START=$start
+    CIDR_END=$(( start + size - 1 ))
   fi
-  CIDR_START=$start
-  CIDR_END=$(( start + size - 1 ))
+  CIDR_PREFIX=$prefix
 }
 
-# kubeadm's convention (and the apiserver's default): kube-dns is the tenth host.
+# Parses a --service-cidr / --cluster-cidr value: one CIDR, or two of
+# different IP families (upstream's dual-stack rule), the first being the
+# primary. Sets CIDR_LIST_V4 / CIDR_LIST_V6 to the entry of each family ("" if absent).
+parse_cidr_list() {
+  local label="$1" list="$2" min4="$3" max4="$4" min6="$5" max6="$6" commas e first_family="" idx=0
+  commas="${list//[^,]/}"
+  CIDR_LIST_V4=""; CIDR_LIST_V6=""
+  if [ "${#commas}" -gt 1 ]; then
+    echo "error: $label '$list' must not contain more than two entries" >&2; return 1
+  fi
+  if [ -z "$commas" ]; then
+    parse_cidr "$label" "$list" "$min4" "$max4" "$min6" "$max6" || return 1
+    if [ "$CIDR_FAMILY" = 4 ]; then CIDR_LIST_V4="$list"; else CIDR_LIST_V6="$list"; fi
+    return 0
+  fi
+  for e in "${list%%,*}" "${list#*,}"; do
+    parse_cidr "${label}[$idx]" "$e" "$min4" "$max4" "$min6" "$max6" || return 1
+    if [ "$first_family" = "$CIDR_FAMILY" ]; then
+      echo "error: ${label}[0] and ${label}[1] must be of different IP family" >&2; return 1
+    fi
+    first_family="$CIDR_FAMILY"; idx=1
+    if [ "$CIDR_FAMILY" = 4 ]; then CIDR_LIST_V4="$e"; else CIDR_LIST_V6="$e"; fi
+  done
+}
+
+# True when two CIDRs of the same family share an address.
+cidrs_overlap() {
+  local s e p h
+  parse_cidr range "$1" 0 32 0 128 || return 1
+  s=${CIDR_START:-0}; e=${CIDR_END:-0}; p=$CIDR_PREFIX; h=${CIDR_HEX:-}
+  parse_cidr range "$2" 0 32 0 128 || return 1
+  if [ "$CIDR_FAMILY" = 4 ]; then
+    [ "$s" -le "$CIDR_END" ] && [ "$CIDR_START" -le "$e" ]
+  else
+    [ "$CIDR_PREFIX" -gt "$p" ] || p=$CIDR_PREFIX
+    ip6_prefix_equal "$h" "$CIDR_HEX" "$p"
+  fi
+}
+
+# kubeadm's convention (and the apiserver's default): kube-dns is the tenth
+# host of the first service range, in that range's family.
 default_cluster_dns() {
-  parse_cidr --service-cidr "$1" 12 28 || return 1
-  int_to_ipv4 $(( CIDR_START + 10 ))
+  parse_cidr --service-cidr "${1%%,*}" 1 28 1 124 || return 1
+  if [ "$CIDR_FAMILY" = 4 ]; then
+    int_to_ipv4 $(( CIDR_START + 10 ))
+  else
+    ip6_hex_to_str "$(ip6_add_hex "$CIDR_HEX" 10)"
+  fi
 }
 
 # Fails loud on a combination no consumer can serve. $1=1 on a worker, which
 # runs only kubelet and so only consumes the DNS address (the ranges are the
-# control plane's).
+# control plane's). Sets SERVICE_CIDR_IPV4/_IPV6 and POD_CLUSTER_CIDR_IPV4/_IPV6
+# (the entry of each family, "" if absent) for the manifest placeholders.
 validate_network_config() {
-  local worker="$1" dns svc_start svc_end
-  if ! dns="$(ipv4_to_int "$CLUSTER_DNS")"; then
-    echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 address" >&2; return 1
+  local worker="$1" dns dns_hex dns_family svc
+  if dns="$(ipv4_to_int "$CLUSTER_DNS")"; then
+    dns_family=4
+  elif dns_hex="$(ip6_to_hex "$CLUSTER_DNS")"; then
+    dns_family=6
+  else
+    echo "error: --cluster-dns '$CLUSTER_DNS' is not a valid IPv4 or IPv6 address" >&2; return 1
   fi
-  [ "$worker" -eq 1 ] && return 0
-  # /12 is the largest range upstream accepts; /28 leaves room for the
-  # kubernetes (.1) and kube-dns (.10) VIPs plus allocation.
-  parse_cidr --service-cidr "$SERVICE_CIDR" 12 28 || return 1
-  svc_start=$CIDR_START; svc_end=$CIDR_END
-  # /24 is KCM's per-node mask; the 16-bit gap to the mask is its limit.
-  parse_cidr --cluster-cidr "$POD_CLUSTER_CIDR" 8 24 || return 1
-  if [ "$svc_start" -le "$CIDR_END" ] && [ "$CIDR_START" -le "$svc_end" ]; then
-    echo "error: --service-cidr $SERVICE_CIDR and --cluster-cidr $POD_CLUSTER_CIDR overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  if [ "$worker" -eq 1 ]; then
+    case "$CLUSTER_FAMILIES" in
+      4|6|4,6|6,4) return 0 ;;
+      *) echo "error: cluster IP families '$CLUSTER_FAMILIES' must be one of 4, 6, 4,6, 6,4" >&2; return 1 ;;
+    esac
   fi
-  if [ "$dns" -le "$svc_start" ] || [ "$dns" -ge "$svc_end" ] || [ "$dns" -eq $(( svc_start + 1 )) ]; then
-    echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $SERVICE_CIDR (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( svc_start + 1 ))) are excluded)" >&2; return 1
+  # Upstream 1.37 and the u7s apiserver bound no range size. /28 and /124 leave
+  # room for the kubernetes (first) and kube-dns (tenth) VIPs; /0 would span
+  # the whole address space and always overlap the node and pod networks.
+  parse_cidr_list --service-cidr "$SERVICE_CIDR" 1 28 1 124 || return 1
+  SERVICE_CIDR_IPV4="$CIDR_LIST_V4"; SERVICE_CIDR_IPV6="$CIDR_LIST_V6"
+  # The per-node masks (/24 IPv4, /64 IPv6) are KCM's; its limit is a 16-bit
+  # gap between them and the cluster range.
+  parse_cidr_list --cluster-cidr "$POD_CLUSTER_CIDR" 8 24 48 64 || return 1
+  POD_CLUSTER_CIDR_IPV4="$CIDR_LIST_V4"; POD_CLUSTER_CIDR_IPV6="$CIDR_LIST_V6"
+  if [ -n "$SERVICE_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV4" ] && cidrs_overlap "$SERVICE_CIDR_IPV4" "$POD_CLUSTER_CIDR_IPV4"; then
+    echo "error: --service-cidr $SERVICE_CIDR_IPV4 and --cluster-cidr $POD_CLUSTER_CIDR_IPV4 overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  fi
+  if [ -n "$SERVICE_CIDR_IPV6" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ] && cidrs_overlap "$SERVICE_CIDR_IPV6" "$POD_CLUSTER_CIDR_IPV6"; then
+    echo "error: --service-cidr $SERVICE_CIDR_IPV6 and --cluster-cidr $POD_CLUSTER_CIDR_IPV6 overlap; Service VIPs and pod IPs would collide" >&2; return 1
+  fi
+  if [ "$dns_family" = 4 ]; then svc="$SERVICE_CIDR_IPV4"; else svc="$SERVICE_CIDR_IPV6"; fi
+  if [ -z "$svc" ]; then
+    echo "error: --cluster-dns $CLUSTER_DNS is an IPv$dns_family address but --service-cidr $SERVICE_CIDR has no IPv$dns_family range" >&2; return 1
+  fi
+  parse_cidr --service-cidr "$svc" 1 28 1 124 || return 1
+  if [ "$dns_family" = 4 ]; then
+    if [ "$dns" -le "$CIDR_START" ] || [ "$dns" -ge "$CIDR_END" ] || [ "$dns" -eq $(( CIDR_START + 1 )) ]; then
+      echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $svc (network, broadcast and the kubernetes Service VIP $(int_to_ipv4 $(( CIDR_START + 1 ))) are excluded)" >&2; return 1
+    fi
+  else
+    # IPv6 has no broadcast address: the all-ones host is allocatable.
+    if ! ip6_prefix_equal "$dns_hex" "$CIDR_HEX" "$CIDR_PREFIX" || [ "$dns_hex" = "$CIDR_HEX" ] || [ "$dns_hex" = "$(ip6_add_hex "$CIDR_HEX" 1)" ]; then
+      echo "error: --cluster-dns $CLUSTER_DNS is not an allocatable host of --service-cidr $svc (network and the kubernetes Service VIP $(ip6_hex_to_str "$(ip6_add_hex "$CIDR_HEX" 1)") are excluded)" >&2; return 1
+    fi
   fi
 }
 
@@ -525,58 +740,229 @@ validate_network_config() {
 # unset keeps the persisted value (or the default for an install that
 # predates persistence, which always ran the defaults); an explicit value that
 # disagrees on an existing install refuses, because Services, pods and every
-# node's kubelet already hold addresses from the old range.
+# node's kubelet already hold addresses from the old range. The one supported
+# change is upstream's single- to dual-stack upgrade: the persisted single
+# range kept as the primary and exactly one range of the other family appended
+# (sets DUAL_STACK_UPGRADE=1).
 reconcile_network_flag() {
-  local flag="$1" var="$2" persisted="$3" default="$4" given effective
+  local flag="$1" var="$2" persisted="$3" default="$4" given effective primary secondary pfam=4 sfam=4
   given="${!var}"
   effective="$default"
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$persisted" ]; then
     effective="$persisted"
   fi
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
-    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+    if [[ "$effective" != *,* && "$given" == *,* ]]; then
+      primary="${given%%,*}"; secondary="${given#*,}"
+      if [ "$primary" != "$effective" ]; then
+        echo "error: $flag $given changes the primary range: this cluster's is $effective (recorded in $CONFIG_FILE) and Services, pods and kubelets already hold addresses from it. Only adding a secondary range of the other IP family is supported ($flag $effective,<other-family range>). To change the primary, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+        return 1
+      fi
+      [[ "$effective" == *:* ]] && pfam=6
+      [[ "$secondary" == *:* ]] && sfam=6
+      if [[ "$secondary" == *,* || "$sfam" = "$pfam" ]]; then
+        echo "error: $flag $given is not a single secondary range of the other IP family: the primary $effective is IPv$pfam, so exactly one IPv$((10 - pfam)) range may follow it ($flag $effective,<other-family range>)." >&2
+        return 1
+      fi
+      DUAL_STACK_UPGRADE=1
+      [ "$flag" = --cluster-cidr ] && POD_CIDR_UPGRADE=1
+      printf -v "$var" '%s' "$given"
+      return 0
+    fi
+    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. Only a single-stack cluster gaining a secondary range ($flag $effective,<other-family range>) can change in place. Otherwise start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
     return 1
   fi
   printf -v "$var" '%s' "${given:-$effective}"
 }
 
+# Prints the first stable global-scope address of each family on interface $1,
+# IPv4 first, one per line. Link-local, tentative, deprecated, dadfailed and
+# temporary (privacy) IPv6 addresses are skipped: a node identity must not
+# change when the kernel rotates a privacy address or DAD has not finished.
+iface_global_addrs() {
+  ip -o addr show dev "$1" | awk '
+    ($3 == "inet" || $3 == "inet6") {
+      scope = ""; bad = 0
+      for (i = 4; i <= NF; i++) {
+        if ($i == "valid_lft") break
+        if ($i == "scope") scope = $(i + 1)
+        if ($i ~ /^(tentative|deprecated|dadfailed|temporary)$/) bad = 1
+      }
+      if (scope != "global" || bad) next
+      a = $4; sub(/\/.*/, "", a)
+      if ($3 == "inet" && v4 == "") v4 = a
+      if ($3 == "inet6" && v6 == "") v6 = a
+    }
+    END { if (v4 != "") print v4; if (v6 != "") print v6 }'
+}
+
+# Validates a comma-separated --node-ip list (each entry a literal IPv4/IPv6
+# address, at most one per family) and sets NODE_IPS to it.
+parse_node_ip_list() {
+  local list="$1" ip have4="" have6=""
+  [ -n "$list" ] || { echo "error: --node-ip is empty" >&2; return 1; }
+  for ip in ${list//,/ }; do
+    if ipv4_to_int "$ip" >/dev/null; then
+      [ -z "$have4" ] || { echo "error: --node-ip $list has two IPv4 addresses ($have4 and $ip); at most one per IP family" >&2; return 1; }
+      have4="$ip"
+    elif ip6_to_hex "$ip" >/dev/null; then
+      [ -z "$have6" ] || { echo "error: --node-ip $list has two IPv6 addresses ($have6 and $ip); at most one per IP family" >&2; return 1; }
+      have6="$ip"
+    else
+      echo "error: --node-ip entry '$ip' is not a literal IPv4 or IPv6 address" >&2; return 1
+    fi
+  done
+  case "$list" in ,*|*,|*,,*) echo "error: --node-ip '$list' has an empty entry" >&2; return 1 ;; esac
+  NODE_IPS="$list"
+}
+
+# Prints the IP families a cluster uses, primary first and comma-separated
+# ("4", "6,4"): the Service ranges' families in order, then any further family
+# only the pod ranges use. $1=service CIDR list, $2=pod CIDR list.
+cluster_families_from_cidrs() {
+  local out="" range fam
+  for range in ${1//,/ } ${2//,/ }; do
+    case "$range" in *:*) fam=6 ;; *) fam=4 ;; esac
+    case ",$out," in *",$fam,"*) ;; *) out="${out:+$out,}$fam" ;; esac
+  done
+  printf '%s' "$out"
+}
+
+# The node address families must be exactly the cluster's ($CLUSTER_FAMILIES,
+# primary first), on control planes and workers alike. A family the cluster
+# needs but the node lacks is always an error (a dual-stack cluster cannot run
+# on a single-family node). A node family the cluster does not use is an error
+# when the operator passed --node-ip (almost certainly a typo'd or mismatched
+# flag) and is dropped when the addresses were auto-detected from the
+# interface (a host that happens to carry an IPv6 address must still join or
+# install a single-stack IPv4 cluster). The first address must have the primary
+# family, as upstream requires of the kubernetes Service endpoint and the
+# node's primary InternalIP: auto-detected addresses are reordered to it, an
+# explicit --node-ip in the wrong order is an error. Rewrites NODE_IPS.
+reconcile_node_ips_with_families() {
+  local have=" " ip fam kept="" primary="${CLUSTER_FAMILIES%%,*}"
+  for ip in ${NODE_IPS//,/ }; do
+    case "$ip" in *:*) have+="6 " ;; *) have+="4 " ;; esac
+  done
+  for fam in ${CLUSTER_FAMILIES//,/ }; do
+    case "$have" in *" $fam "*) continue ;; esac
+    echo "error: the cluster uses IPv$fam (cluster IP families: $CLUSTER_FAMILIES), but the node addresses ($NODE_IPS) have no IPv$fam address. Give the node one (--node-ip <v4>,<v6> or an --iface that carries both) or use a single-stack cluster." >&2
+    return 1
+  done
+  for ip in ${NODE_IPS//,/ }; do
+    case "$ip" in *:*) fam=6 ;; *) fam=4 ;; esac
+    case ",$CLUSTER_FAMILIES," in
+      *",$fam,"*) ;;
+      *) if [ "$NODE_IPS_EXPLICIT" -eq 1 ]; then
+           echo "error: --node-ip $NODE_IPS has an IPv$fam address ($ip) but the cluster has no IPv$fam range (cluster IP families: $CLUSTER_FAMILIES). Drop $ip from --node-ip, or use a dual-stack cluster." >&2
+           return 1
+         fi ;;
+    esac
+  done
+  if [ "$NODE_IPS_EXPLICIT" -eq 1 ]; then
+    case "${NODE_IPS%%,*}" in *:*) fam=6 ;; *) fam=4 ;; esac
+    if [ "$fam" != "$primary" ]; then
+      echo "error: --node-ip $NODE_IPS lists an IPv$fam address first, but the cluster's primary IP family is IPv$primary (cluster IP families: $CLUSTER_FAMILIES). Put the IPv$primary address first." >&2
+      return 1
+    fi
+  fi
+  for fam in ${CLUSTER_FAMILIES//,/ }; do
+    for ip in ${NODE_IPS//,/ }; do
+      case "$ip" in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+      kept="${kept:+$kept,}$ip"
+    done
+  done
+  NODE_IPS="$kept"
+}
+
 # Fails when $IFACE_IP (arg 1) sits inside either range: the node's own address
 # would be unreachable behind Service/pod routing.
 check_node_ip_outside_ranges() {
-  local ip range
-  ip="$(ipv4_to_int "$1")" || return 0
-  for range in "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"; do
-    parse_cidr range "$range" 0 32 || return 1
-    if [ "$ip" -ge "$CIDR_START" ] && [ "$ip" -le "$CIDR_END" ]; then
+  local ip hex family range inside
+  if ip="$(ipv4_to_int "$1")"; then family=4; elif hex="$(ip6_to_hex "$1")"; then family=6; else return 0; fi
+  for range in ${SERVICE_CIDR//,/ } ${POD_CLUSTER_CIDR//,/ }; do
+    parse_cidr range "$range" 0 32 0 128 || return 1
+    [ "$CIDR_FAMILY" = "$family" ] || continue
+    inside=0
+    if [ "$family" = 4 ]; then
+      if [ "$ip" -ge "$CIDR_START" ] && [ "$ip" -le "$CIDR_END" ]; then inside=1; fi
+    elif ip6_prefix_equal "$hex" "$CIDR_HEX" "$CIDR_PREFIX"; then
+      inside=1
+    fi
+    if [ "$inside" -eq 1 ]; then
       echo "error: node address $1 is inside $range; choose --service-cidr/--cluster-cidr ranges that exclude the host network" >&2; return 1
     fi
   done
 }
 
+# KCM's per-node CIDR mask flags for $POD_CLUSTER_CIDR. Upstream rejects
+# --node-cidr-mask-size with two cluster CIDRs and wants one flag per family
+# (kube-controller-manager app/core.go); defaults are /24 IPv4, /64 IPv6.
+kcm_node_cidr_mask_flags() {
+  case "$POD_CLUSTER_CIDR" in
+    *,*) echo "--node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64" ;;
+    *:*) echo "--node-cidr-mask-size=64" ;;
+    *) echo "--node-cidr-mask-size=24" ;;
+  esac
+}
+
 # Writes the install-time placeholders into the vendored manifests in $1.
+# __POD_CLUSTER_CIDR__ is the primary (first) pod CIDR, so a manifest that
+# predates dual-stack keeps a valid single-family value; the full list and
+# each family are __POD_CLUSTER_CIDRS__, __POD_CLUSTER_CIDR_IPV4__ and
+# __POD_CLUSTER_CIDR_IPV6__ (likewise __SERVICE_CIDRS__, __SERVICE_CIDR_IPV4__,
+# __SERVICE_CIDR_IPV6__); an absent family renders empty. Single-stack IPv4
+# renders __POD_CLUSTER_CIDR__ exactly as before. Only a dual-stack install
+# changes manifest shape: flannel keeps its IPv6Network line, beep gets one
+# --pod-cidr per family, CoreDNS gets a second clusterIP, and kube-proxy's
+# server URL brackets an IPv6 node address.
 # CoreDNS ships its default VIP literally (the dev rigs apply the file as-is),
 # so its clusterIP line is rewritten and then verified.
 render_vendored_manifests() {
-  local dir="$1"
+  local dir="$1" nl=$'\\\n' iface_host="${IFACE_IP:-}" other_dns=""
+  local -a flannel_sed=() beep_sed=() coredns_sed=()
+  case "$iface_host" in *:*) iface_host="[$iface_host]" ;; esac
+  if [ -n "$POD_CLUSTER_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ]; then
+    # beep admits a pod IP only against the --pod-cidr of its own family.
+    beep_sed=(-e "s#--pod-cidr=__POD_CLUSTER_CIDR__#--pod-cidr=${POD_CLUSTER_CIDR%%,*}${nl}            - --pod-cidr=${POD_CLUSTER_CIDR#*,}#")
+  else
+    flannel_sed=(-e '/"IPv6Network": "__POD_CLUSTER_CIDR_IPV6__"/d')
+  fi
+  if [ -n "$SERVICE_CIDR_IPV4" ] && [ -n "$SERVICE_CIDR_IPV6" ]; then
+    case "$CLUSTER_DNS" in
+      *:*) other_dns="$(default_cluster_dns "$SERVICE_CIDR_IPV4")" || return 1 ;;
+      *) other_dns="$(default_cluster_dns "$SERVICE_CIDR_IPV6")" || return 1 ;;
+    esac
+    coredns_sed=(-e "s#^  clusterIP: $CLUSTER_DNS\$#  clusterIP: $CLUSTER_DNS${nl}  clusterIPs:${nl}  - $CLUSTER_DNS${nl}  - $other_dns${nl}  ipFamilyPolicy: PreferDualStack#")
+  fi
+  local -a cidr_sed=(
+    -e "s#__POD_CLUSTER_CIDR__#${POD_CLUSTER_CIDR%%,*}#g"
+    -e "s#__POD_CLUSTER_CIDRS__#$POD_CLUSTER_CIDR#g"
+    -e "s#__POD_CLUSTER_CIDR_IPV4__#$POD_CLUSTER_CIDR_IPV4#g"
+    -e "s#__POD_CLUSTER_CIDR_IPV6__#$POD_CLUSTER_CIDR_IPV6#g"
+    -e "s#__SERVICE_CIDRS__#$SERVICE_CIDR#g"
+    -e "s#__SERVICE_CIDR_IPV4__#$SERVICE_CIDR_IPV4#g"
+    -e "s#__SERVICE_CIDR_IPV6__#$SERVICE_CIDR_IPV6#g"
+  )
   if [ -f "$dir/flannel.yaml" ]; then
     # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
     # BSD sed, and this redirect-and-replace form works identically on both.
-    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__IFACE__/$IFACE/g" ${flannel_sed[@]+"${flannel_sed[@]}"} "${cidr_sed[@]}" \
       "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp"
     mv "$dir/flannel.yaml.tmp" "$dir/flannel.yaml"
   fi
   if [ -f "$dir/kube-proxy.yaml" ]; then
-    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#__IFACE_IP__#$IFACE_IP#g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__KUBE_VERSION__/$KUBE_VERSION/g" -e "s#https://__IFACE_IP__:#https://$iface_host:#g" -e "s#__IFACE_IP__#$IFACE_IP#g" "${cidr_sed[@]}" \
       "$dir/kube-proxy.yaml" > "$dir/kube-proxy.yaml.tmp"
     mv "$dir/kube-proxy.yaml.tmp" "$dir/kube-proxy.yaml"
   fi
   if [ -f "$dir/beep.yaml" ]; then
-    sed -e "s/__IFACE__/$IFACE/g" -e "s#__POD_CLUSTER_CIDR__#$POD_CLUSTER_CIDR#g" \
+    sed -e "s/__IFACE__/$IFACE/g" ${beep_sed[@]+"${beep_sed[@]}"} "${cidr_sed[@]}" \
       "$dir/beep.yaml" > "$dir/beep.yaml.tmp"
     mv "$dir/beep.yaml.tmp" "$dir/beep.yaml"
   fi
   if [ -f "$dir/coredns.yaml" ]; then
-    sed -e "s#^  clusterIP: 10\.96\.0\.10\$#  clusterIP: $CLUSTER_DNS#" \
+    sed -e "s#^  clusterIP: 10\.96\.0\.10\$#  clusterIP: $CLUSTER_DNS#" ${coredns_sed[@]+"${coredns_sed[@]}"} \
       "$dir/coredns.yaml" > "$dir/coredns.yaml.tmp"
     mv "$dir/coredns.yaml.tmp" "$dir/coredns.yaml"
     if ! grep -qx "  clusterIP: $CLUSTER_DNS" "$dir/coredns.yaml"; then
@@ -735,13 +1121,9 @@ mint_join_token() {
   echo "On the joining node, run as root. The command carries no token, so it stays out of shell"
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
-  local dns_flag="" persisted_dns
-  # shellcheck disable=SC1090
-  persisted_dns="$([ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE" && printf '%s' "${CLUSTER_DNS:-}" || true)"
-  if [ -n "$persisted_dns" ] && [ "$persisted_dns" != "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" ]; then
-    dns_flag=" --cluster-dns $persisted_dns"
-  fi
-  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]$dns_flag"
+  local tarball_hint=" --tarball <path>"
+  [ -n "${DEFAULT_TARBALL_URL:-}" ] && tarball_hint=""
+  echo "    --ca-cert-hash sha256:$ca_hash$tarball_hint --node-name <name> [--iface <iface>]"
 }
 
 # base64url without padding, from stdin.
@@ -831,6 +1213,45 @@ discover_cluster_ca() {
   printf '%s\n' "$ca_pem" > "$STATE_DIR/ca.pem"
 }
 
+# Reads kube-system/u7s-cluster-config (kubeadm's kubeadm-config analogue) with
+# the join token over TLS verified against the CA discovery pinned, and sets
+# CLUSTER_FAMILIES (derived from the published ranges) and CLUSTER_DNS (the
+# primary kube-dns VIP). The node cannot pick correct --node-ip families
+# without it, so any failure to read it fails the join.
+fetch_cluster_config() {
+  local token="$1" out svc pod dns
+  if ! out="$(curl --proto '=https' --tlsv1.2 -fsS --cacert "$STATE_DIR/ca.pem" \
+      -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+      "$JOIN_SERVER/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config" 2>&1)"; then
+    echo "error: could not read ConfigMap kube-system/u7s-cluster-config from $JOIN_SERVER ($out). The join needs the cluster's IP families and DNS from it: a 403 means the token's group lacks the u7s:nodes-cluster-config RoleBinding (control plane older than this install.sh?), a 404 that the control plane never published it; otherwise check connectivity." >&2
+    return 1
+  fi
+  svc="$(printf '%s' "$out" | jq -r '.data.serviceCIDRs // empty' 2>/dev/null || true)"
+  pod="$(printf '%s' "$out" | jq -r '.data.podCIDRs // empty' 2>/dev/null || true)"
+  dns="$(printf '%s' "$out" | jq -r '.data.clusterDNS // empty' 2>/dev/null || true)"
+  if [ -z "$svc" ] || [ -z "$dns" ]; then
+    echo "error: ConfigMap kube-system/u7s-cluster-config at $JOIN_SERVER lacks data.serviceCIDRs/data.clusterDNS -- refusing to guess the cluster's IP families" >&2
+    return 1
+  fi
+  CLUSTER_FAMILIES="$(cluster_families_from_cidrs "$svc" "$pod")"
+  CLUSTER_DNS="${dns%%,*}"
+}
+
+# --join prelude, run before the node addresses are chosen: pins the cluster
+# CA, then learns the cluster's families and DNS. Leaves the token in
+# JOIN_BOOTSTRAP_TOKEN for join_cluster.
+join_discover() {
+  if [ -z "$CA_CERT_HASH" ]; then
+    echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
+    exit 1
+  fi
+  ensure_jq
+  JOIN_BOOTSTRAP_TOKEN="$(read_join_token)"
+  install -d -m 0700 "$STATE_DIR"
+  discover_cluster_ca "${JOIN_BOOTSTRAP_TOKEN%%.*}" "${JOIN_BOOTSTRAP_TOKEN##*.}"
+  fetch_cluster_config "$JOIN_BOOTSTRAP_TOKEN" || exit 1
+}
+
 # Reads the join token from the --token flag, or from stdin when the flag is
 # absent or "-". Stdin keeps it out of argv, /proc/<pid>/cmdline and history.
 read_join_token() {
@@ -854,6 +1275,19 @@ read_join_token() {
   printf '%s' "$token"
 }
 
+# Writes the node identity key (0600) and CSR (CN=system:node:<name>,
+# O=system:nodes) via the tarball's u7s-apiserver. The openssl CSR tool caps
+# CN at 64 bytes, so node names over 52 chars would not fit.
+generate_node_csr() {
+  local tool
+  tool="$(find "$STAGE_DIR" -type f -name u7s-apiserver | head -n1)"
+  if [ -z "$tool" ] || [ ! -x "$tool" ]; then
+    echo "error: tarball is missing an executable u7s-apiserver (needed to generate the node identity CSR)" >&2
+    exit 1
+  fi
+  "$tool" node-csr --node-name "$NODE_NAME" --key-out "$1" --csr-out "$2"
+}
+
 # --join: run on a fresh node. Verifies the cluster CA via cluster-info and the
 # pinned hash, then builds a PKCS#10 CSR shaped exactly as upstream
 # csrapproving's isNodeClientCert recognizer requires (CN=system:node:<name>,
@@ -865,28 +1299,13 @@ read_join_token() {
 # serving cert is requested by the kubelet itself (serverTLSBootstrap) once its
 # Node exists; wait_for_joined_node checks it was approved and issued.
 join_cluster() {
-  if [ -z "$CA_CERT_HASH" ]; then
-    echo "error: --join requires --ca-cert-hash sha256:<hash> (printed by --mint-join-token)" >&2
-    exit 1
-  fi
-  ensure_jq
+  local bootstrap_token="$JOIN_BOOTSTRAP_TOKEN"
 
-  local bootstrap_token token_id token_secret
-  bootstrap_token="$(read_join_token)"
-  token_id="${bootstrap_token%%.*}"
-  token_secret="${bootstrap_token##*.}"
-
-  discover_cluster_ca "$token_id" "$token_secret"
-
-  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
-  chmod 600 "$STATE_DIR/kubelet-client.key"
-  openssl req -new -key "$STATE_DIR/kubelet-client.key" \
-    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
-    -out "$STATE_DIR/kubelet-client.csr"
+  generate_node_csr "$STATE_DIR/kubelet-client.key" "$STATE_DIR/kubelet-client.csr"
 
   local csr_b64 csr_name csr_body
   csr_b64="$(base64 -w0 "$STATE_DIR/kubelet-client.csr")"
-  csr_name="join-${NODE_NAME}-$(date +%s)"
+  csr_name="join-$(date +%s)-$(openssl rand -hex 4)"
   csr_body="$(jq -n -c \
     --arg name "$csr_name" \
     --arg request "$csr_b64" \
@@ -994,14 +1413,10 @@ issue_cp_kubelet_identity() {
   local server
   server="$("${admin[@]}" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
-  openssl ecparam -name prime256v1 -genkey -noout -out "$STATE_DIR/kubelet-client.key"
-  chmod 600 "$STATE_DIR/kubelet-client.key"
-  openssl req -new -key "$STATE_DIR/kubelet-client.key" \
-    -subj "/O=system:nodes/CN=system:node:$NODE_NAME" \
-    -out "$STATE_DIR/kubelet-client.csr"
+  generate_node_csr "$STATE_DIR/kubelet-client.key" "$STATE_DIR/kubelet-client.csr"
 
   local csr_name
-  csr_name="kubelet-${NODE_NAME}-$(date +%s)"
+  csr_name="kubelet-$(date +%s)-$(openssl rand -hex 4)"
   jq -n -c \
     --arg name "$csr_name" \
     --arg request "$(base64 -w0 < "$STATE_DIR/kubelet-client.csr")" \
@@ -1157,6 +1572,17 @@ wait_for_cluster_ready() {
   return 1
 }
 
+# A worker only runs kubelet, so it cannot know the cluster's families from
+# flags. Its own Node object can: KCM allocates spec.podCIDRs per cluster-cidr
+# family, and nodes may read themselves. $1 is that Node's JSON; an IPv6 podCIDR
+# turns on the same IPv6 forwarding sysctl the control plane writes.
+worker_enable_ipv6_forwarding() {
+  [ -e /etc/sysctl.d/u7s-ipv6-forwarding.conf ] && return 0
+  printf '%s' "$1" | jq -e '[.spec.podCIDRs[]? | select(contains(":"))] | length > 0' >/dev/null 2>&1 || return 0
+  printf 'net.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/u7s-ipv6-forwarding.conf
+  sysctl --system >/dev/null
+}
+
 # Success condition of a join, checked as the new node identity after kubelet
 # started: the Node is Ready and the kubelet's own kubelet-serving CSR
 # (serverTLSBootstrap) is Approved and Issued. The apiserver's approver only
@@ -1164,12 +1590,16 @@ wait_for_cluster_ready() {
 # after the kubelet registered -- never requested up front.
 wait_for_joined_node() {
   local node_auth=(--cacert "$STATE_DIR/ca.pem" --cert "$STATE_DIR/kubelet-client.crt" --key "$STATE_DIR/kubelet-client.key")
-  local ready="" serving="" resp
+  local ready="" serving="" podcidrs="" resp
   echo "Waiting up to 5 min for node $NODE_NAME to be Ready with an issued kubelet serving certificate..."
   for _ in $(seq 1 150); do
-    if [ -z "$ready" ]; then
+    # Keep reading the Node until it has podCIDRs too: Ready does not imply
+    # node-ipam has allocated them, and forwarding is decided from them.
+    if [ -z "$ready" ] || [ -z "$podcidrs" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+      worker_enable_ipv6_forwarding "$resp"
       ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
+      podcidrs="$(printf '%s' "$resp" | jq -r 'select((.spec.podCIDRs // []) | length > 0) | "yes"' 2>/dev/null || true)"
     fi
     if [ -z "$serving" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
@@ -1177,13 +1607,13 @@ wait_for_joined_node() {
       serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
     fi
-    if [ -n "$ready" ] && [ -n "$serving" ]; then
+    if [ -n "$ready" ] && [ -n "$serving" ] && [ -n "$podcidrs" ]; then
       echo "Node $NODE_NAME is Ready and its kubelet serving certificate was approved and issued."
       return 0
     fi
     sleep 2
   done
-  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no) and its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
+  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no), its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no) and podCIDRs allocated=$([ -n "$podcidrs" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
   return 1
 }
 
@@ -1237,6 +1667,22 @@ worker_api_get() {
   [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
   server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
   curl --proto '=https' --tlsv1.2 -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
+}
+
+# Upgrade-path IPv6 forwarding check. Failing to read the Node must not abort
+# the kubelet upgrade, but it must not be silent either: the worker would keep
+# routing no IPv6 without anyone knowing why.
+worker_upgrade_ipv6_forwarding() {
+  local json err errf
+  errf="$(mktemp)"
+  if json="$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>"$errf")" && printf '%s' "$json" | jq -e . >/dev/null 2>"$errf"; then
+    rm -f "$errf"
+    worker_enable_ipv6_forwarding "$json"
+    return 0
+  fi
+  err="$(tr '\n' ' ' < "$errf")"
+  rm -f "$errf"
+  echo "warning: could not read node $NODE_NAME to decide on IPv6 forwarding (${err:-no error output}); the IPv6 forwarding sysctl was NOT checked. If this is a dual-stack cluster, re-run install.sh once the API server is reachable, or set net.ipv6.conf.all.forwarding=1 by hand." >&2
 }
 
 # lastHeartbeatTime (epoch seconds) of the Node's Ready condition as served by
@@ -1333,6 +1779,8 @@ fi
 # the operator, so a re-run reads as an upgrade rather than a silent no-op or
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0
+DUAL_STACK_UPGRADE=0
+POD_CIDR_UPGRADE=0
 if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   EXISTING_INSTALL=1
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
@@ -1404,9 +1852,11 @@ fi
 # conditionally today (for --mint-join-token/--join).
 PERSISTED_NODE_NAME=""
 PERSISTED_IFACE=""
+PERSISTED_NODE_IP=""
 PERSISTED_SERVICE_CIDR=""
 PERSISTED_POD_CLUSTER_CIDR=""
 PERSISTED_CLUSTER_DNS=""
+PERSISTED_CLUSTER_FAMILIES=""
 normalize_node_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
 NODE_NAME="$(normalize_node_name "$NODE_NAME")"
 if [ -f "$CONFIG_FILE" ]; then
@@ -1417,11 +1867,15 @@ if [ -f "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
   PERSISTED_IFACE="$(. "$CONFIG_FILE"; printf '%s' "${IFACE:-}")"
   # shellcheck disable=SC1090
+  PERSISTED_NODE_IP="$(. "$CONFIG_FILE"; printf '%s' "${NODE_IP:-}")"
+  # shellcheck disable=SC1090
   PERSISTED_SERVICE_CIDR="$(. "$CONFIG_FILE"; printf '%s' "${SERVICE_CIDR:-}")"
   # shellcheck disable=SC1090
   PERSISTED_POD_CLUSTER_CIDR="$(. "$CONFIG_FILE"; printf '%s' "${POD_CLUSTER_CIDR:-}")"
   # shellcheck disable=SC1090
   PERSISTED_CLUSTER_DNS="$(. "$CONFIG_FILE"; printf '%s' "${CLUSTER_DNS:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_CLUSTER_FAMILIES="$(. "$CONFIG_FILE"; printf '%s' "${CLUSTER_FAMILIES:-}")"
 fi
 
 # On an upgrade, an unset --iface/--node-name defaults to what was persisted
@@ -1447,17 +1901,37 @@ if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_IFACE" ]; then
   fi
 fi
 
+# An explicit --node-ip is persisted like --iface and guarded the same way: a
+# different list would rebake another --advertise-address and cert SAN set.
+if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$PERSISTED_NODE_IP" ]; then
+  if [ -z "$NODE_IP" ]; then
+    NODE_IP="$PERSISTED_NODE_IP"
+  elif [ "$NODE_IP" != "$PERSISTED_NODE_IP" ]; then
+    echo "error: --node-ip $NODE_IP conflicts with the node address list persisted at install time ($PERSISTED_NODE_IP, recorded in $CONFIG_FILE). Changing it would rebake a different --advertise-address into every kubeconfig the apiserver rewrites, silently breaking any copy already distributed off this box. To proceed anyway: delete $CONFIG_FILE (a flat sibling file next to state.db/CA/kubeconfig -- this touches no cluster data) and re-run install.sh." >&2
+    exit 1
+  fi
+fi
+
 # --- Network ranges: defaults, persisted values, validation -------------------
 #
 # A worker runs only kubelet, which consumes only the DNS address; the ranges
 # are control-plane settings, so passing them with --join is refused rather
 # than silently ignored.
 if [ "$WORKER_MODE" -eq 1 ]; then
-  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ]; then
-    echo "error: --service-cidr/--cluster-cidr are control-plane settings; a joining or already-joined worker takes only --cluster-dns" >&2
+  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]; then
+    echo "error: --service-cidr/--cluster-cidr/--cluster-dns are control-plane settings; a joining or already-joined worker reads them from the cluster (kube-system/u7s-cluster-config)" >&2
     exit 1
   fi
-  reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$(default_cluster_dns "$DEFAULT_SERVICE_CIDR")" || exit 1
+  if [ "$JOIN_MODE" -eq 1 ]; then
+    join_discover
+  else
+    CLUSTER_FAMILIES="$PERSISTED_CLUSTER_FAMILIES"
+    CLUSTER_DNS="$PERSISTED_CLUSTER_DNS"
+    if [ -z "$CLUSTER_FAMILIES" ] || [ -z "$CLUSTER_DNS" ]; then
+      echo "error: $CONFIG_FILE records no cluster IP families/DNS for this worker -- it joined before they were persisted. Re-join: stop kubelet, rm -rf $STATE_DIR, and run install.sh --join with a freshly minted token." >&2
+      exit 1
+    fi
+  fi
 else
   reconcile_network_flag --service-cidr SERVICE_CIDR "$PERSISTED_SERVICE_CIDR" "$DEFAULT_SERVICE_CIDR" || exit 1
   reconcile_network_flag --cluster-cidr POD_CLUSTER_CIDR "$PERSISTED_POD_CLUSTER_CIDR" "$DEFAULT_POD_CLUSTER_CIDR" || exit 1
@@ -1465,6 +1939,7 @@ else
   reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$dns_default" || exit 1
 fi
 validate_network_config "$WORKER_MODE" || exit 1
+[ "$WORKER_MODE" -eq 1 ] || CLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"
 
 # --- Defaults: node name, network interface ----------------------------------
 
@@ -1475,13 +1950,6 @@ if [ -z "$NODE_NAME" ]; then
 fi
 if [ -z "$NODE_NAME" ]; then
   echo "error: refusing to continue: empty node name (hostname is empty; pass --node-name)" >&2
-  exit 1
-fi
-# openssl req rejects a Subject CN over X.509
-# ub-common-name (64) when building the identity CSR, after packages and state
-# are already laid down. "system:node:" is 12 of those 64.
-if [ "${#NODE_NAME}" -gt 52 ]; then
-  echo "error: node name '$NODE_NAME' is ${#NODE_NAME} chars; the node identity certificate CN 'system:node:<name>' would exceed the X.509 64-char limit that openssl enforces (max node name: 52). Pass a shorter --node-name (e.g. the short hostname instead of the FQDN)." >&2
   exit 1
 fi
 
@@ -1501,17 +1969,44 @@ if [ -z "$IFACE" ]; then
   fi
 fi
 
-IFACE_IP="$(ip -o -4 addr show dev "$IFACE" | awk '{print $4}' | cut -d/ -f1 | sed -n 1p)"
-if [ -z "$IFACE_IP" ]; then
-  echo "error: interface $IFACE has no IPv4 address assigned" >&2
-  exit 1
+if [ -n "$NODE_IP" ]; then
+  NODE_IPS_EXPLICIT=1
+  parse_node_ip_list "$NODE_IP" || exit 1
+else
+  NODE_IPS="$(iface_global_addrs "$IFACE" | paste -sd, -)"
+  if [ -z "$NODE_IPS" ]; then
+    echo "error: interface $IFACE has no global-scope IPv4 or IPv6 address assigned (pass --node-ip to set the node address explicitly)" >&2
+    exit 1
+  fi
 fi
-[ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$IFACE_IP" || exit 1
+reconcile_node_ips_with_families || exit 1
+for node_ip in ${NODE_IPS//,/ }; do
+  [ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$node_ip" || exit 1
+done
+IFACE_IP="${NODE_IPS%%,*}"
+# Brackets for an IPv6 primary wherever the address becomes part of a
+# host:port or URL.
+IFACE_IP_HOST="$IFACE_IP"
+case "$IFACE_IP" in *:*) IFACE_IP_HOST="[$IFACE_IP]" ;; esac
+# Every address but the primary (already the advertise host) still has to be
+# in the serving certificate, so a client dialling the node by its other
+# family verifies.
+APISERVER_EXTRA_SANS_FLAG=""
+# The apiserver serves on every node address (not a wildcard: only the
+# interface's own addresses are exposed), as one comma-separated --listen.
+APISERVER_LISTEN=""
+for node_ip in ${NODE_IPS//,/ }; do
+  case "$node_ip" in
+    *:*) APISERVER_LISTEN="${APISERVER_LISTEN:+$APISERVER_LISTEN,}[$node_ip]:6443" ;;
+    *) APISERVER_LISTEN="${APISERVER_LISTEN:+$APISERVER_LISTEN,}$node_ip:6443" ;;
+  esac
+done
+[ "$NODE_IPS" = "$IFACE_IP" ] || APISERVER_EXTRA_SANS_FLAG=" --apiserver-cert-extra-sans ${NODE_IPS#*,}"
 
 if [ "$EXISTING_INSTALL" -eq 1 ]; then
-  echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+  echo "Upgrading u7s: node-name=$NODE_NAME iface=$IFACE ($NODE_IPS)"
 else
-  echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($IFACE_IP)"
+  echo "Installing u7s: node-name=$NODE_NAME iface=$IFACE ($NODE_IPS)"
 fi
 
 # An already-joined worker upgrades with its own identity and no token; refuse
@@ -1572,6 +2067,14 @@ cat > /etc/sysctl.d/u7s-br-netfilter.conf <<'SYSCTL_EOF'
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 SYSCTL_EOF
+# Upstream's container-runtime prerequisites set IPv4 forwarding explicitly.
+# Otherwise only the CNI bridge plugin flips it, at the first pod sandbox.
+printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/u7s-ip-forward.conf
+# IPv6 pod/Service traffic is routed through the node, which the kernel only
+# does with forwarding on; nothing else here sets it.
+if [ -n "$SERVICE_CIDR_IPV6$POD_CLUSTER_CIDR_IPV6" ]; then
+  printf 'net.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/u7s-ipv6-forwarding.conf
+fi
 sysctl --system >/dev/null
 
 # The cri-o package ships a default 10-crio-bridge.conf(list) that gives every
@@ -1624,32 +2127,22 @@ else
   stage_binaries u7s-apiserver u7s-scheduler kubelet kube-controller-manager
 fi
 
-# --- kubectl + CNI plugin binaries (apt, pinned to kubelet's own version) ----
-#
-# kubectl is not in the release tarball, but a zero-argument install has to
-# end at a working `kubectl get nodes`. Pinned to kubelet's own minor version
-# for client/server skew safety.
-#
-# kubernetes-cni supplies the /opt/cni/bin/ plugins (bridge, host-local, ...)
-# that CRI-O's 10-crio-bridge.conflist references. CRI-O only Recommends a
-# CNI-plugins package and cloud-image apt disables recommends, so without this
-# every node sits NotReady forever with "failed to find plugin \"bridge\"".
+# kubectl goes on PATH: the install and operators call it unqualified.
+BIN_DIR=/usr/local/bin stage_binaries kubectl
+
+# CNI plugins come from the tarball: CRI-O only Recommends a CNI-plugins
+# package and cloud-image apt disables recommends, so without them every node
+# sits NotReady forever with "failed to find plugin \"bridge\"". (flannel
+# installs its own /opt/cni/bin/flannel from its init container.)
+install -d -m 0755 /opt/cni/bin
+BIN_DIR=/opt/cni/bin stage_binaries bridge host-local loopback portmap
+
 KUBE_VERSION="$("$BIN_DIR/kubelet" --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p)"
 if [ -z "$KUBE_VERSION" ]; then
   echo "error: could not determine kubelet version from '$BIN_DIR/kubelet --version'" >&2
   exit 1
 fi
 KUBE_MINOR="${KUBE_VERSION%.*}"
-
-# Pinned fingerprint of the isv:kubernetes OBS project key, identical for the
-# v1.35-v1.37 repos (fetched 2026-10-20; expires 2026-12-29, so expect to
-# update this pin when the vendor rotates it).
-install_apt_key "https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/Release.key" \
-  DE15B14486CD377B9E876E1A234654DA9A296436 /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${KUBE_MINOR}/deb/ /" \
-  > /etc/apt/sources.list.d/kubernetes.list
-apt-get update -qq
-apt-get install -y kubectl kubernetes-cni
 
 # apiserver's relative default paths (./state.db, ./kubeconfig, ./ca.key,
 # ./ca.crt, ./sa.key, ./sa.pub) resolve here via WorkingDirectory=. 0700
@@ -1663,8 +2156,13 @@ install -d -m 0755 /etc/u7s/static-pods
 # identity.
 {
   printf 'NODE_NAME="%s"\nIFACE="%s"\nCLUSTER_DNS="%s"\n' "$NODE_NAME" "$IFACE" "$CLUSTER_DNS"
+  if [ "$NODE_IPS_EXPLICIT" -eq 1 ]; then
+    printf 'NODE_IP="%s"\n' "$NODE_IP"
+  fi
   if [ "$WORKER_MODE" -eq 0 ]; then
     printf 'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n' "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"
+  else
+    printf 'CLUSTER_FAMILIES="%s"\n' "$CLUSTER_FAMILIES"
   fi
 } > "$CONFIG_FILE"
 
@@ -1743,6 +2241,7 @@ if [ "$WORKER_MODE" -eq 1 ]; then
       exit 1
     fi
     FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
+    worker_upgrade_ipv6_forwarding
   fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF
@@ -1775,7 +2274,7 @@ Environment=GOMAXPROCS=2
 # --cert-dir CLI flag, not a KubeletConfiguration yaml field -- kubelet has
 # no certDir/certDirectory config-file key, so setting it in
 # kubelet-config.yaml is a silent no-op.
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubeconfig --hostname-override=$NODE_NAME --node-ip=$NODE_IPS --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -1843,7 +2342,7 @@ fi
 
 # $POD_CLUSTER_CIDR (resolved and validated above) feeds node-ipam-controller
 # and Flannel's net-conf.json -- one variable so the two can never drift apart.
-POD_NODE_CIDR_MASK_SIZE=24
+KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
 
 # --- Vendored manifests from the tarball -------------------------------------
 #
@@ -1895,7 +2394,7 @@ WorkingDirectory=$STATE_DIR
 # process rather than a separate u7s-scheduler binary+unit -- never also
 # start u7s-scheduler against this same cluster (see the retirement
 # block above this section for why: uncoordinated double-preemption).
-ExecStart=$BIN_DIR/u7s-apiserver --listen $IFACE_IP:6443 --advertise-address https://$IFACE_IP:6443 --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
+ExecStart=$BIN_DIR/u7s-apiserver --listen $APISERVER_LISTEN --advertise-address https://$IFACE_IP_HOST:6443$APISERVER_EXTRA_SANS_FLAG --local-node-name $NODE_NAME --service-cluster-ip-range $SERVICE_CIDR --cluster-cidr $POD_CLUSTER_CIDR --kube-dns-cluster-ip $CLUSTER_DNS --embedded-scheduler true$([ "$ALLOW_SERVICE_EXTERNAL_IPS" = 1 ] || echo " --deny-service-external-ips")
 # SIGHUP re-scans /etc/u7s/manifests in place instead of restarting -- 'kill -HUP'
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
@@ -1962,7 +2461,7 @@ Environment=GOMAXPROCS=2
 # no longer knows about is a hard --controllers validation error ("is not
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
-ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR --node-cidr-mask-size=$POD_NODE_CIDR_MASK_SIZE --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR $KCM_NODE_CIDR_MASK_FLAGS --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
 Restart=always
 RestartSec=2
 
@@ -2023,7 +2522,7 @@ Environment=GOMAXPROCS=2
 ExecStartPre=/usr/bin/openssl x509 -inform DER -in $STATE_DIR/ca.crt -out $STATE_DIR/ca.pem
 # --cert-dir -- see the worker-mode kubelet.service block above for why this
 # must be a CLI flag under $STATE_DIR rather than a kubelet-config.yaml key.
-ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$IFACE_IP --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
+ExecStart=$BIN_DIR/kubelet --config=$STATE_DIR/kubelet-config.yaml --kubeconfig=$STATE_DIR/kubelet-kubeconfig --hostname-override=$NODE_NAME --node-ip=$NODE_IPS --cert-dir=$STATE_DIR/kubelet/pki $KUBELET_ROUND2_FLAGS
 Restart=always
 RestartSec=2
 
@@ -2079,6 +2578,13 @@ if [ "$EXISTING_INSTALL" -eq 1 ]; then
 fi
 label_control_plane_node || exit 1
 wait_for_cluster_ready || exit 1
+
+if [ "$DUAL_STACK_UPGRADE" -eq 1 ]; then
+  echo "upgraded to dual-stack (cluster IP families: $CLUSTER_FAMILIES). New Services can request ipFamilyPolicy PreferDualStack/RequireDualStack; existing Services keep their single ClusterIP." >&2
+fi
+if [ "$POD_CIDR_UPGRADE" -eq 1 ]; then
+  echo "warning: existing Nodes keep their single-stack spec.podCIDRs. Upstream makes Node.spec.podCIDRs immutable once set and node-ipam only allocates for a Node without one, so pods on such a Node get no pod IP of the new family until the Node object is re-created: kubectl --kubeconfig=$STATE_DIR/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data; kubectl --kubeconfig=$STATE_DIR/kubeconfig delete node <node>; then 'systemctl restart kubelet' on that node and restart flannel so it reads the new podCIDRs (kubectl --kubeconfig=$STATE_DIR/kubeconfig -n kube-flannel delete pod -l app=flannel; pods created before that still get IPv4 only). Deleting the Node drops its node-role.kubernetes.io/control-plane label: for this control-plane node ($NODE_NAME), once it has re-registered, re-run install.sh (it re-applies the label) or kubectl --kubeconfig=$STATE_DIR/kubeconfig label node $NODE_NAME node-role.kubernetes.io/control-plane=. A joined worker must also be re-joined (its families are learned at join): stop kubelet, rm -rf its $STATE_DIR, and run install.sh --join with a new token." >&2
+fi
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"

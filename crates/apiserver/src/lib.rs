@@ -27,6 +27,7 @@ mod go_unicode;
 pub mod handlers;
 mod health;
 mod inflight;
+mod int32_range;
 mod keys;
 mod limit_range;
 mod log_limit;
@@ -36,6 +37,7 @@ mod namespace_guard;
 mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
+pub mod node_csr;
 mod patch;
 mod pki;
 mod pod_security;
@@ -151,6 +153,31 @@ fn bind_listener(addr: &str) -> anyhow::Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into())?)
 }
 
+/// Binds every address in `addrs`; any failure aborts, so a node address that cannot be
+/// served is a startup error rather than a silently unreachable family.
+fn bind_listeners(addrs: &[String]) -> anyhow::Result<Vec<TcpListener>> {
+    addrs
+        .iter()
+        .map(|a| bind_listener(a).map_err(|e| e.context(format!("binding --listen {a}"))))
+        .collect()
+}
+
+/// Serves `app` on every listener; returns when the first one stops.
+async fn serve_all(
+    listeners: Vec<TcpListener>,
+    app: Router,
+    server_config: pki::Swap<Arc<rustls::ServerConfig>>,
+) -> anyhow::Result<()> {
+    let mut set = tokio::task::JoinSet::new();
+    for listener in listeners {
+        set.spawn(serve_tls(listener, app.clone(), server_config.clone()));
+    }
+    match set.join_next().await {
+        Some(res) => res?,
+        None => Ok(()),
+    }
+}
+
 /// Best-effort read of the OS's accept-queue ceiling (Linux: `/proc/sys/net/core/somaxconn`;
 /// macOS: `kern.ipc.somaxconn`), so [`bind_listener`] can warn when it silently truncates
 /// [`LISTEN_BACKLOG`]. `None` on read failure or an unrecognized platform — treated as
@@ -220,11 +247,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     let server_address_early = match args.advertise_address.as_deref() {
         Some(addr) => addr.to_owned(),
         None => {
-            if args.listen.starts_with("0.0.0.0:") {
-                let port = &args.listen["0.0.0.0:".len()..];
+            if args.primary_listen().starts_with("0.0.0.0:") {
+                let port = &args.primary_listen()["0.0.0.0:".len()..];
                 format!("https://127.0.0.1:{port}")
             } else {
-                format!("https://{}", args.listen)
+                format!("https://{}", args.primary_listen())
             }
         }
     };
@@ -242,6 +269,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         &apiserver_ip,
         apiserver_port,
         &args.service_cluster_ip_range,
+        args.kube_dns_cluster_ip.as_deref(),
+    )
+    .await?;
+    seed_cluster_config(
+        &store,
+        &args.service_cluster_ip_range,
+        &args.cluster_cidr,
         args.kube_dns_cluster_ip.as_deref(),
     )
     .await?;
@@ -342,11 +376,11 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         Some(addr) => addr,
         None => {
             // When listening on 0.0.0.0, default to loopback so local kubectl works.
-            if args.listen.starts_with("0.0.0.0:") {
-                let port = &args.listen["0.0.0.0:".len()..];
+            if args.primary_listen().starts_with("0.0.0.0:") {
+                let port = &args.primary_listen()["0.0.0.0:".len()..];
                 format!("https://127.0.0.1:{port}")
             } else {
-                format!("https://{}", args.listen)
+                format!("https://{}", args.primary_listen())
             }
         }
     };
@@ -627,19 +661,18 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         tokio::sync::watch::channel(false);
     {
         let approver_state = state.clone();
-        let apiserver_ips: Vec<std::net::IpAddr> = [
-            tls::parse_advertise(&state.server_address)
-                .ok()
-                .flatten()
-                .and_then(|(h, _)| h.parse().ok()),
-            args.listen
-                .parse::<std::net::SocketAddr>()
-                .ok()
-                .map(|a| a.ip()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let apiserver_ips: Vec<std::net::IpAddr> = tls::parse_advertise(&state.server_address)
+            .ok()
+            .flatten()
+            .and_then(|(h, _)| h.parse().ok())
+            .into_iter()
+            .chain(
+                args.listen
+                    .iter()
+                    .filter_map(|l| l.parse::<std::net::SocketAddr>().ok())
+                    .map(|a| a.ip()),
+            )
+            .collect();
         let local_node_name = args.local_node_name.clone();
         tokio::spawn(async move {
             loop {
@@ -793,7 +826,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     // 12. Bind TLS listener and serve. Uses bind_listener (socket2) rather than
     //     TcpListener::bind so we can set an explicit accept-queue backlog — see
     //     LISTEN_BACKLOG's doc comment for why the OS default isn't enough headroom.
-    let listener = bind_listener(&args.listen)?;
+    let listeners = bind_listeners(&args.listen)?;
 
     // 12a. Kick off the in-process bootstrap YAML applier now that the listen socket is bound,
     // authenticating as system:bootstrap-installer: SSA-apply every manifest under
@@ -868,7 +901,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     });
 
     tokio::select! {
-        result = serve_tls(listener, app, tls_material.server_config) => result?,
+        result = serve_all(listeners, app, tls_material.server_config) => result?,
         Ok(Err(e)) = well_known_manifest_rx => {
             tracing::error!(
                 "fatal: boot-time apply of {} failed: {e:#}",
@@ -1145,10 +1178,11 @@ fn build_routes(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/pods/{name}/log",
             get(handlers::proxy::pod_log),
         )
-        // Pods — exec/attach/portforward: 501 stubs until SPDY/WebSocket is implemented.
+        // Pods — exec/attach/portforward: GET serves WebSocket; POST (SPDY upgrade) is
+        // passed through to the kubelet like upstream's UpgradeAwareHandler.
         //
         // exec/attach's POST legs run the same pre-upgrade checks (pod lookup +
-        // admission) as their GET/WebSocket siblings before returning 501 — see
+        // admission) as their GET/WebSocket siblings before dialing the kubelet — see
         // pod_exec_post/pod_attach_post: a denied GET/WebSocket dial is retried by
         // client-go as POST/SPDY, and that retry must surface the same denial Status
         // instead of a generic 405.
@@ -1537,8 +1571,7 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
 }
 
 /// Seed the two built-in PriorityClasses so `kubectl get priorityclass` lists them, as
-/// upstream's bootstrap hook does. Pod admission resolves these names to fixed values
-/// regardless of what is stored.
+/// upstream's bootstrap hook does. Pod admission resolves them from the store.
 async fn seed_priorityclasses(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
@@ -2673,6 +2706,19 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             "00000000-0000-0000-0000-000000000307",
             "00000000-0000-0000-0000-000000000308",
         ),
+        (
+            "kube-system",
+            "u7s:nodes-cluster-config",
+            serde_json::json!([
+                { "apiGroups": [""], "resources": ["configmaps"], "resourceNames": [CLUSTER_CONFIG_NAME], "verbs": ["get"] }
+            ]),
+            serde_json::json!([
+                { "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:bootstrappers" },
+                { "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }
+            ]),
+            "00000000-0000-0000-0000-000000000310",
+            "00000000-0000-0000-0000-000000000311",
+        ),
     ];
     for (ns, name, rules, subjects, role_uid, binding_uid) in namespace_policy {
         let key = keys::group_object_key(GROUP, "roles", Some(ns), name);
@@ -2791,6 +2837,165 @@ fn validate_kube_dns_ip(
     Ok(ip)
 }
 
+/// The kube-dns ClusterIPs: the primary (`--kube-dns-cluster-ip` or the primary range's tenth
+/// host) first, then the tenth host of every other range, because a dual-stack CoreDNS Service
+/// holds one VIP per family.
+fn kube_dns_cluster_ips(
+    service_cluster_ip_range: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let (kubernetes_ip, derived) = bootstrap_service_ips(service_cluster_ip_range)?;
+    let primary = match kube_dns_override {
+        Some(ip) => validate_kube_dns_ip(service_cluster_ip_range, kubernetes_ip, ip)?,
+        None => derived,
+    };
+    let mut ips = vec![primary];
+    for alloc in service_range_allocators(service_cluster_ip_range)? {
+        if !alloc.contains_host(&primary) {
+            ips.push(alloc.nth_host(10).map_err(|e| {
+                anyhow::anyhow!(
+                    "--service-cluster-ip-range '{service_cluster_ip_range}' too small for the secondary kube-dns ClusterIP: {e}"
+                )
+            })?);
+        }
+    }
+    Ok(ips)
+}
+
+const CLUSTER_CONFIG_NAME: &str = "u7s-cluster-config";
+
+/// The `data` of `kube-system/u7s-cluster-config`: what a joining node needs to configure
+/// itself for this cluster. IP families are not stored; readers derive them from the ranges.
+fn cluster_config_data(
+    service_cluster_ip_range: &str,
+    pod_cidr: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let service_cidrs = if service_cluster_ip_range.is_empty() {
+        "10.96.0.0/12"
+    } else {
+        service_cluster_ip_range
+    };
+    let dns = kube_dns_cluster_ips(service_cluster_ip_range, kube_dns_override)?
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(serde_json::json!({
+        "serviceCIDRs": service_cidrs,
+        "podCIDRs": pod_cidr,
+        "clusterDNS": dns,
+    }))
+}
+
+/// Publish `kube-system/u7s-cluster-config` (the join-side analogue of kubeadm's
+/// `kube-system/kubeadm-config`), rewriting it whenever the configured ranges change.
+async fn seed_cluster_config(
+    store: &SqliteStore,
+    service_cluster_ip_range: &str,
+    pod_cidr: &str,
+    kube_dns_override: Option<&str>,
+) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let data = cluster_config_data(service_cluster_ip_range, pod_cidr, kube_dns_override)?;
+    let key = keys::object_key("configmaps", "kube-system", CLUSTER_CONFIG_NAME);
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": CLUSTER_CONFIG_NAME,
+            "namespace": "kube-system",
+            "creationTimestamp": boot_timestamp()
+        },
+        "data": data
+    });
+    for _ in 0..5 {
+        let res = match store.get(&key).await? {
+            None => store
+                .put(&key, Bytes::from(body.to_string()), Some(0))
+                .await
+                .map(|_| tracing::info!("seeded ConfigMap: kube-system/{CLUSTER_CONFIG_NAME}")),
+            Some(stored) => {
+                let mut cm: serde_json::Value = serde_json::from_slice(&stored.value)?;
+                if cm["data"] == data {
+                    return Ok(());
+                }
+                cm["data"] = data.clone();
+                store
+                    .put(&key, Bytes::from(cm.to_string()), Some(stored.revision))
+                    .await
+                    .map(|_| tracing::info!("updated kube-system/{CLUSTER_CONFIG_NAME}"))
+            }
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(
+                u7s_store::StoreError::AlreadyExists { .. }
+                | u7s_store::StoreError::RevisionMismatch { .. },
+            ) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "seed ConfigMap kube-system/{CLUSTER_CONFIG_NAME}: {e}"
+                ))
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "seed ConfigMap kube-system/{CLUSTER_CONFIG_NAME}: gave up after conflicting writes"
+    ))
+}
+
+/// A bootstrap VIP whose sentinel already exists is a re-seed unless a different Service's
+/// spec lists the address, which would break `ns/name`: that fails startup naming the
+/// holder. Returns true for an orphan: a sentinel not owned by `ns/name` that no Service
+/// lists (`repair` releases it), which the caller only warns about. Specs are read through
+/// `spec_ips` so legacy `clusterIP`-only Services count.
+async fn check_seed_sentinel_holder(
+    store: &SqliteStore,
+    key: &str,
+    ip: std::net::IpAddr,
+    ns: &str,
+    name: &str,
+) -> anyhow::Result<bool> {
+    use u7s_store::Store;
+
+    let ip = ip.to_string();
+    let list = store
+        .list("/registry/services/", u7s_store::ListOptions::default())
+        .await?;
+    let mut held_by_self = false;
+    for o in list.items {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(&o.value) else {
+            continue;
+        };
+        if !service_alloc::spec_ips(&v["spec"]).contains(&ip) {
+            continue;
+        }
+        let (h_ns, h_name) = (
+            v["metadata"]["namespace"].as_str().unwrap_or_default(),
+            v["metadata"]["name"].as_str().unwrap_or_default(),
+        );
+        if (h_ns, h_name) != (ns, name) {
+            anyhow::bail!(
+                "clusterIP {ip} needed by {ns}/{name} is already allocated to {h_ns}/{h_name}"
+            );
+        }
+        held_by_self = true;
+    }
+    let owned_by_self = match store.get(key).await? {
+        Some(s) => {
+            serde_json::from_slice::<serde_json::Value>(&s.value)
+                .ok()
+                .and_then(|v| v["owner"].as_str().map(str::to_string))
+                == Some(format!("{ns}/{name}"))
+        }
+        None => true,
+    };
+    Ok(!held_by_self && !owned_by_self)
+}
+
 async fn seed_services(
     store: &SqliteStore,
     apiserver_ip: &str,
@@ -2801,11 +3006,8 @@ async fn seed_services(
     use bytes::Bytes;
     use u7s_store::Store;
 
-    let (kubernetes_cluster_ip, derived_dns_ip) = bootstrap_service_ips(service_cluster_ip_range)?;
-    let kube_dns_cluster_ip = match kube_dns_override {
-        Some(ip) => validate_kube_dns_ip(service_cluster_ip_range, kubernetes_cluster_ip, ip)?,
-        None => derived_dns_ip,
-    };
+    let (kubernetes_cluster_ip, _) = bootstrap_service_ips(service_cluster_ip_range)?;
+    let kube_dns_cluster_ips = kube_dns_cluster_ips(service_cluster_ip_range, kube_dns_override)?;
 
     // default/kubernetes — reaches the API server from inside pods via
     // in-cluster DNS (kubernetes.default.svc.cluster.local:443 → 10.96.0.1).
@@ -2848,16 +3050,29 @@ async fn seed_services(
     // default/kubernetes' VIP is reserved the same way (upstream's kubernetesservice
     // controller does this every boot), so no tenant Service can claim the apiserver's
     // in-cluster address.
-    for (ip, ns, name) in [
-        (kubernetes_cluster_ip, "default", "kubernetes"),
-        (kube_dns_cluster_ip, "kube-system", "kube-dns"),
-    ] {
+    // A dual-stack CoreDNS Service also asks for the other family's tenth host (scripts/install.sh
+    // default_cluster_dns), so reserve it too.
+    let mut reservations = vec![(kubernetes_cluster_ip, "default", "kubernetes")];
+    reservations.extend(
+        kube_dns_cluster_ips
+            .iter()
+            .map(|ip| (*ip, "kube-system", "kube-dns")),
+    );
+    for (ip, ns, name) in reservations {
         let key = format!("{}{}", state::SERVICE_IP_PREFIX, ip);
         match store
             .put(&key, service_alloc::owned_ip_sentinel(ns, name), Some(0))
             .await
         {
-            Ok(_) | Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Ok(_) => {}
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+                if check_seed_sentinel_holder(store, &key, ip, ns, name).await? {
+                    tracing::warn!(
+                        "clusterIP {ip} for {ns}/{name} is already reserved but no Service lists it; \
+                         continuing, the reservation is an orphan"
+                    );
+                }
+            }
             Err(e) => return Err(anyhow::anyhow!("seed {ns}/{name} clusterIP sentinel: {e}")),
         }
     }
@@ -2915,7 +3130,10 @@ async fn seed_services(
                 "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
             }
         },
-        "addressType": "IPv4",
+        "addressType": apiserver_ip
+            .parse::<std::net::IpAddr>()
+            .map_or(state::IpFamily::of(&kubernetes_cluster_ip), |ip| state::IpFamily::of(&ip))
+            .as_str(),
         "endpoints": [{
             "addresses": [apiserver_ip],
             "conditions": { "ready": true, "serving": true, "terminating": false }
@@ -4391,6 +4609,31 @@ mod tests {
             .await
             .expect("accept task must not panic")
             .expect("listener must successfully accept the pending connection");
+    }
+
+    /// A dual-stack node must be reachable on every address it advertises; each `--listen`
+    /// entry has to become its own accepting socket, and one bad entry must fail startup.
+    #[tokio::test]
+    async fn bind_listeners_binds_every_address_and_fails_on_a_bad_one() {
+        let listeners = bind_listeners(&["127.0.0.1:0".into(), "127.0.0.1:0".into()])
+            .expect("every address must bind");
+        assert_eq!(listeners.len(), 2);
+        let ports: Vec<u16> = listeners
+            .iter()
+            .map(|l| l.local_addr().unwrap().port())
+            .collect();
+        assert_ne!(ports[0], ports[1]);
+        for l in listeners {
+            let addr = l.local_addr().unwrap();
+            let accept = tokio::spawn(async move { l.accept().await });
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("each listener must accept connections");
+            accept.await.unwrap().unwrap();
+        }
+        let err = bind_listeners(&["127.0.0.1:0".into(), "not-an-addr".into()])
+            .expect_err("an unbindable entry must abort startup");
+        assert!(format!("{err:#}").contains("not-an-addr"));
     }
 
     #[tokio::test]
@@ -7722,6 +7965,271 @@ mod tests {
         );
     }
 
+    /// A dual-stack CoreDNS Service requests the other family's tenth host as its second
+    /// clusterIP. If seeding left that address free, a dynamic Service could take it while
+    /// the range fills up and the CoreDNS apply would fail "already allocated", leaving the
+    /// cluster without DNS.
+    #[tokio::test]
+    async fn dual_stack_seed_reserves_secondary_kube_dns_ip_against_dynamic_services() {
+        use axum::http::{Method, Request};
+        use state::IpFamily;
+        use tower_service::Service as _;
+
+        const RANGE: &str = "10.96.0.0/24,fd00:96::/124";
+        let mut state = make_state_with_cidr("10.96.0.0/24");
+        state.secondary_service_ip_allocator = Some(std::sync::Arc::new(
+            state::ServiceIpAllocator::from_cidr("fd00:96::/124").expect("valid CIDR"),
+        ));
+        seed_namespaces(&state.store).await.expect("namespaces");
+        seed_services(&state.store, "127.0.0.1", 6443, RANGE, None)
+            .await
+            .expect("seed");
+
+        let mut handed_out = Vec::new();
+        while let Ok(Some(ip)) = state.allocate_service_ip(IpFamily::V6, "svc", false).await {
+            handed_out.push(ip.to_string());
+        }
+        assert!(
+            !handed_out.is_empty(),
+            "the IPv6 range must have free addresses"
+        );
+        assert!(
+            !handed_out.contains(&"fd00:96::a".to_string()),
+            "fd00:96::a is the secondary kube-dns VIP and must never be handed to a dynamic Service: {handed_out:?}"
+        );
+        assert!(
+            state
+                .store
+                .get(&format!("{}10.96.0.10", state::SERVICE_IP_PREFIX))
+                .await
+                .expect("get")
+                .is_some(),
+            "the primary kube-dns VIP stays reserved"
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "kube-dns", "namespace": "kube-system" },
+            "spec": {
+                "clusterIP": "10.96.0.10",
+                "clusterIPs": ["10.96.0.10", "fd00:96::a"],
+                "ipFamilyPolicy": "PreferDualStack",
+                "selector": { "k8s-app": "kube-dns" },
+                "ports": [{ "name": "dns", "port": 53, "protocol": "UDP" }]
+            }
+        });
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces/kube-system/services")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
+        let resp = build_router(state)
+            .call(req)
+            .await
+            .expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "CoreDNS with both VIPs must apply after the IPv6 pool was exhausted"
+        );
+    }
+
+    /// Seeding over an address another Service already holds must fail startup naming the
+    /// holder; silently skipping would leave CoreDNS's apply failing "already allocated"
+    /// with no pointer to the cause. Re-seeding over its own reservation must stay quiet.
+    #[tokio::test]
+    async fn seed_fails_loudly_when_kube_dns_ip_is_held_by_another_service() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        const RANGE: &str = "10.96.0.0/24,fd00:96::/124";
+        for held in ["fd00:96::a", "10.96.0.10"] {
+            let store = make_store();
+            seed_namespaces(&store).await.expect("namespaces");
+            let svc = serde_json::json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": { "name": "squatter", "namespace": "default" },
+                "spec": { "clusterIP": held, "clusterIPs": [held] }
+            });
+            store
+                .put(
+                    &keys::object_key("services", "default", "squatter"),
+                    Bytes::from(svc.to_string()),
+                    Some(0),
+                )
+                .await
+                .expect("service");
+            store
+                .put(
+                    &format!("{}{held}", state::SERVICE_IP_PREFIX),
+                    Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                    Some(0),
+                )
+                .await
+                .expect("sentinel");
+            let err = seed_services(&store, "127.0.0.1", 6443, RANGE, None)
+                .await
+                .expect_err("seed must refuse a held kube-dns VIP")
+                .to_string();
+            assert!(
+                err.contains(held) && err.contains("default/squatter"),
+                "error must name the IP and its holder: {err}"
+            );
+        }
+
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        for _ in 0..2 {
+            seed_services(&store, "127.0.0.1", 6443, RANGE, None)
+                .await
+                .expect("re-seeding its own reservations is idempotent");
+        }
+    }
+
+    /// Databases from before clusterIPs/owned sentinels hold a plain sentinel and a Service
+    /// with only `spec.clusterIP`; refusing to boot on them would brick an upgrade.
+    #[tokio::test]
+    async fn seed_accepts_legacy_clusterip_only_service_with_plain_sentinel() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        let svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": { "name": "kubernetes", "namespace": "default" },
+            "spec": { "clusterIP": "10.96.0.1" }
+        });
+        store
+            .put(
+                &keys::object_key("services", "default", "kubernetes"),
+                Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("service");
+        store
+            .put(
+                &format!("{}10.96.0.1", state::SERVICE_IP_PREFIX),
+                Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                Some(0),
+            )
+            .await
+            .expect("sentinel");
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("legacy-shaped DB must boot");
+    }
+
+    /// An orphan plain sentinel (no Service lists it) is released by `repair`, so seeding
+    /// continues but must say so.
+    #[tokio::test]
+    async fn seed_warns_and_continues_on_orphan_sentinel() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        let key = format!("{}10.96.0.10", state::SERVICE_IP_PREFIX);
+        store
+            .put(
+                &key,
+                Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                Some(0),
+            )
+            .await
+            .expect("sentinel");
+        let ip = "10.96.0.10".parse().unwrap();
+        assert!(
+            check_seed_sentinel_holder(&store, &key, ip, "kube-system", "kube-dns")
+                .await
+                .expect("an orphan must not be an error"),
+            "an unlisted plain sentinel is reported as an orphan so seeding warns"
+        );
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("an orphan sentinel must not block boot");
+        let own = format!("{}10.96.0.1", state::SERVICE_IP_PREFIX);
+        assert!(
+            !check_seed_sentinel_holder(
+                &store,
+                &own,
+                "10.96.0.1".parse().unwrap(),
+                "default",
+                "kubernetes"
+            )
+            .await
+            .unwrap(),
+            "a sentinel owned by the bootstrap Service is a plain re-seed, not an orphan"
+        );
+    }
+
+    /// With --kube-dns-cluster-ip in the IPv6 family, the IPv4 tenth host is the one the
+    /// dual-stack CoreDNS Service additionally requests, so that one is reserved.
+    #[tokio::test]
+    async fn dual_stack_seed_reservation_follows_kube_dns_override_family() {
+        use u7s_store::ListOptions;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces");
+        seed_services(
+            &store,
+            "127.0.0.1",
+            6443,
+            "10.96.0.0/24,fd00:96::/124",
+            Some("fd00:96::5"),
+        )
+        .await
+        .expect("seed");
+        let mut keys: Vec<String> = store
+            .list(state::SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|o| {
+                o.key
+                    .trim_start_matches(state::SERVICE_IP_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["10.96.0.1", "10.96.0.10", "fd00:96::5"]);
+    }
+
+    /// A single-stack cluster has no second family, so seeding reserves exactly the
+    /// kubernetes and kube-dns VIPs and nothing else.
+    #[tokio::test]
+    async fn single_stack_seed_reserves_only_kubernetes_and_kube_dns_ips() {
+        use u7s_store::ListOptions;
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces first");
+        seed_services(&store, "127.0.0.1", 6443, "10.96.0.0/12", None)
+            .await
+            .expect("seed");
+        let mut keys: Vec<String> = store
+            .list(state::SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+            .expect("list")
+            .items
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                format!("{}10.96.0.1", state::SERVICE_IP_PREFIX),
+                format!("{}10.96.0.10", state::SERVICE_IP_PREFIX)
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn seed_services_is_idempotent() {
         // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
@@ -7885,6 +8393,36 @@ mod tests {
             Some(6443),
             "EndpointSlice port must be the actual apiserver port, not the service port 443"
         );
+    }
+
+    #[tokio::test]
+    async fn kubernetes_endpointslice_address_type_follows_advertise_family() {
+        for (advertise, range, want) in [
+            ("fd00::2", "fd00:96::/108", "IPv6"),
+            ("fd00::2", "fd00:96::/108,10.96.0.0/12", "IPv6"),
+            ("192.168.5.2", "10.96.0.0/12", "IPv4"),
+            ("cp.example.com", "fd00:96::/108", "IPv6"),
+        ] {
+            let store = make_store();
+            seed_namespaces(&store).await.unwrap();
+            seed_services(&store, advertise, 6443, range, None)
+                .await
+                .unwrap();
+            let key = keys::group_object_key(
+                "discovery.k8s.io",
+                "endpointslices",
+                Some("default"),
+                "kubernetes",
+            );
+            let obj = store.get(&key).await.unwrap().unwrap();
+            let eps: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
+            assert_eq!(
+                eps["addressType"].as_str(),
+                Some(want),
+                "advertise {advertise} range {range}: a v6 address in an IPv4 slice is rejected by \
+                 kube-proxy, leaving in-cluster clients without the kubernetes Service backend"
+            );
+        }
     }
 
     /// reconcile_kubernetes_endpointslice must propagate EndpointSlice addresses AND ports
@@ -8527,6 +9065,128 @@ mod tests {
                 "KCM must {verb} the extension-apiserver-authentication configmap"
             );
         }
+    }
+
+    #[test]
+    fn cluster_config_data_carries_ranges_and_one_dns_vip_per_family() {
+        // A joining node derives its IP families and kubelet clusterDNS from this; a missing
+        // secondary VIP or a wrong primary would leave a dual-stack worker single-stack.
+        let d = cluster_config_data(
+            "10.96.0.0/12,fd00:96::/108",
+            "10.244.0.0/16,fd00:244::/56",
+            None,
+        )
+        .unwrap();
+        assert_eq!(d["serviceCIDRs"], "10.96.0.0/12,fd00:96::/108");
+        assert_eq!(d["podCIDRs"], "10.244.0.0/16,fd00:244::/56");
+        assert_eq!(d["clusterDNS"], "10.96.0.10,fd00:96::a");
+
+        let v6 = cluster_config_data("fd00:96::/108", "", None).unwrap();
+        assert_eq!(v6["clusterDNS"], "fd00:96::a", "v6-primary single range");
+        assert_eq!(v6["podCIDRs"], "");
+
+        let d = cluster_config_data("fd00:96::/108,10.96.0.0/12", "", Some("10.96.0.53")).unwrap();
+        assert_eq!(
+            d["clusterDNS"], "10.96.0.53,fd00:96::a",
+            "an explicit kube-dns IP leads, the other family keeps its tenth host"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_cluster_config_publishes_and_follows_range_changes() {
+        // A control-plane re-run with new ranges must update the ConfigMap or new workers join
+        // with the old cluster's families.
+        let store = make_store();
+        seed_cluster_config(&store, "10.96.0.0/12", "10.244.0.0/16", None)
+            .await
+            .unwrap();
+        let key = keys::object_key("configmaps", "kube-system", CLUSTER_CONFIG_NAME);
+        let read = || async {
+            let v = store.get(&key).await.unwrap().expect("must exist");
+            serde_json::from_slice::<serde_json::Value>(&v.value).unwrap()
+        };
+        assert_eq!(read().await["data"]["clusterDNS"], "10.96.0.10");
+
+        seed_cluster_config(&store, "10.96.0.0/12,fd00:96::/108", "10.244.0.0/16", None)
+            .await
+            .unwrap();
+        let cm = read().await;
+        assert_eq!(cm["data"]["serviceCIDRs"], "10.96.0.0/12,fd00:96::/108");
+        assert_eq!(cm["data"]["clusterDNS"], "10.96.0.10,fd00:96::a");
+    }
+
+    #[tokio::test]
+    async fn cluster_config_is_readable_by_joiners_and_nodes_but_not_by_anyone_else() {
+        // Joining workers read the ConfigMap with their bootstrap token; anonymous callers and
+        // other kube-system ConfigMaps / list must stay closed.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.unwrap();
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+        let check = |user: &str, groups: &[&str], verb: &str, name: Option<&str>| {
+            let groups: Vec<String> = groups.iter().map(|g| (*g).to_owned()).collect();
+            state.rbac_index.is_allowed(&rbac::AuthzRequest {
+                username: user,
+                groups: &groups,
+                verb,
+                api_group: "",
+                resource: "configmaps",
+                subresource: "",
+                namespace: Some("kube-system"),
+                name,
+                non_resource_url: None,
+            })
+        };
+        let bootstrapper = ["system:bootstrappers", "system:authenticated"];
+        assert!(check(
+            "system:bootstrap:abcdef",
+            &bootstrapper,
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
+        assert!(check(
+            "system:node:n1",
+            &["system:nodes", "system:authenticated"],
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
+        assert!(
+            !check(
+                "system:bootstrap:abcdef",
+                &bootstrapper,
+                "get",
+                Some("coredns")
+            ),
+            "only the one resourceName"
+        );
+        assert!(
+            !check("system:bootstrap:abcdef", &bootstrapper, "list", None),
+            "no list"
+        );
+        assert!(
+            !check("system:bootstrap:abcdef", &bootstrapper, "watch", None),
+            "no watch"
+        );
+        assert!(
+            !check(
+                "system:anonymous",
+                &["system:unauthenticated"],
+                "get",
+                Some(CLUSTER_CONFIG_NAME)
+            ),
+            "cluster topology must not be anonymously readable"
+        );
+        assert!(!check(
+            "alice",
+            &["system:authenticated"],
+            "get",
+            Some(CLUSTER_CONFIG_NAME)
+        ));
     }
 
     #[tokio::test]
@@ -10300,6 +10960,7 @@ mod tests {
         //    projects an SA token into a pod volume.
         let token_handler_result = handlers::tokens::create_token(
             axum::extract::State(state),
+            axum::Extension(auth::UserInfo::default()),
             axum::extract::Path(("default".to_owned(), "default".to_owned())),
             bytes::Bytes::new(), // empty body → default audience + expiration
         )
@@ -12538,7 +13199,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
         let args = Args {
             db: "./state.db".into(),
-            listen: "0.0.0.0:6443".into(),
+            listen: vec!["0.0.0.0:6443".into()],
             kubeconfig: "./kubeconfig".into(),
             token_auth_file: None,
             sa_key: "./sa.key".into(),
@@ -12554,8 +13215,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: None,
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13355,7 +14018,7 @@ mod tests {
 
         let args = Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -13371,8 +14034,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],
@@ -13556,7 +14221,7 @@ mod tests {
         };
         let args = Args {
             db: dir.join("state.db").to_string_lossy().into_owned(),
-            listen: format!("127.0.0.1:{port}"),
+            listen: vec![format!("127.0.0.1:{port}")],
             kubeconfig: dir.join("kubeconfig").to_string_lossy().into_owned(),
             token_auth_file: None,
             sa_key: dir.join("sa.key").to_string_lossy().into_owned(),
@@ -13572,8 +14237,10 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             advertise_address: Some(format!("https://127.0.0.1:{port}")),
+            apiserver_cert_extra_sans: vec![],
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kube_dns_cluster_ip: None,
+            cluster_cidr: String::new(),
             kubelet_preferred_address: None,
             kubelet_port: 10250,
             node_kubelet_port: vec![],

@@ -10,8 +10,11 @@ pub struct Args {
     #[arg(long, default_value = "./state.db")]
     pub(crate) db: String,
 
-    #[arg(long, default_value = "0.0.0.0:6443")]
-    pub(crate) listen: String,
+    /// Socket address(es) to serve on, comma-separated (e.g. `10.0.0.5:6443,[fd00::5]:6443`).
+    /// One listener per entry; the first is the primary and is what the advertised-address
+    /// fallbacks derive from.
+    #[arg(long, default_value = "0.0.0.0:6443", value_delimiter = ',')]
+    pub(crate) listen: Vec<String>,
 
     /// Output path for the generated kubeconfig. Write-only on first run —
     /// not a read fixture. Generated fresh from TLS material each startup.
@@ -64,11 +67,16 @@ pub struct Args {
     #[arg(long)]
     pub(crate) advertise_address: Option<String>,
 
+    /// Extra IPs or DNS names for the serving certificate's SANs, comma-separated (kubeadm's
+    /// `--apiserver-cert-extra-sans`). Carries the node's non-primary addresses (e.g. its
+    /// IPv6 address on a dual-stack node) so clients can verify the cert on any of them.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) apiserver_cert_extra_sans: Vec<String>,
+
     /// CIDR range(s) from which clusterIPs are auto-allocated for Services: one CIDR, or two
     /// comma-separated CIDRs of different IP families (e.g. "10.96.0.0/12,fd00:96::/108");
-    /// the first is the primary family. Ranges are at most 2^20 addresses (IPv4 /12, IPv6
-    /// /108), as upstream. Matches kubeadm's default. Set to empty string to disable
-    /// auto-allocation.
+    /// the first is the primary family. No range-size bound is enforced. Matches kubeadm's
+    /// default. Set to empty string to disable auto-allocation.
     #[arg(long, default_value = "10.96.0.0/12")]
     pub(crate) service_cluster_ip_range: String,
 
@@ -79,6 +87,12 @@ pub struct Args {
     /// the kubelet's `clusterDNS`.
     #[arg(long)]
     pub(crate) kube_dns_cluster_ip: Option<String>,
+
+    /// Pod CIDR(s) of the cluster (kube-controller-manager's `--cluster-cidr`), comma-separated.
+    /// Used only to publish `kube-system/u7s-cluster-config` for joining nodes; the apiserver
+    /// does not allocate from it.
+    #[arg(long, default_value = "")]
+    pub(crate) cluster_cidr: String,
 
     /// Hostname or IP to use for all kubelet proxy requests (log, exec, attach, port-forward).
     /// When set, overrides the node's InternalIP from status.addresses. Useful when the
@@ -170,10 +184,37 @@ pub struct Args {
     pub(crate) admission_control_config_file: Option<String>,
 }
 
+impl Args {
+    pub(crate) fn primary_listen(&self) -> &str {
+        self.listen.first().map_or("0.0.0.0:6443", String::as_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Args;
     use clap::Parser;
+
+    /// A dual-stack node advertises both families in its cert and kubelet `--node-ip`; if
+    /// `--listen` kept only one address the other family would be dialable by nobody.
+    #[test]
+    fn listen_takes_every_node_address_as_one_comma_separated_flag() {
+        let args =
+            Args::try_parse_from(["u7s-apiserver", "--listen", "10.0.0.5:6443,[fd00::5]:6443"])
+                .expect("--listen must accept a comma-separated list");
+        assert_eq!(args.listen, ["10.0.0.5:6443", "[fd00::5]:6443"]);
+        assert_eq!(
+            args.primary_listen(),
+            "10.0.0.5:6443",
+            "the first entry is the primary the advertised-address fallbacks derive from"
+        );
+    }
+
+    #[test]
+    fn listen_defaults_to_the_single_wildcard_address() {
+        let args = Args::try_parse_from(["u7s-apiserver"]).unwrap();
+        assert_eq!(args.listen, ["0.0.0.0:6443"]);
+    }
 
     /// `run()` passes `args.manifest_dir` straight through to
     /// `bootstrap_apply::apply_well_known_manifest_dir` as the directory it scans — if the

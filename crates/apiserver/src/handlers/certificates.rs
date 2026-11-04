@@ -1708,6 +1708,20 @@ mod tests {
         state
     }
 
+    /// `v` stamped with the stored object's resourceVersion (when it exists): PUT updates of
+    /// these kinds are 422 without one.
+    async fn with_stored_rv(
+        state: &crate::state::AppState,
+        key: &str,
+        v: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut v = v.clone();
+        if let Some(stored) = state.store.get(key).await.unwrap() {
+            v["metadata"]["resourceVersion"] = stored.revision.to_string().into();
+        }
+        v
+    }
+
     /// Returns the (status, message) of one update attempt, `mode` naming the write path.
     async fn update_ctb(
         state: &crate::state::AppState,
@@ -1721,7 +1735,15 @@ mod tests {
             CTB_PLURAL.to_string(),
             OLD_NAME.to_string(),
         ));
-        let full = serde_json::to_vec(&ctb_full(signer, bundle)).unwrap();
+        let full = serde_json::to_vec(
+            &with_stored_rv(
+                state,
+                &format!("/registry/certificates.k8s.io/clustertrustbundles/{OLD_NAME}"),
+                &ctb_full(signer, bundle),
+            )
+            .await,
+        )
+        .unwrap();
         let partial = serde_json::to_vec(
             &serde_json::json!({"spec": {"signerName": signer, "trustBundle": bundle}}),
         )
@@ -2018,6 +2040,12 @@ mod tests {
             name.to_string(),
         ));
         let bytes = |v: &serde_json::Value| Bytes::from(serde_json::to_vec(v).unwrap());
+        let full = &with_stored_rv(
+            state,
+            &format!("/registry/certificates.k8s.io/podcertificaterequests/default/{name}"),
+            full,
+        )
+        .await;
         match mode {
             "post" => outcome(
                 create_pod_certificate_request(
@@ -2251,6 +2279,12 @@ mod tests {
             PCR_NAME.to_string(),
         ));
         let status = body["status"].clone();
+        let body = &with_stored_rv(
+            state,
+            &format!("/registry/certificates.k8s.io/podcertificaterequests/default/{PCR_NAME}"),
+            body,
+        )
+        .await;
         let bytes = Bytes::from(match mode {
             "json-patch" => serde_json::to_vec(
                 &serde_json::json!([{"op": "add", "path": "/status", "value": status}]),

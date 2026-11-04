@@ -39,6 +39,14 @@ assert() {
   fi
 }
 
+# Lists the tarball fully before matching: `tar tzf | grep -q` under pipefail
+# false-fails when grep exits on the first hit and tar dies of SIGPIPE (141).
+tarball_lists() {
+  local listing
+  listing="$(tar tzf "$1" 2>/dev/null)" || return 1
+  grep -q -- "$2" <<<"$listing"
+}
+
 # Extracts the staging-and-package tail of build-release-tarball.sh verbatim:
 # from the license-copy comment (which precedes the manifests-staging step
 # this test exists to cover) through the final `tar tzf` listing.
@@ -70,7 +78,7 @@ STAGE_NAME="u7s-vTEST-x86_64-unknown-linux-gnu"
 WORK_DIR="$WORK/work"
 STAGE_DIR="$WORK_DIR/$STAGE_NAME"
 mkdir -p "$STAGE_DIR" "$OUT_DIR"
-for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
   printf 'fake %s binary\n' "$f" > "$STAGE_DIR/$f"
 done
 
@@ -92,10 +100,10 @@ assert "build-release-tarball.sh's staging/packaging step succeeds against a ful
 
 TARBALL="$OUT_DIR/${STAGE_NAME}.tar.gz"
 assert "the packaged tarball contains manifests/kube-proxy.yaml, the vendored manifest committed at the repo root" \
-  "$(tar tzf "$TARBALL" 2>/dev/null | grep -q "${STAGE_NAME}/manifests/kube-proxy.yaml" && echo 1 || echo 0)"
+  "$(tarball_lists "$TARBALL" "${STAGE_NAME}/manifests/kube-proxy.yaml" && echo 1 || echo 0)"
 
 assert "the packaged tarball's manifests/ directory does NOT include manifests/README.md -- only *.yaml ships, matching install.sh's own *.yaml-only copy glob so non-manifest files never reach the well-known auto-apply folder" \
-  "$(tar tzf "$TARBALL" 2>/dev/null | grep -q "${STAGE_NAME}/manifests/README.md" && echo 0 || echo 1)"
+  "$(tarball_lists "$TARBALL" "${STAGE_NAME}/manifests/README.md" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # The repo's real manifests/ directory is empty today (kube-proxy/Flannel/
@@ -112,7 +120,7 @@ cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$EMPTY_ROOT_FIXTURE/"
 EMPTY_STAGE_NAME="${STAGE_NAME}-empty"
 EMPTY_STAGE_DIR="$WORK_DIR/$EMPTY_STAGE_NAME"
 mkdir -p "$EMPTY_STAGE_DIR"
-for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
   printf 'fake %s binary\n' "$f" > "$EMPTY_STAGE_DIR/$f"
 done
 
@@ -121,7 +129,7 @@ ROOT_DIR="$EMPTY_ROOT_FIXTURE" OUT_DIR="$OUT_DIR" STAGE_NAME="$EMPTY_STAGE_NAME"
   WORK_DIR="$WORK_DIR" STAGE_DIR="$EMPTY_STAGE_DIR" \
   bash "$RUNNER" > "$WORK/out-empty.txt" 2>&1 || empty_status=$?
 assert "the staging step succeeds and still creates manifests/ in the tarball when the repo's manifests/ directory has zero .yaml files yet -- today's real state, matching install.sh's own graceful handling of an empty well-known folder" \
-  "$([ "$empty_status" -eq 0 ] && tar tzf "$OUT_DIR/${EMPTY_STAGE_NAME}.tar.gz" 2>/dev/null | grep -q "${EMPTY_STAGE_NAME}/manifests/" && echo 1 || echo 0)"
+  "$([ "$empty_status" -eq 0 ] && tarball_lists "$OUT_DIR/${EMPTY_STAGE_NAME}.tar.gz" "${EMPTY_STAGE_NAME}/manifests/" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove this suite would actually
@@ -138,7 +146,7 @@ else
   MUTATED_STAGE_NAME="${STAGE_NAME}-mutated"
   MUTATED_STAGE_DIR="$WORK_DIR/$MUTATED_STAGE_NAME"
   mkdir -p "$MUTATED_STAGE_DIR"
-  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
     printf 'fake %s binary\n' "$f" > "$MUTATED_STAGE_DIR/$f"
   done
 
@@ -152,7 +160,7 @@ else
 
   mutated_tarball="$OUT_DIR/${MUTATED_STAGE_NAME}.tar.gz"
   assert "mutation self-check: with the manifests-staging block removed, the resulting tarball is missing manifests/kube-proxy.yaml -- proving the assertion above would fail if this fix were ever reverted" \
-    "$([ "$mutated_status" -eq 0 ] && ! tar tzf "$mutated_tarball" 2>/dev/null | grep -q 'manifests/kube-proxy.yaml' && echo 1 || echo 0)"
+    "$([ "$mutated_status" -eq 0 ] && ! tarball_lists "$mutated_tarball" 'manifests/kube-proxy.yaml' && echo 1 || echo 0)"
 fi
 
 echo ""
