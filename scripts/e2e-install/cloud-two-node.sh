@@ -329,10 +329,12 @@ sonobuoy_dual() {
     sleep "$SLEEP"
   done
   case "$status" in *" complete "*) ;; *) fail "sonobuoy never completed within $SONOBUOY_POLLS polls: $status" ;; esac
-  local d=/tmp/sonobuoy-retrieve tarball= attempt
+  local d=/tmp/sonobuoy-retrieve tarball= out attempt
   for attempt in 1 2 3; do
-    tarball="$(on_cp "sudo rm -rf $d && sudo mkdir -p $d && $SB retrieve $d && sudo sh -c 'ls $d/*.tar.gz'")" && [ -n "$tarball" ] && break
-    tarball=
+    if out="$(on_cp "sudo rm -rf $d && sudo mkdir -p $d && $SB retrieve $d && sudo sh -c 'ls $d/*.tar.gz'")"; then
+      tarball="${out##*$'\n'}" # retrieve prints the path too; ls prints it last
+      [ -z "$tarball" ] || break
+    fi
     echo "sonobuoy retrieve attempt $attempt/3 yielded no tarball" >&2
     sleep "$SLEEP"
   done

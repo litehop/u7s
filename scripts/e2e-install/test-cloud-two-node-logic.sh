@@ -102,7 +102,7 @@ case "$*" in
       *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig retrieve"*)
         if [ -n "${STUB_SB_NOTAR:-}" ]; then echo "$*" >>"$STUB_LOG.retr"; exit 1; fi
         if [ -n "${STUB_SB_RETRIEVE_ONCE:-}" ] && [ ! -e "$STUB_LOG.retr" ]; then echo "$*" >"$STUB_LOG.retr"; exit 1; fi
-        echo "/tmp/sonobuoy-retrieve/202611_sonobuoy_x.tar.gz" ;;
+        p=/tmp/sonobuoy-retrieve/202611_sonobuoy_x.tar.gz; echo "$p"; echo "$p" ;;
       *"sudo sonobuoy results"*)
         printf 'Plugin: e2e\nStatus: passed\nTotal: %s\nPassed: 9\nFailed: %s\nSkipped: 0\n' "${STUB_SB_TOTAL-9}" "${STUB_SB_FAILED-0}" ;;
       *"ip -6 -o addr"*) echo "2: ens4    inet6 2600:1900::4/128 scope global dynamic" ;;
