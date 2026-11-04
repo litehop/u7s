@@ -116,4 +116,9 @@ Nothing is wrong enough to delete wholesale. Remove the README key block if the 
 
 ## Fix beads
 
-(appended below)
+- mayor-jb2l0 (P2): F1, F2 dual-stack install and single-to-dual upgrade.
+- mayor-wi3yg (P2): F3, F8, F11, F12 prerequisites, interface wording, hardware minimum.
+- mayor-ov7qs (P2): F6 stale beep pin in `manifests/README.md`.
+- mayor-yliea (P3): F4, F5, F9, F10 worker join, LoadBalancer, logs/exec, files and reinstall.
+- mayor-a3f15 (P3): F7 signing-key PLACEHOLDER wording.
+- mayor-p1pl3 (P4): F13, F14, F15 style cleanups.
