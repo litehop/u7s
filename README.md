@@ -87,13 +87,59 @@ apply upstream's release manifest:
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
+## Dual-stack install
+
+A dual-stack cluster gives Services and pods an IPv4 and an IPv6 address.
+IPv6-only clusters and clusters with mixed single/dual ranges are not
+supported.
+
+Prerequisites:
+
+- The node has a global-scope address of each family on the cluster
+  interface, or you pass one of each with `--node-ip`. The install fails with
+  an error naming the missing family otherwise.
+- The Service range and the pod range each have two entries, one per
+  family. The first entry is the primary family.
+
+1. Download `install.sh` for your release tag (see Quick start for `TAG`):
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+   ```
+
+2. Run it with a range of each family. Add `--node-ip <ipv4>,<ipv6>` if the
+   interface does not carry both addresses or you want other ones:
+
+   ```bash
+   sudo bash install.sh \
+     --service-cidr 10.96.0.0/12,fd00:96::/108 \
+     --cluster-cidr 10.244.0.0/16,fd00:244::/56
+   ```
+
+3. Check the Service ranges:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get servicecidr kubernetes -o jsonpath='{.spec.cidrs}'
+   ```
+
+   The output lists both ranges.
+
+The ranges are fixed at first install: a re-run that passes a different
+value is refused. The only supported change is the single-stack to
+dual-stack upgrade below. The script enables IPv6 forwarding for a
+dual-stack install by writing `/etc/sysctl.d/u7s-ipv6-forwarding.conf`.
+A joining worker reads the ranges from the cluster, so it needs no CIDR
+flags, only an address of each family.
+
 ## Upgrading
 
 Upgrade in place by re-running the install script of the newer release on each
 node. It needs no token and mints nothing. Upgrade the control plane first,
 then the workers.
 
-- **Control plane**: re-run with no flags. The binaries and unit files are
+- **Control plane**: re-run with no flags. A re-run with no flags keeps a
+  single-stack cluster single-stack; see "Upgrading to dual-stack" below
+  to add IPv6. The binaries and unit files are
   replaced and the services restarted; the CA (`/var/lib/u7s/ca.key`,
   `ca.crt`), the service-account keyring (`sa.key`, `sa.pub`) and the cluster
   state are kept, and the script fails if the CA changed. The keyring rotates
@@ -115,6 +161,71 @@ then the workers.
   (the apiserver answers 403 "it is the control-plane node"); pick a
   different `--node-name`. Other names, including an existing worker's, are
   accepted so a worker can re-join.
+
+### Upgrading to dual-stack
+
+Add an IPv6 range to a single-stack cluster by re-running the install
+script on the control plane with your existing range followed by one range
+of the other family. Any other change to the ranges is refused. The node
+needs an address of each family (see "Dual-stack install").
+
+Existing Nodes keep their single-stack `spec.podCIDRs`, because upstream
+does not allow a Node to gain a pod range in place. Each Node must be
+re-created before its pods get an IPv6 address. Existing Services keep their
+single ClusterIP; new Services can request `ipFamilyPolicy:
+PreferDualStack` or `RequireDualStack`.
+
+1. Read the existing ranges:
+
+   ```bash
+   sudo grep -E '^(SERVICE_CIDR|POD_CLUSTER_CIDR)=' /var/lib/u7s/config
+   ```
+
+2. Re-run `install.sh` of the same release with each existing range followed
+   by a range of the other family. This example upgrades a default install:
+
+   ```bash
+   sudo bash install.sh \
+     --service-cidr 10.96.0.0/12,fd00:96::/108 \
+     --cluster-cidr 10.244.0.0/16,fd00:244::/56
+   ```
+
+   The script prints `upgraded to dual-stack` and the commands in steps 3-6.
+
+3. For each Node, drain it and delete the Node object. Pass `--force` to
+   `drain` if bare pods (not managed by a controller) run on the Node:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig delete node <node>
+   ```
+
+4. On that node, restart kubelet so the Node re-registers with both
+   podCIDRs:
+
+   ```bash
+   sudo systemctl restart kubelet
+   ```
+
+5. Restart flannel so it reads the new podCIDRs. Pods created before this
+   step get an IPv4 address only:
+
+   ```bash
+   kubectl --kubeconfig=/var/lib/u7s/kubeconfig -n kube-flannel delete pod -l app=flannel
+   ```
+
+6. Deleting the control-plane Node removed its
+   `node-role.kubernetes.io/control-plane` label. After it re-registers,
+   re-run the command from step 2 to restore the label.
+
+7. Re-join each worker: its address families are learned at join. On the
+   worker, stop kubelet and clear its state, then follow "Add a worker"
+   with a new token:
+
+   ```bash
+   sudo systemctl stop kubelet
+   sudo rm -rf /var/lib/u7s
+   ```
 
 ## Running on a 1 GiB host
 

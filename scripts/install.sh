@@ -109,9 +109,9 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
-  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>]
+  install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]]
 
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
@@ -121,6 +121,10 @@ Usage:
   --node-name <name>    Node identity (default: hostname).
   --iface <iface>       Network interface used for cluster traffic
                          (default: first non-loopback interface).
+  --node-ip <ip>[,<ip>] Node addresses instead of the interface's: one IP, or
+                         one per IP family (e.g. 10.0.0.5,fd00::5). The first
+                         is the primary. A dual-stack cluster needs one of
+                         each family. Control plane and --join.
   --service-cidr <cidr> Service ClusterIP range (default: 10.96.0.0/12). To inherit
                          a k3s cluster use 10.43.0.0/16. Fixed at first install.
   --cluster-cidr <cidr> Pod CIDR (default: 10.244.0.0/16); k3s uses 10.42.0.0/16.
