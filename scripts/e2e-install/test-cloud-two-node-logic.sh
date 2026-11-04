@@ -99,6 +99,10 @@ case "$*" in
         case "$*" in *" AAAA "*) echo "${STUB_AAAA-fd00:96::50}" ;; *) echo "${STUB_A-10.96.0.50}" ;; esac ;;
       *kubeletVersion*) echo v1.37.1 ;;
       *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig status"*) echo "PLUGIN  STATUS  RESULT  COUNT"; echo "e2e     ${STUB_SB_STATUS-complete}  failed  1" ;;
+      *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig retrieve"*)
+        if [ -n "${STUB_SB_NOTAR:-}" ]; then echo "$*" >>"$STUB_LOG.retr"; exit 1; fi
+        if [ -n "${STUB_SB_RETRIEVE_ONCE:-}" ] && [ ! -e "$STUB_LOG.retr" ]; then echo "$*" >"$STUB_LOG.retr"; exit 1; fi
+        echo "/tmp/sonobuoy-retrieve/202611_sonobuoy_x.tar.gz" ;;
       *"sudo sonobuoy results"*)
         printf 'Plugin: e2e\nStatus: passed\nTotal: %s\nPassed: 9\nFailed: %s\nSkipped: 0\n' "${STUB_SB_TOTAL-9}" "${STUB_SB_FAILED-0}" ;;
       *"ip -6 -o addr"*) echo "2: ens4    inet6 2600:1900::4/128 scope global dynamic" ;;
@@ -121,7 +125,7 @@ chmod +x "$TMP/bin/gcloud"
 
 # run args... -> OUT, RC, LOG (gcloud argv), STDIN (everything piped into ssh), RES (results dir contents)
 run() {
-  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res" "$TMP/log.fw" "$TMP/log.local" "$TMP/log.v4only"
+  : >"$TMP/log"; : >"$TMP/log.stdin"; rm -rf "$TMP/res" "$TMP/log.fw" "$TMP/log.local" "$TMP/log.v4only" "$TMP/log.retr"
   RC=0
   OUT="$(PATH="$TMP/bin:$PATH" STUB_LOG="$TMP/log" STUB_TOKEN="$TOKEN" STUB_HASH="$HASH" \
     STUB_SCRIPT="$SCRIPT" U7S_E2E_RUN_ID=t U7S_E2E_RESULTS_DIR="$TMP/res" U7S_E2E_POLL_SLEEP=0 U7S_E2E_SONOBUOY_POLLS=3 \
@@ -300,8 +304,8 @@ assert "the LB is curled from the client over IPv4 (-4) and IPv6 (-6) on every i
   "$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.2/clientip' "$dual_log")$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.3/clientip' "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::2]/clientip'" "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::3]/clientip'" "$dual_log")"
 assert "sonobuoy runs the upstream dual-stack focus with the node's own conformance image tag" \
   "$(has "--e2e-focus 'IPv6DualStack|dual-stack|DualStack|ipFamilyPolicy'" "$dual_log")$(has 'registry.k8s.io/conformance:v1.37.1' "$dual_log")"
-assert "sonobuoy results are fetched with a WebSocket kubectl exec, not 'sonobuoy retrieve' (SPDY exec gets 501 from the apiserver, so retrieve fails with EOF)" \
-  "$(has 'exec -n sonobuoy sonobuoy -c kube-sonobuoy -- /sonobuoy splat /tmp/sonobuoy' "$dual_log")$(hasnt 'retrieve' "$dual_log")"
+assert "sonobuoy results come from 'sonobuoy retrieve' into a known dir and are read from that tarball (the splat|tar pipeline silently yielded no tarball once)" \
+  "$(has 'retrieve /tmp/sonobuoy-retrieve' "$dual_log")$(has 'sonobuoy results /tmp/sonobuoy-retrieve/202611_sonobuoy_x.tar.gz' "$dual_log")$(hasnt 'splat' "$dual_log")"
 assert "sonobuoy results are reported inline" "$(has 'Total: 9' "$dual_out")$(has 'Failed: 0' "$dual_out")"
 assert "the default (single-stack) run never reaches the dual-stack assertions" \
   "$(hasnt 'dual-nodes' "$(STUB_BEEP=1 run --release v0.4.0-snapshot.1; echo "$OUT")")"
@@ -363,6 +367,11 @@ STUB_SB_TOTAL=0 run --release v0.4.0-snapshot.1 --dual-stack
 assert "a sonobuoy focus that ran zero specs fails (vacuous pass)" "$(rc_is 1)$(has 'ran no specs' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
 STUB_SB_FAILED=5 run --release v0.4.0-snapshot.1 --dual-stack
 assert "failed upstream dual-stack specs fail the run" "$(rc_is 1)$(has 'has failed specs' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
+STUB_SB_NOTAR=1 run --release v0.4.0-snapshot.1 --dual-stack
+assert "a missing results tarball fails the run naming the retrieve step, never passes silently (after bounded retries)" \
+  "$(rc_is 1)$(has 'sonobuoy retrieve produced no results tarball after 3 attempts' "$(cat "$TMP"/res/sonobuoy-dual.log)")$(hasnt 'sonobuoy results' "$LOG")$([ "$(grep -c 'retrieve /tmp' "$TMP/log.retr")" = 3 ] && echo 1 || echo 0)"
+STUB_SB_RETRIEVE_ONCE=1 run --release v0.4.0-snapshot.1 --dual-stack
+assert "one transient empty retrieval is retried and the run still passes (the 2026-11-02 flake)" "$(rc_is 0)$(has 'Total: 9' "$OUT")"
 STUB_SB_STATUS=running run --release v0.4.0-snapshot.1 --dual-stack
 assert "a sonobuoy run that never completes fails" "$(rc_is 1)$(has 'never completed' "$(cat "$TMP"/res/sonobuoy-dual.log)")"
 STUB_BEEP=0 run --release v0.4.0-snapshot.1 --dual-stack
