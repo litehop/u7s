@@ -18,11 +18,13 @@ mitigation awaits an operator decision (`mayor-hjwdo`).
   core after a 120 s burst). A dedicated core is slightly optimistic against a
   shared VPS.
 - `mayor-ltido` (v0.4.3-snapshot.4, `--confirm`): FAIL, 0/3 at 50 pods and 0/3
-  at 40. 20 pods take 14-54 s. The node wedges with ~95% iowait; no OOM, steal
-  0. The earlier e2-micro verdict (`mayor-mk9lv`) was CPU-starved and is not
-  representative. The MariaDB first-init failures on e2-micro (`mayor-vw7jc`,
-  `mayor-yfca9`) came from that shape's CPU cap plus the 375m limit, not a u7s
-  bug.
+  at 40. 20-pod bursts take 14-54 s across the six runs (50-pod runs 14-46 s,
+  40-pod runs 46-54 s). The node wedges with ~95% iowait; no OOM, steal 0. The
+  earlier e2-micro verdict (`mayor-mk9lv`) was CPU-starved and is not
+  representative. `mayor-w5xs5` reproduced the slow MariaDB first init with
+  plain podman on a drained e2-micro (25% sustained CPU plus 11.8.6
+  temp-server RSA keygen); the 375m CPU limit adds throttling under u7s. The
+  fix choice is open (`mayor-yfca9` in progress, `mayor-vw7jc` open).
 
 ## Cause of the burst cliff (`mayor-kutwm`)
 
@@ -33,14 +35,16 @@ eviction removes every pod; there is no recovery at rest. Not CPU, I/O or
 apiserver. Knee: <=20 pods with WordPress+MariaDB, 50-60 without. Findings:
 `git show archive/mayor-kutwm-findings`.
 
-Open:
-- `mayor-hjwdo`: product mitigation, operator decision pending.
-- `mayor-9ygmh` (verdict): #2039's control-plane memory protection measured
+Open: `mayor-hjwdo`, product mitigation, operator decision pending.
+
+Verdicts (2026-11-04):
+- `mayor-9ygmh` (closed): #2039's control-plane memory protection measured
   WORSE than main on the Lima ramp (knee 20 vs 20-50; MemAvailable min 153-161
   vs 195-256 MiB; mem PSI 79-84% vs 41-64%; one OOM of CoreDNS+MariaDB),
-  consistent with the 1 GiB node being capacity-bound. #2039 stays a draft
-  pending an operator decision. The observer-light knee is unknown.
-- `mayor-adwea` (verdict): no release regression; idle headroom is flat
+  consistent with the 1 GiB node being capacity-bound. #2039 is left as a
+  draft (`mayor-i4bvb`: operator to decide whether to close it). The
+  observer-light knee is unknown.
+- `mayor-adwea` (closed): no release regression; idle headroom is flat
   v0.3.0 to v0.4.3-snapshot.4 on GCP N1. The "~100 MiB" was observer load (~79
   MiB from streaming ssh sessions), so the kutwm knee is pessimistic; GCP's
   unstreamed gate still fails at 40/50. Findings: `git show
@@ -58,20 +62,23 @@ Open:
   evidence, and a never-Ready mariadb-0 leaves no describe/logs.
 - Publish needs operator approval on the Release environment; snapshot cuts are
   operator-only.
-- Operator rules (2026-10-30): no pre-pull or sequencing in the gate (users
-  just `kubectl apply`); pd-standard stays; do not publish unmerged code.
 - Gate VPSes are `u7s-rg-<MMDDHHMMSS>-<n>` (`mayor-ddhlo`); check for strays by
   that pattern; node name <= 52 chars. A preemption mid-run yields no verdict.
 - Burst gate: `scripts/release-gate/burst-gate.sh --confirm` (~1-2 h). On Lima,
-  "quiet" means no other Lima VM, host CPU >= 70% idle, no cargo builds; a noisy
-  run counts as FAIL (`6uez9`).
+  "quiet" means no other Lima VM and host CPU >= 70% idle over 30 s (re-checked
+  every ~60 s, plus an in-guest CPU calibration); a non-pass on a noisy host is
+  INVALID (exit 3), repeated up to `MAX_INVALID_RUNS` and never counted; a PASS
+  under contention stays a PASS. Shipped in #1955 (`mayor-6uez9`, still open:
+  collector tests, in-VM watchdog kill, forced-failure path, unifying the
+  aarch64/x86_64 tarball staging).
 
 ## Cert rotation and other checks
 
 Control-plane kubelet runs as `system:node:<name>` with rotating certs (#1932);
 uppercase-hostname install (#1935, `zl285`; live checks need an uppercase
-hostname); advisories bumped (#1938). Non-gating: `xdw6u.8` (two-tier CA),
-`.9` (root succession; worker `ca.pem` goes stale after succession).
+hostname); advisories bumped (#1938); two-tier CA shipped (`xdw6u.8`, #1995).
+Non-gating and open: `xdw6u.9` (root succession; worker `ca.pem` goes stale
+after succession).
 `pki-rotation-e2e` is ADVISORY (removed from required checks 2026-10-24,
 `fhdqw`, #2013); do not re-require it without asking the operator.
 
@@ -89,5 +96,3 @@ archive/mayor-w898x-findings`.
 - `cargo audit` is non-blocking for PRs (operator decision).
 - The tick queues a PR on LGTM and removes its worktree on merge: convert to
   draft before follow-ups; never leave commits unpushed in a queued worktree.
-- The tick discards the regenerated `.beads/issues.jsonl` before each pull; run
-  `bd export -o .beads/issues.jsonl` and land it in the wrap PR.
