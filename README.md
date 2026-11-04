@@ -74,8 +74,9 @@ and kube-controller-manager, and writes a systemd unit for each.
    kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
-   The kubeconfig refers to `ca-bundle.pem` and `admin.pem` beside it by path,
-   so a rotated certificate is picked up without rewriting it. To use it on
+   The kubeconfig is readable by root only, so run `kubectl` as root
+   (`sudo kubectl ...`) in this README's examples. It refers to
+   `ca-bundle.pem` and `admin.pem` beside it by path, so a rotated certificate is picked up without rewriting it. To use it on
    another machine, embed them first:
    `kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten`.
 
@@ -134,9 +135,8 @@ flags, only an address of each family.
 ## Add a worker
 
 A worker runs only kubelet and joins an existing control plane with a
-single-use token. Use the saved `install.sh`, not `curl | sudo bash`: the script reads the token from a
-terminal prompt or from piped stdin, and stdin is the script itself in the
-one-liner.
+single-use token. Use the saved `install.sh`, not `curl | sudo bash`: the
+script reads the token from stdin, which is the script itself in the one-liner.
 
 1. On the control plane, mint a token. The script is the one you installed
    with (see Quick start, "Verify before running"):
@@ -154,17 +154,14 @@ one-liner.
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
    ```
 
-3. On the worker, join. The release copy of `install.sh` downloads the
-   release tarball by itself, so omit the `--tarball <path>` that step 1
-   prints. Choose a `--node-name` other than the control plane's, then paste
-   the token at the prompt (echo is off):
+3. On the worker, join. Choose a `--node-name` other than the control
+   plane's, and pipe the token in with `--token -` (it lands in your shell
+   history, but it expires and works once):
 
    ```bash
-   sudo bash install.sh --join https://<control-plane-ip>:6443 \
-     --ca-cert-hash sha256:<hash> --node-name <worker-name>
+   echo '<token>' | sudo bash install.sh --join https://<control-plane-ip>:6443 \
+     --ca-cert-hash sha256:<hash> --node-name <worker-name> --token -
    ```
-
-   To pass the token without a prompt, pipe it in and add `--token -`.
 
 4. On the control plane, check that the worker is Ready:
 
@@ -244,7 +241,7 @@ reach the node's InternalIP.
 | Static pods | `/etc/u7s/static-pods/` |
 | CRI-O memory settings | `/etc/crio/crio.conf.d/10-memory.conf` |
 | Kernel settings | `/etc/sysctl.d/u7s-*.conf`, `/etc/modules-load.d/u7s-br-netfilter.conf` |
-| Systemd units | `u7s-apiserver`, `u7s-kcm`, `kubelet` (a worker has `kubelet` only) |
+| Systemd units | `u7s-apiserver`, `u7s-kcm`, `u7s-kcm-restart.path` and `.service`, `kubelet` (a worker has `kubelet` only) |
 
 Read a service's log with `journalctl`:
 
@@ -270,8 +267,10 @@ state directory, and re-run `install.sh`:
    ```
 
 3. Run `install.sh` again. A worker must be joined again with a new token;
-   see "Add a worker". Delete its Node object on the control plane first
-   (`kubectl delete node <worker-name>`).
+   see "Add a worker". The worker may re-join under its old name; the Node
+   object need not be deleted first. A control plane re-installed this way
+   comes back with the default ranges unless you pass the dual-stack flags
+   again.
 
 This leaves CRI-O, its apt sources, the systemd unit files, the binaries in
 `/opt/u7s/bin`, and the sysctl and module files in place. Remove them by hand
@@ -310,7 +309,9 @@ then the workers.
 
 ### Upgrading to dual-stack
 
-Add an IPv6 range to a single-stack cluster by re-running the install
+Releases up to and including `v0.4.3-snapshot.4` refuse this and require
+a reinstall; use a later release. To add an IPv6 range to a single-stack
+cluster, re-run the install
 script on the control plane with your existing range followed by one range
 of the other family. Any other change to the ranges is refused. The node
 needs an address of each family (see "Dual-stack install").
