@@ -322,13 +322,14 @@ lan_v6_addr_for() {
 # Script body run at boot: own address plus one permanent neighbour per peer.
 # Args: <iface> <self-addr> [<peer-addr> <peer-mac>]...
 lan_v6_script() {
-  local iface="$1" self="$2"
+  local iface="$1" self="$2" svc_v6
   shift 2
+  svc_v6=$(rig_service_cidr_v6) || return 1
   echo "#!/bin/sh"
   echo "ip -6 addr replace ${self}/64 dev ${iface} nodad"
   # Lima VMs have no default v6 route (no RA), so locally originated traffic to
   # a v6 ClusterIP dies with ENETUNREACH before kube-proxy's OUTPUT DNAT runs.
-  echo "ip -6 route replace ${RIG_SERVICE_CIDR_V6} dev lo"
+  echo "ip -6 route replace ${svc_v6} dev lo"
   while [ "$#" -ge 2 ]; do
     echo "ip -6 neigh replace $1 lladdr $2 dev ${iface} nud permanent"
     shift 2
@@ -393,8 +394,97 @@ lan_v6_seed_mesh() {
 RIG_POD_CIDR_V4="10.244.0.0/16"
 RIG_POD_CIDR_V6="fd00:244::/56"
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
-RIG_SERVICE_CIDR_V6="${RIG_SERVICE_CIDR_DUAL#*,}"
-RIG_KUBE_DNS_V6="fd00:96::a"
+RIG_SERVICE_CIDR_V4="10.96.0.0/12"
+
+# The Service CIDR(s) the apiserver actually runs with, as run-all.sh exports
+# them so lima-start.sh/add-node.sh see a custom --service-cidr. Arg: 1 for
+# dual-stack.
+rig_effective_service_cidr() {
+  if [ "$1" -eq 1 ]; then echo "${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_DUAL}"; else echo "${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_V4}"; fi
+}
+
+# Prints the IPv6 member of a comma-separated Service CIDR list (either order).
+# Args: [<cidr-list>] (default $RIG_SERVICE_CIDR, else the dual default).
+# Fails when there is none.
+rig_service_cidr_v6() {
+  local part list="${1:-${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_DUAL}}"
+  local IFS=,
+  for part in $list; do
+    case "$part" in *:*) echo "$part"; return 0 ;; esac
+  done
+  echo "error: --dual-stack needs an IPv6 Service CIDR, got '$list'" >&2
+  return 1
+}
+
+# Prints the tenth host of a CIDR (kube-dns's VIP: upstream/kubeadm
+# convention, and what the apiserver derives when --kube-dns-cluster-ip is
+# unset). Fails when the range has fewer than 4 host bits, so the tenth host
+# would not be allocatable. Arg: <cidr>.
+rig_cidr_tenth_host() {
+  local cidr="$1" addr="${1%/*}" plen="${1#*/}"
+  if [ "$addr" = "$cidr" ] || ! [[ "$plen" =~ ^[0-9]+$ ]]; then
+    echo "error: '$cidr' is not a CIDR" >&2; return 1
+  fi
+  case "$addr" in
+    *:*)
+      [ "$plen" -le 124 ] || { echo "error: Service CIDR '$cidr' is too small to contain a tenth host" >&2; return 1; }
+      local IFS=: h i x nt=0
+      local -a w=()
+      if [[ "$addr" == *::* ]]; then
+        for x in ${addr%%::*}; do w+=("$x"); done
+        for x in ${addr#*::}; do nt=$((nt + 1)); done
+        while [ "${#w[@]}" -lt $((8 - nt)) ]; do w+=(0); done
+        for x in ${addr#*::}; do w+=("$x"); done
+      else
+        for x in $addr; do w+=("$x"); done
+      fi
+      [ "${#w[@]}" -eq 8 ] || { echo "error: '$cidr' is not a valid IPv6 CIDR" >&2; return 1; }
+      local -a out=()
+      for i in 0 1 2 3 4 5 6 7; do
+        h=$((16#${w[$i]:-0} & 0xffff))
+        local fixed=$((plen - 16 * i)); [ "$fixed" -gt 0 ] || fixed=0; [ "$fixed" -lt 16 ] || fixed=16
+        out+=($((h & (0xffff << (16 - fixed) & 0xffff))))
+      done
+      out[7]=$((out[7] + 10))
+      # RFC 5952: compress the longest run (>=2) of zero hextets, leftmost on a tie.
+      local best=-1 bestlen=1 run=0 start=0
+      for i in 0 1 2 3 4 5 6 7; do
+        if [ "${out[$i]}" -eq 0 ]; then
+          [ "$run" -gt 0 ] || start=$i
+          run=$((run + 1))
+          if [ "$run" -gt "$bestlen" ]; then best=$start; bestlen=$run; fi
+        else
+          run=0
+        fi
+      done
+      local s="" sep=""
+      for i in 0 1 2 3 4 5 6 7; do
+        if [ "$i" -eq "$best" ]; then s+="::"; sep=""; continue; fi
+        if [ "$best" -ge 0 ] && [ "$i" -gt "$best" ] && [ "$i" -lt $((best + bestlen)) ]; then continue; fi
+        s+="$sep$(printf '%x' "${out[$i]}")"; sep=":"
+      done
+      echo "$s" ;;
+    *)
+      [ "$plen" -le 28 ] || { echo "error: Service CIDR '$cidr' is too small to contain a tenth host" >&2; return 1; }
+      local a b c d
+      IFS=. read -r a b c d <<< "$addr"
+      local n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+      n=$(( (n & ((0xffffffff << (32 - plen)) & 0xffffffff)) + 10 ))
+      echo "$(( n >> 24 & 255 )).$(( n >> 16 & 255 )).$(( n >> 8 & 255 )).$(( n & 255 ))" ;;
+  esac
+}
+
+# Prints the kube-dns VIP of every family in a comma-separated Service CIDR
+# list, one per line, in list order (the first is the Service's clusterIP and
+# the kubelet's first clusterDNS). Arg: <cidr-list>.
+rig_kube_dns_ips() {
+  local part ip
+  local IFS=,
+  for part in $1; do
+    ip=$(rig_cidr_tenth_host "$part") || return 1
+    echo "$ip"
+  done
+}
 
 # KCM pod-CIDR flags. Upstream rejects --node-cidr-mask-size with two cluster
 # CIDRs and wants one flag per family (install.sh kcm_node_cidr_mask_flags).
@@ -420,16 +510,22 @@ rig_render_flannel() {
   sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" "${v6[@]}"
 }
 
-# Renders manifests/coredns.yaml (stdin to stdout): a dual-stack Service gets a
-# second kube-dns VIP and PreferDualStack, as install.sh does. Arg: 1 if dual-stack.
+# Renders manifests/coredns.yaml (stdin to stdout): the Service's clusterIP is
+# the first family's kube-dns VIP, and a dual-stack Service lists one VIP per
+# family with PreferDualStack, as install.sh does. Arg: <service-cidr-list>.
 rig_render_coredns() {
-  if [ "$1" -eq 1 ]; then
-    sed -e "s#^  clusterIP: 10.96.0.10\$#  clusterIP: 10.96.0.10\\
-  clusterIPs:\\
-  - 10.96.0.10\\
-  - ${RIG_KUBE_DNS_V6}\\
-  ipFamilyPolicy: PreferDualStack#"
-  else
-    cat
+  local -a ips
+  local lines vip
+  lines=$(rig_kube_dns_ips "$1") || return 1
+  while IFS= read -r vip; do ips+=("$vip"); done <<< "$lines"
+  local repl="  clusterIP: ${ips[0]}"
+  if [ "${#ips[@]}" -gt 1 ]; then
+    repl+="\\
+  clusterIPs:"
+    for vip in "${ips[@]}"; do repl+="\\
+  - ${vip}"; done
+    repl+="\\
+  ipFamilyPolicy: PreferDualStack"
   fi
+  sed -e "s#^  clusterIP: 10.96.0.10\$#${repl}#"
 }

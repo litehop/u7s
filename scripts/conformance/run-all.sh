@@ -454,7 +454,9 @@ if [ -n "$_DUAL_STACK_ARG" ]; then
   # shellcheck source=scripts/conformance/_lib.sh
   source "$DIR/_lib.sh"
   [ -n "$SERVICE_CIDR" ] || SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"
+  rig_service_cidr_v6 "$SERVICE_CIDR" >/dev/null || exit 1
 fi
+[ -n "$SERVICE_CIDR" ] && export RIG_SERVICE_CIDR="$SERVICE_CIDR"
 [ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
 if [ "$RESET" -eq 1 ]; then
