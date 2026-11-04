@@ -72,14 +72,17 @@ and kube-controller-manager, and writes a systemd unit for each.
    `/var/lib/u7s/kubeconfig` by default:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
-   The kubeconfig is readable by root only, so run `kubectl` as root
-   (`sudo kubectl ...`) in this README's examples. It refers to
-   `ca-bundle.pem` and `admin.pem` beside it by path, so a rotated certificate is picked up without rewriting it. To use it on
-   another machine, embed them first:
-   `kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten`.
+   The kubeconfig is readable by root only, so the examples in this README
+   run `kubectl` with `sudo`. It refers to `ca-bundle.pem` and `admin.pem`
+   beside it by path, so a rotated certificate is picked up without
+   rewriting it. To use it on another machine, embed them first:
+
+   ```bash
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten
+   ```
 
 u7s does not ship metrics-server. The `scale` subresource is implemented, so
 `HorizontalPodAutoscaler` works once you install metrics-server yourself —
@@ -121,7 +124,7 @@ Prerequisites:
 3. Check the Service ranges:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get servicecidr kubernetes -o jsonpath='{.spec.cidrs}'
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get servicecidr kubernetes -o jsonpath='{.spec.cidrs}'
    ```
 
    The output lists both ranges.
@@ -167,7 +170,7 @@ script reads the token from stdin, which is the script itself in the one-liner.
 4. On the control plane, check that the worker is Ready:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
 The worker learns the Service and pod ranges from the cluster, so it takes no
@@ -184,7 +187,7 @@ needs kernel >= 6.6, and `install.sh` refuses to run on an older kernel.
    cluster to get an address of each family:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig apply -f - <<'EOF'
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig apply -f - <<'EOF'
    apiVersion: v1
    kind: Service
    metadata:
@@ -202,7 +205,7 @@ needs kernel >= 6.6, and `install.sh` refuses to run on an older kernel.
 2. Read the address from the Service status:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig get svc web -o jsonpath='{.status.loadBalancer.ingress[*].ip}'
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get svc web -o jsonpath='{.status.loadBalancer.ingress[*].ip}'
    ```
 
    The addresses are node addresses: every node under the default
@@ -222,8 +225,8 @@ Differences from upstream Kubernetes:
 workers:
 
 ```bash
-kubectl --kubeconfig=/var/lib/u7s/kubeconfig logs <pod>
-kubectl --kubeconfig=/var/lib/u7s/kubeconfig exec -it <pod> -- sh
+sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig logs <pod>
+sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig exec -it <pod> -- sh
 ```
 
 They fail when the API server reaches a node's kubelet through a `127.0.0.1`
@@ -310,27 +313,30 @@ then the workers.
 
 ### Upgrading to dual-stack
 
-Releases up to and including `v0.4.3-snapshot.4` refuse this and require
-a reinstall; use a later release. To add an IPv6 range to a single-stack
-cluster, re-run the install
-script on the control plane with your existing range followed by one range
-of the other family. Any other change to the ranges is refused. The node
-needs an address of each family (see "Dual-stack install").
+This is not yet in a published release: releases up to the current snapshot
+refuse it and require a reinstall, so use a newer one. Existing Nodes keep
+their single-stack `spec.podCIDRs`, because upstream does not allow a Node
+to gain a pod range in place. Each Node must be re-created before its pods
+get an IPv6 address. Existing Services keep their single ClusterIP; new
+Services can request `ipFamilyPolicy: PreferDualStack` or
+`RequireDualStack`. Any change to the ranges other than adding one range of
+the other family is refused.
 
-Existing Nodes keep their single-stack `spec.podCIDRs`, because upstream
-does not allow a Node to gain a pod range in place. Each Node must be
-re-created before its pods get an IPv6 address. Existing Services keep their
-single ClusterIP; new Services can request `ipFamilyPolicy:
-PreferDualStack` or `RequireDualStack`.
+1. Make sure each node has an address of each family (see "Dual-stack
+   install").
 
-1. Read the existing ranges:
+2. Read the existing ranges:
 
    ```bash
    sudo grep -E '^(SERVICE_CIDR|POD_CLUSTER_CIDR)=' /var/lib/u7s/config
    ```
 
-2. Re-run `install.sh` of the same release with each existing range followed
-   by a range of the other family. This example upgrades a default install:
+   If the file or these lines are missing, the install predates recorded
+   ranges and runs the defaults, `10.96.0.0/12` and `10.244.0.0/16`.
+
+3. On the control plane, re-run `install.sh` of the same release with each
+   existing range followed by a range of the other family. This example
+   upgrades a default install:
 
    ```bash
    sudo bash install.sh \
@@ -338,35 +344,35 @@ PreferDualStack` or `RequireDualStack`.
      --cluster-cidr 10.244.0.0/16,fd00:244::/56
    ```
 
-   The script prints `upgraded to dual-stack` and the commands in steps 3-6.
+   The script prints `upgraded to dual-stack` and the commands in steps 4-7.
 
-3. For each Node, drain it and delete the Node object. Pass `--force` to
+4. For each Node, drain it and delete the Node object. Pass `--force` to
    `drain` if bare pods (not managed by a controller) run on the Node:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig delete node <node>
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig delete node <node>
    ```
 
-4. On that node, restart kubelet so the Node re-registers with both
+5. On that node, restart kubelet so the Node re-registers with both
    podCIDRs:
 
    ```bash
    sudo systemctl restart kubelet
    ```
 
-5. Restart flannel so it reads the new podCIDRs. Pods created before this
+6. Restart flannel so it reads the new podCIDRs. Pods created before this
    step get an IPv4 address only:
 
    ```bash
-   kubectl --kubeconfig=/var/lib/u7s/kubeconfig -n kube-flannel delete pod -l app=flannel
+   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig -n kube-flannel delete pod -l app=flannel
    ```
 
-6. Deleting the control-plane Node removed its
+7. Deleting the control-plane Node removed its
    `node-role.kubernetes.io/control-plane` label. After it re-registers,
-   re-run the command from step 2 to restore the label.
+   re-run the command from step 3 to restore the label.
 
-7. Re-join each worker: its address families are learned at join. On the
+8. Re-join each worker: its address families are learned at join. On the
    worker, stop kubelet and clear its state, then follow "Add a worker"
    with a new token:
 
