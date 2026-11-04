@@ -26,7 +26,8 @@ opt-in so the csi-hostpath snapshot e2e suite can run; real users install it
 themselves from upstream `kubernetes-csi/external-snapshotter`.
 
 `beep.yaml` is u7s's default Service `type=LoadBalancer` provider (the k3s
-klipper-lb role; litehop/beep v0.6.0, image pinned by digest), alongside
+klipper-lb role; litehop/beep, image pinned by digest; the vendored
+version is in the header of `beep.yaml`), alongside
 kube-proxy. It carries `__IFACE__` and `__POD_CLUSTER_CIDR__`, and needs
 kernel >= 6.6 (`install.sh` refuses older). Differences from upstream
 Kubernetes behaviour:
@@ -37,7 +38,8 @@ Kubernetes behaviour:
 - `sessionAffinity: ClientIP` is honoured; `timeoutSeconds` is not.
 
 Uninstalling beep is beep's responsibility; see
-<https://github.com/litehop/beep/blob/v0.6.0/deploy/README.md>.
+the deploy README in the <https://github.com/litehop/beep> repository, at the
+version named in the header of `beep.yaml`.
 
 CoreDNS (`coredns.yaml`), moved off its former `include_bytes!` compile-time
 embed, joins `flannel.yaml` (`__IFACE__`,

@@ -42,8 +42,9 @@ kubectl apply -f examples/e2e/wordpress/
 curl -H 'Host: wordpress.u7s.test' http://<node-ip>:30080/
 ```
 
-Traefik's Service is `NodePort` 30080: `type=LoadBalancer` needs beep, which the
-conformance rig does not run. HTTP only; TLS is out of scope here.
+Traefik's Service is `NodePort` 30080 because the test rig does not run beep, the
+LoadBalancer provider a regular u7s install applies by default. HTTP only; TLS
+is out of scope here.
 
 ## Smoke test
 
