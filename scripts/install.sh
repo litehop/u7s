@@ -737,9 +737,12 @@ validate_network_config() {
 # unset keeps the persisted value (or the default for an install that
 # predates persistence, which always ran the defaults); an explicit value that
 # disagrees on an existing install refuses, because Services, pods and every
-# node's kubelet already hold addresses from the old range.
+# node's kubelet already hold addresses from the old range. The one supported
+# change is upstream's single- to dual-stack upgrade: the persisted single
+# range kept as the primary and exactly one range of the other family appended
+# (sets DUAL_STACK_UPGRADE=1).
 reconcile_network_flag() {
-  local flag="$1" var="$2" persisted="$3" default="$4" given effective
+  local flag="$1" var="$2" persisted="$3" default="$4" given effective primary secondary pfam=4 sfam=4
   given="${!var}"
   effective="$default"
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$persisted" ]; then
@@ -747,10 +750,22 @@ reconcile_network_flag() {
   fi
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
     if [[ "$effective" != *,* && "$given" == *,* ]]; then
-      echo "error: $flag $given requests dual-stack, but this cluster was installed single-stack ($effective, recorded in $CONFIG_FILE). Converting an existing single-stack cluster to dual-stack in place is not supported yet. To get dual-stack now, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh with the dual-stack flags; otherwise re-run without changing $flag." >&2
-      return 1
+      primary="${given%%,*}"; secondary="${given#*,}"
+      if [ "$primary" != "$effective" ]; then
+        echo "error: $flag $given changes the primary range: this cluster's is $effective (recorded in $CONFIG_FILE) and Services, pods and kubelets already hold addresses from it. Only adding a secondary range of the other IP family is supported ($flag $effective,<other-family range>). To change the primary, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+        return 1
+      fi
+      [[ "$effective" == *:* ]] && pfam=6
+      [[ "$secondary" == *:* ]] && sfam=6
+      if [[ "$secondary" == *,* || "$sfam" = "$pfam" ]]; then
+        echo "error: $flag $given is not a single secondary range of the other IP family: the primary $effective is IPv$pfam, so exactly one IPv$((10 - pfam)) range may follow it ($flag $effective,<other-family range>)." >&2
+        return 1
+      fi
+      DUAL_STACK_UPGRADE=1
+      printf -v "$var" '%s' "$given"
+      return 0
     fi
-    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. Only a single-stack cluster gaining a secondary range ($flag $effective,<other-family range>) can change in place. Otherwise start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
     return 1
   fi
   printf -v "$var" '%s' "${given:-$effective}"
@@ -1708,6 +1723,7 @@ fi
 # the operator, so a re-run reads as an upgrade rather than a silent no-op or
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0
+DUAL_STACK_UPGRADE=0
 if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   EXISTING_INSTALL=1
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
@@ -2500,6 +2516,11 @@ if [ "$EXISTING_INSTALL" -eq 1 ]; then
 fi
 label_control_plane_node || exit 1
 wait_for_cluster_ready || exit 1
+
+if [ "$DUAL_STACK_UPGRADE" -eq 1 ]; then
+  echo "upgraded to dual-stack (cluster IP families: $CLUSTER_FAMILIES). New Services can request ipFamilyPolicy PreferDualStack/RequireDualStack; existing Services keep their single ClusterIP." >&2
+  echo "warning: existing Nodes keep their single-stack spec.podCIDRs. Upstream makes Node.spec.podCIDRs immutable once set and node-ipam only allocates for a Node without one, so pods on such a Node get no pod IP of the new family until the Node object is re-created: kubectl --kubeconfig=$STATE_DIR/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data; kubectl --kubeconfig=$STATE_DIR/kubeconfig delete node <node>; then 'systemctl restart kubelet' on that node. This control-plane node: $NODE_NAME. A joined worker must also be re-joined (its families are learned at join): stop kubelet, rm -rf its $STATE_DIR, and run install.sh --join with a new token." >&2
+fi
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"

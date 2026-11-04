@@ -2060,7 +2060,7 @@ for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( tota
   trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
   [ "$trunc_status" -ne 0 ] || trunc_ok=0
   printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
-  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file' || trunc_ok=0
+  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file|unexpected EOF' || trunc_ok=0
 done
 rm -rf "$TRUNC_WORK"
 assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
@@ -2144,7 +2144,7 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
-    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
     echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
     cat "$NET_WORK/fns.sh"
@@ -2363,12 +2363,34 @@ assert "re-running with the same dual-stack flags is idempotent" \
 net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR"'
 assert "a bare re-run keeps the persisted dual-stack lists instead of reverting to the single-stack defaults" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56" ] && echo 1 || echo 0)"
-net_bad "turning a single-stack install dual-stack is refused: existing Services and node podCIDRs hold only the old family" \
-  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "installed single-stack (10.96.0.0/12"
-net_bad "the single-to-dual refusal says upgrading in place is unsupported and how to proceed, so the operator is not left with a generic conflict message" \
-  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "not supported yet. To get dual-stack now, start over"
 net_bad "swapping the family order of a persisted dual-stack list is refused: the primary family determines the kubernetes Service VIP" \
   'EXISTING_INSTALL=1; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve' "--cluster-cidr"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+'"$DUAL"'; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR $CLUSTER_DNS $DUAL_STACK_UPGRADE"'
+assert "a single-stack install re-run with the dual-stack ranges (primary kept, secondary added) is accepted and flagged as an upgrade, with the persisted DNS VIP untouched (moving it would break every running pod's resolv.conf)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56 10.96.0.10 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=fd00:96::/108; PERSISTED_POD=fd00:244::/56; PERSISTED_DNS=fd00:96::a
+SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve && echo "$SERVICE_CIDR $DUAL_STACK_UPGRADE"'
+assert "an IPv6-primary single-stack install can gain an IPv4 secondary: the upgrade is not tied to IPv4 being primary" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::/108,10.96.0.0/12 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE$DUAL"'; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a fresh dual-stack install is not reported as an upgrade (the node-podCIDR warning would mislead)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a bare re-run of an already dual-stack install is not an upgrade" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_bad "making the IPv6 range primary on a single-stack IPv4 install is refused with a primary-change message: the primary family fixes the kubernetes Service VIP and every existing ClusterIP" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; resolve' "changes the primary range"
+net_bad "a different primary range with a secondary added is refused with the primary-change message (existing Services hold addresses from the old primary)" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.100.0.0/16,fd00:96::/108; resolve' "changes the primary range"
+net_bad "a same-family secondary is refused: a dual-stack cluster has one range per family" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,10.97.0.0/16; resolve' "not a single secondary range of the other IP family"
+net_bad "adding two ranges at once is refused: only a pure single-secondary addition is supported" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108,fd00:97::/108; resolve' "not a single secondary range of the other IP family"
+net_bad "changing a single-stack range to another single range is refused and points at the only supported in-place change" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.43.0.0/16; resolve' "Only a single-stack cluster gaining a secondary range"
+net_bad "dropping a family from a dual-stack install is refused: existing dual ClusterIPs and podCIDRs would be stranded" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; SERVICE_CIDR=10.96.0.0/12; resolve' "conflicts with the value in effect"
 
 # KCM: upstream rejects --node-cidr-mask-size with two cluster CIDRs.
 net_run 'POD_CLUSTER_CIDR=10.244.0.0/16; kcm_node_cidr_mask_flags'
