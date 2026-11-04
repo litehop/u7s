@@ -564,6 +564,14 @@ KCEOF
   # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
   limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-resolvconf.sh"
 
+  # kubelet's clusterDNS must equal CoreDNS's Service VIP(s) or pods resolve nothing;
+  # the baked config carries the default 10.96.0.10, so rewrite it from the effective
+  # Service CIDR on every start.
+  KUBE_DNS_LINES=$(rig_kube_dns_ips "$(rig_effective_service_cidr "$DUAL_STACK")") || exit 1
+  KUBE_DNS_IPS=$(echo "$KUBE_DNS_LINES" | paste -sd' ' -)
+  # shellcheck disable=SC2086 # one word per VIP
+  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml $KUBE_DNS_IPS < "$(dirname "$0")/set-kubelet-clusterdns.sh"
+
   # A golden baked before AtomicWriteVolumeUserFields joined lima/kubelet.yaml's featureGates
   # lacks it, and without it kubelet ignores projected defaultUser/user. Idempotent.
   limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml AtomicWriteVolumeUserFields < "$(dirname "$0")/../set-kubelet-featuregate.sh"

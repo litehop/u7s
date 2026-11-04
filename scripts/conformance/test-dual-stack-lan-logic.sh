@@ -102,9 +102,52 @@ check "no unresolved placeholder in either flannel render" \
   "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z0-9_]+__[",]' || true)"
 check "dual-stack CoreDNS Service has a VIP per family, PreferDualStack" \
   "  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack" \
-  "$(rig_render_coredns 1 < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -)"
+  "$(rig_render_coredns "$RIG_SERVICE_CIDR_DUAL" < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -)"
 check "single-stack CoreDNS manifest is staged unchanged" \
-  "$(cat "$ROOT/manifests/coredns.yaml")" "$(rig_render_coredns 0 < "$ROOT/manifests/coredns.yaml")"
+  "$(cat "$ROOT/manifests/coredns.yaml")" "$(rig_render_coredns "$RIG_SERVICE_CIDR_V4" < "$ROOT/manifests/coredns.yaml")"
+
+# Pods resolve DNS only if kubelet's clusterDNS equals CoreDNS's Service IP, so
+# both are derived from the one effective Service CIDR.
+coredns_vips() { rig_render_coredns "$1" < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -; }
+check "default dual CIDR keeps today's exact kubelet clusterDNS VIPs (an existing rig must not move)" \
+  "10.96.0.10 fd00:96::a" "$(rig_kube_dns_ips "$RIG_SERVICE_CIDR_DUAL" | paste -sd' ' -)"
+check "custom dual CIDR: CoreDNS Service VIPs come from that range (a hard-coded 10.96.0.10 is outside it and the apiserver rejects the Service)" \
+  "  clusterIP: 10.97.0.10|  clusterIPs:|  - 10.97.0.10|  - fd00:97::a|  ipFamilyPolicy: PreferDualStack" \
+  "$(coredns_vips "10.97.0.0/16,fd00:97::/108")"
+check "custom dual CIDR: kubelet clusterDNS equals the CoreDNS VIPs (else pods' resolv.conf points at nothing)" \
+  "10.97.0.10 fd00:97::a" "$(rig_kube_dns_ips "10.97.0.0/16,fd00:97::/108" | paste -sd' ' -)"
+check "v6-primary CIDR order: the v6 VIP is clusterIP and the first clusterDNS (the apiserver's primary family)" \
+  "  clusterIP: fd00:97::a|  clusterIPs:|  - fd00:97::a|  - 10.97.0.10|  ipFamilyPolicy: PreferDualStack" \
+  "$(coredns_vips "fd00:97::/108,10.97.0.0/16")"
+check "single-stack custom CIDR also moves the CoreDNS clusterIP" \
+  "  clusterIP: 10.97.0.10" \
+  "$(rig_render_coredns "10.97.0.0/16" < "$ROOT/manifests/coredns.yaml" | grep '^  clusterIP: ')"
+check "a mid-address zero run is compressed canonically (kubectl reports fd00:97:0:1::a, not an expanded form)" \
+  "fd00:97:0:1::a" "$(rig_cidr_tenth_host "fd00:97:0:1::/64")"
+check "an unaligned address is masked to its network before adding 10" \
+  "10.97.0.10" "$(rig_cidr_tenth_host "10.97.3.7/16")"
+if rig_cidr_tenth_host "10.97.0.0/30" >/dev/null 2>&1; then
+  check "a range too small for a tenth host is refused loudly" "refused" "accepted"
+else
+  check "a range too small for a tenth host is refused loudly" "refused" "refused"
+fi
+if rig_kube_dns_ips "10.97.0.0/16,fd00:97::/126" >/dev/null 2>&1; then
+  check "a too-small second-family range is refused too" "refused" "accepted"
+else
+  check "a too-small second-family range is refused too" "refused" "refused"
+fi
+check "u7s-start.sh no longer pins a dual --service-cidr to the default (the guard blocked custom ranges)" \
+  "0" "$(grep -c 'must be \$RIG_SERVICE_CIDR_DUAL' "$ROOT/scripts/u7s-start.sh" || true)"
+check "lima-start.sh rewrites kubelet clusterDNS from the effective Service CIDR" \
+  "1" "$(grep -cF 'rig_kube_dns_ips "$(rig_effective_service_cidr "$DUAL_STACK")"' "$START")"
+
+kcfg=$(mktemp)
+printf 'resolvConf: /etc/resolv.conf\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\n' > "$kcfg"
+"$DIR/set-kubelet-clusterdns.sh" "$kcfg" 10.97.0.10 fd00:97::a
+"$DIR/set-kubelet-clusterdns.sh" "$kcfg" 10.97.0.10 fd00:97::a
+check "kubelet config clusterDNS is replaced (not appended) and idempotent, other keys intact" \
+  "resolvConf: /etc/resolv.conf|clusterDNS:|  - 10.97.0.10|  - fd00:97::a|clusterDomain: cluster.local" "$(paste -sd'|' "$kcfg")"
+rm -f "$kcfg"
 check "04-start-kcm.sh takes its CIDR flags from the rig helper" \
   "1" "$(grep -cF '$KCM_CIDR_FLAGS' "$DIR/04-start-kcm.sh")"
 check "run-all.sh forwards --dual-stack to KCM" \
