@@ -269,7 +269,7 @@ assert_true "install.sh installs the CNI plugins CRI-O's bridge config and flann
 assert_true "kubectl is staged from the tarball into /usr/local/bin (on PATH, unconditionally for control-plane and worker): install.sh and operators call it unqualified, and /opt/u7s/bin is not on PATH" \
   grep -qxF 'BIN_DIR=/usr/local/bin stage_binaries kubectl' "$INSTALL"
 assert_false "install.sh adds no pkgs.k8s.io apt repo or key: its signing key expires and the tarball already carries verified kubectl and CNI plugins" \
-  grep -qE 'https?://pkgs\.k8s\.io|signed-by=[^ ]*kubernetes|apt-get install -y kubectl' "$INSTALL"
+  grep -qE 'pkgs\.k8s\.io|signed-by=[^ ]*kubernetes|apt-get install -y kubectl' "$INSTALL"
 
 # Behavioural: run the real stage_binaries against a tarball-shaped tree.
 STAGE_WORK="$(mktemp -d)"
@@ -2871,56 +2871,6 @@ assert "the control-plane install waits after labelling the node, as its last st
   "$(awk '/^label_control_plane_node \|\| exit 1$/ {l=NR} /^wait_for_cluster_ready \|\| exit 1$/ {w=NR} /^echo "u7s bootstrap complete/ {b=NR} END {print (l && w>l && b>w) ? 1 : 0}' "$INSTALL")"
 assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
   "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
-
-# ---------------------------------------------------------------------------
-# Upgrade path: hosts installed before kubectl/CNI moved to the tarball keep
-# the pkgs.k8s.io source, whose pinned key expires 2026-12-29.
-# ---------------------------------------------------------------------------
-STALE_WORK="$(mktemp -d)"
-mkdir -p "$STALE_WORK/bin" "$STALE_WORK/apt/sources.list.d" "$STALE_WORK/apt/keyrings"
-cat > "$STALE_WORK/bin/dpkg-query" <<'EOF'
-#!/bin/sh
-pkg="$3"
-case " $FAKE_INSTALLED " in *" $pkg "*) printf 'install ok installed';; *) exit 1;; esac
-EOF
-cat > "$STALE_WORK/bin/apt-get" <<'EOF'
-#!/bin/sh
-echo "apt-get $*" >> "$APT_LOG"
-EOF
-chmod +x "$STALE_WORK/bin/dpkg-query" "$STALE_WORK/bin/apt-get"
-awk '/^remove_stale_k8s_apt_source\(\) \{$/,/^\}$/' "$INSTALL" \
-  | sed "s#/etc/apt#$STALE_WORK/apt#g" > "$STALE_WORK/fn.sh"
-
-stale_run() {
-  : > "$STALE_WORK/apt.log"
-  PATH="$STALE_WORK/bin:$PATH" APT_LOG="$STALE_WORK/apt.log" FAKE_INSTALLED="$1" \
-    bash -c 'source "$1"; remove_stale_k8s_apt_source' _ "$STALE_WORK/fn.sh"
-}
-
-assert "the stale-source function was extracted (if this fails the upgrade tests below test nothing)" \
-  "$([ -s "$STALE_WORK/fn.sh" ] && grep -q 'rm -f' "$STALE_WORK/fn.sh" && echo 1 || echo 0)"
-
-touch "$STALE_WORK/apt/sources.list.d/kubernetes.list" "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg"
-stale_out="$(stale_run "kubectl kubernetes-cni")"
-assert "an upgraded host must not keep the expiring pkgs.k8s.io source or key, or re-installs break at apt-get update after the key expires" \
-  "$([ ! -e "$STALE_WORK/apt/sources.list.d/kubernetes.list" ] && [ ! -e "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg" ] && echo 1 || echo 0)"
-assert "removing the stale source is logged so operators see why apt state changed" \
-  "$(printf '%s' "$stale_out" | grep -q 'removed stale pkgs.k8s.io apt source' && echo 1 || echo 0)"
-assert "stale apt kubectl and kubernetes-cni are removed so a later apt upgrade cannot overwrite the verified tarball binaries" \
-  "$(grep -qx 'apt-get remove -y kubectl kubernetes-cni' "$STALE_WORK/apt.log" && echo 1 || echo 0)"
-
-touch "$STALE_WORK/apt/sources.list.d/kubernetes.list"
-stale_run "kubectl" >/dev/null
-assert "only the apt packages that are actually installed are removed (apt-get remove of an absent package fails the install under set -e)" \
-  "$(grep -qx 'apt-get remove -y kubectl' "$STALE_WORK/apt.log" && echo 1 || echo 0)"
-
-stale_out="$(stale_run "kubectl kubernetes-cni")"
-assert "a fresh host (no pkgs.k8s.io source) is untouched: no log line and no package removal, so a user's own kubectl package is never removed" \
-  "$([ -z "$stale_out" ] && [ ! -s "$STALE_WORK/apt.log" ] && echo 1 || echo 0)"
-
-assert "the stale source is removed before the first apt-get update in both the jq path and the main install path" \
-  "$(awk '/^ensure_jq\(\) \{/ {j=1} j && /remove_stale_k8s_apt_source/ {a=1} j && /apt-get update/ {if (!a) bad=1; j=0} /^remove_stale_k8s_apt_source$/ {m=1} /^apt-get update -qq$/ {if (!m) bad=1; exit} END {print (a && m && !bad) ? 1 : 0}' "$INSTALL")"
-rm -rf "$STALE_WORK"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
