@@ -1072,7 +1072,9 @@ mint_join_token() {
   echo "On the joining node, run as root. The command carries no token, so it stays out of shell"
   echo "history; install.sh prompts for the token with echo off (or reads it from piped stdin):"
   echo "  install.sh --join $server \\"
-  echo "    --ca-cert-hash sha256:$ca_hash --tarball <path> --node-name <name> [--iface <iface>]"
+  local tarball_hint=" --tarball <path>"
+  [ -n "$DEFAULT_TARBALL_URL" ] && tarball_hint=""
+  echo "    --ca-cert-hash sha256:$ca_hash$tarball_hint --node-name <name> [--iface <iface>]"
 }
 
 # base64url without padding, from stdin.
