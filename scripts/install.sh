@@ -737,9 +737,12 @@ validate_network_config() {
 # unset keeps the persisted value (or the default for an install that
 # predates persistence, which always ran the defaults); an explicit value that
 # disagrees on an existing install refuses, because Services, pods and every
-# node's kubelet already hold addresses from the old range.
+# node's kubelet already hold addresses from the old range. The one supported
+# change is upstream's single- to dual-stack upgrade: the persisted single
+# range kept as the primary and exactly one range of the other family appended
+# (sets DUAL_STACK_UPGRADE=1).
 reconcile_network_flag() {
-  local flag="$1" var="$2" persisted="$3" default="$4" given effective
+  local flag="$1" var="$2" persisted="$3" default="$4" given effective primary secondary pfam=4 sfam=4
   given="${!var}"
   effective="$default"
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$persisted" ]; then
@@ -747,10 +750,23 @@ reconcile_network_flag() {
   fi
   if [ "$EXISTING_INSTALL" -eq 1 ] && [ -n "$given" ] && [ "$given" != "$effective" ]; then
     if [[ "$effective" != *,* && "$given" == *,* ]]; then
-      echo "error: $flag $given requests dual-stack, but this cluster was installed single-stack ($effective, recorded in $CONFIG_FILE). Converting an existing single-stack cluster to dual-stack in place is not supported yet. To get dual-stack now, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh with the dual-stack flags; otherwise re-run without changing $flag." >&2
-      return 1
+      primary="${given%%,*}"; secondary="${given#*,}"
+      if [ "$primary" != "$effective" ]; then
+        echo "error: $flag $given changes the primary range: this cluster's is $effective (recorded in $CONFIG_FILE) and Services, pods and kubelets already hold addresses from it. Only adding a secondary range of the other IP family is supported ($flag $effective,<other-family range>). To change the primary, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+        return 1
+      fi
+      [[ "$effective" == *:* ]] && pfam=6
+      [[ "$secondary" == *:* ]] && sfam=6
+      if [[ "$secondary" == *,* || "$sfam" = "$pfam" ]]; then
+        echo "error: $flag $given is not a single secondary range of the other IP family: the primary $effective is IPv$pfam, so exactly one IPv$((10 - pfam)) range may follow it ($flag $effective,<other-family range>)." >&2
+        return 1
+      fi
+      DUAL_STACK_UPGRADE=1
+      [ "$flag" = --cluster-cidr ] && POD_CIDR_UPGRADE=1
+      printf -v "$var" '%s' "$given"
+      return 0
     fi
-    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. To change it, start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
+    echo "error: $flag $given conflicts with the value in effect since install time ($effective, recorded in $CONFIG_FILE). Existing Services, pods and kubelets already use it; changing it would strand them. Only a single-stack cluster gaining a secondary range ($flag $effective,<other-family range>) can change in place. Otherwise start over: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
     return 1
   fi
   printf -v "$var" '%s' "${given:-$effective}"
@@ -1519,13 +1535,16 @@ worker_enable_ipv6_forwarding() {
 # after the kubelet registered -- never requested up front.
 wait_for_joined_node() {
   local node_auth=(--cacert "$STATE_DIR/ca.pem" --cert "$STATE_DIR/kubelet-client.crt" --key "$STATE_DIR/kubelet-client.key")
-  local ready="" serving="" resp
+  local ready="" serving="" podcidrs="" resp
   echo "Waiting up to 5 min for node $NODE_NAME to be Ready with an issued kubelet serving certificate..."
   for _ in $(seq 1 150); do
-    if [ -z "$ready" ]; then
+    # Keep reading the Node until it has podCIDRs too: Ready does not imply
+    # node-ipam has allocated them, and forwarding is decided from them.
+    if [ -z "$ready" ] || [ -z "$podcidrs" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
       worker_enable_ipv6_forwarding "$resp"
       ready="$(printf '%s' "$resp" | jq -r '.status.conditions[]? | select(.type == "Ready" and .status == "True") | .type' 2>/dev/null || true)"
+      podcidrs="$(printf '%s' "$resp" | jq -r 'select((.spec.podCIDRs // []) | length > 0) | "yes"' 2>/dev/null || true)"
     fi
     if [ -z "$serving" ]; then
       resp="$(curl --proto '=https' --tlsv1.2 -fsSL "${node_auth[@]}" "$JOIN_SERVER/apis/certificates.k8s.io/v1/certificatesigningrequests" 2>/dev/null || true)"
@@ -1533,13 +1552,13 @@ wait_for_joined_node() {
       serving="$(printf '%s' "$resp" | jq -r --arg u "system:node:$NODE_NAME" --arg since "$JOIN_STARTED_AT" '[.items[]? | select(.spec.signerName == "kubernetes.io/kubelet-serving" and .spec.username == $u and .metadata.creationTimestamp >= $since and ((.status.certificate // "") != "") and any(.status.conditions[]?; .type == "Approved"))] | length' 2>/dev/null || true)"
       [ "${serving:-0}" -ge 1 ] 2>/dev/null || serving=""
     fi
-    if [ -n "$ready" ] && [ -n "$serving" ]; then
+    if [ -n "$ready" ] && [ -n "$serving" ] && [ -n "$podcidrs" ]; then
       echo "Node $NODE_NAME is Ready and its kubelet serving certificate was approved and issued."
       return 0
     fi
     sleep 2
   done
-  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no) and its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
+  echo "error: after 5 min node $NODE_NAME Ready=$([ -n "$ready" ] && echo yes || echo no), its kubelet serving CSR approved+issued=$([ -n "$serving" ] && echo yes || echo no) and podCIDRs allocated=$([ -n "$podcidrs" ] && echo yes || echo no). The join token is already consumed and this node holds a valid client identity; kubelet keeps retrying. Check 'journalctl -u kubelet' here and 'kubectl get csr' on the control plane (a Pending kubelet-serving CSR means the approver rejected its SANs against the Node's addresses; 'kubectl certificate describe' it, or approve it by hand). To start over: on the control plane 'kubectl delete node $NODE_NAME' and mint a new token (install.sh --mint-join-token); here 'systemctl stop kubelet; rm -rf $STATE_DIR' and re-run install.sh --join with the new token." >&2
   return 1
 }
 
@@ -1593,6 +1612,22 @@ worker_api_get() {
   [ "$cert" = "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" ] && key="$cert"
   server="$(sed -n 's/^ *server: *//p' "$STATE_DIR/kubeconfig" | head -n1)"
   curl --proto '=https' --tlsv1.2 -fsSL --cacert "$STATE_DIR/ca.pem" --cert "$cert" --key "$key" "$@" "$server$path"
+}
+
+# Upgrade-path IPv6 forwarding check. Failing to read the Node must not abort
+# the kubelet upgrade, but it must not be silent either: the worker would keep
+# routing no IPv6 without anyone knowing why.
+worker_upgrade_ipv6_forwarding() {
+  local json err errf
+  errf="$(mktemp)"
+  if json="$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>"$errf")" && printf '%s' "$json" | jq -e . >/dev/null 2>"$errf"; then
+    rm -f "$errf"
+    worker_enable_ipv6_forwarding "$json"
+    return 0
+  fi
+  err="$(tr '\n' ' ' < "$errf")"
+  rm -f "$errf"
+  echo "warning: could not read node $NODE_NAME to decide on IPv6 forwarding (${err:-no error output}); the IPv6 forwarding sysctl was NOT checked. If this is a dual-stack cluster, re-run install.sh once the API server is reachable, or set net.ipv6.conf.all.forwarding=1 by hand." >&2
 }
 
 # lastHeartbeatTime (epoch seconds) of the Node's Ready condition as served by
@@ -1689,6 +1724,8 @@ fi
 # the operator, so a re-run reads as an upgrade rather than a silent no-op or
 # a fresh install starting from nothing.
 EXISTING_INSTALL=0
+DUAL_STACK_UPGRADE=0
+POD_CIDR_UPGRADE=0
 if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   EXISTING_INSTALL=1
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
@@ -2156,7 +2193,7 @@ if [ "$WORKER_MODE" -eq 1 ]; then
       exit 1
     fi
     FINGERPRINT_BEFORE="$(client_cert_fingerprint)"
-    worker_enable_ipv6_forwarding "$(worker_api_get "/api/v1/nodes/$NODE_NAME" 2>/dev/null || true)"
+    worker_upgrade_ipv6_forwarding
   fi
 
   cat > /etc/systemd/system/kubelet.service <<EOF
@@ -2481,6 +2518,13 @@ if [ "$EXISTING_INSTALL" -eq 1 ]; then
 fi
 label_control_plane_node || exit 1
 wait_for_cluster_ready || exit 1
+
+if [ "$DUAL_STACK_UPGRADE" -eq 1 ]; then
+  echo "upgraded to dual-stack (cluster IP families: $CLUSTER_FAMILIES). New Services can request ipFamilyPolicy PreferDualStack/RequireDualStack; existing Services keep their single ClusterIP." >&2
+fi
+if [ "$POD_CIDR_UPGRADE" -eq 1 ]; then
+  echo "warning: existing Nodes keep their single-stack spec.podCIDRs. Upstream makes Node.spec.podCIDRs immutable once set and node-ipam only allocates for a Node without one, so pods on such a Node get no pod IP of the new family until the Node object is re-created: kubectl --kubeconfig=$STATE_DIR/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data; kubectl --kubeconfig=$STATE_DIR/kubeconfig delete node <node>; then 'systemctl restart kubelet' on that node and restart flannel so it reads the new podCIDRs (kubectl --kubeconfig=$STATE_DIR/kubeconfig -n kube-flannel delete pod -l app=flannel; pods created before that still get IPv4 only). Deleting the Node drops its node-role.kubernetes.io/control-plane label: for this control-plane node ($NODE_NAME), once it has re-registered, re-run install.sh (it re-applies the label) or kubectl --kubeconfig=$STATE_DIR/kubeconfig label node $NODE_NAME node-role.kubernetes.io/control-plane=. A joined worker must also be re-joined (its families are learned at join): stop kubelet, rm -rf its $STATE_DIR, and run install.sh --join with a new token." >&2
+fi
 
 echo "u7s bootstrap complete (host-level + in-cluster)."
 echo "kubeconfig: $KUBECONFIG_PATH"

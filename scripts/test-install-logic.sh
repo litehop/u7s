@@ -533,10 +533,6 @@ assert_true "a worker whose Node carries an IPv6 podCIDR writes net.ipv6.conf.al
 assert_true "the worker applies the new sysctl immediately (sysctl --system), not only at next boot" \
   grep -qxF -- '--system' "$WORKER_V6_WORK/sysctl.log"
 rm -rf "$WORKER_V6_WORK"
-assert_true "a fresh join feeds the polled Node object to the IPv6-forwarding check (the function is useless unless wait_for_joined_node calls it)" \
-  grep -qF 'worker_enable_ipv6_forwarding "$resp"' "$INSTALL"
-assert_true "an in-place worker upgrade also runs the check, so workers joined before this fix get forwarding" \
-  grep -qF 'worker_enable_ipv6_forwarding "$(worker_api_get' "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Regression guard: 'systemctl enable --now UNIT' is enable+
@@ -1608,22 +1604,35 @@ WAIT_RUNNER="$JOIN_WORK/wait.sh"
 write_join_runner "$WAIT_RUNNER" '
 NODE_NAME=n1; JOIN_STARTED_AT=2026-10-16T10:00:00Z
 sleep() { :; }
+worker_enable_ipv6_forwarding() { printf "%s\n" "$1" >> "$STATE_DIR/fwd.log"; }
 curl() {
   case "$*" in
-    *"/api/v1/nodes/n1"*) printf "%s" "$NODE_JSON" ;;
+    *"/api/v1/nodes/n1"*)
+      n=$(( $(cat "$STATE_DIR/node-gets" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STATE_DIR/node-gets"
+      if [ "$n" -ge 4 ] && [ -n "${NODE_JSON_LATE:-}" ]; then printf "%s" "$NODE_JSON_LATE"; else printf "%s" "$NODE_JSON"; fi ;;
     *certificatesigningrequests*) printf "%s" "$CSR_JSON" ;;
   esac
 }
 wait_for_joined_node'
-READY_NODE='{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_NODE='{"spec":{"podCIDRs":["10.244.1.0/24"]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_NO_CIDR_NODE='{"spec":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
+READY_DUAL_NODE='{"spec":{"podCIDRs":["10.244.1.0/24","fd00:244:0:1::/64"]},"status":{"conditions":[{"type":"Ready","status":"True"}]}}'
 NOTREADY_NODE='{"status":{"conditions":[{"type":"Ready","status":"False"}]}}'
 ISSUED_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
 PENDING_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kubelet-serving","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{}}]}'
 CLIENT_ONLY_CSR='{"items":[{"spec":{"signerName":"kubernetes.io/kube-apiserver-client-kubelet","username":"system:node:n1"},"metadata":{"creationTimestamp":"2026-10-16T10:00:05Z"},"status":{"certificate":"Q0VSVA==","conditions":[{"type":"Approved"}]}}]}'
-run_wait() { NODE_JSON="$1" CSR_JSON="$2" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
+run_wait() { rm -f "$JOIN_WORK/node-gets" "$JOIN_WORK/fwd.log"; NODE_JSON="$1" CSR_JSON="$2" NODE_JSON_LATE="${3:-}" bash "$WAIT_RUNNER" "$JOIN_WORK" 2>&1; }
 ok_status=0; run_wait "$READY_NODE" "$ISSUED_CSR" >/dev/null || ok_status=$?
 assert "join succeeds when the Node is Ready and its kubelet-serving CSR is approved and issued" \
   "$([ "$ok_status" -eq 0 ] && echo 1 || echo 0)"
+assert "the join poll hands the Node it fetched to the IPv6-forwarding check (a worker joined to a dual-stack cluster otherwise routes no IPv6)" \
+  "$([ "$(head -n1 "$JOIN_WORK/fwd.log" 2>/dev/null)" = "$READY_NODE" ] && echo 1 || echo 0)"
+nocidr_status=0; run_wait "$READY_NO_CIDR_NODE" "$ISSUED_CSR" >/dev/null || nocidr_status=$?
+assert "join does not report success while the Node has no podCIDRs, even if Ready and the serving cert is issued (its forwarding would be decided from an incomplete Node)" \
+  "$([ "$nocidr_status" -ne 0 ] && echo 1 || echo 0)"
+late_status=0; run_wait "$READY_NO_CIDR_NODE" "$ISSUED_CSR" "$READY_DUAL_NODE" >/dev/null || late_status=$?
+assert "the join poll keeps reading the Node after Ready until podCIDRs appear, and forwards on the later v6 podCIDR (stopping at Ready would skip IPv6 forwarding permanently)" \
+  "$([ "$late_status" -eq 0 ] && tail -n1 "$JOIN_WORK/fwd.log" | grep -qF 'fd00:244:0:1::/64' && echo 1 || echo 0)"
 pend_status=0; pend_out="$(run_wait "$READY_NODE" "$PENDING_CSR")" || pend_status=$?
 assert "join fails loud with recovery text when the serving CSR stays Pending (logs/exec would be broken on a node reported as joined)" \
   "$([ "$pend_status" -ne 0 ] && printf '%s' "$pend_out" | grep -q 'mint a new token' && echo 1 || echo 0)"
@@ -1741,7 +1750,7 @@ write_upgrade_runner() {
     echo 'set -euo pipefail'
     echo 'STATE_DIR="$1"; NODE_NAME=n1'
     echo 'sleep() { :; }'
-    for fn in current_client_cert verify_worker_identity worker_api_get worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
+    for fn in current_client_cert verify_worker_identity worker_api_get worker_upgrade_ipv6_forwarding worker_ready_heartbeat client_cert_fingerprint wait_for_upgraded_worker cp_identity_fingerprint verify_cp_identity_preserved; do
       awk "/^${fn}\\(\\) \\{/,/^\\}/" "$INSTALL"
     done
     echo "$body"
@@ -1850,7 +1859,7 @@ write_worker_branch_runner() {
     echo 'CONFIG_FILE="$STATE_DIR/config"; DEFAULT_SERVICE_CIDR=10.96.0.0/12'
     echo 'worker_ready_heartbeat() { echo "${HB_BEFORE-1000}"; }'
     echo 'worker_api_get() { echo "{}"; }'
-    echo 'worker_enable_ipv6_forwarding() { :; }'
+    echo 'worker_upgrade_ipv6_forwarding() { echo worker_upgrade_ipv6_forwarding >> "$STATE_DIR/calls"; }'
     echo 'client_cert_fingerprint() { echo FP1; }'
     echo 'wait_for_joined_node() { echo wait_for_joined_node >> "$STATE_DIR/calls"; }'
     echo 'wait_for_upgraded_worker() { echo "wait_for_upgraded_worker $*" >> "$STATE_DIR/calls"; }'
@@ -1881,6 +1890,27 @@ jn_dir="$UPG_WORK/join-branch"; mkdir -p "$jn_dir"
 jn_status=0; bash "$BRANCH_RUNNER" "$jn_dir" 1 >/dev/null 2>&1 || jn_status=$?
 assert "a fresh --join still runs join_cluster and the join wait (the tokenless path must not swallow real joins)" \
   "$([ "$jn_status" -eq 0 ] && grep -qx join_cluster "$jn_dir/calls" && grep -qx wait_for_joined_node "$jn_dir/calls" && ! grep -q '^wait_for_upgraded_worker' "$jn_dir/calls" && echo 1 || echo 0)"
+assert "an in-place worker upgrade runs the IPv6 forwarding check, so workers joined before the check existed get forwarding" \
+  "$(grep -qx worker_upgrade_ipv6_forwarding "$up_dir/calls" && echo 1 || echo 0)"
+assert "a fresh join leaves the forwarding check to the join poll, not the upgrade path (the Node has no podCIDRs yet at that point)" \
+  "$(! grep -qx worker_upgrade_ipv6_forwarding "$jn_dir/calls" && echo 1 || echo 0)"
+
+# The upgrade-path forwarding check: a failed Node read must be loud.
+FWD_RUNNER="$UPG_WORK/fwd.sh"
+write_upgrade_runner "$FWD_RUNNER" '
+worker_enable_ipv6_forwarding() { printf "%s\n" "$1" >> "$STATE_DIR/fwd.log"; }
+worker_api_get() { if [ "${GET_FAIL:-0}" = 1 ]; then echo "curl: (7) connection refused" >&2; return 7; fi; printf "%s" "$GET_BODY"; }
+worker_upgrade_ipv6_forwarding'
+run_fwd() { rm -f "$UPG_WORK/fwd.log"; GET_FAIL="$1" GET_BODY="$2" bash "$FWD_RUNNER" "$UPG_WORK" 2>&1; }
+fwd_ok_status=0; fwd_ok_out="$(run_fwd 0 '{"spec":{"podCIDRs":["fd00::/64"]}}')" || fwd_ok_status=$?
+assert "the upgrade path passes the Node it read to the forwarding check without warning" \
+  "$([ "$fwd_ok_status" -eq 0 ] && [ "$(cat "$UPG_WORK/fwd.log")" = '{"spec":{"podCIDRs":["fd00::/64"]}}' ] && ! printf '%s' "$fwd_ok_out" | grep -q warning && echo 1 || echo 0)"
+fwd_get_status=0; fwd_get_out="$(run_fwd 1 '')" || fwd_get_status=$?
+assert "a failed Node GET on upgrade warns naming the node and the curl error, and does not abort the kubelet upgrade (silently skipping leaves a dual-stack worker without IPv6 forwarding)" \
+  "$([ "$fwd_get_status" -eq 0 ] && printf '%s' "$fwd_get_out" | grep -q 'warning: could not read node n1' && printf '%s' "$fwd_get_out" | grep -q 'connection refused' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
+fwd_jq_status=0; fwd_jq_out="$(run_fwd 0 'not json')" || fwd_jq_status=$?
+assert "a Node GET that returns unparseable JSON also warns instead of passing garbage to the forwarding check" \
+  "$([ "$fwd_jq_status" -eq 0 ] && printf '%s' "$fwd_jq_out" | grep -q 'warning: could not read node n1' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
 
 # Post-restart verification.
 HB_RUNNER="$UPG_WORK/hb.sh"
@@ -2030,7 +2060,7 @@ for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( tota
   trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
   [ "$trunc_status" -ne 0 ] || trunc_ok=0
   printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
-  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file' || trunc_ok=0
+  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file|unexpected EOF' || trunc_ok=0
 done
 rm -rf "$TRUNC_WORK"
 assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
@@ -2114,7 +2144,7 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
-    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0'
+    echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0; POD_CIDR_UPGRADE=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
     echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
     cat "$NET_WORK/fns.sh"
@@ -2333,12 +2363,48 @@ assert "re-running with the same dual-stack flags is idempotent" \
 net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR"'
 assert "a bare re-run keeps the persisted dual-stack lists instead of reverting to the single-stack defaults" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56" ] && echo 1 || echo 0)"
-net_bad "turning a single-stack install dual-stack is refused: existing Services and node podCIDRs hold only the old family" \
-  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "installed single-stack (10.96.0.0/12"
-net_bad "the single-to-dual refusal says upgrading in place is unsupported and how to proceed, so the operator is not left with a generic conflict message" \
-  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve' "not supported yet. To get dual-stack now, start over"
 net_bad "swapping the family order of a persisted dual-stack list is refused: the primary family determines the kubernetes Service VIP" \
   'EXISTING_INSTALL=1; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve' "--cluster-cidr"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+'"$DUAL"'; resolve && echo "$SERVICE_CIDR $POD_CLUSTER_CIDR $CLUSTER_DNS $DUAL_STACK_UPGRADE"'
+assert "a single-stack install re-run with the dual-stack ranges (primary kept, secondary added) is accepted and flagged as an upgrade, with the persisted DNS VIP untouched (moving it would break every running pod's resolv.conf)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "10.96.0.0/12,fd00:96::/108 10.244.0.0/16,fd00:244::/56 10.96.0.10 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=fd00:96::/108; PERSISTED_POD=fd00:244::/56; PERSISTED_DNS=fd00:96::a
+SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; resolve && echo "$SERVICE_CIDR $DUAL_STACK_UPGRADE"'
+assert "an IPv6-primary single-stack install can gain an IPv4 secondary: the upgrade is not tied to IPv4 being primary" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00:96::/108,10.96.0.0/12 1" ] && echo 1 || echo 0)"
+net_run "$RESOLVE$DUAL"'; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a fresh dual-stack install is not reported as an upgrade (the node-podCIDR warning would mislead)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; PERSISTED_POD=10.244.0.0/16,fd00:244::/56; PERSISTED_DNS=10.96.0.10; resolve && echo "$DUAL_STACK_UPGRADE"'
+assert "a bare re-run of an already dual-stack install is not an upgrade" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 0 ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+SERVICE_CIDR=10.96.0.0/12,fd00:96::/108; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining only a service-cidr secondary is accepted but does not trigger the podCIDR drain/re-register recipe: no Node podCIDRs change, so the recipe would make an operator delete Nodes for nothing" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 0" ] && echo 1 || echo 0)"
+net_run "$RESOLVE"'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; PERSISTED_POD=10.244.0.0/16; PERSISTED_DNS=10.96.0.10
+POD_CLUSTER_CIDR=10.244.0.0/16,fd00:244::/56; resolve && echo "$DUAL_STACK_UPGRADE $POD_CIDR_UPGRADE"'
+assert "gaining a cluster-cidr secondary triggers the podCIDR recipe: existing Nodes keep single-stack podCIDRs until re-created" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 1" ] && echo 1 || echo 0)"
+assert_true "the printed podCIDR recipe is gated on the cluster-cidr upgrade flag, not the generic dual-stack one" \
+  grep -qF 'if [ "$POD_CIDR_UPGRADE" -eq 1 ]' "$INSTALL"
+assert_true "the printed podCIDR recipe restarts flannel: it reads the Node's podCIDRs only at start, so without it new pods keep IPv4-only IPs after the Node is re-created" \
+  grep -qF 'kube-flannel delete pod -l app=flannel' "$INSTALL"
+assert_true "the printed recipe tells the operator the Node delete drops the control-plane label and how to restore it (install.sh re-run re-applies it via label_control_plane_node)" \
+  grep -qF 'drops its node-role.kubernetes.io/control-plane label' "$INSTALL"
+net_bad "making the IPv6 range primary on a single-stack IPv4 install is refused with a primary-change message: the primary family fixes the kubernetes Service VIP and every existing ClusterIP" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; resolve' "changes the primary range"
+net_bad "a different primary range with a secondary added is refused with the primary-change message (existing Services hold addresses from the old primary)" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.100.0.0/16,fd00:96::/108; resolve' "changes the primary range"
+net_bad "a same-family secondary is refused: a dual-stack cluster has one range per family" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,10.97.0.0/16; resolve' "not a single secondary range of the other IP family"
+net_bad "adding two ranges at once is refused: only a pure single-secondary addition is supported" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.96.0.0/12,fd00:96::/108,fd00:97::/108; resolve' "not a single secondary range of the other IP family"
+net_bad "changing a single-stack range to another single range is refused and points at the only supported in-place change" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12; SERVICE_CIDR=10.43.0.0/16; resolve' "Only a single-stack cluster gaining a secondary range"
+net_bad "dropping a family from a dual-stack install is refused: existing dual ClusterIPs and podCIDRs would be stranded" \
+  'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; SERVICE_CIDR=10.96.0.0/12; resolve' "conflicts with the value in effect"
 
 # KCM: upstream rejects --node-cidr-mask-size with two cluster CIDRs.
 net_run 'POD_CLUSTER_CIDR=10.244.0.0/16; kcm_node_cidr_mask_flags'
