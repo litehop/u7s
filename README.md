@@ -35,7 +35,8 @@ and kube-controller-manager, and writes a systemd unit for each.
    OpenSSL >= 3.0 is missing. To verify an artifact by hand:
    `openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in <file> -sigfile <file>.sig`.
 
-   Release signing public key (PLACEHOLDER until the first signed release):
+   Release signing public key (releases are signed with the matching private
+   key):
 
    ```
    -----BEGIN PUBLIC KEY-----
