@@ -2939,6 +2939,11 @@ assert "kubelet and crio are reserved on every node, including a worker" \
   "$([ -n "$(reserved_mi "$MEM_WORK/kc-worker/kubelet-config.yaml" kubeReserved)" ] && echo 1 || echo 0)"
 assert "worker systemReserved is smaller than the control plane's (no apiserver/KCM on an agent) but nonzero (the OS still needs memory)" \
   "$([ -n "$worker_sys" ] && [ "$worker_sys" -gt 0 ] && [ "$worker_sys" -lt "$cp_sys" ] && echo 1 || echo 0)"
+cp_kube="$(reserved_mi "$MEM_WORK/kc-cp/kubelet-config.yaml" kubeReserved)"
+ksys_req="$(awk '/^ +requests:/{r=1;next} r&&/^ +memory: [0-9]+Mi/{sub(/Mi$/,"",$2); s+=$2; r=0} END{print s+0}' manifests/flannel.yaml manifests/kube-proxy.yaml manifests/coredns.yaml manifests/beep.yaml)"
+# 947 MiB = MemTotal of the 1 GiB gate VM; 100 = kubelet's default hard eviction; 256 = the MariaDB request in the WordPress example.
+assert "reservations leave room for the kube-system requests plus the MariaDB example on a 1 GiB node (otherwise mariadb-0 stays Pending)" \
+  "$([ "$ksys_req" -gt 0 ] && [ $((947 - cp_sys - cp_kube - 100)) -ge $((ksys_req + 256)) ] && echo 1 || echo 0)"
 assert_true "allocatable is enforced on pods only" \
   awk '/^enforceNodeAllocatable:/{f=1;next} f&&/^  - /{n++; if($2!="pods")bad=1; next} {f=0} END{exit !(n==1&&!bad)}' "$MEM_WORK/kc-cp/kubelet-config.yaml"
 assert_false "enforcing system-reserved/kube-reserved would cap the daemons themselves and starve the control plane the reservation is meant to protect" \

@@ -1041,7 +1041,7 @@ write_kubelet_config_yaml() {
   # system-reserved/kube-reserved would cap the daemons themselves.
   # systemReserved = OS + apiserver + KCM (OS only on a worker);
   # kubeReserved = kubelet + crio.
-  local system_reserved_mib=256 kube_reserved_mib=160
+  local system_reserved_mib=160 kube_reserved_mib=136
   if [ "$worker" -eq 1 ]; then
     system_reserved_mib=128
   fi

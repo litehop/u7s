@@ -20,8 +20,8 @@ nothing by default.
   unit is untouched.
 - `MemoryLow`, not `MemoryMin`: it is best-effort, so an oversized value
   degrades to normal reclaim instead of OOM-killing everything unprotected.
-- `kubelet-config.yaml`: `systemReserved.memory` 256 Mi (128 Mi on an agent),
-  `kubeReserved.memory` 160 Mi, `enforceNodeAllocatable: [pods]`. System and
+- `kubelet-config.yaml`: `systemReserved.memory` 160 Mi (128 Mi on an agent),
+  `kubeReserved.memory` 136 Mi, `enforceNodeAllocatable: [pods]`. System and
   kube cgroups are not enforced; a cap would starve the daemons. The
   eviction threshold stays kubelet's default `memory.available<100Mi`.
 
@@ -30,15 +30,15 @@ nothing by default.
 Idle cgroup `memory.current` (anon + page cache) on the 1 GiB Lima node:
 apiserver 34 MiB, KCM 84, kubelet 73, crio 63; PSS 20/53/62/54. Lows are
 that plus 15-45% headroom. `systemReserved` is apiserver + KCM (118) plus
-OS share; `kubeReserved` is kubelet + crio (136) plus headroom.
+OS share; `kubeReserved` is kubelet + crio (136). Larger reservations (256/160 Mi) left 431 MiB allocatable, less than the kube-system requests (200 MiB) plus the MariaDB example (256 MiB), so mariadb-0 stayed Pending.
 
 The slice is required: the cgroup2 mount here lacks `memory_recursiveprot`,
 and `system.slice` has no low, so a per-unit low under it is inert.
 
 Same VM, fresh install, WordPress apply + 5 min idle: refaults 64.4 M ->
 25.7 M, disk reads 270 -> 110 GB, memory PSI full 22 s -> 14 s, MemAvailable
-minimum 187 -> 288 MiB. Allocatable memory is 431 MiB; `kubepods.slice`
-is capped at 531 MiB.
+minimum 187 -> 288 MiB (measured with 256/160 Mi reserved). Allocatable is 551 MiB; `kubepods.slice`
+is capped at 651 MiB.
 
 ## Consequences
 
@@ -46,5 +46,5 @@ is capped at 531 MiB.
   OS daemons still refault. Swap or smaller footprints remain the lever.
 - Pods are capped in `kubepods.slice` and are OOM-killed there first, never
   the control plane.
-- Allocatable shrinks by about 416 MiB on 1 GiB; requests above 431 MiB
+- Allocatable shrinks by about 296 MiB on 1 GiB; requests above 551 MiB
   stay Pending.
