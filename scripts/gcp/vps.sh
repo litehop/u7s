@@ -5,7 +5,7 @@
 #   up    create a Spot VPS (termination action STOP, max run 16h, label u7s-test=1)
 #         (default IPV4_ONLY; IPV4_IPV6 adds an external IPv6 address;
 #         u7s-probe is the outside-VPC probe VPC; --subnet defaults to the network's namesake;
-#         --machine-type defaults to e2-micro, the release gate uses e2-custom-medium-1024)
+#         --machine-type defaults to e2-micro, the release gate uses n1-custom-1-1024)
 #   list  every u7s-test=1 VPS with state and age; STOPPED ones still bill for disk
 #   gc    delete every u7s-test=1 VPS (probes included), stopped included, and leftover
 #         u7s-e2e-*-lb-v4/v6 firewall rules (mayor/operator only)

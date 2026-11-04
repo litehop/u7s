@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VM backends for burst-gate.sh (sourced, not executed): lima (arm64, local) and gcp (x86_64
-# Spot custom e2-medium 1 GiB, installed from the release mirror). Needs BACKEND and, for lima, HERE and
+# Spot custom n1 1 GiB, installed from the release mirror). Needs BACKEND and, for lima, HERE and
 # MEMORY; for gcp, scripts/gcp/lib.sh sourced and gcp_require_config passed.
 #
 # vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable

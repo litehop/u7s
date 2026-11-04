@@ -18,8 +18,8 @@ GCP_PROBE_SUBNET_RANGE=10.81.0.0/24
 GCP_LABEL=u7s-test=1
 # Network tag on every test VPS: lets a test scope its own firewall rule to these VPSes.
 GCP_VPS_TAG=u7s-test-vps
-# Release-gate VM shape: custom E2 shared-core e2-medium, 1 GiB (1 sustained shared vCPU; e2-micro is 0.25).
-GCP_GATE_MACHINE_TYPE=e2-custom-medium-1024
+# Release-gate VM shape: custom N1, 1 dedicated vCPU, 1 GiB (e2-micro is 0.25 sustained; e2 custom shared-core is 2 vCPUs at 50% each).
+GCP_GATE_MACHINE_TYPE=n1-custom-1-1024
 
 # A stray CLOUDSDK_* variable (project, zone, config dir, impersonation...) would silently
 # override the named configuration.

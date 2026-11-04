@@ -576,14 +576,14 @@ assert "gcp VPS is deleted at the end of the run (a gate VM left up keeps billin
   "$(grep -q 'instances delete u7s-rg-' "$GCLOUD_CALLS" && echo 1 || echo 0)"
 assert "gcp VM names are valid GCE names (lowercase) and run-unique" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
-assert "gate VMs are the custom shared-core e2-medium 1 GiB (e2-micro has 0.25 sustained vCPU, not the 1 vCPU the gate spec requires)" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=e2-custom-medium-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-micro' && echo 1 || echo 0)"
+assert "gate VMs are the custom n1 1 vCPU 1 GiB (e2-micro has 0.25 sustained vCPU; e2 custom shared-core caps one thread at half a core)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-micro' && echo 1 || echo 0)"
 U7S_GCP_MACHINE_TYPE=e2-standard-2 gcp_gate out-gshape --runs 1
 assert "an ambient U7S_GCP_MACHINE_TYPE cannot change the release-authoritative shape" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=e2-custom-medium-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
 gcp_gate out-gfail --runs 1
 assert "gcp verdict line says release-authoritative and names the mirror release" \
-  "$(grep -q 'release-authoritative: x86_64 GCP e2-custom-medium-1024 Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
+  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
 assert "the gcloud project id never reaches the run logs (redacted)" \
   "$(grep -rq 'p-secret' "$TMP/out-gfail" "$TMP/out-gfail.out" && echo 0 || echo 1)"
 export GCLOUD_PREEMPTED=1

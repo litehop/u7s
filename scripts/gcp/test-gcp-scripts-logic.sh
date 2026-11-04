@@ -229,10 +229,10 @@ U7S_GCP_MACHINE_TYPE=e2-standard-2 run "$VPS" up t1
 create="$(grep 'compute instances create' <<<"$LOG" || true)"
 assert "U7S_GCP_MACHINE_TYPE overrides the machine type (the dual-stack sonobuoy subset saturates e2-micro) and nothing else" \
   "$(has '--machine-type=e2-standard-2' "$create")$(hasnt 'e2-micro' "$create")$(has '--provisioning-model=SPOT' "$create")"
-run "$VPS" up --machine-type e2-custom-medium-1024 t1
+run "$VPS" up --machine-type n1-custom-1-1024 t1
 create="$(grep 'compute instances create' <<<"$LOG" || true)"
 assert "up --machine-type reaches gcloud (a tool that cannot pick the shape forces raw gcloud, bypassing labels and the 16h cap)" \
-  "$(has '--machine-type=e2-custom-medium-1024' "$create")$(hasnt 'e2-micro' "$create")$(has '--labels=u7s-test=1' "$create")"
+  "$(has '--machine-type=n1-custom-1-1024' "$create")$(hasnt 'e2-micro' "$create")$(has '--labels=u7s-test=1' "$create")"
 run "$VPS" up t1
 create="$(grep 'compute instances create' <<<"$LOG" || true)"
 assert "up tags the VPS u7s-test-vps (a test's narrow firewall rule targets the tag, never every instance on the network)" \
