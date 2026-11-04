@@ -292,6 +292,7 @@ STUB
 chmod +x "$RW_BIN/ps" "$RW_BIN/lsof"
 git -C "$SA_REAL" commit -q --allow-empty -m init
 git -C "$SA_REAL" worktree add -q -b rw-wt "$SANDBOX_ROOT/rw-live"
+mkdir -p "$SANDBOX_ROOT/rw-live/temp/u7s" "$SANDBOX_ROOT/rw-live/scripts"
 RW_LIVE=$(cd -P "$SANDBOX_ROOT/rw-live" && pwd)
 RW_DEAD="$SANDBOX_ROOT/rw-dead-gone"
 mk_sampler() {  # pid workdir-arg
@@ -322,6 +323,11 @@ assert "an unresolvable workdir is logged loudly as orphan-skip with type, pid a
   "$(printf '%s\n' "$RW_OUT" | grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001 args=' && echo 1 || echo 0)"
 assert "a '..' relative workdir whose cwd is gone cannot be resolved, so it is skipped, not killed" \
   "$([ -z "$(step_a_stub "$(mk_sampler 6001 ../x/temp/u7s)" "STUB_CWD_6001=$RW_DEAD" | grep 'would run')" ] && echo 1 || echo 0)"
+RW_SUB_OUT=$(step_a_stub "$RW_S" "STUB_CWD_6001=$RW_LIVE/scripts")
+assert "a live cwd (subdir of a live worktree) with a missing relative target is never killed (regression: lexical fallback resolved it to the subdir and reaped a live process)" \
+  "$(! printf '%s\n' "$RW_SUB_OUT" | grep -q 'would run' && echo 1 || echo 0)"
+assert "a live cwd with a missing relative target is logged as orphan-skip (unresolvable workdir)" \
+  "$(printf '%s\n' "$RW_SUB_OUT" | grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001' && echo 1 || echo 0)"
 RW_TWO="$(mk_sampler 6001 ./temp/u7s)
 $(mk_sampler 6002 ./temp/u7s)"
 assert "two samplers with the same relative workdir in different cwds: only the stale one dies" \

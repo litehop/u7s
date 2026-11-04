@@ -304,8 +304,9 @@ process_cwd() {
 # absolute form, resolved against the process's cwd; a relative path matches no
 # worktree and would read as orphaned. A line whose workdir cannot be resolved
 # is dropped and logged: with no provable owner it must never be a kill
-# candidate. A cwd that no longer exists still resolves lexically (its owner is
-# gone); a prefix containing `..` needs the directory and is skipped instead.
+# candidate. Only a cwd that no longer exists resolves lexically (its owner is
+# gone); a live cwd with a missing target, or a prefix containing `..`, is
+# skipped.
 absolutize_ps_line() {
   local line="$1" prefix pid cwd dir abs="" from to
   prefix=$(extract_worktree_path_from_psline "$line")
@@ -316,9 +317,11 @@ absolutize_ps_line() {
   cwd=$(process_cwd "$pid")
   if [ -n "$cwd" ]; then
     dir="$cwd/$prefix"
-    if ! abs=$(cd -P "$dir" 2>/dev/null && pwd -P); then
+    if [ -d "$cwd" ]; then
+      [ -d "$dir/temp/u7s" ] && abs=$(cd -P "$dir" 2>/dev/null && pwd -P)
+    else
       case "/$prefix/" in
-        */../*) abs="" ;;
+        */../*) ;;
         *) abs=$(printf '%s' "$dir" | sed -E 's#(/\.)+(/|$)#/#g; s#//+#/#g; s#(.)/$#\1#') ;;
       esac
     fi

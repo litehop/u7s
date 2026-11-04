@@ -4,7 +4,7 @@
 # Exercises the REAL script's workdir_kill_pattern() via its
 # `__call <fn> [args...]` entry point (same "real script, not a
 # reimplementation" technique scripts/test-worktree-hygiene-logic.sh uses for
-# worktree-hygiene.sh's kill_pattern_for()) -- a hardcoded copy of the
+# worktree-hygiene.sh's functions) -- a hardcoded copy of the
 # pattern strings would keep passing even if reset.sh's real function
 # regressed or reverted to the old blanket port-based kill.
 #
