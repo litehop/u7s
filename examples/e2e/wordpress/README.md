@@ -1,6 +1,7 @@
 # WordPress + nginx + php-fpm + MariaDB E2E workload
 
-Committed, apply-able manifests reproducing the nginx -> php-fpm -> MariaDB -> HTTP
+This directory is an end-to-end test fixture, not an operator example.
+It holds committed, apply-able manifests reproducing the nginx -> php-fpm -> MariaDB -> HTTP
 write path validated in an earlier hand-hacked VM session, now built from files
 in this repo, with no dependency on ephemeral VM state.
 
@@ -10,7 +11,7 @@ in this repo, with no dependency on ephemeral VM state.
 2. csi-hostpath v1.17.1, installed from the pinned upstream tag (do not float a
    branch clone -- see `csi-hostpath-storageclass.yaml` for why):
 
-   ```
+   ```bash
    git clone --depth 1 --branch v1.17.1 https://github.com/kubernetes-csi/csi-driver-host-path.git
    cd csi-driver-host-path/deploy/kubernetes-latest && ./deploy.sh
    ```
@@ -20,7 +21,7 @@ in this repo, with no dependency on ephemeral VM state.
 
 ## Apply
 
-```
+```bash
 kubectl apply -f examples/e2e/wordpress/
 ```
 
@@ -35,7 +36,7 @@ WordPress is exposed through Traefik, not `kubectl port-forward` to the pod.
 Service; the controller lives in `examples/e2e/traefik/` (Traefik v3.7.16, its own
 `traefik` namespace, `traefik` IngressClass, ~64 MiB request / 128 MiB limit).
 
-```
+```bash
 kubectl apply -f examples/e2e/traefik/
 kubectl apply -f examples/e2e/wordpress/
 curl -H 'Host: wordpress.u7s.test' http://<node-ip>:30080/
@@ -46,7 +47,7 @@ conformance rig does not run. HTTP only; TLS is out of scope here.
 
 ## Smoke test
 
-```
+```bash
 scripts/e2e-workload/wordpress-smoke.sh
 ```
 

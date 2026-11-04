@@ -17,8 +17,8 @@ host: it installs CRI-O, stages the u7s binaries and the vendored kubelet
 and kube-controller-manager, and writes a systemd unit for each.
 
 1. Run the install script as root on the target host. Every release is
-   still a prerelease (snapshot), so the unpinned `/install.sh` URL
-   returns 404 by design; pin a snapshot tag instead:
+   still a prerelease, so the unpinned `/install.sh` URL returns 404 by
+   design; pin a release tag instead:
 
    ```bash
    TAG=$(curl --proto '=https' --tlsv1.2 -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
