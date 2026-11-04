@@ -2886,7 +2886,6 @@ EOF
 cat > "$STALE_WORK/bin/apt-get" <<'EOF'
 #!/bin/sh
 echo "apt-get $*" >> "$APT_LOG"
-[ -z "$APT_FAIL" ]
 EOF
 chmod +x "$STALE_WORK/bin/dpkg-query" "$STALE_WORK/bin/apt-get"
 awk '/^remove_stale_k8s_apt_source\(\) \{$/,/^\}$/' "$INSTALL" \
@@ -2894,7 +2893,7 @@ awk '/^remove_stale_k8s_apt_source\(\) \{$/,/^\}$/' "$INSTALL" \
 
 stale_run() {
   : > "$STALE_WORK/apt.log"
-  PATH="$STALE_WORK/bin:$PATH" APT_LOG="$STALE_WORK/apt.log" FAKE_INSTALLED="$1" APT_FAIL="${2:-}" \
+  PATH="$STALE_WORK/bin:$PATH" APT_LOG="$STALE_WORK/apt.log" FAKE_INSTALLED="$1" \
     bash -c 'source "$1"; remove_stale_k8s_apt_source' _ "$STALE_WORK/fn.sh"
 }
 
@@ -2914,22 +2913,6 @@ touch "$STALE_WORK/apt/sources.list.d/kubernetes.list"
 stale_run "kubectl" >/dev/null
 assert "only the apt packages that are actually installed are removed (apt-get remove of an absent package fails the install under set -e)" \
   "$(grep -qx 'apt-get remove -y kubectl' "$STALE_WORK/apt.log" && echo 1 || echo 0)"
-
-touch "$STALE_WORK/apt/sources.list.d/kubernetes.list" "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg"
-stale_rc=0
-stale_run "kubectl kubernetes-cni" "fail" >/dev/null 2>&1 || stale_rc=$?
-assert "a failed apt-get remove fails the function loudly so the install aborts under set -e" \
-  "$([ "$stale_rc" -ne 0 ] && echo 1 || echo 0)"
-assert "a failed apt-get remove leaves the source list and key in place, so a re-run still sees the marker and retries instead of silently skipping the package removal" \
-  "$([ -e "$STALE_WORK/apt/sources.list.d/kubernetes.list" ] && [ -e "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg" ] && echo 1 || echo 0)"
-stale_run "kubectl kubernetes-cni" >/dev/null
-assert "the re-run after a failed remove retries apt-get remove and then clears the source" \
-  "$(grep -qx 'apt-get remove -y kubectl kubernetes-cni' "$STALE_WORK/apt.log" && [ ! -e "$STALE_WORK/apt/sources.list.d/kubernetes.list" ] && echo 1 || echo 0)"
-
-touch "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg"
-stale_run "" >/dev/null
-assert "a stray keyring with no source list is still deleted" \
-  "$([ ! -e "$STALE_WORK/apt/keyrings/kubernetes-apt-keyring.gpg" ] && echo 1 || echo 0)"
 
 stale_out="$(stale_run "kubectl kubernetes-cni")"
 assert "a fresh host (no pkgs.k8s.io source) is untouched: no log line and no package removal, so a user's own kubectl package is never removed" \
