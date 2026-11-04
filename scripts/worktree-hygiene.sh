@@ -137,8 +137,6 @@
 set -euo pipefail
 
 REPO_ROOT="${WORKTREE_HYGIENE_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-# shellcheck source=scripts/_kill-pattern.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_kill-pattern.sh"
 
 run_cmd() {
   if [ "${DRY_RUN:-0}" = "1" ]; then
@@ -297,6 +295,54 @@ pid_from_psline() {
   printf '%s' "$1" | awk '{print $2}'
 }
 
+# Process cwd (absolute), or empty if it cannot be read.
+process_cwd() {
+  lsof -a -d cwd -p "$1" -Fn 2>/dev/null | sed -n 's/^n//p' | sed -n 1p
+}
+
+# Rewrites a relative workdir (`--workdir ./temp/u7s`) in a ps line to its
+# absolute form, resolved against the process's cwd; a relative path matches no
+# worktree and would read as orphaned. A line whose workdir cannot be resolved
+# is dropped and logged: with no provable owner it must never be a kill
+# candidate. Only a cwd that no longer exists resolves lexically (its owner is
+# gone); a live cwd with a missing target, or a prefix containing `..`, is
+# skipped.
+absolutize_ps_line() {
+  local line="$1" prefix pid cwd dir abs="" from to
+  prefix=$(extract_worktree_path_from_psline "$line")
+  case "$prefix" in
+    ''|/*) printf '%s\n' "$line"; return 0 ;;
+  esac
+  pid=$(pid_from_psline "$line")
+  cwd=$(process_cwd "$pid")
+  if [ -n "$cwd" ]; then
+    dir="$cwd/$prefix"
+    if [ -d "$cwd" ]; then
+      [ -d "$dir/temp/u7s" ] && abs=$(cd -P "$dir" 2>/dev/null && pwd -P)
+    else
+      case "/$prefix/" in
+        */../*) ;;
+        *) abs=$(printf '%s' "$dir" | sed -E 's#(/\.)+(/|$)#/#g; s#//+#/#g; s#(.)/$#\1#') ;;
+      esac
+    fi
+  fi
+  if [ -z "$abs" ]; then
+    echo "[hygiene] orphan-skip (unresolvable workdir): $(proc_type_from_psline "$line") pid=${pid} args=${line}" >&2
+    return 0
+  fi
+  from="$prefix/temp/u7s"
+  to="$abs/temp/u7s"
+  printf '%s\n' "${line/"$from"/$to}"
+}
+
+absolutize_ps_lines() {
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] && absolutize_ps_line "$line"
+  done <<< "$1"
+  return 0
+}
+
 # Cross-references candidate process lines (pre-filtered `ps aux` output)
 # against the live-worktree path list and emits one
 # `pid|proc_type|dead_worktree_path` record per orphan: a process whose
@@ -414,26 +460,17 @@ filter_orphans_by_live_agents() {
   done <<< "$orphans"
 }
 
-# The pkill -f pattern for one orphan record. Kept as its own function so
-# the kill step and the "did it actually die" verify step derive the exact
-# same pattern instead of two independently-written regexes drifting apart.
-#
-# Anchoring/escaping lives in _kill-pattern.sh.
-kill_pattern_for() {
-  workdir_kill_pattern "$1" "$2/temp/u7s"
-}
-
 stale_records() {
   local ps_out="$1" live="$2"
   filter_orphans_by_live_agents "$(find_orphans "$ps_out" "$live"; find_apiserverless_konnectivity "$ps_out" "$live"; find_mayor_worker_slot_squatters "$ps_out" "$live")" "$LIVE_AGENTS"
 }
 
 scan_ps() {
-  ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep || true
+  absolutize_ps_lines "$(ps aux | grep -E 'u7s-apiserver|u7s-scheduler|konnectivity-server|sample-run-metrics.sh' | grep -v grep || true)"
 }
 
 step_a_orphaned_processes() {
-  local live ps_out line pid ptype wpath pat
+  local live ps_out line pid ptype wpath
   local orphans=() still_alive=()
 
   live=$(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree / {print $2}')
@@ -456,20 +493,9 @@ step_a_orphaned_processes() {
   for line in "${orphans[@]}"; do
     IFS='|' read -r pid ptype wpath <<< "$line"
     echo "[hygiene] orphan-kill: ${ptype} pid=${pid} workdir=${wpath}"
-    case "$ptype" in
-      # Same workdir as the operator's slot-0 stack, so a path pattern would
-      # kill that too; only the pid is specific to the squatter.
-      slot-squatter-*) run_cmd kill "$pid" ;;
-      konnectivity-server)
-        if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
-          run_cmd kill "$pid"
-        else
-          run_cmd pkill -f "$(kill_pattern_for "$ptype" "$wpath")"
-        fi ;;
-      *)
-        pat=$(kill_pattern_for "$ptype" "$wpath")
-        run_cmd pkill -f "$pat" ;;
-    esac
+    # Only the classified pid: a path pattern can also match another owner's
+    # process (the operator's slot-0 stack shares the mayor checkout path).
+    run_cmd kill "$pid"
   done
 
   # Dry-run never actually killed anything, so a re-scan finding the same
