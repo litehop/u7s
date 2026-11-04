@@ -65,8 +65,8 @@ assert "a signature cosign rejects aborts the build before the unverified binary
   "$([ "$bad_status" -ne 0 ] && ! grep -q VERIFIED "$WORK/bad.out" && grep -q 'cosign signature verification failed for kubelet' "$WORK/bad.out" && echo 1 || echo 0)"
 
 # The function is useless unless the fetch loop calls it for each binary.
-loop_body="$(awk '/^for bin in kubelet kube-controller-manager; do/,/^done/' "$SCRIPT")"
-assert "the kubelet/kube-controller-manager fetch loop calls verify_k8s_signature" \
+loop_body="$(awk '/^for bin in kubelet kube-controller-manager kubectl; do/,/^done/' "$SCRIPT")"
+assert "the kubelet/kube-controller-manager/kubectl fetch loop calls verify_k8s_signature" \
   "$(printf '%s' "$loop_body" | grep -qF 'verify_k8s_signature "$STAGE_DIR/$bin" "$url"' && echo 1 || echo 0)"
 assert "the release workflow installs a pinned cosign before the tarball build" \
   "$(grep -qE 'uses: sigstore/cosign-installer@[0-9a-f]{40} ' "$WORKFLOW" && grep -qE 'cosign-release: v[0-9]+\.[0-9]+\.[0-9]+$' "$WORKFLOW" && echo 1 || echo 0)"

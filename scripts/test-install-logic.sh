@@ -264,8 +264,38 @@ assert_false "(regression guard) install.sh's default --iface detection uses no 
 # it, and this assertion is what stops a silent revert from reintroducing it
 # without another full VM run to catch it again.
 # ---------------------------------------------------------------------------
-assert_true "install.sh installs kubernetes-cni (the actual /opt/cni/bin/ plugin binaries CRI-O's bridge config references) alongside kubectl, not just kubectl alone" \
-  grep -qF 'apt-get install -y kubectl kubernetes-cni' "$INSTALL"
+assert_true "install.sh installs the CNI plugins CRI-O's bridge config and flannel's chain reference (bridge host-local loopback portmap) into /opt/cni/bin from the tarball, or nodes sit NotReady with 'failed to find plugin'" \
+  grep -qF 'BIN_DIR=/opt/cni/bin stage_binaries bridge host-local loopback portmap' "$INSTALL"
+assert_true "kubectl is staged from the tarball into /usr/local/bin (on PATH, unconditionally for control-plane and worker): install.sh and operators call it unqualified, and /opt/u7s/bin is not on PATH" \
+  grep -qxF 'BIN_DIR=/usr/local/bin stage_binaries kubectl' "$INSTALL"
+assert_false "install.sh adds no pkgs.k8s.io apt repo or key: its signing key expires and the tarball already carries verified kubectl and CNI plugins" \
+  grep -qE 'pkgs\.k8s\.io|kubernetes-apt-keyring|apt-get install -y kubectl' "$INSTALL"
+
+# Behavioural: run the real stage_binaries against a tarball-shaped tree.
+STAGE_WORK="$(mktemp -d)"
+mkdir -p "$STAGE_WORK/stage/cni-plugins" "$STAGE_WORK/cni"
+for f in bridge host-local loopback portmap; do
+  printf '#!/bin/sh\n' > "$STAGE_WORK/stage/cni-plugins/$f"
+  chmod 0755 "$STAGE_WORK/stage/cni-plugins/$f"
+done
+{
+  echo 'set -euo pipefail'
+  awk '/^stage_binaries\(\) \{/,/^\}/' "$INSTALL"
+  echo 'STAGE_DIR="$1"; BIN_DIR="$2" stage_binaries bridge host-local loopback portmap'
+} > "$STAGE_WORK/run.sh"
+bash "$STAGE_WORK/run.sh" "$STAGE_WORK/stage" "$STAGE_WORK/cni"
+modes_ok=1
+for f in bridge host-local loopback portmap; do
+  [ -x "$STAGE_WORK/cni/$f" ] || modes_ok=0
+  [ "$(stat -c %a "$STAGE_WORK/cni/$f" 2>/dev/null || stat -f %Lp "$STAGE_WORK/cni/$f")" = 755 ] || modes_ok=0
+done
+assert "CNI plugins found in the tarball's cni-plugins/ directory land in the target dir mode 0755 (kubelet/CRI-O execute them as root; a non-executable plugin means NotReady nodes)" "$modes_ok"
+rm "$STAGE_WORK/stage/cni-plugins/portmap" "$STAGE_WORK/cni/portmap"
+missing_status=0
+bash "$STAGE_WORK/run.sh" "$STAGE_WORK/stage" "$STAGE_WORK/cni" >/dev/null 2>&1 || missing_status=$?
+assert "a tarball missing a required CNI plugin aborts the install instead of leaving the node NotReady later" \
+  "$([ "$missing_status" -ne 0 ] && echo 1 || echo 0)"
+rm -rf "$STAGE_WORK"
 
 # ---------------------------------------------------------------------------
 # Regression guard: apiserver-to-kubelet proxy (kubectl logs/exec) BadGateway
@@ -2115,8 +2145,8 @@ run_key_install "$KEY_WORK/both.asc" "$good_fpr"
 assert "a key file carrying the pinned key plus an attacker key is refused, since signed-by would trust both" \
   "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && echo 1 || echo 0)"
 
-assert "both apt keys are installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
-  "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 2 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
+assert "the apt key is installed through the fingerprint-checking function, never piped straight into gpg --dearmor" \
+  "$([ "$(grep -c '^install_apt_key ' "$INSTALL")" -eq 1 ] && ! grep -qE 'curl .*\| *$|^ *\| gpg' "$INSTALL" && echo 1 || echo 0)"
 rm -rf "$KEY_WORK"
 
 # ---------------------------------------------------------------------------

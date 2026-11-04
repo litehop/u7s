@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds the u7s release tarball for linux/x86_64: cargo-builds
 # u7s-apiserver + u7s-scheduler for x86_64-unknown-linux-gnu, downloads the
-# matching kubelet + kube-controller-manager from dl.k8s.io (checksum- and
-# cosign-verified; the .sig/.cert ship alongside), and packages all four into the flat layout scripts/install.sh
+# matching kubelet + kube-controller-manager + kubectl from dl.k8s.io (checksum- and
+# cosign-verified; the .sig/.cert ship alongside) plus the CNI plugins CRI-O and
+# flannel call (SHA-256 pinned below), and packages them into the layout scripts/install.sh
 # expects (it finds each binary by name anywhere in the extracted tree, so
 # internal layout is not load-bearing --
 # docs/decisions/upstream-component-shipping-shape.md).
@@ -78,12 +79,12 @@ verify_k8s_signature() {
 }
 
 if ! command -v cosign >/dev/null 2>&1; then
-  echo "error: cosign not found on PATH -- it verifies the upstream kubelet/kube-controller-manager signatures" >&2
+  echo "error: cosign not found on PATH -- it verifies the upstream kubelet/kube-controller-manager/kubectl signatures" >&2
   exit 1
 fi
 
-echo "==> Fetching kubelet + kube-controller-manager v$K8S_VERSION for linux/$K8S_ARCH" >&2
-for bin in kubelet kube-controller-manager; do
+echo "==> Fetching kubelet + kube-controller-manager + kubectl v$K8S_VERSION for linux/$K8S_ARCH" >&2
+for bin in kubelet kube-controller-manager kubectl; do
   url="https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/${K8S_ARCH}/${bin}"
   curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$STAGE_DIR/$bin" "$url"
 
@@ -102,8 +103,41 @@ done
 
 chmod +x "$STAGE_DIR/u7s-apiserver" "$STAGE_DIR/u7s-scheduler"
 
+# containernetworking/plugins publishes no signature or attestation, only
+# same-origin .sha256/.sha512 sidecars, which a compromised release would
+# regenerate. The tarball digest is therefore pinned here, so a changed
+# artifact needs a reviewed commit. Bump both together:
+#   curl -fsSL <release-url>/cni-plugins-linux-amd64-v<ver>.tgz.sha256
+CNI_PLUGINS_VERSION="1.9.1"
+CNI_PLUGINS_SHA256_AMD64="b98f74a0f8522f0a83867178729c1aa70f2158f90c45a2ca8fa791db1c76b303"
+# bridge + host-local + loopback: CRI-O's default conflists and flannel's
+# delegate; portmap: flannel's cni-conf chain.
+CNI_PLUGINS="bridge host-local loopback portmap"
+
+fetch_cni_plugins() {
+  local dest="$1" url="$2" expected="$3" tgz actual
+  tgz="$(mktemp)"
+  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$tgz" "$url"
+  actual="$(sha256sum "$tgz" | cut -d' ' -f1)"
+  if [ "$expected" != "$actual" ]; then
+    rm -f "$tgz"
+    echo "error: checksum mismatch for $(basename "$url"): expected $expected, got $actual" >&2
+    exit 1
+  fi
+  mkdir -p "$dest"
+  # shellcheck disable=SC2086 # CNI_PLUGINS is a fixed word list
+  tar -xzf "$tgz" -C "$dest" $(printf './%s ' $CNI_PLUGINS)
+  rm -f "$tgz"
+}
+
+echo "==> Fetching CNI plugins v$CNI_PLUGINS_VERSION ($CNI_PLUGINS) for linux/$K8S_ARCH" >&2
+fetch_cni_plugins "$STAGE_DIR/cni-plugins" \
+  "https://github.com/containernetworking/plugins/releases/download/v${CNI_PLUGINS_VERSION}/cni-plugins-linux-${K8S_ARCH}-v${CNI_PLUGINS_VERSION}.tgz" \
+  "$CNI_PLUGINS_SHA256_AMD64"
+
 # Apache-2.0 section 4 requires redistributing this license text alongside
-# the unmodified kubelet/kube-controller-manager binaries fetched above.
+# the unmodified kubelet/kube-controller-manager/kubectl binaries and CNI
+# plugins fetched above.
 cp "$ROOT_DIR/THIRD_PARTY_LICENSES.md" "$STAGE_DIR/"
 
 # manifests/*.yaml (repo root, see manifests/README.md) is the well-known-

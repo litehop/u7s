@@ -68,8 +68,12 @@ STAGE_NAME="u7s-vTEST-x86_64-unknown-linux-gnu"
 WORK_DIR="$WORK/work"
 STAGE_DIR="$WORK_DIR/$STAGE_NAME"
 mkdir -p "$STAGE_DIR" "$OUT_DIR"
-for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
   printf 'fake %s binary\n' "$f" > "$STAGE_DIR/$f"
+done
+mkdir -p "$STAGE_DIR/cni-plugins"
+for f in bridge host-local loopback portmap; do
+  printf 'fake %s plugin\n' "$f" > "$STAGE_DIR/cni-plugins/$f"
 done
 
 RUNNER="$WORK/runner.sh"
@@ -92,6 +96,13 @@ assert "build-release-tarball.sh's staging/packaging step succeeds against a ful
 TARBALL="$OUT_DIR/${STAGE_NAME}.tar.gz"
 assert "the packaged tarball contains THIRD_PARTY_LICENSES.md (Apache-2.0 attribution for bundled kubelet/kube-controller-manager)" \
   "$(tarball_lists "$TARBALL" "${STAGE_NAME}/THIRD_PARTY_LICENSES.md" && echo 1 || echo 0)"
+assert "the packaged tarball lists kubectl, which install.sh no longer gets from apt" \
+  "$(tarball_lists "$TARBALL" "${STAGE_NAME}/kubectl$" && echo 1 || echo 0)"
+cni_ok=1
+for f in bridge host-local loopback portmap; do
+  tarball_lists "$TARBALL" "${STAGE_NAME}/cni-plugins/$f$" || cni_ok=0
+done
+assert "the packaged tarball lists every CNI plugin install.sh stages (bridge host-local loopback portmap); a missing one aborts the install" "$cni_ok"
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove this suite would actually
@@ -108,7 +119,7 @@ else
   MUTATED_STAGE_NAME="${STAGE_NAME}-mutated"
   MUTATED_STAGE_DIR="$WORK_DIR/$MUTATED_STAGE_NAME"
   mkdir -p "$MUTATED_STAGE_DIR"
-  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager; do
+  for f in u7s-apiserver u7s-scheduler kubelet kube-controller-manager kubectl; do
     printf 'fake %s binary\n' "$f" > "$MUTATED_STAGE_DIR/$f"
   done
 
