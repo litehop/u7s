@@ -42,10 +42,22 @@ check "boot script assigns own ULA without DAD (no multicast to run DAD)" \
   "1" "$(printf '%s\n' "$script" | grep -cxF 'ip -6 addr replace fd85:0:0:1::3/64 dev eth0 nodad')"
 check "boot script pins peer as a permanent neighbour (NDP is dropped by the switch)" \
   "1" "$(printf '%s\n' "$script" | grep -cxF 'ip -6 neigh replace fd85:0:0:1::100 lladdr 52:55:55:aa:bb:cc dev eth0 nud permanent')"
-check "boot script routes the v6 Service CIDR from the rig constant (else node->v6 ClusterIP is ENETUNREACH before kube-proxy DNAT)" \
-  "1" "$(printf '%s\n' "$script" | grep -cxF "ip -6 route replace ${RIG_SERVICE_CIDR_V6} dev lo")"
-check "the v6 Service CIDR constant is the v6 half of the dual Service range" \
-  "fd00:96::/108" "$RIG_SERVICE_CIDR_V6"
+check "default boot script routes the default v6 Service CIDR (else node->v6 ClusterIP is ENETUNREACH before kube-proxy DNAT)" \
+  "1" "$(printf '%s\n' "$script" | grep -cxF "ip -6 route replace fd00:96::/108 dev lo")"
+custom_script=$(RIG_SERVICE_CIDR="10.97.0.0/16,fd00:97::/108" lan_v6_script eth0 fd85:0:0:1::3)
+check "a custom v6 Service CIDR is routed (else a Service IP in that range is unreachable from the host path)" \
+  "1" "$(printf '%s\n' "$custom_script" | grep -cxF "ip -6 route replace fd00:97::/108 dev lo")"
+check "the default v6 range is not routed when a custom one is in use (stale route hides the misconfiguration)" \
+  "0" "$(printf '%s\n' "$custom_script" | grep -cF "fd00:96::/108")"
+check "a v6-primary Service CIDR order still routes the v6 half (it is not assumed to be second)" \
+  "fd00:97::/108" "$(rig_service_cidr_v6 "fd00:97::/108,10.97.0.0/16")"
+if RIG_SERVICE_CIDR="10.97.0.0/16" lan_v6_script eth0 fd85:0:0:1::3 >/dev/null 2>&1; then
+  check "dual-stack with no v6 Service CIDR is refused (no route would be installed and v6 ClusterIPs would not exist)" "refused" "accepted"
+else
+  check "dual-stack with no v6 Service CIDR is refused (no route would be installed and v6 ClusterIPs would not exist)" "refused" "refused"
+fi
+check "run-all.sh exports the effective Service CIDR to the VM provisioning scripts (else lima-start routes the default)" \
+  "1" "$(grep -cF 'export RIG_SERVICE_CIDR="$SERVICE_CIDR"' "$DIR/run-all.sh")"
 check "lima-start.sh adds no v6 route itself, so the single-stack rig gets none (route lives only in the dual-stack boot script)" \
   "0" "$(grep -c 'ip -6 route' "$DIR/lima-start.sh" || true)"
 check "script with no peers has no neighbour lines" \

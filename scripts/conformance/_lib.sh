@@ -322,13 +322,14 @@ lan_v6_addr_for() {
 # Script body run at boot: own address plus one permanent neighbour per peer.
 # Args: <iface> <self-addr> [<peer-addr> <peer-mac>]...
 lan_v6_script() {
-  local iface="$1" self="$2"
+  local iface="$1" self="$2" svc_v6
   shift 2
+  svc_v6=$(rig_service_cidr_v6) || return 1
   echo "#!/bin/sh"
   echo "ip -6 addr replace ${self}/64 dev ${iface} nodad"
   # Lima VMs have no default v6 route (no RA), so locally originated traffic to
   # a v6 ClusterIP dies with ENETUNREACH before kube-proxy's OUTPUT DNAT runs.
-  echo "ip -6 route replace ${RIG_SERVICE_CIDR_V6} dev lo"
+  echo "ip -6 route replace ${svc_v6} dev lo"
   while [ "$#" -ge 2 ]; do
     echo "ip -6 neigh replace $1 lladdr $2 dev ${iface} nud permanent"
     shift 2
@@ -393,8 +394,23 @@ lan_v6_seed_mesh() {
 RIG_POD_CIDR_V4="10.244.0.0/16"
 RIG_POD_CIDR_V6="fd00:244::/56"
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
-RIG_SERVICE_CIDR_V6="${RIG_SERVICE_CIDR_DUAL#*,}"
 RIG_KUBE_DNS_V6="fd00:96::a"
+
+# The Service CIDR(s) the apiserver actually runs with; run-all.sh exports it
+# so lima-start.sh/add-node.sh see a custom --service-cidr.
+RIG_SERVICE_CIDR="${RIG_SERVICE_CIDR:-$RIG_SERVICE_CIDR_DUAL}"
+
+# Prints the IPv6 member of a comma-separated Service CIDR list (either order).
+# Args: [<cidr-list>] (default $RIG_SERVICE_CIDR). Fails when there is none.
+rig_service_cidr_v6() {
+  local part
+  local IFS=,
+  for part in ${1:-$RIG_SERVICE_CIDR}; do
+    case "$part" in *:*) echo "$part"; return 0 ;; esac
+  done
+  echo "error: --dual-stack needs an IPv6 Service CIDR, got '${1:-$RIG_SERVICE_CIDR}'" >&2
+  return 1
+}
 
 # KCM pod-CIDR flags. Upstream rejects --node-cidr-mask-size with two cluster
 # CIDRs and wants one flag per family (install.sh kcm_node_cidr_mask_flags).
