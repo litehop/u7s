@@ -2389,6 +2389,8 @@ assert "gaining a cluster-cidr secondary triggers the podCIDR recipe: existing N
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "1 1" ] && echo 1 || echo 0)"
 assert_true "the printed podCIDR recipe is gated on the cluster-cidr upgrade flag, not the generic dual-stack one" \
   grep -qF 'if [ "$POD_CIDR_UPGRADE" -eq 1 ]' "$INSTALL"
+assert_true "the printed podCIDR recipe restarts flannel: it reads the Node's podCIDRs only at start, so without it new pods keep IPv4-only IPs after the Node is re-created" \
+  grep -qF 'kube-flannel delete pod -l app=flannel' "$INSTALL"
 assert_true "the printed recipe tells the operator the Node delete drops the control-plane label and how to restore it (install.sh re-run re-applies it via label_control_plane_node)" \
   grep -qF 'drops its node-role.kubernetes.io/control-plane label' "$INSTALL"
 net_bad "making the IPv6 range primary on a single-stack IPv4 install is refused with a primary-change message: the primary family fixes the kubernetes Service VIP and every existing ClusterIP" \
