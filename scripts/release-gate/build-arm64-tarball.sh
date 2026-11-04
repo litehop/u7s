@@ -44,11 +44,8 @@ for bin in kubelet kube-controller-manager; do
 done
 
 command -v cosign >/dev/null 2>&1 || { echo "error: cosign not found on PATH -- it verifies kubectl" >&2; exit 1; }
-if [ ! -x "$CACHE/kubectl" ]; then
-  echo "==> fetching kubectl v$K8S_VERSION (sha256 + cosign)" >&2
-  fetch_k8s_binary "$CACHE" arm64 kubectl
-fi
-cp "$CACHE"/kubectl "$CACHE"/kubectl.sig "$CACHE"/kubectl.cert "$STAGE/"
+echo "==> fetching kubectl v$K8S_VERSION (sha256 + cosign, verified on every build)" >&2
+fetch_k8s_binary "$STAGE" arm64 kubectl
 
 echo "==> fetching CNI plugins v$CNI_PLUGINS_VERSION (pinned sha256)" >&2
 fetch_cni_plugins_for_arch "$STAGE/cni-plugins" arm64

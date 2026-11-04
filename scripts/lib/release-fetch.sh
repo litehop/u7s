@@ -71,7 +71,11 @@ CNI_PLUGINS="bridge host-local loopback portmap"
 fetch_cni_plugins() {
   local dest="$1" url="$2" expected="$3" tgz actual
   tgz="$(mktemp)"
-  curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$tgz" "$url"
+  if ! curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$tgz" "$url"; then
+    rm -f "$tgz"
+    echo "error: failed to download $url" >&2
+    exit 1
+  fi
   actual="$(sha256_of "$tgz")"
   if [ "$expected" != "$actual" ]; then
     rm -f "$tgz"

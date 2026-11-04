@@ -42,7 +42,9 @@ for f in bridge host-local loopback portmap dhcp tap; do
   printf 'fake %s\n' "$f" > "$WORK/fixture/$f"
   chmod 0755 "$WORK/fixture/$f"
 done
-tar -czf "$WORK/good.tgz" -C "$WORK/fixture" bridge host-local loopback portmap dhcp tap
+# Upstream members are "./"-prefixed; GNU tar matches member names literally, so
+# a fixture without the prefix would not exercise the real extract on Linux.
+tar -czf "$WORK/good.tgz" -C "$WORK/fixture" ./bridge ./host-local ./loopback ./portmap ./dhcp ./tap
 GOOD_SHA="$(sha256_of "$WORK/good.tgz")"
 cp "$WORK/good.tgz" "$WORK/tampered.tgz"
 printf 'extra' >> "$WORK/tampered.tgz"
@@ -98,7 +100,9 @@ done
 assert "the amd64 release build fetches kubectl through fetch_k8s_binary (sha256 + cosign) and plugins through fetch_cni_plugins_for_arch" \
   "$(grep -q '^  fetch_k8s_binary "\$STAGE_DIR" "\$K8S_ARCH" "\$bin"$' "$SCRIPT" && grep -q 'fetch_cni_plugins_for_arch "\$STAGE_DIR/cni-plugins" "\$K8S_ARCH"' "$SCRIPT" && echo 1 || echo 0)"
 assert "the arm64 release-gate build stages kubectl (sha256 + cosign) and the pinned CNI plugins through the same shared functions, so install.sh finds every required binary" \
-  "$(grep -q '^  fetch_k8s_binary "\$CACHE" arm64 kubectl$' "$ARM" && grep -q 'fetch_cni_plugins_for_arch "\$STAGE/cni-plugins" arm64' "$ARM" && grep -q 'release-fetch.sh' "$ARM" && grep -q 'kubectl.cert "\$STAGE/"' "$ARM" && echo 1 || echo 0)"
+  "$(grep -q '^fetch_k8s_binary "\$STAGE" arm64 kubectl$' "$ARM" && grep -q 'fetch_cni_plugins_for_arch "\$STAGE/cni-plugins" arm64' "$ARM" && grep -q 'release-fetch.sh' "$ARM" && echo 1 || echo 0)"
+assert "the arm64 gate build never reuses a cached kubectl, so a binary swapped in the cache is not shipped unverified" \
+  "$(grep -q 'CACHE/kubectl' "$ARM" && echo 0 || echo 1)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

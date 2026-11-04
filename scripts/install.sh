@@ -349,10 +349,38 @@ wait_for_authentication_configmap() {
   fi
 }
 
+# Older installs added the pkgs.k8s.io apt source, whose pinned signing key
+# expires 2026-12-29; once it does, every `apt-get update` fails and aborts a
+# re-run under set -e. kubectl and the CNI plugins now come from the verified
+# tarball, so drop the source and the apt packages it supplied (a later apt
+# upgrade would otherwise overwrite /opt/cni/bin and /usr/bin/kubectl).
+# Packages are only removed when the source file proves u7s installed them.
+remove_stale_k8s_apt_source() {
+  local list=/etc/apt/sources.list.d/kubernetes.list
+  local key=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  local had_list=0 pkg stale=()
+  [ -e "$list" ] && had_list=1
+  if [ "$had_list" -eq 1 ] || [ -e "$key" ]; then
+    rm -f "$list" "$key"
+    echo "removed stale pkgs.k8s.io apt source (kubectl and CNI plugins now come from the verified tarball)"
+  fi
+  if [ "$had_list" -eq 1 ]; then
+    for pkg in kubectl kubernetes-cni; do
+      if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q '^install ok installed'; then
+        stale+=("$pkg")
+      fi
+    done
+    if [ "${#stale[@]}" -gt 0 ]; then
+      apt-get remove -y "${stale[@]}"
+    fi
+  fi
+}
+
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
 # default path's apt footprint stays unchanged.
 ensure_jq() {
   if ! command -v jq >/dev/null 2>&1; then
+    remove_stale_k8s_apt_source
     apt-get update -qq
     apt-get install -y jq
   fi
@@ -1967,6 +1995,7 @@ fi
 # real deployment) and its containerd-disabling step (a fresh Ubuntu box ships
 # no containerd package at all; the unit Lima VMs have is injected by Lima's
 # guest agent, so a real install has nothing to conflict with).
+remove_stale_k8s_apt_source
 apt-get update -qq
 apt-get install -y apt-transport-https ca-certificates curl gpg
 
