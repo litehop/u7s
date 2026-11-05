@@ -15,14 +15,19 @@
 #   (e) scripts/e2e-workload/webhook-smoke.sh passes on the shipped-install VM
 # Exit codes: see "Release-gate exit codes" in docs/dev-setup.md (3 = not enough valid runs).
 #
-# INVALID: a run that did not pass while the host was not quiet is neither PASS nor FAIL. Quiet
+# INVALID: a run during which the host was not quiet is neither PASS nor FAIL, whatever its
+# verdict (validity never depends on the outcome; reasons land in contention.txt). Quiet
 # means no other Lima VM running and host CPU idle >= 70% over 30 s (the floor drops by the gate
 # VM's own vCPU share once it runs), checked before the VM is created and then every ~60 s, plus
 # an in-guest CPU calibration at the idle boundary before the first burst (median > 1.5x the
 # pre-install baseline of the same VM; never sampled after a burst, and with fewer than 3
 # samples it is unmeasured and judges nothing). A harness error (marker write failing before the
 # bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
-# RG_RETRY_WAIT_SECS, default 300) and never counted; a PASS under contention stays a PASS.
+# RG_RETRY_WAIT_SECS, default 300) and never counted.
+#
+# A/B runs (comparing builds or mitigations) must use the in-VM sampler (vm-sampler.sh) only. Off-VM
+# observers (limactl shell streams) cost ~79 MiB MemAvailable on 1 GiB, die at the first burst,
+# and attach unevenly across arms; do not attach any to a measured run.
 #
 # --backend gcp --release <tag> is the RELEASE-AUTHORITATIVE run: a real dedicated-core (1 dedicated vCPU, 1 GiB; kubelet allocatable cpu=1; more generous than a typical shared 1-vCPU VPS, so a PASS is slightly optimistic for shared hosts)
 # Spot custom N1 (n1-custom-1-1024: x86_64, no swap) on GCP (docs/dev-setup.md, "GCP test VPSes"), installing
@@ -30,7 +35,7 @@
 # phases, collectors and verdict are the same as on Lima (lib.sh); the Lima arm64 run is an
 # advisory pre-check. Contention mapping: on GCP the guest is the host, so the Lima host-side
 # checks (host idle CPU, other VMs) are replaced by in-guest steal time over the idle window
-# (> RG_STEAL_MAX_PCT, 10%) plus the same in-guest calibration; a non-pass with either is
+# (> RG_STEAL_MAX_PCT, 10%) plus the same in-guest calibration; either makes the run
 # INVALID. A non-pass on an instance Google reclaimed (Spot preemption) is PREEMPTED, counted
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
 # A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
@@ -253,7 +258,7 @@ host_state() {
   echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(vm_running "$VM")"
 }
 
-overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
+knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
 while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ]; do
   attempt=$((attempt + 1))
   # The guest's hostname is the VPS name plus GCE's ".c.<project>.internal"; the node's
@@ -366,10 +371,10 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   [ -z "$harness_error" ] || echo "HARNESS ERROR (run is INVALID, not a u7s FAIL): $harness_error"
   [ ! -s "$RUN_OUT/out/results.env" ] || rg_cal_unmeasured "$RUN_OUT/out/results.env" | sed 's/^/warning: /'
   echo "run status: $status"
-  [ "$status" = PASS ] || { [ ! -s "$RUN_OUT/contention.txt" ] || { echo "contention observed:"; cat "$RUN_OUT/contention.txt"; }; }
+  [ ! -s "$RUN_OUT/contention.txt" ] || { echo "contention observed:"; cat "$RUN_OUT/contention.txt"; }
   case "$status" in
-    PASS) passed=$((passed + 1)); valid=$((valid + 1)) ;;
-    FAIL) overall=1; valid=$((valid + 1)) ;;
+    PASS) passed=$((passed + 1)); valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
+    FAIL) overall=1; valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
     INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
@@ -394,5 +399,6 @@ if [ -s "$OUT/leaked-vps.txt" ]; then
   echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
   [ "$rc" != 0 ] || { rc=4; verdict="$verdict [LEAKED VPS: exit 4]"; }
 fi
-echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="
+if [ -n "$RAMP" ]; then rg_ramp_summary "$RAMP_SIZES" "$knees" "$verdict" "$OUT"
+else echo "==== GATE: $passed/$RUNS runs passed at $BURST_PODS pods -> $verdict (results in $OUT) ===="; fi
 exit "$rc"

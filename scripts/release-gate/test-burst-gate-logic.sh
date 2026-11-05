@@ -223,6 +223,14 @@ for key in secs oom_host oom_kubesystem notready ready_final wp_ok marker_ok; do
   assert "ramp step missing ramp_30_$key is not a pass (a step that died midway must not become the candidate)" \
     "$(rg_ramp_step "$TMP/rampm.env" 30 >/dev/null && echo 0 || echo 1)"
 done
+rg_ramp_verdict "$TMP/ramp.env" "30 40 50 60" "$TMP/s.tsv" > "$TMP/ramp.verdict" || true
+assert "ramp knee is read from the verdict (40), so the summary can report where the node broke" \
+  "$([ "$(rg_ramp_knee "$TMP/ramp.verdict")" = 40 ] && echo 1 || echo 0)"
+out="$(rg_ramp_summary "30 40 50 60" " $(rg_ramp_knee "$TMP/ramp.verdict")" PASS /o)"
+assert "ramp summary reports the knee and never 'passed at <max> pods' for a run that broke at 50 (operators read this line as the result)" \
+  "$(echo "$out" | grep -q 'knee.*: 40 ' && ! echo "$out" | grep -qE 'passed at [0-9]+ pods' && echo 1 || echo 0)"
+rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv" > "$TMP/ramp0.verdict" || true
+assert "ramp with no passing step has knee none" "$([ "$(rg_ramp_knee "$TMP/ramp0.verdict")" = none ] && echo 1 || echo 0)"
 ramp_env 30 | sed 's/^ramp_30_oom_kubesystem=0/ramp_30_oom_kubesystem=1/' > "$TMP/rampo.env"
 assert "ramp step with a kube-system OOM fails criterion (a) only" "$([ "$(rg_ramp_step "$TMP/rampo.env" 30)" = "FAIL PASS PASS PASS" ] && echo 1 || echo 0)"
 ramp_env 30 | sed 's/^ramp_30_secs=20/ramp_30_secs=181/' > "$TMP/rampc.env"
@@ -429,10 +437,12 @@ qpid=$!
 sleep 1; touch "$TMP/qloop.stop"; wait "$qpid"
 assert "stopping the quiet loop waits for the in-flight sample so the verdict reads a complete quiet.log" \
   "$([ "$(cat "$TMP/qloop.log" 2>/dev/null)" = sampled ] && echo 1 || echo 0)"
-assert "PASS under contention stays PASS (a green run on a noisy host is still evidence u7s survives)" \
-  "$([ "$(rg_run_status 0 "$TMP/noisy.log" "$TMP/empty.env")" = PASS ] && echo 1 || echo 0)"
+assert "PASS under contention -> INVALID (validity must not depend on outcome, or only failures get discarded and A/B arms are biased)" \
+  "$([ "$(rg_run_status 0 "$TMP/noisy.log" "$TMP/empty.env")" = INVALID ] && echo 1 || echo 0)"
 assert "FAIL under contention -> INVALID (the failure cannot be blamed on u7s)" \
   "$([ "$(rg_run_status 1 "$TMP/noisy.log" "$TMP/empty.env")" = INVALID ] && echo 1 || echo 0)"
+assert "PASS on a quiet host stays PASS (the contention rule must not discard clean passes)" \
+  "$([ "$(rg_run_status 0 "$TMP/quiet.log" "$TMP/empty.env")" = PASS ] && echo 1 || echo 0)"
 assert "FAIL on a quiet host stays FAIL" "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$TMP/empty.env")" = FAIL ] && echo 1 || echo 0)"
 cal_env 100 3 400 3
 assert "FAIL with a slow idle-boundary calibration on a quiet-looking host -> INVALID (steal the host probe missed)" \
@@ -541,8 +551,8 @@ assert "steal is not judged on Lima (its host-side checks own contention; a Lima
 BACKEND=gcp
 assert "steal above 10% on a non-pass -> INVALID (a stolen shared core must not be blamed on u7s)" \
   "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$(steal_env 25.0)")" = INVALID ] && echo 1 || echo 0)"
-assert "steal above 10% on a PASS stays PASS (noise never turns a pass into anything else)" \
-  "$([ "$(rg_run_status 0 "$TMP/q-ok.log" "$(steal_env 25.0)")" = PASS ] && echo 1 || echo 0)"
+assert "steal above 10% on a PASS -> INVALID (a stolen core must discard passes and failures alike)" \
+  "$([ "$(rg_run_status 0 "$TMP/q-ok.log" "$(steal_env 25.0)")" = INVALID ] && echo 1 || echo 0)"
 assert "steal at 2% on a non-pass stays FAIL (ordinary shared-core jitter must not launder a u7s failure)" \
   "$([ "$(rg_run_status 1 "$TMP/q-ok.log" "$(steal_env 2.0)")" = FAIL ] && echo 1 || echo 0)"
 assert "unmeasured steal judges nothing: a non-pass without steal_idle_pct stays FAIL" \
