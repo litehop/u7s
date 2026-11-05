@@ -266,6 +266,8 @@ if [ "$COREDNS_REQ" = 1 ]; then
   log "coredns requests applied"
 fi
 
+[ -f "$RG/exp-hook.sh" ] && { bash "$RG/exp-hook.sh" 2>&1 | tee "$OUT/exp-hook.log"; kw wait --for=condition=Ready "node/$NODE" --timeout=120s >> "$OUT/run.log" 2>&1; }
+
 phase idle
 cpu_before="$(head -1 /proc/stat)"
 sleep "$SETTLE_IDLE"
@@ -353,10 +355,21 @@ run_overload() {
   k scale deployment/rg-overload --replicas="$OVERLOAD_PODS" >/dev/null 2>&1
   while [ $(( $(date +%s) - t0 )) -lt "$OVERLOAD_WINDOW_SECS" ]; do
     ok=0
-    if [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] \
-      && k get --raw /readyz >/dev/null 2>&1 \
-      && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
+    local c0 c1 c2 c3 nr rz wc ndat
+    c0="$(date +%s.%N)"
+    ndat="$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}/{.status.conditions[?(@.type=="MemoryPressure")].status}/{.spec.taints[*].key}' 2>/dev/null)"
+    nr="${ndat%%/*}"
+    c1="$(date +%s.%N)"
+    k get --raw /readyz >/dev/null 2>&1 && rz=1 || rz=0
+    c2="$(date +%s.%N)"
+    wc=-
+    [ "$NO_WORKLOAD" = 1 ] || wc="$(wp_code)"
+    c3="$(date +%s.%N)"
+    if [ "$nr" = True ] && [ "$rz" = 1 ] \
+      && { [ "$NO_WORKLOAD" = 1 ] || case "$wc" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
+    awk -v t="${c0%.*}" -v ok="$ok" -v nd="$ndat" -v rz="$rz" -v wc="$wc" -v c0="$c0" -v c1="$c1" -v c2="$c2" -v c3="$c3" \
+      'BEGIN { printf "%s ok=%s node=[%s] readyz=%s wp=%s dur_node=%.1f dur_readyz=%.1f dur_wp=%.1f cycle=%.1f\n", t, ok, nd, rz, wc, c1-c0, c2-c1, c3-c2, c3-c0 }' >> "$OUT/probes.log"
     [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
     sleep 5
   done

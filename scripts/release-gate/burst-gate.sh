@@ -101,7 +101,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
+EXP_HOOK=""; COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=600
@@ -117,6 +117,7 @@ while [ $# -gt 0 ]; do
     --runs) RUNS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --coredns-requests) COREDNS_REQ=1; shift ;;
+    --exp-hook) EXP_HOOK="$2"; shift 2 ;;
     --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
     --capture) CAPTURE=1; shift ;;
     --ramp) RAMP="$2"; shift 2 ;;
@@ -280,6 +281,7 @@ if [ "$BACKEND" = lima ]; then
   [ "${#staged[@]}" = 1 ] || { echo "expected exactly one u7s-gate-*.tar.gz in $STAGE, found ${#staged[@]}" >&2; exit 2; }
   INSTALL_TARBALL="/var/tmp/rg/$(basename "${staged[0]}")"
 fi
+[ -n "$EXP_HOOK" ] && cp "$EXP_HOOK" "$STAGE/exp-hook.sh"
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
 printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nOVERLOAD_PODS=%s\nOVERLOAD_MIB=%s\nNO_WORKLOAD=%s\nOVERLOAD_WINDOW_SECS=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\nWEDGE_STALL_SECS=%s\nBURST_CAP_SECS=%s\n' \
   "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$OVERLOAD_PODS" "$OVERLOAD_MIB" "$NO_WORKLOAD" "$OVERLOAD_WINDOW_SECS" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" "$WEDGE_STALL_SECS" "$BURST_CAP_SECS" > "$STAGE/gate.env"
