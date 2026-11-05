@@ -2,7 +2,10 @@
 
 Bead: mayor-6bw98 (sampler), mayor-36soz (killable overload repro)
 
-Answer: PENDING (runs not yet done).
+Answer: in every overload run the MemAvailable loss is anonymous memory of the overload pods
+(kubepods-besteffort), balanced by file-cache eviction; control-plane anon, slab (~+10-25 MiB) and
+page tables (<20 MiB) are not the consumers, and the node (Lima and GCP) does not recover within
+300 s even when the kernel OOM killer fires on the killable pods (n=1 per run).
 
 ## Method
 
@@ -68,6 +71,42 @@ Overload NOT recovered (2 OK probes then node Unknown at +35 s, API unreachable)
   (`sh` holding 18-25 MiB anon-rss, plus head/tr/sleep children); no control-plane victim.
   The killer works here, but the pods restart (restart loop) and the node does not leave the
   thrash within 300 s.
+
+### G1: GCP n1-custom-1-1024 Spot, WordPress+MariaDB resident
+
+Release v0.4.3-snapshot.4 (newest; it predates `OOMScoreAdjust=-997`), this branch's gate scripts,
+same 30 x 25 MiB overload. Harness status FAIL (valid, not INVALID). NOT recovered (1 OK probe of
+6; node-ready log ends True, API then unreachable). The guest froze for 173 s mid-window (largest
+sampler gap), the collect phase never completed (no kernel log / OOM victims file; the
+`oom_kill` counter read 16 at +390 s, victims unknown).
+
+| t after scale | AnonPages | file | MemAvailable | besteffort anon |
+|---|---|---|---|---|
+| +1 s | 391 MiB | 280 MiB | 292 MiB | 40 MiB |
+| +142 s | 398 | 268 | 271 | 34 |
+| +181 s | 325 | 322 | 342 | - |
+| +194 s | 479 | 225 | 185 | - |
+| +390 s | 480 | 211 | 185 | 211 |
+
+- Overload pods are slow to start on GCP (besteffort anon 35-40 MiB for ~170 s, then 211 MiB at
+  +390 s); the control plane's anon is flat (kcm 48, crio 33, kubelet 35, apiserver 15 MiB) and
+  its Pss_File fell to 3-6 MiB per component.
+- Mem PSI full +236 s of 390 s (61%), CPU iowait 54% and system 37% of the window: the same
+  thrash signature as Lima (file refault, ~0 free), but at a higher MemAvailable (185 vs 40-90 MiB).
+  Refault counters are not comparable across platforms.
+- GCP cleanup: `gcloud compute instances list` after the run: `Listed 0 items.`
+
+## Verdict and caveats
+
+- Consumer: overload-pod anon (Lima +236-400 MiB within 7-50 s). Components, slab and page tables
+  do not grow materially, so the earlier "unattributed 70-160 MiB" in burst runs is most plausibly
+  file-cache loss plus per-pod sandbox anon, to be re-checked with a pause-burst run (this work ran
+  only the overload mode).
+- Recovery: 0 of 3 runs recovered in 300 s. L2 shows the OOM killer works on killable pods
+  (26 kills, all adj 1000, no control-plane victim) but the restart loop keeps the node thrashing.
+- Not tested: dose-response at several sizes, a pause-pod burst, recovery windows beyond 300 s.
+- L1/L2 are flagged INVALID by the harness (host idle 57-59% vs 62% floor).
+- The sampler costs 0.6% of a core at idle but 8-9% during a Lima thrash and 1.8% on GCP.
 
 ### Sampler cost
 
