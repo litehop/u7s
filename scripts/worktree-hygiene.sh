@@ -567,10 +567,11 @@ is_unmerged_by_patch_id() {
 # a PR-state check can.
 has_open_pr() {
   local branch="$1" open_pr_branches="$2"
+  [ -n "$branch" ] || return 1
   printf '%s\n' "$open_pr_branches" | grep -qxF "$branch"
 }
 
-# All open PRs' head branch names, one per line -- the shared query behind
+# All open PRs as "<headRefName> <headRefOid>" lines -- the shared query behind
 # has_open_pr's exact-match check. `--limit` is set well above `gh pr list`'s
 # default page cap (30): without it, a repo with more than 30 open PRs would
 # silently truncate this list, and a branch whose PR fell past the cap would
@@ -579,18 +580,22 @@ has_open_pr() {
 # STEP C and STEP F so this fix (and the single `gh` call per invocation
 # each already relies on) lives in one place.
 fetch_open_pr_branches() {
-  gh pr list -R litehop/u7s --state open --limit 1000 --json headRefName --jq '.[].headRefName'
+  gh pr list -R litehop/u7s --state open --limit 1000 --json headRefName,headRefOid --jq '.[] | "\(.headRefName) \(.headRefOid)"'
 }
 
 # Open-PR head list, fetched at most once per run and shared by every
-# destructive step (C, D, F, G) whatever the branch is named. A `gh` failure
-# aborts the run via `set -e` rather than letting a step delete without the
-# check.
+# destructive step (C, D, F, G) whatever the branch is named. Each step calls it
+# itself and returns 1 on a `gh` failure, so no step can delete with an empty
+# list.
 OPEN_PR_BRANCHES=""
+OPEN_PR_OIDS=""
 OPEN_PR_LOADED=0
 load_open_prs() {
   [ "$OPEN_PR_LOADED" = 1 ] && return 0
-  OPEN_PR_BRANCHES=$(fetch_open_pr_branches)
+  local raw
+  raw=$(fetch_open_pr_branches) || return 1
+  OPEN_PR_BRANCHES=$(printf '%s\n' "$raw" | awk 'NF {print $1}')
+  OPEN_PR_OIDS=$(printf '%s\n' "$raw" | awk 'NF > 1 {print $2}')
   OPEN_PR_LOADED=1
 }
 
@@ -615,7 +620,7 @@ step_c_stale_worker_branches() {
   local porcelain checked_out branch
   porcelain=$(git -C "$REPO_ROOT" worktree list --porcelain)
   checked_out=$(checked_out_branches "$porcelain")
-  load_open_prs
+  load_open_prs || return 1
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     case "$branch" in
@@ -646,7 +651,7 @@ gone_upstream_branches() {
 
 step_d_gone_upstream_branches() {
   local refs branch checked_out
-  load_open_prs
+  load_open_prs || return 1
   refs=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads/)
   checked_out=$(checked_out_branches "$(git -C "$REPO_ROOT" worktree list --porcelain)")
   while IFS= read -r branch; do
@@ -778,7 +783,7 @@ archive_findings_branch() {
 
 step_f_orphaned_origin_branches() {
   local branch
-  load_open_prs
+  load_open_prs || return 1
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
@@ -798,12 +803,14 @@ step_f_orphaned_origin_branches() {
 # A fix-round worker checks out an existing PR branch as a local branch such
 # as fix-<PR>, so STEP C (worker/agent-* names only) never considers its
 # worktree and STEP D skips a checked-out branch. Reaped here once the
-# worker is gone: agent-id not live, worktree clean, and HEAD already
-# reachable from a remote ref (nothing unpushed to lose).
+# worker is gone: agent-id not live, worktree clean, HEAD already reachable
+# from a remote ref (nothing unpushed to lose), and no open PR matching the
+# local branch name, the upstream branch, or HEAD's sha (the local name of a
+# fix-round checkout need not equal the PR head).
 # ---------------------------------------------------------------------------
 step_g_fix_round_worktrees() {
-  local path branch agent_id rc=0
-  load_open_prs
+  local path branch upstream agent_id rc=0
+  load_open_prs || return 1
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     agent_id=$(agent_id_from_worktree_path "$path" || true)
@@ -814,6 +821,9 @@ step_g_fix_round_worktrees() {
       ""|HEAD|worker/agent-*) continue ;;
     esac
     has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
+    has_open_pr "$(git -C "$path" rev-parse HEAD 2>/dev/null)" "$OPEN_PR_OIDS" && continue
+    upstream=$(git -C "$path" rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || true)
+    [ -n "$upstream" ] && has_open_pr "${upstream#*/}" "$OPEN_PR_BRANCHES" && continue
     [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || continue
     [ -z "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ] || continue
     echo "worktree-hygiene: STEP G: removing worktree $path and branch $branch"
@@ -913,10 +923,8 @@ main() {
     # live-protection set. This does NOT lower the staleness bar: STEP C's
     # merge-state and open-PR guards apply regardless of LIVE_AGENTS'
     # contents (see the file header), so a branch with an open, unmerged
-    # PR is still preserved by STEP C even with zero live workers. STEP D
-    # needs no such guard -- its scope (branches with a literally `[gone]`
-    # tracked upstream) already excludes any branch an open PR keeps alive.
-    # STEP F's own open-PR guard applies the same way as STEP C's.
+    # PR is still preserved by STEP C even with zero live workers. STEPs D, F
+    # and G apply the same open-PR guard.
     LIVE_AGENTS=""
   # Fail-safe, not a default: STEP A/C/D/F are destructive (process kill,
   # branch delete), and dir-existence/merge-state alone already proved

@@ -1247,9 +1247,62 @@ git -C "$P" fetch -q --prune origin
 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
   call step_d_gone_upstream_branches >/dev/null 2>&1
 assert "STEP D keeps gone-upstream branches with an open PR (agent- and non-agent-named)" \
-  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-gone-pr >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-foo >/dev/null && echo 1 || echo 0)"
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-gone-pr >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-bar >/dev/null && echo 1 || echo 0)"
 assert "...and deletes a gone-upstream branch with no open PR" \
   "$(! git -C "$P" rev-parse --verify -q refs/heads/worker/fix-gone-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP G: a fix-round worktree whose LOCAL branch name differs from the PR head
+# (pr9-fix vs PR head worker/fix-pr9) must survive while that PR is open,
+# matched by HEAD sha. Its commit is pushed under another name so the
+# "nothing unpushed" guard alone would call it reapable.
+git -C "$P" checkout -q -b pr9-fix main
+git -C "$P" commit -q --allow-empty -m pr9
+PR9_SHA=$(git -C "$P" rev-parse HEAD)
+git -C "$P" push -q origin pr9-fix:refs/heads/pr9-remote
+git -C "$P" checkout -q main
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a9" pr9-fix
+STUB_GH_PR_SHA="$SANDBOX_ROOT/stub-gh-pr-sha"
+mkdir -p "$STUB_GH_PR_SHA"
+cat > "$STUB_GH_PR_SHA/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'worker/fix-pr9 %s\n' "$STUB_PR_SHA"
+EOF
+chmod +x "$STUB_GH_PR_SHA/gh"
+STUB_PR_SHA="$PR9_SHA" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_PR_SHA:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G keeps a fix-round worktree on local branch pr9-fix whose HEAD sha is an open PR's head -- local name != PR head name, so reaping by name alone closes a PR under review" \
+  "$([ -d "$P/ai/worktrees/agent-a9" ] && git -C "$P" rev-parse --verify -q refs/heads/pr9-fix >/dev/null && echo 1 || echo 0)"
+STUB_PR_SHA="deadbeef" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_PR_SHA:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "...and reaps it once no open PR head matches its sha (the guard is the sha match, not a blanket keep)" \
+  "$([ ! -d "$P/ai/worktrees/agent-a9" ] && echo 1 || echo 0)"
+
+# gh failure: no destructive step may delete on an unknown PR list.
+STUB_GH_FAIL="$SANDBOX_ROOT/stub-gh-fail"
+mkdir -p "$STUB_GH_FAIL"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_GH_FAIL/gh"
+chmod +x "$STUB_GH_FAIL/gh"
+git -C "$P" branch worker/agent-failc main
+git -C "$P" branch worker/fix-faild main
+git -C "$P" push -q -u origin worker/fix-faild
+git -C "$P" push -q origin --delete worker/fix-faild
+git -C "$P" fetch -q --prune origin
+git -C "$P" branch fix-failg main
+git -C "$P" push -q origin fix-failg
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a10" fix-failg
+git -C "$P" branch worker/agent-failf main
+git -C "$P" push -q origin worker/agent-failf
+GH_FAIL_RC=0
+for step in step_c_stale_worker_branches step_d_gone_upstream_branches step_f_orphaned_origin_branches step_g_fix_round_worktrees; do
+  RC=0
+  LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_FAIL:$PATH" \
+    call "$step" >/dev/null 2>&1 || RC=$?
+  [ "$RC" -ne 0 ] || GH_FAIL_RC=1
+done
+assert "C/D/F/G each exit non-zero when gh fails -- a failed PR fetch must never look like 'no open PRs'" \
+  "$([ "$GH_FAIL_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and delete nothing (stale branch, gone-upstream branch, fix-round worktree, origin branch all survive)" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-failc >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-faild >/dev/null && [ -d "$P/ai/worktrees/agent-a10" ] && git -C "$P" ls-remote --exit-code origin refs/heads/worker/agent-failf >/dev/null && echo 1 || echo 0)"
 
 # Step labels make the log attributable to a step.
 git -C "$P" branch fix-lbl main
