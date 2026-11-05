@@ -35,7 +35,6 @@ ALLOW=(
   'test-kill-sites-logic.sh::.::extracts and drives the real scripts'"'"' lines against its own sleepers'
   'release-gate/burst-gate.sh::pkill -KILL -f "\$RG_VM_KILL_PATTERN"::runs inside the gate'"'"'s dedicated VM against a line-anchored fixed /var/tmp/rg/*.sh pattern, no host workdir'
   'release-gate/test-burst-gate-logic.sh::for cmd in .bash -c sudo pkill::fixture command strings fed to the kill pattern regex; no pkill is run'
-  'conformance/run-all.sh::echo "  pkill -TERM -f ::an echo printing a hint with the expanded workdir_kill_pattern, not a pkill (the guard scans echo text; separate bug)'
   'test-kill-pattern-guard-logic.sh::.::fixtures for this guard'
 )
 
@@ -53,6 +52,13 @@ flagged_lines() {
     [ -n "$line" ] || continue
     n="${line%%:*}"; line="${line#*:}"
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    # A line that starts with echo/printf only prints text (e.g. a hint naming
+    # pkill); it is not a kill, unless a ; && || | separator introduces a kill
+    # command later on the line (text containing "; pkill" is flagged too).
+    if [[ "$line" =~ ^[[:space:]]*(echo|printf)[[:space:]] ]] \
+      && ! [[ "$line" =~ [\;\&\|][[:space:]]*(pkill|pgrep|killall)([^A-Za-z0-9_-]|$) ]]; then
+      continue
+    fi
     if [[ "$line" =~ ([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(workdir_kill_pattern ]]; then
       wkp_vars+="${BASH_REMATCH[1]} "
     fi
@@ -142,6 +148,30 @@ pkill -f '$(workdir_kill_pattern scheduler "$WORKDIR")'
 EOF
 assert_true "a single-quoted \$(workdir_kill_pattern ...) is flagged: pkill would get the literal unexpanded text and match nothing, silently leaving the peer-safe kill a no-op" \
   [ "$(flagged_lines "$T/squote.sh" | wc -l | tr -d ' ')" = 1 ]
+cat > "$T/echo.sh" <<'EOF'
+echo "  pkill -TERM -f '$(workdir_kill_pattern apiserver "$(cd "$WORKDIR" && pwd)")'"
+  printf 'pkill -f %s\n' "$WORKDIR"
+EOF
+assert_true "an echo/printf hint naming pkill -f is not flagged: it prints text, and flagging it forced a per-line allowlist entry" \
+  [ -z "$(flagged_lines "$T/echo.sh")" ]
+cat > "$T/echo-then-kill.sh" <<'EOF'
+echo "stopping"
+pkill -f "$WORKDIR"
+EOF
+assert_true "a real raw pkill right after an echo is still flagged" \
+  [ "$(flagged_lines "$T/echo-then-kill.sh")" = '2:pkill -f "$WORKDIR"' ]
+cat > "$T/echo-chain.sh" <<'EOF'
+echo x; pkill -f "$WORKDIR"
+echo x && pkill --full "$WORKDIR"
+printf x | pgrep -f "$WORKDIR"
+EOF
+assert_true "a real kill chained after an echo/printf on one line is still flagged (3 of 3), else the echo skip hides raw kills from the guard" \
+  [ "$(flagged_lines "$T/echo-chain.sh" | wc -l | tr -d ' ')" = 3 ]
+assert_true "run-all.sh passes the guard with no allowlist entry" \
+  [ -z "$(unallowed_lines "conformance/run-all.sh" "$DIR/conformance/run-all.sh")" ]
+sed -E 's/\$\(workdir_kill_pattern [a-z-]+ "\$WORKDIR_ABS"\)/$WORKDIR_ABS/' "$DIR/conformance/run-all.sh" > "$T/run-all-raw.sh"
+assert_true "run-all.sh's real pkill lines stay guarded: made raw they are flagged (the echo skip must not blind the guard to them)" \
+  [ "$(flagged_lines "$T/run-all-raw.sh" | wc -l | tr -d ' ')" -ge 2 ]
 assert_true "guard accepts workdir_kill_pattern lines, comments and pkill -P" \
   [ -z "$(flagged_lines "$T/good.sh")" ]
 assert_true "an un-allowlisted file with a raw line is reported" \

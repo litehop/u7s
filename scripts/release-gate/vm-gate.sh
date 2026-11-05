@@ -361,9 +361,9 @@ run_overload() {
     [ $(( $(date +%s) - c0 )) -lt 5 ] && sleep $(( 5 - ($(date +%s) - c0) ))
   done
   res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
-  fin="$(k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
+  fin="$(K_TIMEOUT=10 k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
     | awk '{c[$1]++; r += $2} END {for (p in c) printf "%s=%d ", p, c[p]; printf "restarts=%d", r}')"
-  res overload_final "node=$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) overload-pods: $fin"
+  res overload_final "node=$(K_TIMEOUT=10 k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) overload-pods: $fin"
   log "overload: recovery_secs=$(rg_get "$OUT/results.env" recovery_secs) final: $(rg_get "$OUT/results.env" overload_final)"
   write_tally
 }

@@ -152,8 +152,10 @@ sed '/\[ "\$moved" != "\$dead" \]/,/^  fi$/d' "$REAL_SCRIPT" > "$TMP/norecheck.s
 assert_true "mutation copy really drops the owner re-check" not cmp -s "$TMP/norecheck.sh" "$REAL_SCRIPT"
 rm -f "$LOCK7"; ln -s "$dead" "$LOCK7"
 rc=0
-input_for "$repo7" agent-race2 | U7S_TEST_RECLAIM_HOOK="bash $TMP/race-hook.sh" U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=1 bash "$TMP/norecheck.sh" > /dev/null 2>&1 || rc=$?
+input_for "$repo7" agent-race2 | U7S_TEST_RECLAIM_HOOK="bash $TMP/race-hook.sh; touch $TMP/mutant-reclaimed" U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=1 bash "$TMP/norecheck.sh" > "$TMP/mutant.out" 2>&1 || rc=$?
 assert_true "test detects the steal when the owner re-check is removed" not [ "$(readlink "$LOCK7" 2>/dev/null || true)" = "$live" ]
+assert_true "mutant removed the live lock via the reclaim path, not an unrelated failure (else the detection above proves nothing)" [ -e "$TMP/mutant-reclaimed" -a "$rc" -eq 0 ]
+assert_true "mutant did not just time out on the live lock" not grep -q 'timed out' "$TMP/mutant.out"
 
 # release must not remove a lock another process now owns.
 repo8=$(new_repo foreign)

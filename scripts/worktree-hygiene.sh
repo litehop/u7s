@@ -10,11 +10,11 @@
 # to run at all without EITHER this or --no-live-workers below (see main()):
 # dir-existence and merge-state checks alone already proved insufficient to
 # tell a live worker's branch/worktree apart from a genuinely stale one, and
-# STEP A/C/D/F are destructive (process kill, branch delete).
+# STEP A/C/D/F/G are destructive (process kill, branch/worktree delete).
 #
 # --no-live-workers: an affirmative alternative to --live-agents for the
 # idle state -- the caller has confirmed via ListAgents that ZERO
-# worker/agent-* subagents are running, so STEP A/C/D/F run with an empty
+# worker/agent-* subagents are running, so STEP A/C/D/F/G run with an empty
 # live-protection set. Mutually exclusive with --live-agents (passing both
 # is a usage error). Deliberately distinct from an empty/omitted
 # --live-agents value, which still refuses to run (see main()) -- without
@@ -24,15 +24,15 @@
 # defeat this script's only reap opportunity while zero workers are running.
 # STEP C's merge-state and open-PR guards (is_unmerged_by_patch_id,
 # has_open_pr, has_live_worktree_dir, is_checked_out) already run
-# independent of LIVE_AGENTS' contents, so --no-live-workers only waives
-# the live-agent protection dimension there -- it never lowers the
-# staleness bar those checks enforce. STEP D needs no equivalent guard for
-# the same result: it only ever considers branches whose tracked upstream
-# is literally `[gone]`, and an open PR (or any other live reference) keeps
-# the remote ref alive, so such a branch can never enter STEP D's candidate
-# set in the first place -- this is a scope argument, not a guard STEP D
-# re-runs (it does NOT call has_open_pr/is_unmerged_by_patch_id itself; see
-# STEP D below).
+# independent of LIVE_AGENTS' contents (STEP D runs has_open_pr and
+# is_checked_out), so --no-live-workers only waives the live-agent
+# protection dimension there -- it never lowers the staleness bar those
+# checks enforce.
+#
+# gh outage: steps C/D/F load the open-PR set via `gh` and return 1 on
+# failure; main() runs them without `|| rc=1`, so under `set -e` the tick
+# aborts before E/G/H and STEP H's audit status is not reported. Fail-safe
+# (nothing is deleted without the open-PR set) but noisy.
 #
 # STEP A: kill host-side `u7s-apiserver`/`u7s-scheduler`/`konnectivity-server`/
 #   `sample-run-metrics.sh` processes left running after their worktree was
@@ -147,7 +147,7 @@ run_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# --live-agents liveness guard, shared by STEP A/C/D/F. The mayor's own
+# --live-agents liveness guard, shared by STEP A/C/D/F/G. The mayor's own
 # ListAgents call is the ONLY reliable signal that an in-process worker
 # sub-agent is still running: a sub-agent cannot call ListAgents on itself,
 # and `claude agents --json` doesn't enumerate in-process subagents (both
@@ -919,14 +919,14 @@ main() {
   fi
 
   if [ "$no_live_workers" -eq 1 ]; then
-    # Affirmative idle-state declaration: run STEP A/C/D/F with an empty
+    # Affirmative idle-state declaration: run STEP A/C/D/F/G with an empty
     # live-protection set. This does NOT lower the staleness bar: STEP C's
     # merge-state and open-PR guards apply regardless of LIVE_AGENTS'
     # contents (see the file header), so a branch with an open, unmerged
     # PR is still preserved by STEP C even with zero live workers. STEPs D, F
     # and G apply the same open-PR guard.
     LIVE_AGENTS=""
-  # Fail-safe, not a default: STEP A/C/D/F are destructive (process kill,
+  # Fail-safe, not a default: STEP A/C/D/F/G are destructive (process kill,
   # branch delete), and dir-existence/merge-state alone already proved
   # insufficient to distinguish a live worker from a stale one (the bug
   # this script exists to close). Refusing outright on a missing flag --
@@ -941,7 +941,7 @@ main() {
   # and must still refuse -- --no-live-workers above is the only way to
   # affirmatively declare zero live workers.
   elif [ "$live_agents_provided" -ne 1 ] || [ -z "$(normalize_live_agents "$LIVE_AGENTS")" ]; then
-    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> (non-empty after trimming whitespace) or --no-live-workers is required. Without one there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D/F are destructive." >&2
+    echo "worktree-hygiene: refusing to run -- --live-agents <comma-separated-agent-ids> (non-empty after trimming whitespace) or --no-live-workers is required. Without one there is no way to tell a live worker's branch/worktree apart from a stale one, and STEP A/C/D/F/G are destructive." >&2
     exit 2
   fi
 

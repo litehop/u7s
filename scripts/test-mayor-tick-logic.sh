@@ -1479,6 +1479,61 @@ assert "...and the merged PR is recorded in merged_prs, proving the cleanup path
   "$([ "$(jq -c '.merged_prs' "$TICK_STATE")" = "[7777]" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 22b. The checkout refresh must not depend on a worker worktree still
+#      existing: the mayor may remove worktrees before their PR merges, and the
+#      tick would then keep running a stale copy of itself.
+# ---------------------------------------------------------------------------
+
+build_scratch_repo
+NW_REPO="$SCRATCH_REPO"
+NW_ORIGIN="$(dirname "$NW_REPO")/origin.git"
+NW_ADVANCER="$(dirname "$NW_REPO")/advancer"
+git init -q --bare -b main "$NW_ORIGIN"
+git -C "$NW_REPO" branch -M main
+git -C "$NW_REPO" remote add origin "$NW_ORIGIN"
+git -C "$NW_REPO" push -q -u origin main 2>/dev/null
+git clone -q -b main "$NW_ORIGIN" "$NW_ADVANCER" 2>/dev/null
+git -C "$NW_ADVANCER" config user.email test@example.com
+git -C "$NW_ADVANCER" config user.name "Test"
+git -C "$NW_ADVANCER" commit -q --allow-empty -m "PR lands on origin main"
+git -C "$NW_ADVANCER" push -q origin HEAD:main 2>/dev/null
+NW_ORIGIN_SHA=$(git -C "$NW_ADVANCER" rev-parse HEAD)
+invoke_tick "$STUB_MERGED_BIN" "$NW_REPO" 0
+assert "with no worker worktree at all, the checkout still fast-forwards to origin main (else the tick keeps running a stale copy of itself)" \
+  "$([ "$(git -C "$NW_REPO" rev-parse HEAD)" = "$NW_ORIGIN_SHA" ] && echo 1 || echo 0)"
+
+git -C "$NW_ADVANCER" commit -q --allow-empty -m "second PR lands"
+git -C "$NW_ADVANCER" push -q origin HEAD:main 2>/dev/null
+NW_ORIGIN_SHA2=$(git -C "$NW_ADVANCER" rev-parse HEAD)
+NW_ORDER_BIN="$WORKDIR/stub-order-bin"
+mkdir -p "$NW_ORDER_BIN"
+cat > "$NW_ORDER_BIN/gh" <<EOF
+#!/bin/bash
+[ -s "$WORKDIR/first-gh-head" ] || git -C "$NW_REPO" rev-parse HEAD > "$WORKDIR/first-gh-head"
+exec "$STUB_MERGED_BIN/gh" "\$@"
+EOF
+chmod +x "$NW_ORDER_BIN/gh"
+invoke_tick "$NW_ORDER_BIN" "$NW_REPO" 0
+assert "the checkout is fast-forwarded before the tick's first gh call, so gating and bead closing run on fresh state, not a stale copy" \
+  "$([ "$(cat "$WORKDIR/first-gh-head")" = "$NW_ORIGIN_SHA2" ] && echo 1 || echo 0)"
+
+git -C "$NW_REPO" remote set-url origin "$WORKDIR/no-such-origin.git"
+git -C "$NW_ADVANCER" commit -q --allow-empty -m "unreachable"
+invoke_tick "$STUB_MERGED_BIN" "$NW_REPO" 0
+assert "an offline fetch only warns: exit 0 and no checkout-pull-blocked, since nothing could be pulled anyway" \
+  "$([ "$TICK_RC" -eq 0 ] && [ "$(jq -c '[.queue_warnings[]? | select(.reason=="checkout-pull-blocked")] | length' "$TICK_STATE")" = 0 ] && echo 1 || echo 0)"
+git -C "$NW_REPO" remote set-url origin "$NW_ORIGIN"
+
+mkdir -p "$NW_REPO/.beads"
+echo regenerated > "$NW_REPO/.beads/issues.jsonl"
+git -C "$NW_REPO" add -f .beads/issues.jsonl
+git -C "$NW_REPO" commit -q -m "track beads jsonl"
+echo local-regen > "$NW_REPO/.beads/issues.jsonl"
+invoke_tick "$STUB_MERGED_BIN" "$NW_REPO" 0
+assert "an up-to-date checkout leaves a regenerated bead JSONL alone: it is only discarded when a pull actually needs the path" \
+  "$([ "$(cat "$NW_REPO/.beads/issues.jsonl")" = "local-regen" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 23. A merged worker PR whose bead-snapshot commit touches a path the mayor
 #     checkout holds a local edit of. bd regenerates .beads/issues.jsonl on
 #     every write, so that path must be discarded and the pull must land;
@@ -1538,6 +1593,17 @@ mkdir -p "$FF_REPO/.beads"
 echo base > "$FF_REPO/.beads/issues.jsonl"
 git -C "$FF_REPO" add .beads/issues.jsonl
 git -C "$FF_REPO" commit -q -m "track beads jsonl"
+LK_ORIGIN="$(dirname "$FF_REPO")/origin.git"; LK_ADV="$(dirname "$FF_REPO")/advancer"
+git init -q --bare -b main "$LK_ORIGIN"
+git -C "$FF_REPO" branch -M main
+git -C "$FF_REPO" remote add origin "$LK_ORIGIN"
+git -C "$FF_REPO" push -q -u origin main 2>/dev/null
+git clone -q -b main "$LK_ORIGIN" "$LK_ADV" 2>/dev/null
+git -C "$LK_ADV" config user.email test@example.com
+git -C "$LK_ADV" config user.name "Test"
+echo upstream > "$LK_ADV/.beads/issues.jsonl"
+git -C "$LK_ADV" commit -q -am "snapshot lands on origin main"
+git -C "$LK_ADV" push -q origin HEAD:main 2>/dev/null
 echo regenerated > "$FF_REPO/.beads/issues.jsonl"
 touch "$FF_REPO/.git/index.lock"
 invoke_tick "$STUB_MERGED_BIN" "$FF_REPO" 0
