@@ -500,6 +500,15 @@ assert "a probe step returns the probe's status and logs '<epoch> <name> <rc> <s
   "$([ "$rc" = 3 ] && awk '$2 == "node" && $3 == 3 && $4 >= 1 && $1 > 1000000000 { f = 1 } END { exit !f }' "$PL" && echo 1 || echo 0)"
 rc=0; rg_probe_step "$PL" readyz true || rc=$?
 assert "a passing probe step logs rc 0" "$([ "$rc" = 0 ] && tail -n 1 "$PL" | awk '$2 == "readyz" && $3 == 0 { f = 1 } END { exit !f }' && echo 1 || echo 0)"
+PT="$TMP/pt.rec"; : > "$PT"
+# shellcheck disable=SC2329
+k() { echo "k ${K_TIMEOUT-unset}" >> "$PT"; case "$*" in "get node"*) echo True ;; esac; }
+# shellcheck disable=SC2329
+wp_code() { echo "wp ${WP_TIMEOUT-unset}" >> "$PT"; echo 200; }
+NODE=n1; rc=0; rg_probe_cycle "$TMP/pc.log" 0 || rc=$?
+assert "every probe call in a cycle carries RG_PROBE_TIMEOUT: an unbounded call lets one hung API server stretch the cycle past the max gap so recovery is never observed" \
+  "$([ "$rc" = 0 ] && [ "$(sort "$PT" | uniq -c | tr -s ' ' | tr '\n' ';')" = " 2 k $RG_PROBE_TIMEOUT; 1 wp $RG_PROBE_TIMEOUT;" ] && echo 1 || echo 0)"
+unset -f k wp_code
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
 assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \

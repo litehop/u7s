@@ -479,6 +479,20 @@ rg_probe_step() {
   return "$rc"
 }
 
+# Each probe bounds its own call (k honours K_TIMEOUT, wp_code honours WP_TIMEOUT) so a hung API
+# server or ingress cannot stretch a cycle past RG_PROBE_MAX_GAP. Needs k, wp_code, $NODE.
+probe_node_ready() { [ "$(K_TIMEOUT=$RG_PROBE_TIMEOUT k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
+probe_readyz() { K_TIMEOUT=$RG_PROBE_TIMEOUT k get --raw /readyz >/dev/null 2>&1; }
+probe_wordpress() { case "$(WP_TIMEOUT=$RG_PROBE_TIMEOUT wp_code)" in 200|301|302) true ;; *) false ;; esac; }
+
+# One recovery probe cycle: logs each step to probe log $1, returns 0 only when node Ready AND
+# /readyz AND (unless $2 = 1, no workload) WordPress all pass.
+rg_probe_cycle() {
+  rg_probe_step "$1" node probe_node_ready \
+    && rg_probe_step "$1" readyz probe_readyz \
+    && { [ "$2" = 1 ] || rg_probe_step "$1" wordpress probe_wordpress; }
+}
+
 # Recovery probe log: "<epoch> <1|0>" per probe, 1 = node Ready AND API /readyz AND WordPress 200
 # (WordPress only when deployed). Prints seconds from $2 (overload start) to the first probe of a
 # streak of 1s that lasted at least $3 seconds, or "none". A 0, or a gap above $4 seconds between

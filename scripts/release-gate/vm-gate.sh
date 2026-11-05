@@ -37,7 +37,7 @@ res() {
   mv "$OUT/results.tmp" "$OUT/results.env"
 }
 phase() { { echo "# $(cat "$OUT/phase" 2>/dev/null)"; cat "$OUT/burst-progress.log" 2>/dev/null; } >> "$OUT/burst-progress.hist"; : > "$OUT/burst-progress.log"; echo "$1" > "$OUT/phase"; log "phase: $1"; }
-k() { timeout "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
+k() { timeout -k 1 "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
 # Scales deployment rg-burst to $1 replicas; echoes seconds until all Ready or "timeout".
@@ -343,10 +343,6 @@ fi
 # Scales rg-overload to OVERLOAD_PODS and probes every 5 s until node Ready + API /readyz + WordPress 200
 # have held RECOVERY_HOLD_SECS, or OVERLOAD_WINDOW_SECS pass. The overload pods stay: a user's overload
 # does not go away on its own.
-probe_node_ready() { [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
-probe_readyz() { k get --raw /readyz >/dev/null 2>&1; }
-probe_wordpress() { case "$(WP_TIMEOUT=$RG_PROBE_TIMEOUT wp_code)" in 200|301|302) true ;; *) false ;; esac; }
-
 run_overload() {
   local t0 c0 ok fin
   phase overload
@@ -356,19 +352,15 @@ run_overload() {
   : > "$OUT/recovery.log"
   k scale deployment/rg-overload --replicas="$OVERLOAD_PODS" >/dev/null 2>&1
   : > "$OUT/probes.log"
-  K_TIMEOUT=$RG_PROBE_TIMEOUT
   while [ $(( $(date +%s) - t0 )) -lt "$OVERLOAD_WINDOW_SECS" ]; do
     c0="$(date +%s)"
     ok=0
-    if rg_probe_step "$OUT/probes.log" node probe_node_ready \
-      && rg_probe_step "$OUT/probes.log" readyz probe_readyz \
-      && { [ "$NO_WORKLOAD" = 1 ] || rg_probe_step "$OUT/probes.log" wordpress probe_wordpress; }; then ok=1; fi
+    if rg_probe_cycle "$OUT/probes.log" "$NO_WORKLOAD"; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
     [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
     [ $(( $(date +%s) - c0 )) -lt 5 ] && sleep $(( 5 - ($(date +%s) - c0) ))
   done
   res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
-  K_TIMEOUT=10
   fin="$(k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
     | awk '{c[$1]++; r += $2} END {for (p in c) printf "%s=%d ", p, c[p]; printf "restarts=%d", r}')"
   res overload_final "node=$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) overload-pods: $fin"
@@ -444,6 +436,7 @@ run_full() {
 }
 
 snap pre-burst
+# Guest clock; quiet.log is host clock, so a few seconds of skew only shifts the judged boundary.
 res load_t0 "$(date +%s)"
 if [ "$OVERLOAD_PODS" -gt 0 ]; then run_overload; elif [ -n "$RAMP" ]; then run_ramp; else run_full; fi
 
