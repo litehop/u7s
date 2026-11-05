@@ -19,9 +19,11 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
-INSTALL_TARBALL=""; INSTALL_ONLY=0
+INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
+RG_WEDGE_SECS="$WEDGE_SECS"
+RG_JIFFIES_PER_SEC=$(( $(nproc 2>/dev/null || echo 1) * 100 ))
 
 mkdir -p "$OUT"
 : > "$OUT/results.env"
@@ -45,10 +47,12 @@ run_burst() {
   k scale deployment/rg-burst --replicas="$n" >/dev/null 2>&1
   while :; do
     now="$(date +%s)"
+    if [ -e "$OUT/wedge.txt" ]; then echo wedge; return; fi
     if [ $((now - start)) -ge "$HARD_KILL_SECS" ]; then echo timeout; return; fi
     exec 3< <(exec timeout $((HARD_KILL_SECS - (now - start))) kubectl --kubeconfig "$KCFG" \
       get deployment rg-burst -w -o jsonpath='{.status.readyReplicas}{"\n"}' 2>/dev/null)
     wpid=$!
+    echo "$wpid" > "$OUT/burst-watch.pid"
     if rg_wait_ready "$n" <&3; then
       kill "$wpid" 2>/dev/null; exec 3<&-
       echo $(( $(date +%s) - start )); return
@@ -131,6 +135,29 @@ wait_node_ready() {
   return 1
 }
 
+# While a burst phase runs, checks every 5 s whether the guest has wedged (rg_wedge_reason from
+# node-ready.log and the sampler's STAT rows: no new processes beyond one awk pass over the
+# sampler's last rows). On a wedge writes wedge.txt and kills the burst watch so run_burst returns.
+wedge_monitor() {
+  local why
+  while [ ! -e "$OUT/watch-stop" ]; do
+    sleep 5
+    case "$(cat "$OUT/phase" 2>/dev/null)" in burst*) ;; *) continue ;; esac
+    why="$(rg_wedge_reason "$(date +%s)" "$OUT/node-ready.log" <(tail -n 4000 "$OUT/attrib.tsv"))"
+    [ -n "$why" ] || continue
+    echo "$why" > "$OUT/wedge.txt"
+    kill "$(cat "$OUT/burst-watch.pid" 2>/dev/null)" 2>/dev/null
+    return
+  done
+}
+
+# Run after a wedged burst: the guest is barely answering, so keep each kubectl short.
+note_wedge() {
+  K_TIMEOUT=10
+  res wedge_reason "$(cat "$OUT/wedge.txt")"
+  log "WEDGE: $(cat "$OUT/wedge.txt"); aborting the burst and collecting evidence"
+}
+
 # Node tally and run-wide steal as observed so far. Rewritten after each burst and at collect.
 write_tally() {
   local oomh oomk
@@ -178,11 +205,11 @@ fi
 phase install
 CPU_RUN0="$(head -1 /proc/stat)"
 calibrate_boundary
-WATCH_PID=""; CAPTURE_PID=""
+WATCH_PID=""; CAPTURE_PID=""; MONITOR_PID=""
 stop_bg() {
   touch "$OUT/watch-stop"
   [ -n "$WATCH_PID" ] && pkill -P "$WATCH_PID" 2>/dev/null
-  kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID 2>/dev/null
+  kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID $MONITOR_PID 2>/dev/null
 }
 trap stop_bg EXIT
 bash "$RG/vm-sampler.sh" "$OUT" 5 </dev/null >> "$OUT/sampler.log" 2>&1 &
@@ -225,6 +252,7 @@ res watch_t0 "$WATCH_T0"
     sleep 5
   done ) &
 WATCH_PID=$!
+wedge_monitor & MONITOR_PID=$!
 [ "$CAPTURE" = 1 ] && { bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 5 & CAPTURE_PID=$!; }
 if [ "$COREDNS_REQ" = 1 ]; then
   k -n kube-system set resources deployment/coredns --requests=cpu=100m,memory=70Mi >> "$OUT/run.log" 2>&1
@@ -300,6 +328,7 @@ run_ramp() {
     t0="$(date +%s)"
     phase "burst$n"
     secs="$(run_burst "$n")"; log "$n-pod burst: $secs s"
+    if [ "$secs" = wedge ]; then res "ramp_${n}_secs" wedge; note_wedge; break; fi
     snap "burst$n"
     burst_cleanup; phase "settle$n"; wait_node_ready || log "node not Ready after $n-pod burst"
     sleep "$SETTLE_STEP"
@@ -320,6 +349,7 @@ run_ramp() {
 run_full() {
   phase burst20
   b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
+  if [ "$b20" = wedge ]; then note_wedge; return; fi
   snap burst20
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
   record_uids
@@ -327,6 +357,7 @@ run_full() {
 
   phase burstn
   bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
+  if [ "$bn" = wedge ]; then note_wedge; return; fi
   snap burstn
   burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
   record_uids

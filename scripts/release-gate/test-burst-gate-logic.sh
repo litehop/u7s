@@ -735,7 +735,7 @@ printf '100 True\n200 False\n300 unreachable\n' > "$TMP/dead-nr.log"
 rg_fill_tally "$TMP/dead.env" "$TMP/dead-nr.log"
 verdict_of "$TMP/dead.env"
 assert "dead run: observed not-Ready evidence replaces 'missing' in criterion (b) (1 observation after watch start, final=unreachable)" \
-  "$(echo "$V_OUT" | grep -E '^FAIL +\(b\)' | grep -q 'observations=1, final=unreachable' && echo 1 || echo 0)"
+  "$(grep -qE '^FAIL +\(b\).*observations=1, final=unreachable' <<< "$V_OUT" && echo 1 || echo 0)"
 assert "dead run: the verdict says the tally was rebuilt and OOM counts are unknown, not silently green" \
   "$(echo "$V_OUT" | grep -q 'OOM counts unknown' && echo 1 || echo 0)"
 good | grep -vE '^(notready_events|node_ready_final)=' > "$TMP/dead2.env"
@@ -758,6 +758,75 @@ OUT="$TMP/resout"; mkdir -p "$OUT"; : > "$OUT/results.env"
 set +e; res oom_host 0; res notready_events 0; res oom_host 2; set -e
 assert "res replaces a key: the final tally must override the partial one (rg_get reads the first match)" \
   "$([ "$(rg_get "$OUT/results.env" oom_host)" = 2 ] && [ "$(grep -c '^oom_host=' "$OUT/results.env")" = 1 ] && [ "$(rg_get "$OUT/results.env" notready_events)" = 0 ] && echo 1 || echo 0)"
+
+# --- wedge detection: a wedged burst must end in ~60 s, not after the 600 s hard kill ---
+NOW=10000
+wedge() { RG_WEDGE_SECS="${W:-60}" rg_wedge_reason "$NOW" "$1" "${2:-/dev/null}"; }
+printf '%s True\n%s False\n' $((NOW - 500)) $((NOW - 60)) > "$TMP/wn1.log"
+assert "node not Ready for exactly 60 s is a wedge (abort within the ~60-90 s budget)" \
+  "$(wedge "$TMP/wn1.log" | grep -qx 'node Ready=False for 60s' && echo 1 || echo 0)"
+printf '%s True\n%s False\n' $((NOW - 500)) $((NOW - 59)) > "$TMP/wn2.log"
+assert "node not Ready for 59 s is not yet a wedge (a brief flap must not kill a passing run)" "$([ -z "$(wedge "$TMP/wn2.log")" ] && echo 1 || echo 0)"
+printf '%s True\n%s Unknown\n%s unreachable\n%s unreachable\n' $((NOW - 500)) $((NOW - 90)) $((NOW - 40)) $((NOW - 5)) > "$TMP/wn3.log"
+assert "the not-Ready run is timed from its first observation and an unreachable API is named as such" \
+  "$(wedge "$TMP/wn3.log" | grep -qx 'API unreachable for 90s' && echo 1 || echo 0)"
+printf '%s True\n%s False\n%s True\n' $((NOW - 500)) $((NOW - 200)) $((NOW - 100)) > "$TMP/wn4.log"
+assert "a node that recovered (trailing True) is not a wedge: only a current outage aborts" "$([ -z "$(wedge "$TMP/wn4.log")" ] && echo 1 || echo 0)"
+assert "RG_WEDGE_SECS=0 disables detection (--wedge-secs 0 for deliberate long-stall studies)" "$([ -z "$(W=0 wedge "$TMP/wn1.log")" ] && echo 1 || echo 0)"
+: > "$TMP/empty.log"
+stat_rows() { # <iowait jiffies per 5 s sample> <samples> <last-ts>
+  local i
+  for i in $(seq 0 $(($2 - 1))); do printf '%s\tburstn\tSTAT\t10\t10\t%s\t0\n' $(($3 - (($2 - 1 - i)) * 5)) $(( i * $1 )); done
+}
+stat_rows 475 14 $((NOW - 2)) > "$TMP/io95.tsv"
+assert "95% iowait over the last 60 s is a wedge even while the node still reports Ready (the 94%-iowait hang)" \
+  "$(wedge "$TMP/empty.log" "$TMP/io95.tsv" | grep -q '^iowait 9[0-9]% over the last 6[0-9]s$' && echo 1 || echo 0)"
+stat_rows 250 14 $((NOW - 2)) > "$TMP/io50.tsv"
+assert "50% iowait is a slow burst, not a wedge: do not abort a run that could still pass" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/io50.tsv")" ] && echo 1 || echo 0)"
+stat_rows 475 14 $((NOW - 100)) > "$TMP/iostale.tsv"
+assert "stale sampler rows (older than the window) judge nothing" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/iostale.tsv")" ] && echo 1 || echo 0)"
+stat_rows 475 5 $((NOW - 2)) > "$TMP/ioshort.tsv"
+assert "high iowait seen for only 20 s is not a wedge (window not covered)" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/ioshort.tsv")" ] && echo 1 || echo 0)"
+
+# --- ramp stops at the first failing step, wedge or not ---
+eval "$(sed -n '/^res() {/,/^}/p;/^run_ramp() {/,/^}/p;/^note_wedge() {/,/^}/p' "$HERE/vm-gate.sh")"
+ramp_run() { # <burst outcomes "30=20 40=wedge ...">; sets RAN, leaves OUT/results.env
+  OUT="$TMP/ro-$1"; rm -rf "$OUT"; mkdir -p "$OUT"; echo install_ok=1 > "$OUT/results.env"; : > "$OUT/ran"; : > "$OUT/node-ready.log"
+  OUTCOMES="$2"; RAMP="30,40,50,60"; SETTLE_STEP=0; NODE=n; export OUT
+  phase() { :; }; log() { :; }; snap() { echo "snap $1" >> "$OUT/ran"; }; burst_cleanup() { :; }; wait_node_ready() { :; }
+  record_uids() { :; }; oom_since() { echo "0 0"; }; k() { echo True; }; wp_ok_poll() { echo 1; }; marker_ok() { echo 1; }; write_tally() { :; }
+  run_burst() {
+    echo "burst $1" >> "$OUT/ran"
+    local o v
+    for o in $OUTCOMES; do
+      [ "${o%%=*}" = "$1" ] || continue
+      v="${o#*=}"; [ "$v" != wedge ] || echo wedge > "$OUT/wedge.txt"
+      echo "$v"
+    done
+  }
+  set +e; run_ramp; set -e
+  RAN="$(grep '^burst' "$OUT/ran" | cut -d' ' -f2 | tr '\n' ' ')"
+}
+ramp_run ok "30=20 40=20 50=20 60=20"
+assert "ramp sanity: with every step passing all four sizes run" "$([ "$RAN" = "30 40 50 60 " ] && echo 1 || echo 0)"
+ramp_run slow "30=20 40=timeout 50=20 60=20"
+assert "ramp stops at the first failing step (40 hit the probe hard-kill): 50/60 never run, no wasted climb" \
+  "$([ "$RAN" = "30 40 " ] && echo 1 || echo 0)"
+ramp_run wedge "30=20 40=wedge 50=20 60=20"
+assert "a wedged step ends the ramp at once: recorded as ramp_40_secs=wedge with the reason" \
+  "$([ "$RAN" = "30 40 " ] && [ "$(rg_get "$OUT/results.env" ramp_40_secs)" = wedge ] && rg_get "$OUT/results.env" wedge_reason | grep -q . && echo 1 || echo 0)"
+assert "a wedged step runs no scale-down/settle/snapshot on the dead guest (they would burn minutes)" \
+  "$(grep -q 'snap burst40' "$OUT/ran" && echo 0 || echo 1)"
+rg_ramp_verdict "$OUT/results.env" "30 40 50 60" /dev/null > "$TMP/wedge.ramp" || true
+assert "ramp verdict keeps 30 as the candidate and names the wedge" \
+  "$(grep -q 'candidate N=30' "$TMP/wedge.ramp" && grep -q 'WEDGE, burst aborted early' "$TMP/wedge.ramp" && echo 1 || echo 0)"
+good | sed 's/^burst_secs=140/burst_secs=wedge/' > "$TMP/wedge-full.env"; echo "wedge_reason=API unreachable for 61s" >> "$TMP/wedge-full.env"
+verdict_of "$TMP/wedge-full.env"
+assert "a wedged full run FAILs (c) and the verdict says why" \
+  "$([ "$V_RC" != 0 ] && echo "$V_OUT" | grep -qE '^FAIL +\(c\)' && echo "$V_OUT" | grep -q 'WEDGE: burst aborted early, API unreachable for 61s' && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --wedge-secs x --tarball-dir "$TMP/tb" --out "$TMP/out-ws" >/dev/null 2>&1 || rc=$?
+assert "--wedge-secs x rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+assert "--wedge-secs reaches the VM env" "$(gate_env ws --wedge-secs 90 | grep -qx 'WEDGE_SECS=90' && echo 1 || echo 0)"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
