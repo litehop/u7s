@@ -111,6 +111,11 @@ assert_true "u7s-kcm.service delegates authorization to the apiserver (SubjectAc
 kcm_unit="$(awk '/^cat > \/etc\/systemd\/system\/u7s-kcm.service/,/^EOF$/' "$INSTALL")"
 assert_true "u7s-kcm.service sets StartLimitIntervalSec=0 -- KCM exits until the apiserver publishes extension-apiserver-authentication, and systemd's default 5 starts/10s would leave it failed for good" \
   grep -qx 'StartLimitIntervalSec=0' <<<"$kcm_unit"
+assert_true "u7s-kcm.service runs at OOMScoreAdjust=-997 so the control plane outlives pods under node OOM (kubeadm static pods are node-critical)" \
+  grep -qx 'OOMScoreAdjust=-997' <<<"$kcm_unit"
+apiserver_unit="$(awk '/^cat > \/etc\/systemd\/system\/u7s-apiserver.service/,/^EOF$/' "$INSTALL")"
+assert_true "u7s-apiserver.service (apiserver+scheduler) runs at OOMScoreAdjust=-997 so the control plane outlives pods under node OOM" \
+  grep -qx 'OOMScoreAdjust=-997' <<<"$apiserver_unit"
 assert_true "install waits for kube-system/extension-apiserver-authentication before restarting u7s-kcm.service, so KCM does not start into its fatal lookup failure" \
   grep -qF 'wait_for_authentication_configmap "$STATE_DIR/kubeconfig"' "$INSTALL"
 cm_wait_line="$(grep -n '^wait_for_authentication_configmap "' "$INSTALL" | cut -d: -f1)"
