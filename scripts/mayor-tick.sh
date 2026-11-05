@@ -732,8 +732,8 @@ sync_checkout_to_main() {
 }
 
 extract_bead_ids() {
-  printf '%s' "$1" | { grep -oE '(^|[^A-Za-z0-9_-])mayor-[a-z0-9]+(\.[0-9]+)*' || true; } \
-    | sed -E 's/^[^m]*//' | sort -u
+  printf '%s' "$1" | { grep -oE '(^|[^A-Za-z0-9_-])mayor-[a-z0-9]{3,5}(\.[0-9]+)*($|[^A-Za-z0-9_-])' || true; } \
+    | sed -E 's/^[^m]*//; s/[^a-z0-9]+$//; /^mayor-tick$/d' | sort -u
 }
 
 # Beads close when their PR merges, but only if the worker declared the PR
