@@ -197,6 +197,9 @@ pull_pending_evidence() {
 }
 cleanup() {
   pull_pending_evidence
+  [ -z "${RUN_OUT:-}" ] || touch "$RUN_OUT/quiet.stop"
+  # shellcheck disable=SC2046
+  kill $(jobs -p) 2>/dev/null
   [ "$KEEP" = 1 ] && return
   local vm
   for vm in $VMS; do vm_delete "$vm"; done

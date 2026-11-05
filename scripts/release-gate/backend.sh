@@ -38,14 +38,16 @@ vm_create() {
 # 8 glibc arenas in the arm64 kubelet) that the GCP image does not; GCP's own agents are real
 # production cost and stay. The kubelet drop-in exists before install writes kubelet.service.
 # Host copy-in/out and shell go over ssh, so the guest agent is not needed.
-RG_LIMA_TRIM_UNITS="udisks2.service ModemManager.service multipathd.service multipathd.socket polkit.service lima-guestagent.service"
+RG_LIMA_TRIM_UNITS="udisks2.service ModemManager.service multipathd.service multipathd.socket polkit.service"
 vm_trim() {
   [ "$BACKEND" = lima ] || return 0
+  # lima-guestagent.service is a real file under /etc/systemd/system, which mask refuses to replace.
   # shellcheck disable=SC2086
   vm_shell "$1" sudo bash -c "
     install -d /etc/systemd/system/kubelet.service.d &&
     printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=1\n' > /etc/systemd/system/kubelet.service.d/10-gate-arenas.conf &&
-    systemctl mask --now $RG_LIMA_TRIM_UNITS"
+    systemctl mask --now $RG_LIMA_TRIM_UNITS &&
+    systemctl disable --now lima-guestagent.service"
 }
 
 vm_shell() {

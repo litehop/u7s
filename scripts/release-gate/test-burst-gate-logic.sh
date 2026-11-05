@@ -828,6 +828,9 @@ for _ in $(seq 1 100); do grep -q 'vm-gate.sh' "$LIMA_CALLS" 2>/dev/null && brea
 kill -TERM "$gpid" 2>/dev/null; wait "$gpid" 2>/dev/null || true
 assert "SIGTERM (host cap) mid-run pulls /var/tmp/rg/out from the VM before deleting it, or a killed run leaves no evidence" \
   "$(grep -q 'copy -r u7s-rg-.*:/var/tmp/rg/out' "$LIMA_CALLS" && [ "$(cat "$TMP"/out-term/*run-1/out/run.log 2>/dev/null)" = 'wedge evidence' ] && awk '/copy -r .*:\/var\/tmp\/rg\/out/ {c = NR} /delete/ {d = NR} END {exit !(c && d && c < d)}' "$LIMA_CALLS" && echo 1 || echo 0)"
+sleep 3
+assert "a SIGTERMed gate leaves no background subshell behind (the quiet-sample loop otherwise loops forever as an orphan)" \
+  "$(ps -axo command | grep -F -- "--out $TMP/out-term" | grep -qv grep && echo 0 || echo 1)"
 printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"
 
 # --- ramp stops at the first failing step, wedge or not ---
@@ -876,10 +879,12 @@ printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 0\n' > "$TMP/bin/limactl"
 (BACKEND=lima; . "$HERE/backend.sh"; vm_trim u7s-rg-x)
 trim_call="$(cat "$LIMA_CALLS")"
 trim_ok=1
-for u in udisks2 ModemManager multipathd multipathd.socket polkit lima-guestagent; do
+for u in udisks2 ModemManager multipathd multipathd.socket polkit; do
   echo "$trim_call" | grep -q "mask --now .*$u" || trim_ok=0
 done
-assert "Lima trim masks every Lima-only/oversized daemon (each left running costs 7-22 MiB of a 1 GiB node and makes Lima knees pessimistic vs GCP)" "$trim_ok"
+echo "$trim_call" | grep -q 'disable --now lima-guestagent' || trim_ok=0
+echo "$trim_call" | grep 'mask --now' | grep -q 'lima-guestagent' && trim_ok=0
+assert "Lima trim masks every oversized daemon and disables (not masks: it is a real unit file, mask fails live and aborts the trim) the guest agent; each left running costs 7-22 MiB of a 1 GiB node and makes Lima knees pessimistic vs GCP" "$trim_ok"
 assert "Lima trim sets MALLOC_ARENA_MAX=1 for kubelet before install (8 arm64 glibc arenas = 16 MiB)" \
   "$(echo "$trim_call" | grep -q 'kubelet.service.d' && echo "$trim_call" | grep -q 'MALLOC_ARENA_MAX=1' && echo 1 || echo 0)"
 : > "$LIMA_CALLS"
