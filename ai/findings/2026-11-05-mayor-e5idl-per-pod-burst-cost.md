@@ -3,7 +3,7 @@
 Bead: mayor-e5idl
 Date: 2026-11-05
 
-**Answer: PENDING (measurement in progress; numbers are appended per snapshot below).**
+**Answer: on GCP the steady per-pod cost is about 0.7-0.9 MiB/pod (kernel+slab 0.2-0.3, crio+kubelet PSS about 0.5), not 5, and the damage is transient: a 10 -> 20 pod ramp on a post-burst node took 3.5 min with about 4 GiB of page-cache refaults and a MariaDB restart, so the lever is limiting parallel sandbox creation and protecting hot pages, not crio/conmon tuning. Lima side was NOT measured (see below).**
 
 Method: release v0.4.3-snapshot.4, `burst-gate.sh --backend gcp --release v0.4.3-snapshot.4 --ramp 20 --keep`
 (WordPress+MariaDB, one gate 20-pod burst), so the baseline is POST-BURST, not fresh. Then the 20 gate pods
@@ -56,4 +56,8 @@ Transient: no snapshot caught a peak above settled by more than noise on MemAvai
 - Page cache attributed to pod cgroups swings 27-56 MiB between snapshots (shared pause image layers + churn), well above any per-pod anon.
 
 ## Lima u7s-vps-1g
-(pending)
+NOT MEASURED. The Lima gate waited for the host to clear (another worker's VM until 03:00Z), then
+`burst-gate.sh --backend lima --ramp 20 --keep` (no `--release`: lima rejects it and builds from the
+checkout, here main 1643cd95) aborted at 03:05Z during the arm64 build with `cosign not found on PATH -- it
+verifies kubectl`. Installing cosign on the host was not attempted and no Lima VM was created. Lima and GCP are
+therefore not compared. GCP is n=1 with a post-burst baseline; the snapshots do not capture conmon/pause PSS.
