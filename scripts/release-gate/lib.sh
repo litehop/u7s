@@ -96,6 +96,18 @@ rg_oom_victims() {
   done
 }
 
+# Kernel-log "Killed process" lines on stdin -> "<comm> <oom_score_adj> <anon-rss kB>" per victim.
+rg_oom_events() {
+  local line comm adj rss
+  while IFS= read -r line; do
+    case "$line" in *"Killed process "*) ;; *) continue ;; esac
+    comm="${line#*Killed process * (}"; comm="${comm%%)*}"
+    adj="${line##*oom_score_adj:}"; adj="${adj%% *}"
+    rss="${line#*anon-rss:}"; rss="${rss%%kB*}"
+    echo "$comm $adj $rss"
+  done
+}
+
 _rg_is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
 # Reads `kubectl get deployment -w -o jsonpath={.status.readyReplicas}` lines on stdin;

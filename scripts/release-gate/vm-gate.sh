@@ -401,6 +401,7 @@ k get pods -A -o wide > "$OUT/pods.txt" 2>&1
 k get events -A --field-selector reason=Evicted -o custom-columns=NS:.metadata.namespace,OBJ:.involvedObject.name --no-headers > "$OUT/evictions.txt" 2>/dev/null
 k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} restarts={.status.containerStatuses[*].restartCount} last={.status.containerStatuses[*].lastState.terminated.reason}{"\n"}{end}' > "$OUT/pod-restarts.txt" 2>&1
 rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
+rg_oom_events < "$OUT/kernel.log" > "$OUT/oom-events.txt"
 read -r oomh oomk <<< "$(rg_oom_counts < "$OUT/oom-victims.txt")"
 res oom_host "$oomh"
 res oom_kubesystem "$oomk"
