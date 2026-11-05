@@ -471,6 +471,16 @@ assert "a freeze bracketed by two OK probes is not 'held 120 s'; the streak rest
 assert "probes within the max gap keep a streak (slow-but-answering probes still count)" \
   "$({ for t in $(seq 1010 15 1130); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 10 ] && echo 1 || echo 0)"
 assert "no probes at all is not recovered" "$([ "$(rl)" = none ] && echo 1 || echo 0)"
+assert "a worst-case probe cycle (3 calls all timing out) fits the max gap: otherwise a starved-but-alive node can never be observed recovering" \
+  "$([ $((3 * RG_PROBE_TIMEOUT)) -le "$RG_PROBE_MAX_GAP" ] && echo 1 || echo 0)"
+assert "a slow-but-alive node answering every ~12 s (worst bounded cycle) is observed recovering" \
+  "$({ for t in $(seq 1012 $((3 * RG_PROBE_TIMEOUT)) 1180); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 "$RG_PROBE_MAX_GAP")" = 12 ] && echo 1 || echo 0)"
+PL="$TMP/probes.log"; : > "$PL"
+rc=0; rg_probe_step "$PL" node bash -c 'sleep 1; exit 3' || rc=$?
+assert "a probe step returns the probe's status and logs '<epoch> <name> <rc> <secs>' (slow probes must be visible after a run)" \
+  "$([ "$rc" = 3 ] && awk '$2 == "node" && $3 == 3 && $4 >= 1 && $1 > 1000000000 { f = 1 } END { exit !f }' "$PL" && echo 1 || echo 0)"
+rc=0; rg_probe_step "$PL" readyz true || rc=$?
+assert "a passing probe step logs rc 0" "$([ "$rc" = 0 ] && tail -n 1 "$PL" | awk '$2 == "readyz" && $3 == 0 { f = 1 } END { exit !f }' && echo 1 || echo 0)"
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
 assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \

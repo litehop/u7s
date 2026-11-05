@@ -459,6 +459,23 @@ rg_probe_and_record_marker_failure() {
   rg_record_marker_write_failure "$f" "$was_ready" "$arc" "$aout" "$prc" "$pout"
 }
 
+# Recovery probes are bounded so one cycle (node Ready, /readyz, WordPress: three calls, each
+# timing out as "not OK") plus its pacing sleep fits inside RG_PROBE_MAX_GAP. rg_recovery_secs
+# breaks a streak on a larger gap, so slower cycles could never show a starved node recovering.
+RG_PROBE_TIMEOUT=4
+RG_PROBE_MAX_GAP=15
+
+# Runs "$@" and appends "<epoch> <name> <rc> <secs>" to probe log $1, so slow probes stay visible
+# after the fact. Returns the command's status.
+rg_probe_step() {
+  local log="$1" name="$2" t0 rc=0
+  shift 2
+  t0="$(date +%s)"
+  "$@" || rc=$?
+  echo "$(date +%s) $name $rc $(( $(date +%s) - t0 ))" >> "$log"
+  return "$rc"
+}
+
 # Recovery probe log: "<epoch> <1|0>" per probe, 1 = node Ready AND API /readyz AND WordPress 200
 # (WordPress only when deployed). Prints seconds from $2 (overload start) to the first probe of a
 # streak of 1s that lasted at least $3 seconds, or "none". A 0, or a gap above $4 seconds between

@@ -19,7 +19,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=20; OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0
-OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=15
+OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=$RG_PROBE_MAX_GAP
 INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
@@ -282,7 +282,7 @@ MARIADB_READY=1
 kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; diag_pods mariadb-not-ready; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
-wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
+wp_code() { curl -s -o /dev/null -m "${WP_TIMEOUT:-10}" -w '%{http_code}' "http://$WP_IP/"; }
 for _ in $(seq 1 100); do wp_code >/dev/null; done
 log "wordpress warm-up GET / -> $(wp_code)"
 
@@ -343,22 +343,29 @@ fi
 # Scales rg-overload to OVERLOAD_PODS and probes every 5 s until node Ready + API /readyz + WordPress 200
 # have held RECOVERY_HOLD_SECS, or OVERLOAD_WINDOW_SECS pass. The overload pods stay: a user's overload
 # does not go away on its own.
+probe_node_ready() { [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
+probe_readyz() { k get --raw /readyz >/dev/null 2>&1; }
+probe_wordpress() { case "$(WP_TIMEOUT=$RG_PROBE_TIMEOUT wp_code)" in 200|301|302) true ;; *) false ;; esac; }
+
 run_overload() {
-  local t0 ok fin
+  local t0 c0 ok fin
   phase overload
   t0="$(date +%s)"
   res overload_t0 "$t0"; res overload_pods "$OVERLOAD_PODS"; res overload_mib "$OVERLOAD_MIB"
   res overload_window_secs "$OVERLOAD_WINDOW_SECS"; res recovery_hold_secs "$RECOVERY_HOLD_SECS"
   : > "$OUT/recovery.log"
   k scale deployment/rg-overload --replicas="$OVERLOAD_PODS" >/dev/null 2>&1
+  : > "$OUT/probes.log"
+  K_TIMEOUT=$RG_PROBE_TIMEOUT
   while [ $(( $(date +%s) - t0 )) -lt "$OVERLOAD_WINDOW_SECS" ]; do
+    c0="$(date +%s)"
     ok=0
-    if [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] \
-      && k get --raw /readyz >/dev/null 2>&1 \
-      && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
+    if rg_probe_step "$OUT/probes.log" node probe_node_ready \
+      && rg_probe_step "$OUT/probes.log" readyz probe_readyz \
+      && { [ "$NO_WORKLOAD" = 1 ] || rg_probe_step "$OUT/probes.log" wordpress probe_wordpress; }; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
     [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
-    sleep 5
+    [ $(( $(date +%s) - c0 )) -lt 5 ] && sleep $(( 5 - ($(date +%s) - c0) ))
   done
   res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
   K_TIMEOUT=10
