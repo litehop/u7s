@@ -18,6 +18,9 @@
 #   cal_ref_ms / cal_ref_n   median / count of in-guest CPU calibration loops before install (baseline)
 #   cal_idle_ms / cal_idle_n same, at the idle boundary before the first burst (contention probe)
 #   steal_idle_pct=N.N       in-guest steal time over the idle window (a shared-core host's noise)
+#   steal_run_pct=N.N        steal over the whole run so far (informational; never judged)
+#   watch_t0=EPOCH           when the node-ready watch started (notready_events counts from here)
+#   tally_note=TEXT          set when the node tally was rebuilt host-side (rg_fill_tally)
 #   marker_fail=TEXT        why the marker could not be written (set with marker_ok=0)
 #   harness_error=TEXT       the harness itself broke before the bursts (not a u7s verdict)
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
@@ -123,6 +126,28 @@ rg_node_watch_stamp() {
 # An "unreachable" poll (API down: a dead apiserver is the worst not-Ready) counts too.
 rg_notready_since() {
   awk -v t0="$2" '$1 >= t0 && ($2 == "False" || $2 == "Unknown" || $2 == "unreachable") {n++} END {print n + 0}' "$1"
+}
+
+# Reads `kubectl get pods -A` lines "<ns> <name> <phase> <Ready status>" on stdin and prints
+# "<ns> <name>" of pods that are not Ready (finished pods and the burst workload excluded), max 20.
+rg_notready_pods() {
+  awk '{r = (NF >= 4 ? $4 : "")} $3 != "Succeeded" && r != "True" && $2 !~ /^rg-burst-/ {print $1, $2}' | head -n 20
+}
+
+# Fills the node tally into results file $1 from node-ready.log $2 when the run died before the
+# final tally was written (no notready_events key). A dead guest's last Ready=True is stale, so
+# node_ready_final stays "unconfirmed" unless the last observation was itself not Ready.
+rg_fill_tally() {
+  local f="$1" log="$2" last t0
+  [ -z "$(rg_get "$f" notready_events)" ] && [ -s "$log" ] || return 0
+  last="$(tail -n 1 "$log" | cut -d' ' -f2)" || true
+  t0="$(rg_get "$f" watch_t0)" || true
+  {
+    echo "notready_events=$(rg_notready_since "$log" "${t0:-0}")"
+    echo "api_unreachable_polls=$(grep -c ' unreachable$' "$log")"
+    echo "node_ready_final=$([ "$last" = True ] && echo unconfirmed || echo "$last")"
+    echo "tally_note=run died before the final tally; node figures rebuilt from node-ready.log, OOM counts unknown"
+  } >> "$f"
 }
 
 # --- collectors (pure: take kernel-log / kubectl text on stdin) ---
@@ -506,7 +531,8 @@ rg_verdict() {
   _check "(e)" "$([ "$wh" = 1 ] && echo 1 || echo 0)" "webhook-smoke.sh passes (webhook_ok=${wh:-missing})"
 
   # Not a criterion: kubelet memory-pressure evictions delete pods without an OOM kill.
-  _rg_row INFO "" "evicted pods: $(rg_get "$f" evicted_pods) api-unreachable polls: $(rg_get "$f" api_unreachable_polls)"
+  _rg_row INFO "" "evicted pods: $(rg_get "$f" evicted_pods) api-unreachable polls: $(rg_get "$f" api_unreachable_polls) steal-run: $(rg_get "$f" steal_run_pct)%"
+  [ -z "$(rg_get "$f" tally_note)" ] || _rg_row INFO "" "$(rg_get "$f" tally_note)"
 
   if [ "$rc" -eq 0 ]; then echo "RESULT: PASS (${np:-?}-pod burst)"; else echo "RESULT: FAIL (${np:-?}-pod burst)"; fi
   return "$rc"

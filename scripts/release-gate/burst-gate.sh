@@ -333,6 +333,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
   mkdir -p "$RUN_OUT/out"; touch "$RUN_OUT/out/results.env"
+  rg_fill_tally "$RUN_OUT/out/results.env" "$RUN_OUT/out/node-ready.log"
   if [ -z "$status" ]; then
     echo "---- attempt $attempt verdict ----"
     if [ "$INSTALL_ONLY" = 1 ]; then

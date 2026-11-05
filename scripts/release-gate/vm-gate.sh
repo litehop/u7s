@@ -26,9 +26,14 @@ INSTALL_TARBALL=""; INSTALL_ONLY=0
 mkdir -p "$OUT"
 : > "$OUT/results.env"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
-res() { echo "$1=$2" >> "$OUT/results.env"; }
+# Last write wins: the tally is rewritten after every burst so a dead guest leaves what was
+# observed so far, and rg_get reads the first match.
+res() {
+  { grep -v "^$1=" "$OUT/results.env" 2>/dev/null; echo "$1=$2"; } > "$OUT/results.tmp"
+  mv "$OUT/results.tmp" "$OUT/results.env"
+}
 phase() { echo "$1" > "$OUT/phase"; log "phase: $1"; }
-k() { timeout 30 kubectl --kubeconfig "$KCFG" "$@"; }
+k() { timeout "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
 # Scales deployment rg-burst to $1 replicas; echoes seconds until all Ready or "timeout".
@@ -126,6 +131,34 @@ wait_node_ready() {
   return 1
 }
 
+# Node tally and run-wide steal as observed so far. Rewritten after each burst and at collect.
+write_tally() {
+  local oomh oomk
+  journalctl -k --no-pager 2>/dev/null | rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" | rg_oom_counts > "$OUT/tally-oom.tmp"
+  read -r oomh oomk < "$OUT/tally-oom.tmp"
+  res oom_host "$oomh"
+  res oom_kubesystem "$oomk"
+  res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
+  res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
+  res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+  res steal_run_pct "$(rg_steal_pct "$CPU_RUN0" "$(head -1 /proc/stat)")"
+}
+
+# describe + logs of every pod that is not Ready, into pod-diag/<tag>/, so the cause (OOM, probe
+# timeout, image pull, CPU) can be read after the VM is deleted.
+diag_pods() {
+  local d="$OUT/pod-diag/$1" ns name
+  mkdir -p "$d"
+  k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {.status.phase} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+    | rg_notready_pods > "$d/pods.txt"
+  while read -r ns name; do
+    { k -n "$ns" describe pod "$name"
+      k -n "$ns" logs "$name" --all-containers --tail=200
+      k -n "$ns" logs "$name" --all-containers --previous --tail=200
+    } > "$d/${ns}_$name.txt" 2>&1 < /dev/null
+  done < "$d/pods.txt"
+}
+
 if [ "$ZRAM_MIB" -gt 0 ]; then
   zram_fail() {
     log "zram_setup=failed:$1"; res zram_setup "failed:$1"; res install_ok 0
@@ -143,6 +176,7 @@ if [ "$ZRAM_MIB" -gt 0 ]; then
 fi
 
 phase install
+CPU_RUN0="$(head -1 /proc/stat)"
 calibrate_boundary
 WATCH_PID=""; CAPTURE_PID=""
 stop_bg() {
@@ -181,6 +215,7 @@ record_uids
 # leaves the replay of install-time Unknown/False flaps out. A watch that ends while the API
 # does not answer is logged as "unreachable" (counted by criterion (b)) and re-established.
 WATCH_T0="$(date +%s)"
+res watch_t0 "$WATCH_T0"
 ( while :; do
     kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
       -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
@@ -207,7 +242,7 @@ phase wordpress
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
 for _ in $(seq 1 60); do k -n default get pod mariadb-0 >/dev/null 2>&1 && break; sleep 2; done
 MARIADB_READY=1
-kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; }
+kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; diag_pods mariadb-not-ready; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
 wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
@@ -277,6 +312,7 @@ run_ramp() {
     res "ramp_${n}_ready_final" "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
     res "ramp_${n}_wp_ok" "$(wp_ok_poll)"
     res "ramp_${n}_marker_ok" "$(marker_ok)"
+    write_tally
     if ! rg_ramp_step "$OUT/results.env" "$n" >/dev/null; then log "ramp stopped: $n-pod burst failed"; break; fi
   done
 }
@@ -287,16 +323,19 @@ run_full() {
   snap burst20
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
   record_uids
+  write_tally
 
   phase burstn
   bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
   snap burstn
   burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
   record_uids
+  write_tally
 
   phase wpcheck
   wp_ok="$(wp_ok_poll)"
   res wp_ok "$wp_ok"; log "WordPress after settle: ok=$wp_ok"
+  diag_pods wpcheck
   res marker_ok "$(marker_ok)"; log "DB marker after settle: marker_ok=$(rg_get "$OUT/results.env" marker_ok)"
 
   phase webhook
@@ -332,8 +371,7 @@ res oom_kubesystem "$oomk"
 read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" install)"; res cal_ref_ms "$cal_ms"; res cal_ref_n "$cal_n"
 read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" idle)"; res cal_idle_ms "$cal_ms"; res cal_idle_n "$cal_n"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
-res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
 res evicted_pods "$(awk '{print $1"/"$2}' "$OUT/evictions.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+write_tally
+diag_pods collect
 log "collected"

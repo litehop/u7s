@@ -728,5 +728,36 @@ assert "a failed install leaves no sampler running (an orphan would hold the ssh
 assert "sampler stdout/stderr go to its own log, not the gate's stream (a held pipe stalls ssh/limactl)" \
   "$(! grep -q SAMPLER_LEAK "$TMP/vg.out" && grep -q SAMPLER_LEAK_OUT "$VG/out/sampler.log" && echo 1 || echo 0)"
 
+# --- evidence survives a wedge (final tally absent) ---
+good | grep -vE '^(oom_host|oom_kubesystem|notready_events|node_ready_final|webhook_ok|wp_ok|marker_ok)=' > "$TMP/dead.env"
+echo "watch_t0=250" >> "$TMP/dead.env"
+printf '100 True\n200 False\n300 unreachable\n' > "$TMP/dead-nr.log"
+rg_fill_tally "$TMP/dead.env" "$TMP/dead-nr.log"
+verdict_of "$TMP/dead.env"
+assert "dead run: observed not-Ready evidence replaces 'missing' in criterion (b) (1 observation after watch start, final=unreachable)" \
+  "$(echo "$V_OUT" | grep -E '^FAIL +\(b\)' | grep -q 'observations=1, final=unreachable' && echo 1 || echo 0)"
+assert "dead run: the verdict says the tally was rebuilt and OOM counts are unknown, not silently green" \
+  "$(echo "$V_OUT" | grep -q 'OOM counts unknown' && echo 1 || echo 0)"
+good | grep -vE '^(notready_events|node_ready_final)=' > "$TMP/dead2.env"
+printf '100 True\n' > "$TMP/dead2-nr.log"
+rg_fill_tally "$TMP/dead2.env" "$TMP/dead2-nr.log"
+assert "dead run whose log ends at a stale Ready=True is 'unconfirmed', never a (b) PASS: a vanished guest must not look green" \
+  "$(rg_get "$TMP/dead2.env" node_ready_final | grep -qx unconfirmed && echo 1 || echo 0)"
+good > "$TMP/full.env"; cp "$TMP/full.env" "$TMP/full2.env"
+rg_fill_tally "$TMP/full2.env" "$TMP/dead-nr.log"
+assert "a complete tally is never overwritten by the host-side rebuild" "$(cmp -s "$TMP/full.env" "$TMP/full2.env" && echo 1 || echo 0)"
+
+out="$(printf 'kube-system coredns Running True\ndefault mariadb-0 Pending \ndefault job-x Succeeded False\ndefault rg-burst-abc Pending \nkube-system kcm Running False\n' | rg_notready_pods)"
+assert "not-Ready pods are listed incl. a Pending pod with no Ready condition (mariadb-0 never Ready must get diagnostics)" \
+  "$([ "$out" = "$(printf 'default mariadb-0\nkube-system kcm')" ] && echo 1 || echo 0)"
+assert "finished pods and the burst workload are excluded (50 describes would flood a wedged guest)" \
+  "$(echo "$out" | grep -qE 'job-x|rg-burst' && echo 0 || echo 1)"
+
+eval "$(sed -n '/^res() {/,/^}/p' "$HERE/vm-gate.sh")"
+OUT="$TMP/resout"; mkdir -p "$OUT"; : > "$OUT/results.env"
+set +e; res oom_host 0; res notready_events 0; res oom_host 2; set -e
+assert "res replaces a key: the final tally must override the partial one (rg_get reads the first match)" \
+  "$([ "$(rg_get "$OUT/results.env" oom_host)" = 2 ] && [ "$(grep -c '^oom_host=' "$OUT/results.env")" = 1 ] && [ "$(rg_get "$OUT/results.env" notready_events)" = 0 ] && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
