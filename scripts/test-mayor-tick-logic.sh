@@ -1502,6 +1502,28 @@ invoke_tick "$STUB_MERGED_BIN" "$NW_REPO" 0
 assert "with no worker worktree at all, the checkout still fast-forwards to origin main (else the tick keeps running a stale copy of itself)" \
   "$([ "$(git -C "$NW_REPO" rev-parse HEAD)" = "$NW_ORIGIN_SHA" ] && echo 1 || echo 0)"
 
+git -C "$NW_ADVANCER" commit -q --allow-empty -m "second PR lands"
+git -C "$NW_ADVANCER" push -q origin HEAD:main 2>/dev/null
+NW_ORIGIN_SHA2=$(git -C "$NW_ADVANCER" rev-parse HEAD)
+NW_ORDER_BIN="$WORKDIR/stub-order-bin"
+mkdir -p "$NW_ORDER_BIN"
+cat > "$NW_ORDER_BIN/gh" <<EOF
+#!/bin/bash
+[ -s "$WORKDIR/first-gh-head" ] || git -C "$NW_REPO" rev-parse HEAD > "$WORKDIR/first-gh-head"
+exec "$STUB_MERGED_BIN/gh" "\$@"
+EOF
+chmod +x "$NW_ORDER_BIN/gh"
+invoke_tick "$NW_ORDER_BIN" "$NW_REPO" 0
+assert "the checkout is fast-forwarded before the tick's first gh call, so gating and bead closing run on fresh state, not a stale copy" \
+  "$([ "$(cat "$WORKDIR/first-gh-head")" = "$NW_ORIGIN_SHA2" ] && echo 1 || echo 0)"
+
+git -C "$NW_REPO" remote set-url origin "$WORKDIR/no-such-origin.git"
+git -C "$NW_ADVANCER" commit -q --allow-empty -m "unreachable"
+invoke_tick "$STUB_MERGED_BIN" "$NW_REPO" 0
+assert "an offline fetch only warns: exit 0 and no checkout-pull-blocked, since nothing could be pulled anyway" \
+  "$([ "$TICK_RC" -eq 0 ] && [ "$(jq -c '[.queue_warnings[]? | select(.reason=="checkout-pull-blocked")] | length' "$TICK_STATE")" = 0 ] && echo 1 || echo 0)"
+git -C "$NW_REPO" remote set-url origin "$NW_ORIGIN"
+
 mkdir -p "$NW_REPO/.beads"
 echo regenerated > "$NW_REPO/.beads/issues.jsonl"
 git -C "$NW_REPO" add -f .beads/issues.jsonl

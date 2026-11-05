@@ -706,7 +706,9 @@ gate_and_merge_prs() {
 # them before the PR merged). bd regenerates the tracked bead JSONL on every
 # write, so those two paths are discarded first, only when a pull is needed
 # (bd re-exports on the next write); any other failure to pull is surfaced as
-# a gate exception (exit 20) instead of aborting the tick.
+# a gate exception (exit 20) instead of aborting the tick. A failed fetch
+# (offline) only warns. Runs first in the tick so every later step sees fresh
+# state, and again before worktree cleanup to pick up merges issued this tick.
 sync_checkout_to_main() {
   local dirty_beads pull_blocked=0
   git -C "$REPO_ROOT" remote get-url origin >/dev/null 2>&1 || return 0
@@ -727,7 +729,8 @@ sync_checkout_to_main() {
       fi
     fi
   else
-    pull_blocked=1
+    echo "mayor-tick: warning: fetch origin main failed; checkout left as is" >&2
+    return 0
   fi
   if [ "$pull_blocked" -eq 1 ] \
     || ! run_cmd git -C "$REPO_ROOT" merge --ff-only origin/main; then
@@ -1009,6 +1012,7 @@ main() {
     esac
   done
 
+  sync_checkout_to_main
   process_review_queue
   reconcile_missing_queue_entries
   gate_and_merge_prs
