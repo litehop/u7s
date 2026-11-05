@@ -57,6 +57,14 @@ new_sandbox() {
 SANDBOX_ROOT=$(mktemp -d)
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
 
+# Default `gh`: no open PRs. Every destructive step queries open PRs, so a
+# test must never reach the real gh; tests needing PRs prepend their own stub.
+STUB_GH_DEFAULT="$SANDBOX_ROOT/stub-gh-default"
+mkdir -p "$STUB_GH_DEFAULT"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_GH_DEFAULT/gh"
+chmod +x "$STUB_GH_DEFAULT/gh"
+export PATH="$STUB_GH_DEFAULT:$PATH"
+
 # ---------------------------------------------------------------------------
 # 1. STEP A -- orphaned host process detection.
 # ---------------------------------------------------------------------------
@@ -1178,6 +1186,131 @@ DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_AUDIT:$PATH" STU
   bash "$SCRIPT" --live-agents someagent >/dev/null 2>&1 || H_RC=$?
 assert "main() exits with the audit bit (4) under --live-agents when main's audit failed" \
   "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 11. Open-PR guard on every destructive step, regardless of branch naming.
+#     A fix-round worker's PR branch (worker/fix-foo, not agent-<id>) was
+#     deleted along with its finished worktree by STEP G while its PR was
+#     still open; GitHub then treats the PR head as gone.
+# ---------------------------------------------------------------------------
+
+STUB_GH_OPEN_PRS="$SANDBOX_ROOT/stub-gh-open-prs"
+mkdir -p "$STUB_GH_OPEN_PRS"
+cat > "$STUB_GH_OPEN_PRS/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' worker/fix-foo worker/fix-bar worker/agent-pr1 worker/agent-gone-pr
+EOF
+chmod +x "$STUB_GH_OPEN_PRS/gh"
+
+BARE_P="$SANDBOX_ROOT/origin-p.git"
+git init -q --bare "$BARE_P"
+P="$SANDBOX_ROOT/open-pr-repo"
+new_sandbox "$P"
+printf 'x\n' > "$P/file.txt"
+git -C "$P" add -A
+git -C "$P" commit -q -m initial
+git -C "$P" remote add origin "$BARE_P"
+git -C "$P" push -q origin main
+mkdir -p "$P/ai/worktrees"
+# Finished fix-round worktrees (clean, pushed): one with an open PR, one without.
+for pair in a1:worker/fix-foo a2:worker/fix-nopr; do
+  id="${pair%%:*}"; br="${pair#*:}"
+  git -C "$P" branch "$br" main
+  git -C "$P" push -q origin "$br"
+  git -C "$P" worktree add -q "$P/ai/worktrees/agent-$id" "$br"
+done
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G keeps a non-agent-named branch (worker/fix-foo) and its worktree while its PR is open -- reaping it closes/orphans a PR under review" \
+  "$([ -d "$P/ai/worktrees/agent-a1" ] && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-foo >/dev/null && echo 1 || echo 0)"
+assert "...while a finished fix-round worktree and branch with no open PR is still reaped" \
+  "$([ ! -d "$P/ai/worktrees/agent-a2" ] && ! git -C "$P" rev-parse --verify -q refs/heads/worker/fix-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP C: agent-<id> branches whose agent is not live, no worktree dir.
+for br in worker/agent-pr1 worker/agent-nopr; do
+  git -C "$P" branch "$br" main
+done
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_c_stale_worker_branches >/dev/null 2>&1
+assert "STEP C keeps a non-live worker/agent-<id> branch whose PR is open" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-pr1 >/dev/null && echo 1 || echo 0)"
+assert "...and deletes one with no open PR" \
+  "$(! git -C "$P" rev-parse --verify -q refs/heads/worker/agent-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP D: gone-upstream branches (including a non-agent one) with open PRs.
+for br in worker/fix-bar worker/agent-gone-pr worker/fix-gone-nopr; do
+  git -C "$P" branch "$br" main 2>/dev/null || true
+  git -C "$P" push -q -u origin "$br"
+  git -C "$P" push -q origin --delete "$br"
+done
+git -C "$P" fetch -q --prune origin
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_d_gone_upstream_branches >/dev/null 2>&1
+assert "STEP D keeps gone-upstream branches with an open PR (agent- and non-agent-named)" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-gone-pr >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-bar >/dev/null && echo 1 || echo 0)"
+assert "...and deletes a gone-upstream branch with no open PR" \
+  "$(! git -C "$P" rev-parse --verify -q refs/heads/worker/fix-gone-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP G: a fix-round worktree whose LOCAL branch name differs from the PR head
+# (pr9-fix vs PR head worker/fix-pr9) must survive while that PR is open,
+# matched by HEAD sha. Its commit is pushed under another name so the
+# "nothing unpushed" guard alone would call it reapable.
+git -C "$P" checkout -q -b pr9-fix main
+git -C "$P" commit -q --allow-empty -m pr9
+PR9_SHA=$(git -C "$P" rev-parse HEAD)
+git -C "$P" push -q origin pr9-fix:refs/heads/pr9-remote
+git -C "$P" checkout -q main
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a9" pr9-fix
+STUB_GH_PR_SHA="$SANDBOX_ROOT/stub-gh-pr-sha"
+mkdir -p "$STUB_GH_PR_SHA"
+cat > "$STUB_GH_PR_SHA/gh" <<'EOF'
+#!/usr/bin/env bash
+printf 'worker/fix-pr9 %s\n' "$STUB_PR_SHA"
+EOF
+chmod +x "$STUB_GH_PR_SHA/gh"
+STUB_PR_SHA="$PR9_SHA" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_PR_SHA:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G keeps a fix-round worktree on local branch pr9-fix whose HEAD sha is an open PR's head -- local name != PR head name, so reaping by name alone closes a PR under review" \
+  "$([ -d "$P/ai/worktrees/agent-a9" ] && git -C "$P" rev-parse --verify -q refs/heads/pr9-fix >/dev/null && echo 1 || echo 0)"
+STUB_PR_SHA="deadbeef" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_PR_SHA:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "...and reaps it once no open PR head matches its sha (the guard is the sha match, not a blanket keep)" \
+  "$([ ! -d "$P/ai/worktrees/agent-a9" ] && echo 1 || echo 0)"
+
+# gh failure: no destructive step may delete on an unknown PR list.
+STUB_GH_FAIL="$SANDBOX_ROOT/stub-gh-fail"
+mkdir -p "$STUB_GH_FAIL"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_GH_FAIL/gh"
+chmod +x "$STUB_GH_FAIL/gh"
+git -C "$P" branch worker/agent-failc main
+git -C "$P" branch worker/fix-faild main
+git -C "$P" push -q -u origin worker/fix-faild
+git -C "$P" push -q origin --delete worker/fix-faild
+git -C "$P" fetch -q --prune origin
+git -C "$P" branch fix-failg main
+git -C "$P" push -q origin fix-failg
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a10" fix-failg
+git -C "$P" branch worker/agent-failf main
+git -C "$P" push -q origin worker/agent-failf
+GH_FAIL_RC=0
+for step in step_c_stale_worker_branches step_d_gone_upstream_branches step_f_orphaned_origin_branches step_g_fix_round_worktrees; do
+  RC=0
+  LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_FAIL:$PATH" \
+    call "$step" >/dev/null 2>&1 || RC=$?
+  [ "$RC" -ne 0 ] || GH_FAIL_RC=1
+done
+assert "C/D/F/G each exit non-zero when gh fails -- a failed PR fetch must never look like 'no open PRs'" \
+  "$([ "$GH_FAIL_RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and delete nothing (stale branch, gone-upstream branch, fix-round worktree, origin branch all survive)" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-failc >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-faild >/dev/null && [ -d "$P/ai/worktrees/agent-a10" ] && git -C "$P" ls-remote --exit-code origin refs/heads/worker/agent-failf >/dev/null && echo 1 || echo 0)"
+
+# Step labels make the log attributable to a step.
+git -C "$P" branch fix-lbl main
+git -C "$P" push -q origin fix-lbl
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a3" fix-lbl
+P_OUT=$(DRY_RUN=1 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" call step_g_fix_round_worktrees 2>&1 || true)
+assert "destructive steps label their output with the step so the log names what was deleted" \
+  "$(printf '%s\n' "$P_OUT" | grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
