@@ -26,8 +26,8 @@
 # A missing key is a FAIL, never a pass: a run that died halfway must not look green.
 #
 # A run's status is PASS, FAIL or INVALID. INVALID means host contention was observed
-# (rg_contention_reasons) on a run that did not pass: the failure cannot be blamed on u7s,
-# so the run is repeated and never counted. A PASS under contention stays a PASS.
+# (rg_contention_reasons) or the harness errored, whatever the verdict: validity never depends
+# on the outcome, so a contended PASS and a contended FAIL are both repeated and never counted.
 
 BURST_CAP_SECS="${BURST_CAP_SECS:-300}"
 RG_IDLE_MIN_PCT=70
@@ -292,11 +292,11 @@ rg_apply_preemption() {
 }
 
 # PASS / FAIL / INVALID for one run. $1 verdict exit code, $2 quiet.log, $3 results file.
-# PASS stays PASS under contention; a non-pass under contention is INVALID.
+# Contention or a harness error makes the run INVALID regardless of the verdict.
 rg_run_status() {
-  if [ "$1" = 0 ]; then echo PASS
-  elif [ -n "$(rg_get "$3" harness_error)" ]; then echo INVALID
+  if [ -n "$(rg_get "$3" harness_error)" ]; then echo INVALID
   elif [ -n "$(rg_contention_reasons "$2" "$3")" ]; then echo INVALID
+  elif [ "$1" = 0 ]; then echo PASS
   else echo FAIL
   fi
 }
@@ -448,6 +448,19 @@ rg_ramp_verdict() {
     return 0
   fi
   echo "RAMP: no size passed"; return 1
+}
+
+# Largest passing step of one ramp verdict file ($1), or "none".
+rg_ramp_knee() {
+  local n
+  n="$(sed -n 's/^RAMP: candidate N=\([0-9][0-9]*\) .*/\1/p' "$1")"
+  echo "${n:-none}"
+}
+
+# Final line of a ramp invocation. $1 sizes, $2 knee per valid run (space-separated), $3 verdict,
+# $4 out dir. A ramp's knee is not a gate pass at the top step, so no "passed at N pods".
+rg_ramp_summary() {
+  echo "==== RAMP: steps [$1], knee (largest passing step) per valid run:${2:- none} -> $3 (results in $4) ===="
 }
 
 _rg_row() { printf '%-4s %-5s %s\n' "$1" "$2" "$3"; }
