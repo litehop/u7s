@@ -34,3 +34,36 @@ Not recovered in 600 s (`recovery_secs=none`). Run flagged INVALID for host cont
 - Restart counts at end: not collectable (API unreachable at collect).
 
 ## Arm D (A+B)
+
+Not recovered in 600 s; no better than control, API availability worse. INVALID for host
+contention (idle CPU 28-58% < 62%; a pre-push test run on the host overlapped the window).
+- memory.min took effect without further changes (systemd drop-in + `set-property --runtime`;
+  MemoryAccounting default on, memory controller already in root subtree_control):
+  kcm 92274688 B (88 MiB), apiserver 30408704 (29), kubelet 65011712 (62), crio 70254592 (67),
+  system.slice 278921216 (266). system.slice was given the sum + 20 MiB so ancestor
+  protection does not cap the children.
+- kernelMemcgNotification: true was accepted on cgroup v2: no parse error, kubelet logged
+  "created memoryThresholdNotifier" for the hard, soft and hard-allocatable thresholds. Whether
+  the notifier fired is unknown: kubelet logged no eviction activity at all after the overload.
+- /readyz OK in 2 of 6 probe cycles (33%); only 6 cycles fit in 600 s because 5 of them took
+  52-134 s (max 134.5 s: node get 30.9 s timeout, readyz 79.0 s, wp 24.7 s), vs 10 of 21 in C.
+  Only the first cycle (overload start) had ok=1; no recovery under any gap setting.
+- OOM victims: php-fpm x1, sh x4 (adj 1000); no control-plane victim; zero `Evicted` events,
+  no MemoryPressure=True, no memory-pressure taint (node went Unknown/unreachable at +181 s,
+  before kubelet could act). Restart counts not collectable (API unreachable at collect).
+
+## Verdict
+
+Neither protection nor earlier eviction restored the API or WordPress inside 600 s. Evidence
+(n=1 each, both INVALID for contention): the node still wedged within ~3 min; the control plane
+was not OOM-killed in either arm (kubelet adj -999, apiserver/kcm -997), so the failure is
+reclaim thrash/starvation, not kills; kubelet is starved too and never reached its eviction
+loop, so evictionSoft/Hard at 300/200 Mi cannot act as back-pressure here. MemoryMin totalling
+~246 MiB of a ~900 MiB VM did not keep the control plane responsive, and left less for
+everything else (D had fewer completed probe cycles than C). Not tested: larger MemoryLow,
+protecting WordPress/mariadb, a lower overload (dose-response), kubepods memory.max / pod limits
+on the overload pods.
+
+Harness finding: probe cycles of 50-135 s occur while the node is alive-but-starved, so the 15 s
+max-gap rule cannot be satisfied by a starved node and a recovery could be read as `none`. A
+probe should have a per-call timeout well under the gap (e.g. 5 s each) so cycle <= gap.
