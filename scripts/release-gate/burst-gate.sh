@@ -296,6 +296,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
       quiet_pid=$!
     fi
+    vm_trim "$VM" >"$RUN_OUT/trim.log" 2>&1 || echo "warning: could not trim $VM (see $RUN_OUT/trim.log)" >&2
     vm_shell "$VM" sudo install -d -m 0777 /var/tmp/rg
     vm_shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
     stage_files=()

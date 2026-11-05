@@ -828,5 +828,26 @@ rc=0; "$HERE/burst-gate.sh" --wedge-secs x --tarball-dir "$TMP/tb" --out "$TMP/o
 assert "--wedge-secs x rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
 assert "--wedge-secs reaches the VM env" "$(gate_env ws --wedge-secs 90 | grep -qx 'WEDGE_SECS=90' && echo 1 || echo 0)"
 
+# --- Lima VM trim to GCP parity ---
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 0\n' > "$TMP/bin/limactl"
+: > "$LIMA_CALLS"
+(BACKEND=lima; . "$HERE/backend.sh"; vm_trim u7s-rg-x)
+trim_call="$(cat "$LIMA_CALLS")"
+trim_ok=1
+for u in udisks2 ModemManager multipathd multipathd.socket polkit lima-guestagent; do
+  echo "$trim_call" | grep -q "mask --now .*$u" || trim_ok=0
+done
+assert "Lima trim masks every Lima-only/oversized daemon (each left running costs 7-22 MiB of a 1 GiB node and makes Lima knees pessimistic vs GCP)" "$trim_ok"
+assert "Lima trim sets MALLOC_ARENA_MAX=1 for kubelet before install (8 arm64 glibc arenas = 16 MiB)" \
+  "$(echo "$trim_call" | grep -q 'kubelet.service.d' && echo "$trim_call" | grep -q 'MALLOC_ARENA_MAX=1' && echo 1 || echo 0)"
+: > "$LIMA_CALLS"
+(BACKEND=gcp; . "$HERE/backend.sh"; vm_trim x)
+assert "GCP is never trimmed (its agents are real production cost the gate must model)" "$([ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\ncase "$*" in list*) exit 0;; "copy -r"*:/var/tmp/rg/out*) mkdir -p "${@: -1}";; esac\nexit 0\n' > "$TMP/bin/limactl"
+: > "$LIMA_CALLS"
+RG_RUN_WALL_SECS=30 "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tbl" --out "$TMP/out-trim" >/dev/null 2>&1 || true
+assert "the Lima gate trims the VM after boot and before the gate scripts run (otherwise the trim never reaches a real run)" \
+  "$(awk '/mask --now/ {t = NR} /vm-gate.sh/ {g = NR} END {exit !(t && g && t < g)}' "$LIMA_CALLS" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
