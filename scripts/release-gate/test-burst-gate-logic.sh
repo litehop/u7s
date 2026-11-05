@@ -285,11 +285,11 @@ assert "vm-capture is off by default (its kubectl probes cost memory on the 1 Gi
 "$HERE/burst-gate.sh" --capture --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-cap" >/dev/null 2>&1 || true
 assert "--capture opts vm-capture in" "$(grep -qx 'CAPTURE=1' "$TMP/out-cap/stage/gate.env" && echo 1 || echo 0)"
 
-assert "default burst is 50 pods, reaching the VM env" "$(grep -qx 'BURST_PODS=50' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+assert "default burst is 20 pods, reaching the VM env: the operator-decided gate size must not drift to a size a 1 GiB node cannot hold" "$(grep -qx 'BURST_PODS=20' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
 rm -rf "$TMP/out-conf"
 rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf" 2>/dev/null)" || rc=$?
-assert "--confirm with every run failing tries 50 then falls to 40 and ends FAIL (exit non-zero)" \
-  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=50' "$TMP/out-conf/burst-50/stage/gate.env" && grep -qx 'BURST_PODS=40' "$TMP/out-conf/burst-40/stage/gate.env" && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
+assert "--confirm is a single 3/3 gate at 20 pods with no smaller fall-back size, and a failing gate ends FAIL" \
+  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
 # --- marker (item: criterion (d) false pass) ---
 assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
