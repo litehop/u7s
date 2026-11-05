@@ -63,8 +63,8 @@
 #                     tighter than the 300 s criterion (c) cap so probes fail fast)
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --wedge-secs SECS abort a burst, collect evidence and end the attempt as FAIL when, during a burst,
-#                     the node has been not Ready / the API unreachable for SECS, or the CPU spent
-#                     >= 90% of the last SECS in iowait (default 60; 0 disables)
+#                     the node has been not Ready / the API unreachable for SECS, or the Ready-pod
+#                     count has not changed for 120 s (default 60; 0 disables both)
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
 #   --backend B       lima (default; local arm64 VM) or gcp (needs --release; rejects --memory and
@@ -180,7 +180,23 @@ OUT="${OUT:-$PWD/temp/release-gate/$OUT_PREFIX$STAMP}"
 mkdir -p "$OUT"
 [ -z "$EXP_TAG" ] || echo "$EXP_TAG" > "$OUT/EXPERIMENT.txt"
 VMS=""
+EVIDENCE_COPY_SECS="${RG_EVIDENCE_COPY_SECS:-120}"
+# A run killed from outside (host cap, ^C, SIGTERM) leaves its results only in the guest; pull
+# them before the VM is deleted. Bounded: a wedged guest may never answer the copy.
+PENDING_VM=""; PENDING_OUT=""
+pull_pending_evidence() {
+  local cp wd
+  [ -n "$PENDING_VM" ] || return 0
+  echo "run interrupted: pulling /var/tmp/rg/out from $PENDING_VM (up to ${EVIDENCE_COPY_SECS}s)" >&2
+  vm_copy_from "$PENDING_VM" /var/tmp/rg/out "$PENDING_OUT" 2>/dev/null & cp=$!
+  ( sleep "$EVIDENCE_COPY_SECS"; rg_kill_tree "$cp" ) & wd=$!
+  wait "$cp" 2>/dev/null || echo "warning: evidence copy from $PENDING_VM failed or timed out" >&2
+  kill "$wd" 2>/dev/null
+  rg_fill_tally "$PENDING_OUT/results.env" "$PENDING_OUT/node-ready.log"
+  PENDING_VM=""
+}
 cleanup() {
+  pull_pending_evidence
   [ "$KEEP" = 1 ] && return
   local vm
   for vm in $VMS; do vm_delete "$vm"; done
@@ -296,6 +312,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       rg_quiet_loop "$RUN_OUT/quiet.stop" "$RUN_OUT/quiet.log" "$QUIET_RECHECK_SECS" quiet_sample &
       quiet_pid=$!
     fi
+    PENDING_VM="$VM"; PENDING_OUT="$RUN_OUT/out"
     vm_trim "$VM" >"$RUN_OUT/trim.log" 2>&1 || echo "warning: could not trim $VM (see $RUN_OUT/trim.log)" >&2
     vm_shell "$VM" sudo install -d -m 0777 /var/tmp/rg
     vm_shell "$VM" grep -E 'MemTotal|SwapTotal' /proc/meminfo | tee "$RUN_OUT/meminfo-total.txt"
@@ -332,6 +349,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     if [ -n "$quiet_pid" ]; then touch "$RUN_OUT/quiet.stop"; wait "$quiet_pid" 2>/dev/null; fi
     vm_copy_from "$VM" /var/tmp/rg/out "$RUN_OUT/out" 2>/dev/null \
       || echo "warning: could not copy results out of $VM" >&2
+    PENDING_VM=""
   else
     echo "VM $VM failed to create/start (see $RUN_OUT/*-create.log)" >&2
     if [ "$BACKEND" = gcp ]; then

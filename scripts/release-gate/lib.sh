@@ -39,7 +39,8 @@ RG_CAL_MAX_RATIO_X10=15
 RG_CAL_MIN_SAMPLES=3
 RG_STEAL_MAX_PCT=10
 RG_WEDGE_SECS=60
-RG_WEDGE_IOWAIT_PCT=90
+RG_WEDGE_IOWAIT_PCT=0
+RG_WEDGE_STALL_SECS=120
 RG_JIFFIES_PER_SEC=100
 # Pattern for pkill -f inside the VM: every script the gate runs there is started as
 # `bash /var/tmp/rg/<name>.sh`. Anchored so the pkill's own wrapper shell never matches.
@@ -101,8 +102,11 @@ _rg_is_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 # returns 0 once a line equals $1 (all replicas Ready), 1 if the stream ends first. An
 # unset readyReplicas prints an empty line, which never equals a positive target.
 rg_wait_ready() {
-  local want="$1" line
+  local want="$1" prog="${2:-/dev/null}" line last
+  last="$(tail -n 1 "$prog" 2>/dev/null | cut -d' ' -f2)" || true
   while IFS= read -r line; do
+    [ "${line:-0}" = "$last" ] || printf '%s %s\n' "$(date +%s)" "${line:-0}" >> "$prog"
+    last="${line:-0}"
     [ "$line" = "$want" ] && return 0
   done
   return 1
@@ -133,10 +137,15 @@ rg_notready_since() {
 }
 
 # Wedge detection during a burst. $1 now (epoch), $2 node-ready.log, $3 attrib.tsv (STAT rows,
-# jiffies; see vm-sampler.sh). Prints a reason when the node has been not Ready / the API
-# unreachable for >= RG_WEDGE_SECS, or the CPU spent >= RG_WEDGE_IOWAIT_PCT of the last
-# RG_WEDGE_SECS in iowait (RG_JIFFIES_PER_SEC = vCPUs x USER_HZ). Prints nothing otherwise.
-# RG_WEDGE_SECS=0 disables it.
+# jiffies; see vm-sampler.sh), $4 burst-progress.log ("<epoch> <ready pods>" per change, first
+# line at burst start). Prints a reason when the node has been not Ready / the API unreachable
+# for >= RG_WEDGE_SECS, or the Ready-pod count has not changed for RG_WEDGE_STALL_SECS (catches
+# reclaim thrash: node Ready, iowait ~0, sys CPU ~100%), or the CPU spent >= RG_WEDGE_IOWAIT_PCT
+# of the last RG_WEDGE_SECS in iowait (RG_JIFFIES_PER_SEC = vCPUs x USER_HZ). Prints nothing
+# otherwise. A threshold of 0 disables that signal; RG_WEDGE_SECS=0 disables all. Memory PSI
+# "full" is deliberately not a signal: healthy bursts that pass criterion (c) reach 40-68% over
+# 60 s windows (wedge-calibrate.sh), so no threshold separates them from a thrash; a stalled
+# ready count does.
 rg_wedge_reason() {
   local now="$1" w="${RG_WEDGE_SECS:-60}" r
   [ "$w" -gt 0 ] 2>/dev/null || return 0
@@ -150,17 +159,33 @@ rg_wedge_reason() {
       }
     }' "$2" 2>/dev/null)"
   if [ -n "$r" ]; then echo "$r"; return 0; fi
-  awk -F'\t' -v now="$now" -v w="$w" -v thr="${RG_WEDGE_IOWAIT_PCT:-90}" -v jps="${RG_JIFFIES_PER_SEC:-100}" '
+  r="$(awk -F'\t' -v now="$now" -v w="$w" -v thr="${RG_WEDGE_IOWAIT_PCT:-0}" -v jps="${RG_JIFFIES_PER_SEC:-100}" '
     $3 == "STAT" {n++; ts[n] = $1; io[n] = $6}
     END {
-      if (!n || now - ts[n] > w) exit
+      if (thr <= 0 || !n || now - ts[n] > w) exit
       for (i = 1; i < n && ts[i] < ts[n] - w; i++) ;
       span = ts[n] - ts[i]
       if (span < w * 0.8) exit
       pct = 100 * (io[n] - io[i]) / (span * jps)
       if (pct >= thr) printf "iowait %.0f%% over the last %ds\n", pct, span
-    }' "$3" 2>/dev/null
+    }' "$3" 2>/dev/null)"
+  if [ -n "$r" ]; then echo "$r"; return 0; fi
+  awk -v now="$now" -v s="${RG_WEDGE_STALL_SECS:-0}" '
+    NF >= 2 {t = $1; n = $2}
+    END { if (s > 0 && t && now - t >= s) printf "no burst progress for %ds (%d pods Ready)\n", now - t, n }' "${4:-/dev/null}" 2>/dev/null
   return 0
+}
+
+# Prints the PID in pidfile $1 only if it is still the burst watch (cmdline under proc root $2,
+# default /proc): a watch that exited leaves its PID free for an unrelated process, and the
+# wedge monitor must never kill that.
+rg_burst_watch_pid() {
+  local pid cmd
+  pid="$(cat "$1" 2>/dev/null)" || return 0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  [ -r "${2:-/proc}/$pid/cmdline" ] || return 0
+  cmd="$(tr '\0' ' ' < "${2:-/proc}/$pid/cmdline")" || return 0
+  case "$cmd" in *"get deployment rg-burst"*) echo "$pid" ;; esac
 }
 
 # Reads `kubectl get pods -A` lines "<ns> <name> <phase> <Ready status>" on stdin and prints

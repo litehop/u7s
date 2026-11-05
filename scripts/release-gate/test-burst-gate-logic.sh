@@ -761,7 +761,7 @@ assert "res replaces a key: the final tally must override the partial one (rg_ge
 
 # --- wedge detection: a wedged burst must end in ~60 s, not after the 600 s hard kill ---
 NOW=10000
-wedge() { RG_WEDGE_SECS="${W:-60}" rg_wedge_reason "$NOW" "$1" "${2:-/dev/null}"; }
+wedge() { RG_WEDGE_IOWAIT_PCT="${IO-90}" RG_WEDGE_SECS="${W:-60}" rg_wedge_reason "$NOW" "$1" "${2:-/dev/null}" "${3:-/dev/null}"; }
 printf '%s True\n%s False\n' $((NOW - 500)) $((NOW - 60)) > "$TMP/wn1.log"
 assert "node not Ready for exactly 60 s is a wedge (abort within the ~60-90 s budget)" \
   "$(wedge "$TMP/wn1.log" | grep -qx 'node Ready=False for 60s' && echo 1 || echo 0)"
@@ -787,6 +787,48 @@ stat_rows 475 14 $((NOW - 100)) > "$TMP/iostale.tsv"
 assert "stale sampler rows (older than the window) judge nothing" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/iostale.tsv")" ] && echo 1 || echo 0)"
 stat_rows 475 5 $((NOW - 2)) > "$TMP/ioshort.tsv"
 assert "high iowait seen for only 20 s is not a wedge (window not covered)" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/ioshort.tsv")" ] && echo 1 || echo 0)"
+
+# --- reclaim-thrash wedge: node Ready, iowait ~0, burst stuck ---
+pwedge() { RG_WEDGE_STALL_SECS="${S:-0}" IO=0 wedge "$@"; }
+stat_rows 0 14 $((NOW - 2)) > "$TMP/io0.tsv"
+printf '%s 0\n%s 1\n' $((NOW - 200)) $((NOW - 150)) > "$TMP/prog-stuck.log"
+assert "ready-pod count stuck for 150 s (120 s limit) is a wedge with node Ready and iowait 0, the reclaim-thrash that ran to the 600 s kill; the reason names the pod count" \
+  "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-stuck.log" | grep -qx 'no burst progress for 150s (1 pods Ready)' && echo 1 || echo 0)"
+printf '%s 0\n%s 1\n%s 5\n' $((NOW - 200)) $((NOW - 150)) $((NOW - 30)) > "$TMP/prog-ok.log"
+assert "a burst whose ready count last moved 30 s ago is progressing, not wedged" "$([ -z "$(S=120 pwedge "$TMP/empty.log" /dev/null "$TMP/prog-ok.log")" ] && echo 1 || echo 0)"
+assert "an empty progress log (no burst running) judges nothing" "$([ -z "$(S=120 pwedge "$TMP/empty.log" /dev/null "$TMP/empty.log")" ] && echo 1 || echo 0)"
+assert "stall limit 0 disables the no-progress signal" "$([ -z "$(S=0 pwedge "$TMP/empty.log" /dev/null "$TMP/prog-stuck.log")" ] && echo 1 || echo 0)"
+assert "iowait signal is off by default: healthy bursts that pass (c) hit 84-88% over 60 s (wedge-calibrate.sh), so 90% would FAIL a good attempt" \
+  "$([ -z "$(RG_WEDGE_SECS=60 rg_wedge_reason "$NOW" "$TMP/empty.log" "$TMP/io95.tsv" /dev/null)" ] && echo 1 || echo 0)"
+assert "stall signal is on by default (a gate that only waits for the 600 s kill leaves hours of nothing)" "$([ "$RG_WEDGE_STALL_SECS" -gt 0 ] && echo 1 || echo 0)"
+printf '3\n3\n4\n\n4\n' | rg_wait_ready 9 "$TMP/prog-w.log" || true
+assert "rg_wait_ready logs only changes of the ready count (a watch re-print must not reset the stall clock); empty means 0" \
+  "$([ "$(wc -l < "$TMP/prog-w.log" | tr -d ' ')" = 4 ] && [ "$(awk '{print $2}' "$TMP/prog-w.log" | tr '\n' ' ')" = '3 4 0 4 ' ] && echo 1 || echo 0)"
+printf '5 5\n' > "$TMP/prog-w2.log"
+printf '5\n5\n' | rg_wait_ready 9 "$TMP/prog-w2.log" || true
+assert "a re-established watch re-printing the current count does not reset the stall clock" "$([ "$(wc -l < "$TMP/prog-w2.log" | tr -d ' ')" = 1 ] && echo 1 || echo 0)"
+
+# --- the wedge monitor must never kill a reused PID ---
+mkdir -p "$TMP/proc/111" "$TMP/proc/222"
+printf 'timeout\0600\0kubectl\0--kubeconfig\0k\0get\0deployment\0rg-burst\0-w\0' > "$TMP/proc/111/cmdline"
+printf 'sleep\0300\0' > "$TMP/proc/222/cmdline"
+echo 111 > "$TMP/wp1.pid"; echo 222 > "$TMP/wp2.pid"; echo 333 > "$TMP/wp3.pid"; : > "$TMP/wp4.pid"
+assert "the live burst watch's PID is returned" "$([ "$(rg_burst_watch_pid "$TMP/wp1.pid" "$TMP/proc")" = 111 ] && echo 1 || echo 0)"
+assert "a PID reused by an unrelated process is not returned (killing it would hit a random guest process)" \
+  "$([ -z "$(rg_burst_watch_pid "$TMP/wp2.pid" "$TMP/proc")" ] && echo 1 || echo 0)"
+assert "an exited PID, an empty pid file and a missing pid file are all not returned" \
+  "$([ -z "$(rg_burst_watch_pid "$TMP/wp3.pid" "$TMP/proc")" ] && [ -z "$(rg_burst_watch_pid "$TMP/wp4.pid" "$TMP/proc")" ] && [ -z "$(rg_burst_watch_pid "$TMP/nope.pid" "$TMP/proc")" ] && echo 1 || echo 0)"
+
+# --- evidence survives a host-side kill ---
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$LIMA_CALLS"' \
+  'case "$*" in list*) exit 0;; *vm-gate.sh*) exec sleep 8;; "copy -r"*:/var/tmp/rg/out*) d=""; for a; do d="$a"; done; mkdir -p "$d"; echo "wedge evidence" > "$d/run.log";; esac' 'exit 0' > "$TMP/bin/limactl"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-term"
+RG_RUN_WALL_SECS=300 "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tbl" --out "$TMP/out-term" >/dev/null 2>&1 & gpid=$!
+for _ in $(seq 1 100); do grep -q 'vm-gate.sh' "$LIMA_CALLS" 2>/dev/null && break; sleep 0.2; done
+kill -TERM "$gpid" 2>/dev/null; wait "$gpid" 2>/dev/null || true
+assert "SIGTERM (host cap) mid-run pulls /var/tmp/rg/out from the VM before deleting it, or a killed run leaves no evidence" \
+  "$(grep -q 'copy -r u7s-rg-.*:/var/tmp/rg/out' "$LIMA_CALLS" && [ "$(cat "$TMP"/out-term/*run-1/out/run.log 2>/dev/null)" = 'wedge evidence' ] && awk '/copy -r .*:\/var\/tmp\/rg\/out/ {c = NR} /delete/ {d = NR} END {exit !(c && d && c < d)}' "$LIMA_CALLS" && echo 1 || echo 0)"
+printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"
 
 # --- ramp stops at the first failing step, wedge or not ---
 eval "$(sed -n '/^res() {/,/^}/p;/^run_ramp() {/,/^}/p;/^note_wedge() {/,/^}/p' "$HERE/vm-gate.sh")"
