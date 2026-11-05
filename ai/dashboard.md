@@ -7,10 +7,10 @@ updated: 2026-11-05T09:52Z
 
 ## 🎯 Waiting on you
 - Gate burst size: 2026-10-15 decision says 80 pods; script and confirmation pass use 50 (else 40). Which?
-- Lima measurements need a quiet-host window from you (all 2026-11-05 Lima runs INVALID); GCP is the default for verdicts.
 
 ## ⏭ Next
-1. `st8o2` (P1): probe timeouts make recovery unobservable on a starved node.
+1. `f3yoo` (P1): the quiet-host check flags the gate VM's own thrash as contention — today's Lima "INVALID" runs were self-induced, not host load. Also corrects #2118's doc.
+   `st8o2` (P1): probe timeouts make recovery unobservable on a starved node.
 2. `pzhtd` (P1) experiment E on GCP: cap `kubepods.slice` via `enforceNodeAllocatable` (#2039's allocatable half) under the killable overload.
 3. Overload/recovery gate criterion, targets from E. Follow-ons `y7xy9`, `xseef`, `pj20g`.
 
