@@ -2340,6 +2340,8 @@ ExecStart=$BIN_DIR/u7s-apiserver --listen $APISERVER_LISTEN --advertise-address 
 # reports success the instant the signal is delivered, so a failed reload is only visible via
 # 'journalctl -u u7s-apiserver', never through this reload job's own exit status.
 ExecReload=/bin/kill -HUP \$MAINPID
+# system-node-critical equivalent: kubelet gives kubeadm's static control-plane pods -997
+OOMScoreAdjust=-997
 Restart=always
 RestartSec=2
 
@@ -2400,6 +2402,8 @@ Environment=GOMAXPROCS=2
 # in the list of known controllers") that crash-loops kcm before it ever
 # reaches its control loops.
 ExecStart=$BIN_DIR/kube-controller-manager --kubeconfig=$STATE_DIR/kcm-kubeconfig --authentication-kubeconfig=$STATE_DIR/kcm-kubeconfig --authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig --cluster-signing-cert-file=$STATE_DIR/intermediate-cert.pem --cluster-signing-key-file=$STATE_DIR/intermediate.key --cluster-signing-duration=8760h --root-ca-file=$STATE_DIR/ca-bundle.pem --controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller --allocate-node-cidrs=true --cluster-cidr=$POD_CLUSTER_CIDR --service-cluster-ip-range=$SERVICE_CIDR $KCM_NODE_CIDR_MASK_FLAGS --use-service-account-credentials=true --leader-elect=false --bind-address=127.0.0.1 --kube-api-content-type=application/json
+# system-node-critical equivalent: kubelet gives kubeadm's static control-plane pods -997
+OOMScoreAdjust=-997
 Restart=always
 RestartSec=2
 
