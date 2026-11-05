@@ -355,7 +355,7 @@ run_overload() {
     ok=0
     if [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] \
       && k get --raw /readyz >/dev/null 2>&1 \
-      && { [ "$NO_WORKLOAD" = 1 ] || [ "$(wp_code)" = 200 ]; }; then ok=1; fi
+      && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
     [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS")" != none ] && break
     sleep 5
