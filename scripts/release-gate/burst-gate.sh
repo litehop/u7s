@@ -87,7 +87,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
-RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
+RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0; MIN_TTL_MS=""
 BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
@@ -99,6 +99,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --runs) RUNS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --min-ttl-ms) MIN_TTL_MS="$2"; shift 2 ;;
     --coredns-requests) COREDNS_REQ=1; shift ;;
     --zram-mib) ZRAM_MIB="$2"; shift 2 ;;
     --capture) CAPTURE=1; shift ;;

@@ -47,7 +47,8 @@ vm_trim() {
     install -d /etc/systemd/system/kubelet.service.d &&
     printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=1\n' > /etc/systemd/system/kubelet.service.d/10-gate-arenas.conf &&
     systemctl mask --now $RG_LIMA_TRIM_UNITS &&
-    systemctl disable --now lima-guestagent.service"
+    systemctl disable --now lima-guestagent.service &&
+    { [ -z '${MIN_TTL_MS:-}' ] || echo '${MIN_TTL_MS:-}' > /sys/kernel/mm/lru_gen/min_ttl_ms; }"
 }
 
 vm_shell() {
