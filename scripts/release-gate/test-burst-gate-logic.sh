@@ -458,19 +458,26 @@ for cmd in 'bash -c sudo pkill -KILL -f ^bash /var/tmp/rg/vm-gate.sh' 'pkill -KI
     "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 0 || echo 1)"
 done
 
-# --- forced failure must fail in the burst, not the install ---
-good | sed 's/^burst_secs=.*/burst_secs=timeout/' > "$TMP/ff-burst.env"
-printf 'burst20\n' > "$TMP/ph-burst"; printf 'idle\n' > "$TMP/ph-idle"
-assert "forced failure that failed (c) in the burst phase -> OK" \
-  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-burst" >/dev/null && echo 1 || echo 0)"
-assert "forced failure that never left the idle phase is NOT OK (it proved nothing about the burst)" \
-  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-idle" >/dev/null && echo 0 || echo 1)"
-assert "forced failure with a failed install is NOT OK (the earlier 640 MiB run died in tar, not in the burst)" \
-  "$(good | sed 's/^install_ok=.*/install_ok=0/' > "$TMP/ff-inst.env"; rg_forced_failure_check "$TMP/ff-inst.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
-assert "forced failure whose run passed is NOT OK (the gate failed to fail)" \
-  "$(rg_forced_failure_check "$TMP/good.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
-assert "forced failure failing only (e) webhook is NOT OK (not a burst/OOM criterion)" \
-  "$(good | sed 's/^webhook_ok=.*/webhook_ok=0/' > "$TMP/ff-wh.env"; rg_forced_failure_check "$TMP/ff-wh.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
+# --- overload recovery metric ---
+rl() { printf '%s\n' "$@" > "$TMP/rec.log"; rg_recovery_secs "$TMP/rec.log" 1000 120; }
+assert "recovery is the start of the first all-OK streak held for the hold time (a brief OK during the thrash is not recovery)" \
+  "$([ "$(rl '1010 0' '1020 1' '1030 0' '1040 1' '1100 1' '1160 1')" = 40 ] && echo 1 || echo 0)"
+assert "an OK streak shorter than the hold is not recovered" \
+  "$([ "$(rl '1010 0' '1020 1' '1100 1' '1130 1')" = none ] && echo 1 || echo 0)"
+assert "a probe gap inside an OK streak does not break it (a slow probe is not a relapse)" \
+  "$([ "$(rl '1010 1' '1200 1')" = 10 ] && echo 1 || echo 0)"
+assert "no probes at all is not recovered" "$([ "$(rl)" = none ] && echo 1 || echo 0)"
+good > "$TMP/ov.env"
+printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
+assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \
+  "$(rg_overload_verdict "$TMP/ov.env" | grep -q 'RECOVERED 95s after overload start (40 pods x 60 MiB)' && echo 1 || echo 0)"
+{ grep -v '^recovery_secs=' "$TMP/ov.env"; echo recovery_secs=none; } > "$TMP/ov2.env"; mv "$TMP/ov2.env" "$TMP/ov.env"
+assert "overload verdict is NOT RECOVERED with non-zero exit, naming the final pod state" \
+  "$(rg_overload_verdict "$TMP/ov.env" > "$TMP/ov.out"; rc=$?; [ "$rc" != 0 ] && grep -q 'NOT RECOVERED.*Running=30 restarts=12' "$TMP/ov.out" && echo 1 || echo 0)"
+assert "overload args: pods without mib is refused (an allocator of 0 MiB is not an overload)" "$([ -n "$(rg_overload_args_error 40 0 0 '' 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: --no-workload without an overload is refused" "$([ -n "$(rg_overload_args_error 0 0 1 '' 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: overload plus --ramp is refused" "$([ -n "$(rg_overload_args_error 40 60 0 30,40 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: valid combination is accepted" "$([ -z "$(rg_overload_args_error 40 60 1 '' 0 420)" ] && echo 1 || echo 0)"
 
 # --- vm-sampler.sh attribution records ---
 SR="$TMP/sroot"; SO="$TMP/sout"
@@ -545,10 +552,12 @@ assert "OOM events carry victim comm, oom_score_adj and anon rss (shows whether 
   "$([ "$oomev" = "$(printf 'rg-alloc 1000 51200\nu7s-apiserver 0 9')" ] && echo 1 || echo 0)"
 
 # --- burst-gate.sh end to end with stubs ---
-assert "--mem-hog-mib reaches the VM env" "$("$HERE/burst-gate.sh" --runs 1 --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-hog" >/dev/null 2>&1; grep -qx 'HOG_MIB=400' "$TMP/out-hog/stage/gate.env" && echo 1 || echo 0)"
-assert "HOG_MIB defaults to 0" "$(grep -qx 'HOG_MIB=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
-rc=0; "$HERE/burst-gate.sh" --mem-hog-mib x --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
-assert "--mem-hog-mib x rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+assert "--overload-pods/--overload-mib/--no-workload reach the VM env" "$("$HERE/burst-gate.sh" --runs 1 --overload-pods 40 --overload-mib 60 --no-workload --tarball-dir "$TMP/tb" --out "$TMP/out-ov" >/dev/null 2>&1; grep -qx 'OVERLOAD_PODS=40' "$TMP/out-ov/stage/gate.env" && grep -qx 'OVERLOAD_MIB=60' "$TMP/out-ov/stage/gate.env" && grep -qx 'NO_WORKLOAD=1' "$TMP/out-ov/stage/gate.env" && echo 1 || echo 0)"
+assert "OVERLOAD_PODS defaults to 0 (a normal gate run must not overload)" "$(grep -qx 'OVERLOAD_PODS=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --overload-pods 40 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
+assert "--overload-pods without --overload-mib rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
+assert "the unkillable tmpfs --mem-hog-mib is gone (it produced a harness-artefact wedge)" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
 
 printf '#!/bin/sh\necho 30\n' > "$TMP/bin/idle30"; chmod +x "$TMP/bin/idle30"
 : > "$LIMA_CALLS"; rm -rf "$TMP/out-noisy"

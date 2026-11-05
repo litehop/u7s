@@ -459,20 +459,28 @@ rg_probe_and_record_marker_failure() {
   rg_record_marker_write_failure "$f" "$was_ready" "$arc" "$aout" "$prc" "$pout"
 }
 
-# Forced-failure self-check: $1 results file, $2 the VM's phase file. OK (0) only when install
-# succeeded, the run got to the burst phases, and a burst criterion (a)-(c) FAILed there.
-rg_forced_failure_check() {
-  local f="$1" phase verdict
-  phase="$(cat "$2" 2>/dev/null)"
-  [ "$(rg_get "$f" install_ok)" = 1 ] || { echo "forced-failure NOT OK: install did not succeed"; return 1; }
-  case "$phase" in
-    burst*|settle*|wpcheck|webhook|collect) ;;
-    *) echo "forced-failure NOT OK: run never reached the burst phases (last phase: ${phase:-none})"; return 1 ;;
-  esac
-  verdict="$(rg_verdict "$f")" || true
-  echo "$verdict" | grep -qE '^FAIL +\((a|b|c)\) ' \
-    || { echo "forced-failure NOT OK: no burst criterion (a)-(c) failed"; return 1; }
-  echo "forced-failure OK: burst reached and failed there"
+# Recovery probe log: "<epoch> <1|0>" per probe, 1 = node Ready AND API /readyz AND WordPress 200
+# (WordPress only when deployed). Prints seconds from $2 (overload start) to the first probe of a
+# streak of 1s that lasted at least $3 seconds, or "none". A probe gap inside a streak (a hung
+# probe) does not break it; a 0 does.
+rg_recovery_secs() {
+  awk -v t0="$2" -v hold="$3" '
+    $2 == 1 { if (!s) s = $1; if ($1 - s >= hold) { print s - t0; found = 1; exit } }
+    $2 != 1 { s = 0 }
+    END { if (!found) print "none" }' "$1"
+}
+
+# Overload verdict from results file $1: a measurement, not a PASS. 0 only when the node recovered.
+rg_overload_verdict() {
+  local f="$1" rec
+  [ "$(rg_get "$f" install_ok)" = 1 ] || { echo "RESULT: FAIL (install or node Ready; no overload ran)"; return 1; }
+  rec="$(rg_get "$f" recovery_secs)"
+  if _rg_is_num "$rec"; then
+    echo "RESULT: RECOVERED ${rec}s after overload start ($(rg_get "$f" overload_pods) pods x $(rg_get "$f" overload_mib) MiB), held $(rg_get "$f" recovery_hold_secs)s; final: $(rg_get "$f" overload_final)"
+    return 0
+  fi
+  echo "RESULT: NOT RECOVERED within $(rg_get "$f" overload_window_secs)s of overload start ($(rg_get "$f" overload_pods) pods x $(rg_get "$f" overload_mib) MiB); final: $(rg_get "$f" overload_final)"
+  return 1
 }
 
 # Minimum MemAvailable (MiB) over samples.tsv rows of phase $2, or "-" when none.
@@ -645,6 +653,19 @@ rg_experiment_args_error() {
   elif [ -n "$3" ] && [ "$1" != gcp ]; then echo "--tarball is only for --backend gcp (lima builds its own tarball; use --tarball-dir)"
   elif [ -n "$3" ] && [ "$4" = 1 ]; then echo "--confirm is the release gate and refuses an EXPERIMENT (unpublished tarball) run"
   elif [ -z "$3" ] && [ "$5" = 1 ]; then echo "--install-only is only for an experiment (--tarball)"
+  fi
+}
+
+# Echoes why the overload flags are refused, or nothing. $1 --overload-pods, $2 --overload-mib,
+# $3 --no-workload (0|1), $4 --ramp, $5 --confirm (0|1), $6 --overload-window-secs.
+rg_overload_args_error() {
+  local p="$1" m="$2"
+  case "$p$m$6" in *[!0-9]*) echo "--overload-pods, --overload-mib and --overload-window-secs must be non-negative integers"; return ;; esac
+  if [ "$p" -gt 0 ] && [ "$m" -eq 0 ]; then echo "--overload-pods needs --overload-mib (each pod's anonymous allocation)"
+  elif [ "$p" -eq 0 ] && [ "$m" -gt 0 ]; then echo "--overload-mib needs --overload-pods"
+  elif [ "$p" -eq 0 ] && [ "$3" = 1 ]; then echo "--no-workload is only for an overload run (--overload-pods)"
+  elif [ "$p" -gt 0 ] && { [ -n "$4" ] || [ "$5" = 1 ]; }; then echo "--overload-pods cannot be combined with --ramp or --confirm"
+  elif [ "$p" -gt 0 ] && [ "$6" -eq 0 ]; then echo "--overload-window-secs must be positive"
   fi
 }
 
