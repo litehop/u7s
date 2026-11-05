@@ -4,6 +4,7 @@
 # MEMORY; for gcp, scripts/gcp/lib.sh sourced and gcp_require_config passed.
 #
 # vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable
+# vm_trim NAME            lima: stop/mask guest daemons the GCP image lacks (no-op on gcp)
 # vm_shell NAME cmd...    run cmd as the login user; arguments keep their quoting
 # vm_copy_to NAME DIR SRC...   copy files/directories into DIR on NAME
 # vm_copy_from NAME SRC DST    copy a directory out of NAME
@@ -30,6 +31,23 @@ vm_create() {
       echo "$name never became reachable over IAP ssh" >>"$logdir/gcp-create.log"
       return 1 ;;
   esac
+}
+
+# Lima only: brings the guest to GCP-image parity before install. Ubuntu's cloud image and Lima
+# carry ~85 MiB of anon (udisks2, ModemManager, multipathd, polkit, lima-guestagent, and
+# 8 glibc arenas in the arm64 kubelet) that the GCP image does not; GCP's own agents are real
+# production cost and stay. The kubelet drop-in exists before install writes kubelet.service.
+# Host copy-in/out and shell go over ssh, so the guest agent is not needed.
+RG_LIMA_TRIM_UNITS="udisks2.service ModemManager.service multipathd.service multipathd.socket polkit.service"
+vm_trim() {
+  [ "$BACKEND" = lima ] || return 0
+  # lima-guestagent.service is a real file under /etc/systemd/system, which mask refuses to replace.
+  # shellcheck disable=SC2086
+  vm_shell "$1" sudo bash -c "
+    install -d /etc/systemd/system/kubelet.service.d &&
+    printf '[Service]\nEnvironment=MALLOC_ARENA_MAX=1\n' > /etc/systemd/system/kubelet.service.d/10-gate-arenas.conf &&
+    systemctl mask --now $RG_LIMA_TRIM_UNITS &&
+    systemctl disable --now lima-guestagent.service"
 }
 
 vm_shell() {

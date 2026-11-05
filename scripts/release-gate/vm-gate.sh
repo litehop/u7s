@@ -19,10 +19,11 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
-INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60
+INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
 RG_WEDGE_SECS="$WEDGE_SECS"
+RG_WEDGE_STALL_SECS="$WEDGE_STALL_SECS"
 RG_JIFFIES_PER_SEC=$(( $(nproc 2>/dev/null || echo 1) * 100 ))
 
 mkdir -p "$OUT"
@@ -34,7 +35,7 @@ res() {
   { grep -v "^$1=" "$OUT/results.env" 2>/dev/null; echo "$1=$2"; } > "$OUT/results.tmp"
   mv "$OUT/results.tmp" "$OUT/results.env"
 }
-phase() { echo "$1" > "$OUT/phase"; log "phase: $1"; }
+phase() { { echo "# $(cat "$OUT/phase" 2>/dev/null)"; cat "$OUT/burst-progress.log" 2>/dev/null; } >> "$OUT/burst-progress.hist"; : > "$OUT/burst-progress.log"; echo "$1" > "$OUT/phase"; log "phase: $1"; }
 k() { timeout "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
@@ -44,17 +45,19 @@ kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 run_burst() {
   local n="$1" start now wpid
   start="$(date +%s)"
+  echo "$start 0" > "$OUT/burst-progress.log"
   k scale deployment/rg-burst --replicas="$n" >/dev/null 2>&1
   while :; do
     now="$(date +%s)"
     if [ -e "$OUT/wedge.txt" ]; then echo wedge; return; fi
-    if [ $((now - start)) -ge "$HARD_KILL_SECS" ]; then echo timeout; return; fi
+    if [ $((now - start)) -ge "$HARD_KILL_SECS" ]; then rm -f "$OUT/burst-watch.pid"; echo timeout; return; fi
     exec 3< <(exec timeout $((HARD_KILL_SECS - (now - start))) kubectl --kubeconfig "$KCFG" \
       get deployment rg-burst -w -o jsonpath='{.status.readyReplicas}{"\n"}' 2>/dev/null)
     wpid=$!
     echo "$wpid" > "$OUT/burst-watch.pid"
-    if rg_wait_ready "$n" <&3; then
+    if rg_wait_ready "$n" "$OUT/burst-progress.log" <&3; then
       kill "$wpid" 2>/dev/null; exec 3<&-
+      rm -f "$OUT/burst-watch.pid"
       echo $(( $(date +%s) - start )); return
     fi
     exec 3<&-
@@ -139,14 +142,16 @@ wait_node_ready() {
 # node-ready.log and the sampler's STAT rows: no new processes beyond one awk pass over the
 # sampler's last rows). On a wedge writes wedge.txt and kills the burst watch so run_burst returns.
 wedge_monitor() {
-  local why
+  local why pid
   while [ ! -e "$OUT/watch-stop" ]; do
     sleep 5
     case "$(cat "$OUT/phase" 2>/dev/null)" in burst*) ;; *) continue ;; esac
-    why="$(rg_wedge_reason "$(date +%s)" "$OUT/node-ready.log" <(tail -n 4000 "$OUT/attrib.tsv"))"
+    why="$(rg_wedge_reason "$(date +%s)" "$OUT/node-ready.log" <(tail -n 4000 "$OUT/attrib.tsv") "$OUT/burst-progress.log")"
     [ -n "$why" ] || continue
+    pid="$(rg_burst_watch_pid "$OUT/burst-watch.pid")"
+    [ -n "$pid" ] || continue
     echo "$why" > "$OUT/wedge.txt"
-    kill "$(cat "$OUT/burst-watch.pid" 2>/dev/null)" 2>/dev/null
+    kill "$pid" 2>/dev/null
     return
   done
 }
