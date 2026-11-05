@@ -87,6 +87,11 @@ impl ServiceIpAllocator {
                 bits - 2
             ));
         }
+        if addr.is_ipv6() && prefix < 64 {
+            return Err(format!(
+                "shortest allowed prefix length for service CIDR is 64, got {prefix}"
+            ));
+        }
         let host_bits = bits - prefix;
         let size = 1u128 << host_bits;
         let base = match addr {
@@ -2915,6 +2920,16 @@ mod tests {
             err.1.message,
             "Internal error occurred: failed to allocate a serviceIP for Service \"svc\": range is full"
         );
+        let details = err
+            .1
+            .details
+            .as_ref()
+            .expect("upstream NewInternalError sets details");
+        assert_eq!(
+            details["causes"],
+            serde_json::json!([{"message": "failed to allocate a serviceIP for Service \"svc\": range is full"}]),
+            "upstream NewInternalError carries one cause with only the message (no type/field)"
+        );
     }
 
     /// Offset 1 (.1) is skipped for normal services but used for the kubernetes Service.
@@ -3024,6 +3039,52 @@ mod tests {
         assert!(
             ServiceIpAllocator::from_cidr("999.0.0.0/24").is_err(),
             "from_cidr must reject invalid IP address"
+        );
+    }
+
+    /// Upstream `ipallocator.NewIPAllocator` rejects IPv6 prefixes shorter than /64; without
+    /// that bound `::/0` computed `1u128 << 128` (panic in debug, size 1 in release). Every
+    /// prefix of either family must return Ok or Err, never panic.
+    #[test]
+    fn from_cidr_rejects_short_ipv6_prefixes_and_never_panics() {
+        for p in 0..64 {
+            let err = ServiceIpAllocator::from_cidr(&format!("::/{p}"))
+                .err()
+                .unwrap_or_else(|| panic!("::/{p} must be rejected"));
+            assert_eq!(
+                err,
+                format!("shortest allowed prefix length for service CIDR is 64, got {p}")
+            );
+        }
+        for p in 64..=126 {
+            assert!(
+                ServiceIpAllocator::from_cidr(&format!("fd00::/{p}")).is_ok(),
+                "/{p}"
+            );
+        }
+        for p in 127..=128 {
+            assert!(
+                ServiceIpAllocator::from_cidr(&format!("fd00::/{p}")).is_err(),
+                "/{p}"
+            );
+        }
+        let v4_zero = ServiceIpAllocator::from_cidr("0.0.0.0/0").unwrap();
+        assert_eq!((v4_zero.size, v4_zero.prefix_len()), (1 << 32, 0));
+        for p in 0..=30 {
+            assert!(
+                ServiceIpAllocator::from_cidr(&format!("10.0.0.0/{p}")).is_ok(),
+                "/{p}"
+            );
+        }
+        for p in 31..=32 {
+            assert!(
+                ServiceIpAllocator::from_cidr(&format!("10.0.0.0/{p}")).is_err(),
+                "/{p}"
+            );
+        }
+        assert!(
+            parse_service_cluster_ip_ranges("10.96.0.0/12,::/0").is_err(),
+            "a short secondary range must fail startup parsing too"
         );
     }
 
