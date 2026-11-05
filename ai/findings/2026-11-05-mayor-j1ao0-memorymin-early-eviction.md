@@ -2,7 +2,7 @@
 
 Bead: mayor-j1ao0
 
-Answer: (filled in after both arms; see sections below).
+Answer: no. MemoryMin on the control-plane units plus earlier kubelet eviction did not recover the node, API or WordPress within 600 s (n=1 per arm, both INVALID for host contention), and the API was less available in arm D than in control.
 
 Setup: trimmed Lima VM (1 GiB, 1 vCPU), WordPress+MariaDB resident, 30 BestEffort pods x 25 MiB
 scaled at once, 600 s window, 120 s hold, reused arm64 tarball from the #2117 branch (includes
