@@ -19,7 +19,7 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0
-OVERLOAD_WINDOW_SECS=420; RECOVERY_HOLD_SECS=120
+OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=15
 INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
@@ -357,10 +357,10 @@ run_overload() {
       && k get --raw /readyz >/dev/null 2>&1 \
       && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
-    [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS")" != none ] && break
+    [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
     sleep 5
   done
-  res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS")"
+  res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
   K_TIMEOUT=10
   fin="$(k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
     | awk '{c[$1]++; r += $2} END {for (p in c) printf "%s=%d ", p, c[p]; printf "restarts=%d", r}')"

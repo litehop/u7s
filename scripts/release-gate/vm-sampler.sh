@@ -176,6 +176,8 @@ sample_self() {
 }
 
 last_full=0
+# Every row of one iteration carries the iteration's start time, so on a starved node a row's
+# values may have been read seconds after its timestamp.
 while true; do
   ts="$(date +%s)"
   read -r phase < "$OUT/phase" 2>/dev/null || phase=none

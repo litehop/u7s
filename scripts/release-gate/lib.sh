@@ -461,11 +461,12 @@ rg_probe_and_record_marker_failure() {
 
 # Recovery probe log: "<epoch> <1|0>" per probe, 1 = node Ready AND API /readyz AND WordPress 200
 # (WordPress only when deployed). Prints seconds from $2 (overload start) to the first probe of a
-# streak of 1s that lasted at least $3 seconds, or "none". A probe gap inside a streak (a hung
-# probe) does not break it; a 0 does.
+# streak of 1s that lasted at least $3 seconds, or "none". A 0, or a gap above $4 seconds between
+# consecutive probes (a hung or frozen node cannot be shown to have held), breaks the streak; the
+# next 1 starts a new one. The vm-gate probes every 5 s, so it passes 15 (3 intervals).
 rg_recovery_secs() {
-  awk -v t0="$2" -v hold="$3" '
-    $2 == 1 { if (!s) s = $1; if ($1 - s >= hold) { print s - t0; found = 1; exit } }
+  awk -v t0="$2" -v hold="$3" -v gap="$4" '
+    $2 == 1 { if (s && $1 - last > gap) s = 0; if (!s) s = $1; last = $1; if ($1 - s >= hold) { print s - t0; found = 1; exit } }
     $2 != 1 { s = 0 }
     END { if (!found) print "none" }' "$1"
 }

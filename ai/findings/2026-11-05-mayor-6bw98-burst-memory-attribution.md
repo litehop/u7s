@@ -2,10 +2,11 @@
 
 Bead: mayor-6bw98 (sampler), mayor-36soz (killable overload repro)
 
-Answer: in every overload run the MemAvailable loss is anonymous memory of the overload pods
+Answer: on Lima (L1, L2) the MemAvailable loss is anonymous memory of the overload pods
 (kubepods-besteffort), balanced by file-cache eviction; control-plane anon, slab (~+10-25 MiB) and
-page tables (<20 MiB) are not the consumers, and the node (Lima and GCP) does not recover within
-300 s even when the kernel OOM killer fires on the killable pods (n=1 per run).
+page tables (<20 MiB) are not the consumers, and the node does not recover within 300 s (n=1 per
+run). The GCP mechanism is unconfirmed: G1 showed besteffort anon of only 34-40 MiB for ~170 s at
+MemAvailable 271-292 MiB and lost its OOM log.
 
 ## Method
 
@@ -16,8 +17,12 @@ page tables (<20 MiB) are not the consumers, and the node (Lima and GCP) does no
 - `u7s-apiserver` runs apiserver and scheduler in one process (`--embedded-scheduler true`),
   so there is no separate scheduler row.
 - Overload: `--overload-pods N --overload-mib M`: BestEffort pods (`nginx:alpine`, busybox ash
-  holds M MiB in a shell variable), killable at oom_score_adj 1000. Recovery = node Ready +
-  `/readyz` + WordPress 200 held 120 s.
+  holds M MiB in a shell variable), killable at oom_score_adj 1000, restartPolicy Always (killed
+  pods restart and re-allocate). Recovery = node Ready + `/readyz` + WordPress 200/301/302 held
+  120 s with no probe gap above 15 s. Per-pod resident is at least M; the `$(head|tr)` peak while
+  building the variable is not measured. The runs below used a 300 s window and the earlier
+  recovery metric, which treated a probe gap as held; none of them recovered, so no verdict here
+  depends on that.
 
 ## Runs
 
@@ -98,7 +103,9 @@ sampler gap), the collect phase never completed (no kernel log / OOM victims fil
 
 ## Verdict and caveats
 
-- Consumer: overload-pod anon (Lima +236-400 MiB within 7-50 s). Components, slab and page tables
+- Consumer on Lima: overload-pod anon (+236-400 MiB within 7-50 s). On GCP unconfirmed (G1
+  besteffort anon 34-40 MiB for ~170 s at MemAvailable 271-292 MiB, OOM log lost). L1's OOM
+  victims were php-fpm, not overload pods. Components, slab and page tables
   do not grow materially, so the earlier "unattributed 70-160 MiB" in burst runs is most plausibly
   file-cache loss plus per-pod sandbox anon, to be re-checked with a pause-burst run (this work ran
   only the overload mode).

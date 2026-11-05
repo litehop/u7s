@@ -459,13 +459,17 @@ for cmd in 'bash -c sudo pkill -KILL -f ^bash /var/tmp/rg/vm-gate.sh' 'pkill -KI
 done
 
 # --- overload recovery metric ---
-rl() { printf '%s\n' "$@" > "$TMP/rec.log"; rg_recovery_secs "$TMP/rec.log" 1000 120; }
+rl() { printf '%s\n' "$@" > "$TMP/rec.log"; rg_recovery_secs "$TMP/rec.log" 1000 120 15; }
 assert "recovery is the start of the first all-OK streak held for the hold time (a brief OK during the thrash is not recovery)" \
-  "$([ "$(rl '1010 0' '1020 1' '1030 0' '1040 1' '1100 1' '1160 1')" = 40 ] && echo 1 || echo 0)"
+  "$({ echo '1010 0'; echo '1020 1'; echo '1030 0'; for t in $(seq 1040 10 1160); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 40 ] && echo 1 || echo 0)"
 assert "an OK streak shorter than the hold is not recovered" \
   "$([ "$(rl '1010 0' '1020 1' '1100 1' '1130 1')" = none ] && echo 1 || echo 0)"
-assert "a probe gap inside an OK streak does not break it (a slow probe is not a relapse)" \
-  "$([ "$(rl '1010 1' '1200 1')" = 10 ] && echo 1 || echo 0)"
+assert "a probe gap above the max gap breaks the streak (an unobserved freeze is not held health)" \
+  "$([ "$(rl '1010 1' '1200 1')" = none ] && echo 1 || echo 0)"
+assert "a freeze bracketed by two OK probes is not 'held 120 s'; the streak restarts after it" \
+  "$({ echo '1010 1'; for t in $(seq 1140 10 1270); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 140 ] && echo 1 || echo 0)"
+assert "probes within the max gap keep a streak (slow-but-answering probes still count)" \
+  "$({ for t in $(seq 1010 15 1130); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 10 ] && echo 1 || echo 0)"
 assert "no probes at all is not recovered" "$([ "$(rl)" = none ] && echo 1 || echo 0)"
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"

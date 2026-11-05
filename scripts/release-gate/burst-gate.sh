@@ -52,12 +52,21 @@
 #                     overload measurement instead of the bursts: after WordPress is up, scale a
 #                     Deployment of N BestEffort pods (oom_score_adj 1000, so killable) that each
 #                     hold M MiB of anonymous memory. The metric is recovery: seconds from the scale
-#                     to node Ready + API /readyz + WordPress 200, held 120 s, plus the final pod
+#                     to node Ready + API /readyz + WordPress 200/301/302, held 120 s with no gap
+#                     above 15 s between probes (a frozen node is not "held"), plus the final pod
 #                     state and OOM victims by oom_score_adj; not a PASS criterion (exit 0 iff
 #                     recovered within the window)
+#                     Pods are BestEffort with restartPolicy Always: an OOM-killed pod restarts
+#                     (restartCount grows) and re-allocates, so the overload is sustained, not a
+#                     one-shot spike. Resident per pod is at least M MiB; the ash $(head|tr)
+#                     allocator may transiently peak above M while building the variable (not
+#                     measured), so size N x M with that headroom in mind.
 #   --no-workload     overload run without WordPress/MariaDB (headroom dose-response); recovery then
 #                     means node Ready + /readyz
-#   --overload-window-secs SECS  give up on recovery SECS after the overload starts (default 420)
+#   --overload-window-secs SECS  give up on recovery SECS after the overload starts (default 600:
+#                     the 120 s hold must fit inside the window, so recovery must START by
+#                     SECS-120 = 480 s; the old 420 left 300 s, too short for the 380 s freezes
+#                     seen on Lima)
 #   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
 #   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --capture         also run vm-capture.sh (PSI/CPU/refault diagnostics; its kubectl probes
@@ -95,7 +104,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
-OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=420
+OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=600
 BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
