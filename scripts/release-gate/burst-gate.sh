@@ -40,7 +40,7 @@
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
 # A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
 #
-# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
+# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--overload-pods N --overload-mib M [--no-workload] [--overload-window-secs SECS]] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--wedge-secs SECS] [--wedge-stall-secs SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 50); the verdict names it
@@ -48,9 +48,25 @@
 #                     50 pods, and only if any fails 3 at 40. Reports the gated no-swap ceiling or FAIL.
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (applies from boot, so it can break the install)
-#   --mem-hog-mib N   forced-failure check: after install, pin N MiB (tmpfs, no swap) so the burst
-#                     is what fails. The run is then judged by whether it failed in the burst,
-#                     and exits 0 only if so (e.g. 400)
+#   --overload-pods N --overload-mib M
+#                     overload measurement instead of the bursts: after WordPress is up, scale a
+#                     Deployment of N BestEffort pods (oom_score_adj 1000, so killable) that each
+#                     hold M MiB of anonymous memory. The metric is recovery: seconds from the scale
+#                     to node Ready + API /readyz + WordPress 200/301/302, held 120 s with no gap
+#                     above 15 s between probes (a frozen node is not "held"), plus the final pod
+#                     state and OOM victims by oom_score_adj; not a PASS criterion (exit 0 iff
+#                     recovered within the window)
+#                     Pods are BestEffort with restartPolicy Always: an OOM-killed pod restarts
+#                     (restartCount grows) and re-allocates, so the overload is sustained, not a
+#                     one-shot spike. Resident per pod is at least M MiB; the ash $(head|tr)
+#                     allocator may transiently peak above M while building the variable (not
+#                     measured), so size N x M with that headroom in mind.
+#   --no-workload     overload run without WordPress/MariaDB (headroom dose-response); recovery then
+#                     means node Ready + /readyz
+#   --overload-window-secs SECS  give up on recovery SECS after the overload starts (default 600:
+#                     the 120 s hold must fit inside the window, so recovery must START by
+#                     SECS-120 = 480 s; the old 420 left 300 s, too short for the 380 s freezes
+#                     seen on Lima)
 #   --coredns-requests experiment: set CoreDNS cpu/memory requests after install
 #   --zram-mib N      experiment: give the VM an N MiB zram swap device before install
 #   --capture         also run vm-capture.sh (PSI/CPU/refault diagnostics; its kubectl probes
@@ -87,7 +103,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
-RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
+RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
+OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=600
 BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
@@ -107,7 +124,10 @@ while [ $# -gt 0 ]; do
     --confirm) CONFIRM=1; shift ;;
     --probe-kill) PROBE_KILL_SECS="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
-    --mem-hog-mib) HOG_MIB="$2"; shift 2 ;;
+    --overload-pods) OVERLOAD_PODS="$2"; shift 2 ;;
+    --overload-mib) OVERLOAD_MIB="$2"; shift 2 ;;
+    --no-workload) NO_WORKLOAD=1; shift ;;
+    --overload-window-secs) OVERLOAD_WINDOW_SECS="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --wedge-secs) WEDGE_SECS="$2"; shift 2 ;;
     --wedge-stall-secs) WEDGE_STALL_SECS="$2"; shift 2 ;;
@@ -130,9 +150,6 @@ case "$WEDGE_STALL_SECS" in
 esac
 case "$ZRAM_MIB" in
   ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
-esac
-case "$HOG_MIB" in
-  ''|*[!0-9]*) echo "--mem-hog-mib must be a non-negative integer (MiB), got '$HOG_MIB'" >&2; exit 2 ;;
 esac
 case "$RUNS" in
   ''|*[!0-9]*) echo "--runs must be a positive integer, got '$RUNS'" >&2; exit 2 ;;
@@ -174,6 +191,8 @@ case "$BURST_PODS" in
   ''|*[!0-9]*|0) echo "--burst-pods must be a positive integer, got '$BURST_PODS'" >&2; exit 2 ;;
 esac
 if [ "$CONFIRM" = 1 ] && [ -n "$RAMP" ]; then echo "--confirm and --ramp are mutually exclusive" >&2; exit 2; fi
+ov_err="$(rg_overload_args_error "$OVERLOAD_PODS" "$OVERLOAD_MIB" "$NO_WORKLOAD" "$RAMP" "$CONFIRM" "$OVERLOAD_WINDOW_SECS")"
+[ -z "$ov_err" ] || { echo "$ov_err" >&2; exit 2; }
 if [ -n "$RAMP" ]; then
   RAMP_SIZES="$(rg_parse_ramp "$RAMP")" \
     || { echo "--ramp must be strictly increasing positive integers like 30,40,50, got '$RAMP'" >&2; exit 2; }
@@ -262,8 +281,8 @@ if [ "$BACKEND" = lima ]; then
   INSTALL_TARBALL="/var/tmp/rg/$(basename "${staged[0]}")"
 fi
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\nWEDGE_STALL_SECS=%s\nBURST_CAP_SECS=%s\n' \
-  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" "$WEDGE_STALL_SECS" "$BURST_CAP_SECS" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nOVERLOAD_PODS=%s\nOVERLOAD_MIB=%s\nNO_WORKLOAD=%s\nOVERLOAD_WINDOW_SECS=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\nWEDGE_STALL_SECS=%s\nBURST_CAP_SECS=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$OVERLOAD_PODS" "$OVERLOAD_MIB" "$NO_WORKLOAD" "$OVERLOAD_WINDOW_SECS" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" "$WEDGE_STALL_SECS" "$BURST_CAP_SECS" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -378,6 +397,8 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       else
         echo "RESULT: FAIL (install or node Ready; no bursts ran)" > "$RUN_OUT/verdict.txt"; rc=1
       fi
+    elif [ "$OVERLOAD_PODS" -gt 0 ]; then
+      rg_overload_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
     elif [ -n "$RAMP" ]; then
       rg_ramp_verdict "$RUN_OUT/out/results.env" "$RAMP_SIZES" "$RUN_OUT/out/samples.tsv" > "$RUN_OUT/verdict.txt"; rc=$?
     else
@@ -386,10 +407,6 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     [ -z "$EXP_TAG" ] || { { echo "$EXP_TAG"; cat "$RUN_OUT/verdict.txt"; } > "$RUN_OUT/verdict.tmp"; mv "$RUN_OUT/verdict.tmp" "$RUN_OUT/verdict.txt"; }
     cat "$RUN_OUT/verdict.txt"
     status="$(rg_run_status "$rc" "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env")"
-    if [ "$status" != INVALID ] && [ "$HOG_MIB" -gt 0 ]; then
-      rg_forced_failure_check "$RUN_OUT/out/results.env" "$RUN_OUT/out/phase" | tee -a "$RUN_OUT/verdict.txt"; rc=${PIPESTATUS[0]}
-      [ "$rc" -eq 0 ] && status=PASS || status=FAIL
-    fi
   fi
   if [ "$BACKEND" = gcp ] && [ "$status" != PASS ]; then
     pre_rc=0; gcp_vps_was_preempted "$VM" || pre_rc=$?

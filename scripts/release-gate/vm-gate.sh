@@ -18,7 +18,8 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0
+OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=15
 INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
@@ -272,6 +273,9 @@ res steal_idle_pct "$(rg_steal_pct "$cpu_before" "$(head -1 /proc/stat)")"
 calibrate_boundary
 
 phase wordpress
+if [ "$NO_WORKLOAD" = 1 ]; then
+  log "no-workload: WordPress and MariaDB not deployed"
+else
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
 for _ in $(seq 1 60); do k -n default get pod mariadb-0 >/dev/null 2>&1 && break; sleep 2; done
 MARIADB_READY=1
@@ -300,21 +304,70 @@ marker_ok() {
   done
   rg_marker_ok "$MARKER" "$v"
 }
+fi
 sleep "$SETTLE_STEP"
 
 phase warmup
 k create deployment rg-burst --image="$PAUSE_IMAGE" --replicas=1 >> "$OUT/run.log" 2>&1
 kw wait --for=condition=Available deployment/rg-burst --timeout=300s >> "$OUT/run.log" 2>&1 || log "warm-up pod not Available"
 
-# Forced-failure lever applied after install: pinned tmpfs pages (no swap) squeeze the burst
-# instead of the install.
-if [ "$HOG_MIB" -gt 0 ]; then
-  phase hog
-  mkdir -p /mnt/rg-hog && mount -t tmpfs -o "size=${HOG_MIB}m" tmpfs /mnt/rg-hog \
-    && dd if=/dev/zero of=/mnt/rg-hog/hog bs=1M count="$HOG_MIB" 2>/dev/null \
-    || { log "memory hog setup failed"; res hog_ok 0; exit 1; }
-  res hog_ok 1; log "memory hog: ${HOG_MIB} MiB pinned"
+if [ "$OVERLOAD_PODS" -gt 0 ]; then
+  # BestEffort pods (oom_score_adj 1000, killable) that each hold OVERLOAD_MIB of anonymous memory in a
+  # shell variable. nginx:alpine is the image WordPress already pulled, and busybox ash has head/tr.
+  k apply -f - >> "$OUT/run.log" 2>&1 <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rg-overload
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rg-overload
+  template:
+    metadata:
+      labels:
+        app: rg-overload
+    spec:
+      containers:
+        - name: alloc
+          image: nginx:alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - 'x=\$(head -c \$((${OVERLOAD_MIB} * 1048576)) /dev/zero | tr "\\0" x); while :; do sleep 3600; done'
+EOF
+  kw wait --for=condition=Available deployment/rg-overload --timeout=300s >> "$OUT/run.log" 2>&1 || log "overload warm-up pod not Available"
 fi
+
+# Scales rg-overload to OVERLOAD_PODS and probes every 5 s until node Ready + API /readyz + WordPress 200
+# have held RECOVERY_HOLD_SECS, or OVERLOAD_WINDOW_SECS pass. The overload pods stay: a user's overload
+# does not go away on its own.
+run_overload() {
+  local t0 ok fin
+  phase overload
+  t0="$(date +%s)"
+  res overload_t0 "$t0"; res overload_pods "$OVERLOAD_PODS"; res overload_mib "$OVERLOAD_MIB"
+  res overload_window_secs "$OVERLOAD_WINDOW_SECS"; res recovery_hold_secs "$RECOVERY_HOLD_SECS"
+  : > "$OUT/recovery.log"
+  k scale deployment/rg-overload --replicas="$OVERLOAD_PODS" >/dev/null 2>&1
+  while [ $(( $(date +%s) - t0 )) -lt "$OVERLOAD_WINDOW_SECS" ]; do
+    ok=0
+    if [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] \
+      && k get --raw /readyz >/dev/null 2>&1 \
+      && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
+    echo "$(date +%s) $ok" >> "$OUT/recovery.log"
+    [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
+    sleep 5
+  done
+  res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
+  K_TIMEOUT=10
+  fin="$(k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
+    | awk '{c[$1]++; r += $2} END {for (p in c) printf "%s=%d ", p, c[p]; printf "restarts=%d", r}')"
+  res overload_final "node=$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) overload-pods: $fin"
+  log "overload: recovery_secs=$(rg_get "$OUT/results.env" recovery_secs) final: $(rg_get "$OUT/results.env" overload_final)"
+  write_tally
+}
 
 wp_ok_poll() {
   local _
@@ -384,7 +437,7 @@ run_full() {
 }
 
 snap pre-burst
-if [ -n "$RAMP" ]; then run_ramp; else run_full; fi
+if [ "$OVERLOAD_PODS" -gt 0 ]; then run_overload; elif [ -n "$RAMP" ]; then run_ramp; else run_full; fi
 
 phase collect
 stop_bg
@@ -401,6 +454,7 @@ k get pods -A -o wide > "$OUT/pods.txt" 2>&1
 k get events -A --field-selector reason=Evicted -o custom-columns=NS:.metadata.namespace,OBJ:.involvedObject.name --no-headers > "$OUT/evictions.txt" 2>/dev/null
 k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} restarts={.status.containerStatuses[*].restartCount} last={.status.containerStatuses[*].lastState.terminated.reason}{"\n"}{end}' > "$OUT/pod-restarts.txt" 2>&1
 rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" < "$OUT/kernel.log" > "$OUT/oom-victims.txt"
+rg_oom_events < "$OUT/kernel.log" > "$OUT/oom-events.txt"
 read -r oomh oomk <<< "$(rg_oom_counts < "$OUT/oom-victims.txt")"
 res oom_host "$oomh"
 res oom_kubesystem "$oomk"

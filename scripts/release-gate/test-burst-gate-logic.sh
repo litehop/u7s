@@ -458,19 +458,30 @@ for cmd in 'bash -c sudo pkill -KILL -f ^bash /var/tmp/rg/vm-gate.sh' 'pkill -KI
     "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 0 || echo 1)"
 done
 
-# --- forced failure must fail in the burst, not the install ---
-good | sed 's/^burst_secs=.*/burst_secs=timeout/' > "$TMP/ff-burst.env"
-printf 'burst20\n' > "$TMP/ph-burst"; printf 'idle\n' > "$TMP/ph-idle"
-assert "forced failure that failed (c) in the burst phase -> OK" \
-  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-burst" >/dev/null && echo 1 || echo 0)"
-assert "forced failure that never left the idle phase is NOT OK (it proved nothing about the burst)" \
-  "$(rg_forced_failure_check "$TMP/ff-burst.env" "$TMP/ph-idle" >/dev/null && echo 0 || echo 1)"
-assert "forced failure with a failed install is NOT OK (the earlier 640 MiB run died in tar, not in the burst)" \
-  "$(good | sed 's/^install_ok=.*/install_ok=0/' > "$TMP/ff-inst.env"; rg_forced_failure_check "$TMP/ff-inst.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
-assert "forced failure whose run passed is NOT OK (the gate failed to fail)" \
-  "$(rg_forced_failure_check "$TMP/good.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
-assert "forced failure failing only (e) webhook is NOT OK (not a burst/OOM criterion)" \
-  "$(good | sed 's/^webhook_ok=.*/webhook_ok=0/' > "$TMP/ff-wh.env"; rg_forced_failure_check "$TMP/ff-wh.env" "$TMP/ph-burst" >/dev/null && echo 0 || echo 1)"
+# --- overload recovery metric ---
+rl() { printf '%s\n' "$@" > "$TMP/rec.log"; rg_recovery_secs "$TMP/rec.log" 1000 120 15; }
+assert "recovery is the start of the first all-OK streak held for the hold time (a brief OK during the thrash is not recovery)" \
+  "$({ echo '1010 0'; echo '1020 1'; echo '1030 0'; for t in $(seq 1040 10 1160); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 40 ] && echo 1 || echo 0)"
+assert "an OK streak shorter than the hold is not recovered" \
+  "$([ "$(rl '1010 0' '1020 1' '1100 1' '1130 1')" = none ] && echo 1 || echo 0)"
+assert "a probe gap above the max gap breaks the streak (an unobserved freeze is not held health)" \
+  "$([ "$(rl '1010 1' '1200 1')" = none ] && echo 1 || echo 0)"
+assert "a freeze bracketed by two OK probes is not 'held 120 s'; the streak restarts after it" \
+  "$({ echo '1010 1'; for t in $(seq 1140 10 1270); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 140 ] && echo 1 || echo 0)"
+assert "probes within the max gap keep a streak (slow-but-answering probes still count)" \
+  "$({ for t in $(seq 1010 15 1130); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 10 ] && echo 1 || echo 0)"
+assert "no probes at all is not recovered" "$([ "$(rl)" = none ] && echo 1 || echo 0)"
+good > "$TMP/ov.env"
+printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
+assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \
+  "$(rg_overload_verdict "$TMP/ov.env" | grep -q 'RECOVERED 95s after overload start (40 pods x 60 MiB)' && echo 1 || echo 0)"
+{ grep -v '^recovery_secs=' "$TMP/ov.env"; echo recovery_secs=none; } > "$TMP/ov2.env"; mv "$TMP/ov2.env" "$TMP/ov.env"
+assert "overload verdict is NOT RECOVERED with non-zero exit, naming the final pod state" \
+  "$(rg_overload_verdict "$TMP/ov.env" > "$TMP/ov.out"; rc=$?; [ "$rc" != 0 ] && grep -q 'NOT RECOVERED.*Running=30 restarts=12' "$TMP/ov.out" && echo 1 || echo 0)"
+assert "overload args: pods without mib is refused (an allocator of 0 MiB is not an overload)" "$([ -n "$(rg_overload_args_error 40 0 0 '' 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: --no-workload without an overload is refused" "$([ -n "$(rg_overload_args_error 0 0 1 '' 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: overload plus --ramp is refused" "$([ -n "$(rg_overload_args_error 40 60 0 30,40 0 420)" ] && echo 1 || echo 0)"
+assert "overload args: valid combination is accepted" "$([ -z "$(rg_overload_args_error 40 60 1 '' 0 420)" ] && echo 1 || echo 0)"
 
 # --- vm-sampler.sh attribution records ---
 SR="$TMP/sroot"; SO="$TMP/sout"
@@ -481,17 +492,30 @@ printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=7\nfull avg10=0.00 avg60=0.
 echo 'some avg10=0.00 avg60=0.00 avg300=0.00 total=1' > "$SR/proc/pressure/memory"
 echo 'cpu  100 5 50 1000 300 0 0 40 0 0' > "$SR/proc/stat"
 printf '   8       0 sda 111 0 2222 0 333 0 4444 0 0 555 0\n   8       1 sda1 1 0 2 0 3 0 4 0 0 5 0\n   7       0 loop0 9 0 9 0 9 0 9 0 0 9 0\n' > "$SR/proc/diskstats"
-echo 'MemAvailable:   500000 kB' > "$SR/proc/meminfo"
-echo '42 (my proc) S 1 1 1 0 -1 0 0 0 0 0 70 30 0 0 20 0 1 0 1 0 0' > "$SR/proc/42/stat"
+printf '%s\n' 'MemAvailable:   500000 kB' 'AnonPages:   111 kB' 'Active(file):   222 kB' 'Inactive(file):   333 kB' 'Slab:   444 kB' \
+  'SReclaimable:   400 kB' 'SUnreclaim:   44 kB' 'PageTables:   555 kB' 'KernelStack:   66 kB' 'Shmem:   77 kB' 'Cached:   9999 kB' > "$SR/proc/meminfo"
+echo '42 (my proc) S 1 1 1 0 -1 0 0 0 0 0 70 30 5 0 20 0 1 0 1 0 0' > "$SR/proc/42/stat"
+mkdir -p "$SR/proc/50" "$SR/proc/51" "$SR/proc/52" "$SR/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice"
+echo conmon > "$SR/proc/50/comm"; echo conmon > "$SR/proc/51/comm"; echo sshd > "$SR/proc/52/comm"
+printf 'Pss:   100 kB\nRss:   200 kB\nPss_Anon:   30 kB\nPss_File:   60 kB\n' > "$SR/proc/50/smaps_rollup"
+printf 'Pss:   10 kB\nRss:   20 kB\nPss_Anon:   3 kB\nPss_File:   6 kB\n' > "$SR/proc/51/smaps_rollup"
+printf 'Pss:   9999 kB\nRss:   9999 kB\nPss_Anon:   9999 kB\nPss_File:   9999 kB\n' > "$SR/proc/52/smaps_rollup"
+printf 'anon 4096\nfile 8192\nslab 1024\nworkingset_refault_file 321\nworkingset_refault_anon 9\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/memory.stat"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=700\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=600\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/memory.pressure"
+printf 'anon 1\nfile 2\nslab 3\nworkingset_refault_file 4\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice/memory.stat"
+printf 'some avg10=0.00 avg60=0.00 avg300=0.00 total=8\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=7\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice/memory.pressure"
 printf 'rchar: 1\nwchar: 2\nread_bytes: 8192\nwrite_bytes: 4096\n' > "$SR/proc/42/io"
 printf 'usage_usec 5000000\nthrottled_usec 250\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/cpu.stat"
 printf '8:0 rbytes=1000 wbytes=2000 rios=3 wios=4 dbytes=0 dios=0\n' > "$SR/sys/fs/cgroup/system.slice/snapd.service/io.stat"
 printf 'usage_usec 900\nthrottled_usec 800\n' > "$SR/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/cpu.stat"
 printf 'usage_usec 42\nthrottled_usec 0\n' > "$SR/sys/fs/cgroup/init.scope/cpu.stat"
-printf 'pgfault 9\npgmajfault 77\nworkingset_refault_file 1234\nworkingset_refault_anon 55\npgscan_kswapd 600\npgscan_direct 70\npgsteal_kswapd 500\npgsteal_direct 60\nworkingset_refault 1289\n' > "$SR/proc/vmstat"
+printf 'oom_kill 3\npgfault 9\npgmajfault 77\nworkingset_refault_file 1234\nworkingset_refault_anon 55\npgscan_kswapd 600\npgscan_direct 70\npgsteal_kswapd 500\npgsteal_direct 60\nworkingset_refault 1289\n' > "$SR/proc/vmstat"
 echo 123456789 > "$SR/sys/fs/cgroup/system.slice/snapd.service/memory.current"
 echo 987654321 > "$SR/sys/fs/cgroup/kubepods.slice/memory.current"
-SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
+SAMPLER_ROOT="$SR" SAMPLER_SELF=42 SAMPLER_ONCE=1 bash "$HERE/vm-sampler.sh" "$SO" 1 >/dev/null 2>&1
+SO3="$TMP/sout3"; mkdir -p "$SO3"; echo burstn > "$SO3/phase"
+SAMPLER_ROOT="$SR" bash "$HERE/vm-sampler.sh" "$SO3" 1000 >/dev/null 2>&1 & sp3=$!
+sleep 5; kill "$sp3" 2>/dev/null || true; wait "$sp3" 2>/dev/null || true
 SO2="$TMP/sout2"; mkdir -p "$SO2"
 SAMPLER_ROOT="$SR" SAMPLER_ONCE=1 SAMPLER_PROC_INTERVAL=100000000000 bash "$HERE/vm-sampler.sh" "$SO2" 1 >/dev/null 2>&1
 attrib_has() { awk -F'\t' -v w="$1" '{l=$3; for (i=4;i<=NF;i++) l=l "\t" $i; if (l == w && $2 == "wordpress") f=1} END {exit !f}' "$SO/attrib.tsv"; }
@@ -514,12 +538,30 @@ assert "sampler records pgmajfault and pgscan/pgsteal per reclaimer but not unre
 assert "sampler records memory.current of system.slice units and kubepods.slice (who holds the memory)" \
   "$(attrib_has "$(printf 'CGMEM\t/system.slice/snapd.service\t123456789')" && attrib_has "$(printf 'CGMEM\t/kubepods.slice\t987654321')" && echo 1 || echo 0)"
 assert "sampler still writes MemAvailable to samples.tsv (the gate verdict reads it)" "$(grep -q "MEM.500000" "$SO/samples.tsv" && echo 1 || echo 0)"
+assert "sampler splits the MemAvailable drop into anon/file/slab/pagetables/kstack/shmem (PSS alone cannot tell anon growth from file eviction)" \
+  "$(attrib_has "$(printf 'MEMI\t111\t222\t333\t444\t400\t44\t555\t66\t77\t500000')" && echo 1 || echo 0)"
+assert "sampler sums Pss_Anon and Pss_File over all pids of a component and ignores other comms" \
+  "$(grep -q "$(printf 'wordpress\tconmon\t110\t220\t33\t66$')" "$SO/samples.tsv" && ! grep -q 9999 "$SO/samples.tsv" && echo 1 || echo 0)"
+assert "sampler records per-cgroup anon/file/slab and refault_file (which cgroup is being evicted)" \
+  "$(attrib_has "$(printf 'CGSTAT\t/system.slice/snapd.service\t4096\t8192\t1024\t321')" && attrib_has "$(printf 'CGSTAT\t/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice\t1\t2\t3\t4')" && echo 1 || echo 0)"
+assert "sampler records per-cgroup memory PSI some/full for system.slice units and kubepods pod slices" \
+  "$(attrib_has "$(printf 'CGPSI\t/system.slice/snapd.service\t700\t600')" && attrib_has "$(printf 'CGPSI\t/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc.slice\t8\t7')" && echo 1 || echo 0)"
+assert "sampler records the kernel oom_kill counter (OOM events during the run)" "$(attrib_has "$(printf 'VM\toom_kill\t3')" && echo 1 || echo 0)"
+assert "sampler records its own CPU jiffies including reaped children (the probe must not hide its cost on 1 vCPU)" "$(attrib_has "$(printf 'SELF\t105')" && echo 1 || echo 0)"
+assert "meminfo is sampled every 2 s in a burst phase even when the full sample interval is long" \
+  "$([ "$(grep -c "MEMI" "$SO3/attrib.tsv")" -ge 3 ] && [ "$(grep -c "PSI.io" "$SO3/attrib.tsv")" = 1 ] && echo 1 || echo 0)"
+
+oomev="$(printf '%s\n' 'Nov 05 kernel: Out of memory: Killed process 4242 (rg-alloc) total-vm:60000kB, anon-rss:51200kB, file-rss:100kB, shmem-rss:0kB, UID:0 pgtables:200kB oom_score_adj:1000' 'Nov 05 kernel: Killed process 77 (u7s-apiserver) total-vm:1kB, anon-rss:9kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:2kB oom_score_adj:0' 'unrelated line' | rg_oom_events)"
+assert "OOM events carry victim comm, oom_score_adj and anon rss (shows whether the killer picked the overload or the control plane)" \
+  "$([ "$oomev" = "$(printf 'rg-alloc 1000 51200\nu7s-apiserver 0 9')" ] && echo 1 || echo 0)"
 
 # --- burst-gate.sh end to end with stubs ---
-assert "--mem-hog-mib reaches the VM env" "$("$HERE/burst-gate.sh" --runs 1 --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-hog" >/dev/null 2>&1; grep -qx 'HOG_MIB=400' "$TMP/out-hog/stage/gate.env" && echo 1 || echo 0)"
-assert "HOG_MIB defaults to 0" "$(grep -qx 'HOG_MIB=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
-rc=0; "$HERE/burst-gate.sh" --mem-hog-mib x --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
-assert "--mem-hog-mib x rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+assert "--overload-pods/--overload-mib/--no-workload reach the VM env" "$("$HERE/burst-gate.sh" --runs 1 --overload-pods 40 --overload-mib 60 --no-workload --tarball-dir "$TMP/tb" --out "$TMP/out-ov" >/dev/null 2>&1; grep -qx 'OVERLOAD_PODS=40' "$TMP/out-ov/stage/gate.env" && grep -qx 'OVERLOAD_MIB=60' "$TMP/out-ov/stage/gate.env" && grep -qx 'NO_WORKLOAD=1' "$TMP/out-ov/stage/gate.env" && echo 1 || echo 0)"
+assert "OVERLOAD_PODS defaults to 0 (a normal gate run must not overload)" "$(grep -qx 'OVERLOAD_PODS=0' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --overload-pods 40 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
+assert "--overload-pods without --overload-mib rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --mem-hog-mib 400 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" >/dev/null 2>&1 || rc=$?
+assert "the unkillable tmpfs --mem-hog-mib is gone (it produced a harness-artefact wedge)" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
 
 printf '#!/bin/sh\necho 30\n' > "$TMP/bin/idle30"; chmod +x "$TMP/bin/idle30"
 : > "$LIMA_CALLS"; rm -rf "$TMP/out-noisy"
