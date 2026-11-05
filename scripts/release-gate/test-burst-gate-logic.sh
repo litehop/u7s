@@ -509,6 +509,11 @@ NODE=n1; rc=0; rg_probe_cycle "$TMP/pc.log" 0 || rc=$?
 assert "every probe call in a cycle carries RG_PROBE_TIMEOUT: an unbounded call lets one hung API server stretch the cycle past the max gap so recovery is never observed" \
   "$([ "$rc" = 0 ] && [ "$(sort "$PT" | uniq -c | tr -s ' ' | tr '\n' ';')" = " 2 k $RG_PROBE_TIMEOUT; 1 wp $RG_PROBE_TIMEOUT;" ] && echo 1 || echo 0)"
 unset -f k wp_code
+RO_BODY="$(sed -n '/^run_overload() {$/,/^}$/p' "$HERE/vm-gate.sh")"
+assert "run_overload probes through rg_probe_cycle: an inline probe loop would bypass the per-call timeouts the test above covers" \
+  "$(grep -q 'rg_probe_cycle ' <<<"$RO_BODY" && echo 1 || echo 0)"
+assert "run_overload's post-window k calls are time-bounded: they run on a possibly-starved node and the 30 s default stalls the verdict" \
+  "$(grep -c 'K_TIMEOUT=10 k get' <<<"$RO_BODY" | grep -qx 2 && echo 1 || echo 0)"
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
 assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \
