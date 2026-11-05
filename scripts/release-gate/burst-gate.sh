@@ -41,7 +41,7 @@
 # A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
 #
 # Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--mem-hog-mib N] [--zram-mib N] [--coredns-requests]
-#                      [--burst-cap SECS] [--wedge-secs SECS] [--tarball-dir DIR] [--out DIR]
+#                      [--burst-cap SECS] [--wedge-secs SECS] [--wedge-stall-secs SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 50); the verdict names it
 #   --confirm         release-gate mode, run on a QUIET host (~1 h): --runs (default 3) full runs at
@@ -64,7 +64,10 @@
 #   --burst-cap SECS  criterion (c) cap (default 300)
 #   --wedge-secs SECS abort a burst, collect evidence and end the attempt as FAIL when, during a burst,
 #                     the node has been not Ready / the API unreachable for SECS, or the Ready-pod
-#                     count has not changed for 120 s (default 60; 0 disables both)
+#                     count is unchanged (default 60; 0 disables all wedge signals)
+#   --wedge-stall-secs SECS  Ready-pod count unchanged for SECS, counted only once the burst has run
+#                     --burst-cap seconds (a burst that stalls and still finishes inside the cap
+#                     passes (c), so it is never aborted); default 120, 0 disables
 #   --tarball-dir DIR reuse the output of build-arm64-tarball.sh instead of rebuilding
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
 #   --backend B       lima (default; local arm64 VM) or gcp (needs --release; rejects --memory and
@@ -85,7 +88,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
 BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""; HOG_MIB=0
-BURST_CAP_SECS=300; WEDGE_SECS=60
+BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
 MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
@@ -107,6 +110,7 @@ while [ $# -gt 0 ]; do
     --mem-hog-mib) HOG_MIB="$2"; shift 2 ;;
     --burst-cap) BURST_CAP_SECS="$2"; shift 2 ;;
     --wedge-secs) WEDGE_SECS="$2"; shift 2 ;;
+    --wedge-stall-secs) WEDGE_STALL_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
     --release) RELEASE="$2"; shift 2 ;;
@@ -120,6 +124,9 @@ done
 export BURST_CAP_SECS
 case "$WEDGE_SECS" in
   ''|*[!0-9]*) echo "--wedge-secs must be a non-negative integer (seconds; 0 disables), got '$WEDGE_SECS'" >&2; exit 2 ;;
+esac
+case "$WEDGE_STALL_SECS" in
+  ''|*[!0-9]*) echo "--wedge-stall-secs must be a non-negative integer (seconds; 0 disables), got '$WEDGE_STALL_SECS'" >&2; exit 2 ;;
 esac
 case "$ZRAM_MIB" in
   ''|*[!0-9]*) echo "--zram-mib must be a non-negative integer (MiB), got '$ZRAM_MIB'" >&2; exit 2 ;;
@@ -192,7 +199,7 @@ pull_pending_evidence() {
   ( sleep "$EVIDENCE_COPY_SECS"; rg_kill_tree "$cp" ) & wd=$!
   wait "$cp" 2>/dev/null || echo "warning: evidence copy from $PENDING_VM failed or timed out" >&2
   kill "$wd" 2>/dev/null
-  rg_fill_tally "$PENDING_OUT/results.env" "$PENDING_OUT/node-ready.log"
+  [ ! -d "$PENDING_OUT" ] || rg_fill_tally "$PENDING_OUT/results.env" "$PENDING_OUT/node-ready.log"
   PENDING_VM=""
 }
 cleanup() {
@@ -218,7 +225,7 @@ fi
 if [ "$CONFIRM" = 1 ]; then
   tried=()
   for size in $CONFIRM_SIZES; do
-    sub_args=(--runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --wedge-secs "$WEDGE_SECS" --out "$OUT/burst-$size")
+    sub_args=(--runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --wedge-secs "$WEDGE_SECS" --wedge-stall-secs "$WEDGE_STALL_SECS" --out "$OUT/burst-$size")
     if [ "$BACKEND" = gcp ]; then sub_args+=(--backend gcp --release "$RELEASE"); else sub_args+=(--tarball-dir "$TARBALL_DIR"); fi
     "$0" "${sub_args[@]}" >&2 || true
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
@@ -255,8 +262,8 @@ if [ "$BACKEND" = lima ]; then
   INSTALL_TARBALL="/var/tmp/rg/$(basename "${staged[0]}")"
 fi
 cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh" "$ROOT/scripts/e2e-workload/webhook-smoke.sh" "$STAGE/"
-printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\n' \
-  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" > "$STAGE/gate.env"
+printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nHOG_MIB=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\nWEDGE_STALL_SECS=%s\nBURST_CAP_SECS=%s\n' \
+  "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$HOG_MIB" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" "$WEDGE_STALL_SECS" "$BURST_CAP_SECS" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
 # MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
 awk '
@@ -405,7 +412,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   case "$status" in
     PASS) passed=$((passed + 1)); valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
     FAIL) overall=1; valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
-    INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && sleep "$RG_RETRY_WAIT_SECS" ;;
+    INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
   [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out"; } | tee "$RUN_OUT/summary.md"

@@ -5,7 +5,7 @@
 #
 # vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable
 # vm_trim NAME            lima: stop/mask guest daemons the GCP image lacks (no-op on gcp)
-# vm_shell NAME cmd...  run cmd as the login user; arguments keep their quoting
+# vm_shell NAME cmd...    run cmd as the login user; arguments keep their quoting
 # vm_copy_to NAME DIR SRC...   copy files/directories into DIR on NAME
 # vm_copy_from NAME SRC DST    copy a directory out of NAME
 # vm_delete NAME

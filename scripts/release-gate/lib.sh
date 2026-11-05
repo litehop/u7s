@@ -139,8 +139,10 @@ rg_notready_since() {
 # Wedge detection during a burst. $1 now (epoch), $2 node-ready.log, $3 attrib.tsv (STAT rows,
 # jiffies; see vm-sampler.sh), $4 burst-progress.log ("<epoch> <ready pods>" per change, first
 # line at burst start). Prints a reason when the node has been not Ready / the API unreachable
-# for >= RG_WEDGE_SECS, or the Ready-pod count has not changed for RG_WEDGE_STALL_SECS (catches
-# reclaim thrash: node Ready, iowait ~0, sys CPU ~100%), or the CPU spent >= RG_WEDGE_IOWAIT_PCT
+# for >= RG_WEDGE_SECS, or the Ready-pod count has not changed for RG_WEDGE_STALL_SECS once the
+# burst has run BURST_CAP_SECS (catches reclaim thrash: node Ready, iowait ~0, sys CPU ~100%, without
+# waiting for the 600 s kill; a burst that stalls early but finishes inside the cap passes criterion
+# (c), so the signal is held back until the cap and never FAILs a would-be pass), or the CPU spent >= RG_WEDGE_IOWAIT_PCT
 # of the last RG_WEDGE_SECS in iowait (RG_JIFFIES_PER_SEC = vCPUs x USER_HZ). Prints nothing
 # otherwise. A threshold of 0 disables that signal; RG_WEDGE_SECS=0 disables all. Memory PSI
 # "full" is deliberately not a signal: healthy bursts that pass criterion (c) reach 40-68% over
@@ -170,9 +172,9 @@ rg_wedge_reason() {
       if (pct >= thr) printf "iowait %.0f%% over the last %ds\n", pct, span
     }' "$3" 2>/dev/null)"
   if [ -n "$r" ]; then echo "$r"; return 0; fi
-  awk -v now="$now" -v s="${RG_WEDGE_STALL_SECS:-0}" '
-    NF >= 2 {t = $1; n = $2}
-    END { if (s > 0 && t && now - t >= s) printf "no burst progress for %ds (%d pods Ready)\n", now - t, n }' "${4:-/dev/null}" 2>/dev/null
+  awk -v now="$now" -v s="${RG_WEDGE_STALL_SECS:-0}" -v cap="${BURST_CAP_SECS:-300}" '
+    NF >= 2 {if (!b) b = $1; t = $1; n = $2}
+    END { if (s > 0 && t && now - b >= cap && now - t >= s) printf "no burst progress for %ds (%d pods Ready)\n", now - t, n }' "${4:-/dev/null}" 2>/dev/null
   return 0
 }
 

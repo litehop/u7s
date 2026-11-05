@@ -528,6 +528,11 @@ assert "noisy host at pre-flight: exit 3 INVALID, no VM created (a noisy host mu
   "$([ "$rc" = 3 ] && ! grep -q '^create ' "$LIMA_CALLS" && [ "$(cat "$TMP/out-noisy/valid")" = 0 ] && [ "$(cat "$TMP/out-noisy/passed")" = 0 ] && echo 1 || echo 0)"
 assert "INVALID attempts are retried up to MAX_INVALID_RUNS (3) and never counted toward RUNS" \
   "$([ "$(ls -d "$TMP"/out-noisy/run-* | wc -l | tr -d ' ')" = 3 ] && echo 1 || echo 0)"
+: > "$LIMA_CALLS"; rm -rf "$TMP/out-term"
+RG_IDLE_PROBE="$TMP/bin/idle30" RG_RETRY_WAIT_SECS=60 "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-term" >/dev/null 2>&1 & tpid=$!
+sleep 4; t0=$SECONDS; kill -TERM "$tpid"; rc=0; wait "$tpid" || rc=$?
+assert "TERM during the INVALID-retry wait exits promptly (a plain foreground sleep defers the trap for the whole wait)" \
+  "$([ "$rc" = 143 ] && [ $((SECONDS - t0)) -lt 10 ] && echo 1 || echo 0)"
 : > "$LIMA_CALLS"; rm -rf "$TMP/out-quiet"
 rc=0; "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-quiet" >/dev/null 2>&1 || rc=$?
 assert "quiet host + VM that cannot start -> FAIL exit 1 (not INVALID: no contention was observed)" \
@@ -791,15 +796,26 @@ assert "high iowait seen for only 20 s is not a wedge (window not covered)" "$([
 # --- reclaim-thrash wedge: node Ready, iowait ~0, burst stuck ---
 pwedge() { RG_WEDGE_STALL_SECS="${S:-0}" IO=0 wedge "$@"; }
 stat_rows 0 14 $((NOW - 2)) > "$TMP/io0.tsv"
-printf '%s 0\n%s 1\n' $((NOW - 200)) $((NOW - 150)) > "$TMP/prog-stuck.log"
-assert "ready-pod count stuck for 150 s (120 s limit) is a wedge with node Ready and iowait 0, the reclaim-thrash that ran to the 600 s kill; the reason names the pod count" \
+printf '%s 0\n%s 1\n' $((NOW - 400)) $((NOW - 150)) > "$TMP/prog-stuck.log"
+assert "ready-pod count stuck for 150 s (120 s limit) in a burst past the 300 s cap is a wedge with node Ready and iowait 0, the reclaim-thrash that ran to the 600 s kill; the reason names the pod count" \
   "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-stuck.log" | grep -qx 'no burst progress for 150s (1 pods Ready)' && echo 1 || echo 0)"
-printf '%s 0\n%s 1\n%s 5\n' $((NOW - 200)) $((NOW - 150)) $((NOW - 30)) > "$TMP/prog-ok.log"
+printf '%s 0\n%s 1\n' $((NOW - 200)) $((NOW - 150)) > "$TMP/prog-early.log"
+assert "the same stall inside the 300 s cap is NOT a wedge: the burst may still finish and pass (c), and a healthy slow-pull burst must never be failed by the monitor" \
+  "$([ -z "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-early.log")" ] && echo 1 || echo 0)"
+printf '%s 0\n' $((NOW - 250)) > "$TMP/prog-late.log"
+assert "zero Ready for 250 s with the first wave still to land (late healthy burst) is not a wedge" \
+  "$([ -z "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-late.log")" ] && echo 1 || echo 0)"
+printf '%s 0\n%s 1\n%s 5\n' $((NOW - 400)) $((NOW - 350)) $((NOW - 30)) > "$TMP/prog-ok.log"
 assert "a burst whose ready count last moved 30 s ago is progressing, not wedged" "$([ -z "$(S=120 pwedge "$TMP/empty.log" /dev/null "$TMP/prog-ok.log")" ] && echo 1 || echo 0)"
 assert "an empty progress log (no burst running) judges nothing" "$([ -z "$(S=120 pwedge "$TMP/empty.log" /dev/null "$TMP/empty.log")" ] && echo 1 || echo 0)"
 assert "stall limit 0 disables the no-progress signal" "$([ -z "$(S=0 pwedge "$TMP/empty.log" /dev/null "$TMP/prog-stuck.log")" ] && echo 1 || echo 0)"
 assert "iowait signal is off by default: healthy bursts that pass (c) hit 84-88% over 60 s (wedge-calibrate.sh), so 90% would FAIL a good attempt" \
   "$([ -z "$(RG_WEDGE_SECS=60 rg_wedge_reason "$NOW" "$TMP/empty.log" "$TMP/io95.tsv" /dev/null)" ] && echo 1 || echo 0)"
+assert "--wedge-stall-secs reaches the VM env with the burst cap it is measured against" \
+  "$(wsenv="$(gate_env ws --wedge-stall-secs 77 --burst-cap 250)"; grep -qx 'WEDGE_STALL_SECS=77' <<< "$wsenv" && grep -qx 'BURST_CAP_SECS=250' <<< "$wsenv" && echo 1 || echo 0)"
+assert "--wedge-stall-secs defaults to 120" "$(gate_env wsd | grep -qx 'WEDGE_STALL_SECS=120' && echo 1 || echo 0)"
+rc=0; "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-badws" --wedge-stall-secs x >/dev/null 2>&1 || rc=$?
+assert "--wedge-stall-secs x rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
 assert "stall signal is on by default (a gate that only waits for the 600 s kill leaves hours of nothing)" "$([ "$RG_WEDGE_STALL_SECS" -gt 0 ] && echo 1 || echo 0)"
 printf '3\n3\n4\n\n4\n' | rg_wait_ready 9 "$TMP/prog-w.log" || true
 assert "rg_wait_ready logs only changes of the ready count (a watch re-print must not reset the stall clock); empty means 0" \
@@ -883,7 +899,7 @@ for u in udisks2 ModemManager multipathd multipathd.socket polkit; do
   echo "$trim_call" | grep -q "mask --now .*$u" || trim_ok=0
 done
 echo "$trim_call" | grep -q 'disable --now lima-guestagent' || trim_ok=0
-echo "$trim_call" | grep 'mask --now' | grep -q 'lima-guestagent' && trim_ok=0
+[ "$(echo "$trim_call" | grep -c 'mask --now.*lima-guestagent')" = 0 ] || trim_ok=0
 assert "Lima trim masks every oversized daemon and disables (not masks: it is a real unit file, mask fails live and aborts the trim) the guest agent; each left running costs 7-22 MiB of a 1 GiB node and makes Lima knees pessimistic vs GCP" "$trim_ok"
 assert "Lima trim sets MALLOC_ARENA_MAX=1 for kubelet before install (8 arm64 glibc arenas = 16 MiB)" \
   "$(echo "$trim_call" | grep -q 'kubelet.service.d' && echo "$trim_call" | grep -q 'MALLOC_ARENA_MAX=1' && echo 1 || echo 0)"
