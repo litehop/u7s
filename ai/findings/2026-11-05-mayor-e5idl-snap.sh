@@ -20,3 +20,8 @@ echo "--- slab top (kB name objs)"
 awk 'NR>2{printf "%d %s %d\n",$3*$4/1024,$1,$3}' /proc/slabinfo | sort -nr | head -8
 echo "--- netns=$(ls /run/netns 2>/dev/null | wc -l) veth=$(ls /sys/class/net | grep -c '^veth') pause_procs=$(pgrep -c -x pause) conmon=$(pgrep -c -x conmon)"
 echo "--- vmstat: $(grep -E '^(pgmajfault|workingset_refault_file|pgscan_direct) ' /proc/vmstat | tr '\n' ' ')"
+echo "--- conmon/pause/crun PSS kB (n pss)"
+for p in /proc/[0-9]*; do c=$(cat $p/comm 2>/dev/null); case $c in conmon|pause|crun) awk -v c=$c '/^Pss:/{print c,$2}' $p/smaps_rollup 2>/dev/null;; esac; done | awk '{n[$1]++;p[$1]+=$2}END{for(k in n)print k,n[k],p[k]}'
+echo "--- pods not-restart-zero / OOM"
+kubectl --kubeconfig /var/lib/u7s/kubeconfig get pods -A --no-headers 2>/dev/null | awk '$2!~/^rg-burst/ {print $1,$2,$4,$5}'
+journalctl -k --no-pager 2>/dev/null | grep -i -E "oom|out of memory" | tail -5
