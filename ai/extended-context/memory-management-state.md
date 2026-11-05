@@ -10,27 +10,31 @@ cycle).
 
 ## 1 GiB burst gate (mayor-hjwdo)
 
-**A 1 GiB / 1 vCPU node wedges under a 40-50 pod burst because it sits at a
-headroom cliff: with no swap, the only reclaimable memory is file pages, so
-pressure evicts control-plane code and the node refault-thrashes. Which
-mitigation ships is undecided.**
+**A 1 GiB / 1 vCPU node wedges under a 40-50 pod burst. The leading,
+supported explanation is a headroom cliff: with no swap only file pages are
+reclaimable, so pressure evicts control-plane code and the node
+refault-thrashes. Which mitigation ships is undecided.**
 
-Mechanism (mayor-kutwm, mayor-6bw98/36soz via #2117):
+Caveats: evidence is n=1 per run, every 2026-11-05 Lima run was INVALID for
+host contention, and the mechanism is unconfirmed on GCP.
+
+Evidence for the mechanism (mayor-kutwm, mayor-6bw98/36soz via #2117):
 - A killable 30x25 MiB BestEffort overload shows the `MemAvailable` drop is the
   overload's own anon, paid for by evicting file cache. Control-plane
   anon/slab/pagetables stay ~flat; control-plane `Pss_File` -> 0, then
-  refaults.
-- Pre-burst `MemAvailable` predicts the knee regardless of arm. A trimmed
-  Lima VM (-60-70 MiB idle) passed a 50-pod burst that wedged before
-  (#2115); knees were 20 observed / 40-50 unobserved.
-- Symptom differs by platform: GCP pd-standard shows ~95% iowait (ltido);
-  Lima shows ~100% sys CPU with iowait ~0 (#2114 live run).
+  refaults (Lima, n=1).
+- In the Lima #2039 A/B, pre-burst `MemAvailable` predicted the knee
+  regardless of arm. A trimmed Lima VM (-60-70 MiB idle) passed a 50-pod
+  burst that wedged before (#2115); knees were 20 observed / 40-50
+  unobserved.
+- Symptom differs by platform: GCP pd-standard showed ~95% iowait in the
+  gate wedge (ltido); Lima shows ~100% sys CPU with iowait ~0 (#2114 live
+  run). The GCP overload run G1 did not recover (PSI full 61%, iowait 54%).
 - The kernel OOM killer does fire, ordered by `oom_score_adj`: pods die
   first, killed BestEffort pods restart-loop and the node never recovers
-  (L2: 26 kills; GCP G1 not recovered). One Lima run froze ~380 s with no
-  kill (L1).
-- Recovery therefore needs an earlier pressure-driven kill/evict trigger and
-  back-pressure against restart/replacement.
+  (L2: 26 kills). One Lima run froze ~380 s with no kill (L1).
+- Recovery therefore appears to need an earlier pressure-driven kill/evict
+  trigger and back-pressure against restart/replacement.
 
 Disproven (do not re-investigate):
 
@@ -39,13 +43,19 @@ Disproven (do not re-investigate):
 | ~5 MiB/pod burst cost | settled <~1 MiB/pod (Lima 0.4-0.5); transient not captured (mayor-e5idl) |
 | u7s idle regression | none; the ~100 MiB was observer load (mayor-adwea) |
 | Lima-specific u7s bloat | Lima +75 MiB is guest daemons, trimmed by #2115 (mayor-18a8g) |
-| concurrent control-plane growth in bursts | ~+21 MiB summed PSS in PASS and FAIL (mayor-g28ic, corrected by mayor-6bw98) |
-| MGLRU `min_ttl_ms` | made the wedge worse, killed apiserver/KCM (mayor-65y7s) |
-| MemoryMin + early kubelet eviction | kubelet starved, 0 evictions, no taint (mayor-j1ao0) |
-| MemoryLow-only (#2039) | knee unchanged in pause bursts (mayor-9ygmh, corrected in PR body) |
+| concurrent control-plane growth in bursts | control-plane anon/slab/pagetables ~flat (Lima, n=1, mayor-6bw98) |
+| MemoryLow-only (#2039) | knee 20 on both arms in observer-matched runs; secondary metrics (MemAvailable min, mem PSI) worse on the PR (mayor-9ygmh, corrected in PR body) |
 
-Userspace responders cannot act once the node is starved; containment has to
-be kernel cgroup limits.
+Tried, did not help (weak evidence):
+- MGLRU `min_ttl_ms=1000` made the wedge worse (killed apiserver/KCM), but
+  only on the tmpfs `--mem-hog-mib` repro, which is not representative
+  (mayor-65y7s).
+- MemoryMin + early kubelet eviction: kubelet starved, 0 evictions, no
+  taint. n=1, INVALID for contention, and its recovery metric was broken
+  (mayor-j1ao0, mayor-st8o2).
+
+Hypothesis (untested): userspace responders cannot act once the node is
+starved, so containment must be kernel cgroup limits.
 
 Landed:
 - #2113 contention makes a run INVALID regardless of outcome; truthful ramp
