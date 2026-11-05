@@ -60,7 +60,7 @@ run_concurrent "$REAL_SCRIPT" "$repo" "$N"
 assert_true "all $N concurrent creations succeed" [ "$CONC_FAILS" -eq 0 ]
 assert_true "critical sections never overlap (else git reads half-written sibling admin dirs)" no_overlap "$TMP/overlap.log" $((2 * N))
 assert_true "$N distinct worktrees registered" [ "$(git -C "$repo" worktree list | grep -c 'ai/worktrees/agent-')" -eq "$N" ]
-assert_true "lock released afterwards" [ ! -e "$repo/.git/u7s-create-worktree.lock" ]
+assert_true "lock released afterwards" [ ! -L "$repo/.git/u7s-create-worktree.lock" ]
 assert_true "stdout contract: last line is the worktree path" [ "$(tail -n1 "$TMP/out-1")" = "$repo/ai/worktrees/agent-1" ]
 assert_true "settings.json synced into worktree" [ -f "$repo/ai/worktrees/agent-1/.claude/settings.json" ]
 
@@ -85,7 +85,7 @@ rc=0
 input_for "$repo3" agent-fail | PATH="$TMP/shim:$PATH" bash "$REAL_SCRIPT" > /dev/null 2>&1 || rc=$?
 assert_true "failed add exits non-zero" [ "$rc" -ne 0 ]
 assert_true "failed add leaves no orphan worker/agent-fail branch" [ -z "$(git -C "$repo3" branch --list 'worker/agent-fail')" ]
-assert_true "lock released after failure" [ ! -e "$repo3/.git/u7s-create-worktree.lock" ]
+assert_true "lock released after failure" [ ! -L "$repo3/.git/u7s-create-worktree.lock" ]
 
 # A pre-existing branch is not ours to delete.
 git -C "$repo3" branch worker/agent-keep
@@ -98,20 +98,76 @@ assert_true "pre-existing branch survives the failure" [ -n "$(git -C "$repo3" b
 repo4=$(new_repo stale)
 sleep 0 & dead=$!
 wait "$dead"
-mkdir "$repo4/.git/u7s-create-worktree.lock"
-echo "$dead" > "$repo4/.git/u7s-create-worktree.lock/pid"
+ln -s "$dead" "$repo4/.git/u7s-create-worktree.lock"
 rc=0
 input_for "$repo4" agent-stale | U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=5 bash "$REAL_SCRIPT" > /dev/null 2>&1 || rc=$?
 assert_true "stale lock (dead owner pid) is reclaimed" [ "$rc" -eq 0 ]
 
 # A live holder with no progress yields a bounded, clear failure.
 repo5=$(new_repo live)
-mkdir "$repo5/.git/u7s-create-worktree.lock"
-echo "$$" > "$repo5/.git/u7s-create-worktree.lock/pid"
+ln -s "$$" "$repo5/.git/u7s-create-worktree.lock"
 rc=0
 input_for "$repo5" agent-live | U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=1 bash "$REAL_SCRIPT" > "$TMP/live.out" 2>&1 || rc=$?
 assert_true "live lock times out non-zero instead of hanging" [ "$rc" -ne 0 ]
 assert_true "timeout message names the lock" grep -q 'timed out' "$TMP/live.out"
+
+# A holder SIGKILLed right after taking the lock (before it can record anything)
+# must leave a reclaimable lock, not wedge every later dispatch. The shim kills
+# the script immediately after the lock-creating command succeeds.
+repo6=$(new_repo killed)
+mkdir -p "$TMP/killshim"
+for cmd in mkdir ln; do
+  real=$(command -v "$cmd")
+  cat > "$TMP/killshim/$cmd" <<EOF
+#!/usr/bin/env bash
+"$real" "\$@" || exit \$?
+case "\${*: -1}" in *u7s-create-worktree.lock) kill -9 \$PPID;; esac
+EOF
+  chmod +x "$TMP/killshim/$cmd"
+done
+{ input_for "$repo6" agent-killed | PATH="$TMP/killshim:$PATH" bash "$REAL_SCRIPT" > /dev/null 2>&1; } 2>/dev/null || true
+assert_true "killed holder left a lock behind (shim effective)" [ -e "$repo6/.git/u7s-create-worktree.lock" -o -L "$repo6/.git/u7s-create-worktree.lock" ]
+rc=0
+input_for "$repo6" agent-after | U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=3 bash "$REAL_SCRIPT" > /dev/null 2>&1 || rc=$?
+assert_true "lock left by holder killed right after acquiring is reclaimed (else every dispatch wedges)" [ "$rc" -eq 0 ]
+
+# Two waiters see the same dead owner; the other reclaims and a live holder
+# acquires before this waiter's reclaim runs. The live lock must survive.
+sleep 30 & live=$!
+repo7=$(new_repo race)
+LOCK7="$repo7/.git/u7s-create-worktree.lock"
+ln -s "$dead" "$LOCK7"
+cat > "$TMP/race-hook.sh" <<EOF
+rm -f "$LOCK7"
+ln -s "$live" "$LOCK7"
+EOF
+rc=0
+input_for "$repo7" agent-race | U7S_TEST_RECLAIM_HOOK="bash $TMP/race-hook.sh" U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=1 bash "$REAL_SCRIPT" > /dev/null 2>&1 || rc=$?
+assert_true "reclaim never steals a live holder's lock (else two creators overlap)" [ "$rc" -ne 0 -a "$(readlink "$LOCK7")" = "$live" ]
+assert_true "no stale aside file left behind" [ -z "$(find "$repo7/.git" -maxdepth 1 -name '*lock.stale*')" ]
+
+# Mutation: without the post-move owner check the race test must fail.
+# shellcheck disable=SC2016
+sed '/\[ "\$moved" != "\$dead" \]/,/^  fi$/d' "$REAL_SCRIPT" > "$TMP/norecheck.sh"
+assert_true "mutation copy really drops the owner re-check" not cmp -s "$TMP/norecheck.sh" "$REAL_SCRIPT"
+rm -f "$LOCK7"; ln -s "$dead" "$LOCK7"
+rc=0
+input_for "$repo7" agent-race2 | U7S_TEST_RECLAIM_HOOK="bash $TMP/race-hook.sh" U7S_CREATE_WORKTREE_LOCK_WAIT_SECS=1 bash "$TMP/norecheck.sh" > /dev/null 2>&1 || rc=$?
+assert_true "test detects the steal when the owner re-check is removed" not [ "$(readlink "$LOCK7" 2>/dev/null || true)" = "$live" ]
+
+# release must not remove a lock another process now owns.
+repo8=$(new_repo foreign)
+LOCK8="$repo8/.git/u7s-create-worktree.lock"
+cat > "$TMP/foreign-hook.sh" <<EOF
+rm -f "$LOCK8"
+ln -s "$live" "$LOCK8"
+EOF
+rc=0
+input_for "$repo8" agent-foreign | U7S_TEST_CRITICAL_SECTION_HOOK="bash $TMP/foreign-hook.sh" bash "$REAL_SCRIPT" > /dev/null 2>&1 || rc=$?
+assert_true "creation succeeds" [ "$rc" -eq 0 ]
+assert_true "release leaves a foreign-owned lock alone" [ "$(readlink "$LOCK8" 2>/dev/null || true)" = "$live" ]
+
+kill "$live" 2>/dev/null; wait "$live" 2>/dev/null || true
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
