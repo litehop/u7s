@@ -57,6 +57,14 @@ new_sandbox() {
 SANDBOX_ROOT=$(mktemp -d)
 trap 'rm -rf "$SANDBOX_ROOT"' EXIT
 
+# Default `gh`: no open PRs. Every destructive step queries open PRs, so a
+# test must never reach the real gh; tests needing PRs prepend their own stub.
+STUB_GH_DEFAULT="$SANDBOX_ROOT/stub-gh-default"
+mkdir -p "$STUB_GH_DEFAULT"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_GH_DEFAULT/gh"
+chmod +x "$STUB_GH_DEFAULT/gh"
+export PATH="$STUB_GH_DEFAULT:$PATH"
+
 # ---------------------------------------------------------------------------
 # 1. STEP A -- orphaned host process detection.
 # ---------------------------------------------------------------------------
@@ -1178,6 +1186,78 @@ DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_AUDIT:$PATH" STU
   bash "$SCRIPT" --live-agents someagent >/dev/null 2>&1 || H_RC=$?
 assert "main() exits with the audit bit (4) under --live-agents when main's audit failed" \
   "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# 11. Open-PR guard on every destructive step, regardless of branch naming.
+#     A fix-round worker's PR branch (worker/fix-foo, not agent-<id>) was
+#     deleted along with its finished worktree by STEP G while its PR was
+#     still open; GitHub then treats the PR head as gone.
+# ---------------------------------------------------------------------------
+
+STUB_GH_OPEN_PRS="$SANDBOX_ROOT/stub-gh-open-prs"
+mkdir -p "$STUB_GH_OPEN_PRS"
+cat > "$STUB_GH_OPEN_PRS/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' worker/fix-foo worker/fix-bar worker/agent-pr1 worker/agent-gone-pr
+EOF
+chmod +x "$STUB_GH_OPEN_PRS/gh"
+
+BARE_P="$SANDBOX_ROOT/origin-p.git"
+git init -q --bare "$BARE_P"
+P="$SANDBOX_ROOT/open-pr-repo"
+new_sandbox "$P"
+printf 'x\n' > "$P/file.txt"
+git -C "$P" add -A
+git -C "$P" commit -q -m initial
+git -C "$P" remote add origin "$BARE_P"
+git -C "$P" push -q origin main
+mkdir -p "$P/ai/worktrees"
+# Finished fix-round worktrees (clean, pushed): one with an open PR, one without.
+for pair in a1:worker/fix-foo a2:worker/fix-nopr; do
+  id="${pair%%:*}"; br="${pair#*:}"
+  git -C "$P" branch "$br" main
+  git -C "$P" push -q origin "$br"
+  git -C "$P" worktree add -q "$P/ai/worktrees/agent-$id" "$br"
+done
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G keeps a non-agent-named branch (worker/fix-foo) and its worktree while its PR is open -- reaping it closes/orphans a PR under review" \
+  "$([ -d "$P/ai/worktrees/agent-a1" ] && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-foo >/dev/null && echo 1 || echo 0)"
+assert "...while a finished fix-round worktree and branch with no open PR is still reaped" \
+  "$([ ! -d "$P/ai/worktrees/agent-a2" ] && ! git -C "$P" rev-parse --verify -q refs/heads/worker/fix-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP C: agent-<id> branches whose agent is not live, no worktree dir.
+for br in worker/agent-pr1 worker/agent-nopr; do
+  git -C "$P" branch "$br" main
+done
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_c_stale_worker_branches >/dev/null 2>&1
+assert "STEP C keeps a non-live worker/agent-<id> branch whose PR is open" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-pr1 >/dev/null && echo 1 || echo 0)"
+assert "...and deletes one with no open PR" \
+  "$(! git -C "$P" rev-parse --verify -q refs/heads/worker/agent-nopr >/dev/null && echo 1 || echo 0)"
+
+# STEP D: gone-upstream branches (including a non-agent one) with open PRs.
+for br in worker/fix-bar worker/agent-gone-pr worker/fix-gone-nopr; do
+  git -C "$P" branch "$br" main 2>/dev/null || true
+  git -C "$P" push -q -u origin "$br"
+  git -C "$P" push -q origin --delete "$br"
+done
+git -C "$P" fetch -q --prune origin
+LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" PATH="$STUB_GH_OPEN_PRS:$PATH" \
+  call step_d_gone_upstream_branches >/dev/null 2>&1
+assert "STEP D keeps gone-upstream branches with an open PR (agent- and non-agent-named)" \
+  "$(git -C "$P" rev-parse --verify -q refs/heads/worker/agent-gone-pr >/dev/null && git -C "$P" rev-parse --verify -q refs/heads/worker/fix-foo >/dev/null && echo 1 || echo 0)"
+assert "...and deletes a gone-upstream branch with no open PR" \
+  "$(! git -C "$P" rev-parse --verify -q refs/heads/worker/fix-gone-nopr >/dev/null && echo 1 || echo 0)"
+
+# Step labels make the log attributable to a step.
+git -C "$P" branch fix-lbl main
+git -C "$P" push -q origin fix-lbl
+git -C "$P" worktree add -q "$P/ai/worktrees/agent-a3" fix-lbl
+P_OUT=$(DRY_RUN=1 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" call step_g_fix_round_worktrees 2>&1 || true)
+assert "destructive steps label their output with the step so the log names what was deleted" \
+  "$(printf '%s\n' "$P_OUT" | grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

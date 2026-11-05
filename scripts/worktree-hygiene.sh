@@ -524,6 +524,7 @@ step_a_orphaned_processes() {
 # STEP B -- worktree metadata.
 # ---------------------------------------------------------------------------
 step_b_prune_worktrees() {
+  echo "worktree-hygiene: STEP B: pruning worktree metadata"
   run_cmd git -C "$REPO_ROOT" worktree prune -v
 }
 
@@ -581,6 +582,18 @@ fetch_open_pr_branches() {
   gh pr list -R litehop/u7s --state open --limit 1000 --json headRefName --jq '.[].headRefName'
 }
 
+# Open-PR head list, fetched at most once per run and shared by every
+# destructive step (C, D, F, G) whatever the branch is named. A `gh` failure
+# aborts the run via `set -e` rather than letting a step delete without the
+# check.
+OPEN_PR_BRANCHES=""
+OPEN_PR_LOADED=0
+load_open_prs() {
+  [ "$OPEN_PR_LOADED" = 1 ] && return 0
+  OPEN_PR_BRANCHES=$(fetch_open_pr_branches)
+  OPEN_PR_LOADED=1
+}
+
 # True (exit 0) iff `branch` is `worker/agent-<id>` and a live worktree
 # directory ai/worktrees/agent-<id> exists, regardless of which branch that
 # worktree currently has checked out. Observed 2026-08-28: a worker
@@ -599,15 +612,10 @@ has_live_worktree_dir() {
 
 step_c_stale_worker_branches() {
   run_cmd git -C "$REPO_ROOT" fetch origin main
-  local porcelain checked_out branch open_pr_branches
+  local porcelain checked_out branch
   porcelain=$(git -C "$REPO_ROOT" worktree list --porcelain)
   checked_out=$(checked_out_branches "$porcelain")
-  # Fetched once up front (not per-branch) to keep this to a single `gh`
-  # call regardless of how many worker/agent-* branches exist. A `gh`
-  # failure here aborts the whole tick via this script's own `set -e`
-  # (see file header) rather than silently deleting branches without the
-  # PR check that motivated this guard in the first place.
-  open_pr_branches=$(fetch_open_pr_branches)
+  load_open_prs
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     case "$branch" in
@@ -617,8 +625,9 @@ step_c_stale_worker_branches() {
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
     is_checked_out "$branch" "$checked_out" && continue
     is_unmerged_by_patch_id "$branch" && continue
-    has_open_pr "$branch" "$open_pr_branches" && continue
+    has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
     has_live_worktree_dir "$branch" "$REPO_ROOT" && continue
+    echo "worktree-hygiene: STEP C: deleting stale branch $branch"
     run_cmd git -C "$REPO_ROOT" branch -D "$branch"
   done < <(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short)' refs/heads/)
 }
@@ -637,6 +646,7 @@ gone_upstream_branches() {
 
 step_d_gone_upstream_branches() {
   local refs branch checked_out
+  load_open_prs
   refs=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads/)
   checked_out=$(checked_out_branches "$(git -C "$REPO_ROOT" worktree list --porcelain)")
   while IFS= read -r branch; do
@@ -650,6 +660,8 @@ step_d_gone_upstream_branches() {
     # worktree is gone) instead of erroring on a benign, self-resolving race.
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
     is_checked_out "$branch" "$checked_out" && continue
+    has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
+    echo "worktree-hygiene: STEP D: deleting gone-upstream branch $branch"
     run_cmd git -C "$REPO_ROOT" branch -d "$branch"
   done < <(gone_upstream_branches "$refs")
 }
@@ -765,19 +777,17 @@ archive_findings_branch() {
 }
 
 step_f_orphaned_origin_branches() {
-  local branch open_pr_branches
-  # Fetched once up front, same reasoning as STEP C: a `gh` failure here
-  # aborts the whole tick via this script's own `set -e` rather than
-  # deleting a branch without the PR check that guards it.
-  open_pr_branches=$(fetch_open_pr_branches)
+  local branch
+  load_open_prs
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
     is_live_agent_branch "$branch" "$LIVE_AGENTS" && continue
-    has_open_pr "$branch" "$open_pr_branches" && continue
+    has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
     if ! archive_findings_branch "$branch"; then
       echo "worktree-hygiene: could not archive findings on $branch; keeping it" >&2
       continue
     fi
+    echo "worktree-hygiene: STEP F: deleting origin branch $branch"
     run_cmd git -C "$REPO_ROOT" push origin --delete "$branch"
   done < <(origin_worker_branches "$REPO_ROOT")
 }
@@ -793,6 +803,7 @@ step_f_orphaned_origin_branches() {
 # ---------------------------------------------------------------------------
 step_g_fix_round_worktrees() {
   local path branch agent_id rc=0
+  load_open_prs
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     agent_id=$(agent_id_from_worktree_path "$path" || true)
@@ -802,8 +813,10 @@ step_g_fix_round_worktrees() {
     case "$branch" in
       ""|HEAD|worker/agent-*) continue ;;
     esac
+    has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
     [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || continue
     [ -z "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ] || continue
+    echo "worktree-hygiene: STEP G: removing worktree $path and branch $branch"
     if ! run_cmd git -C "$REPO_ROOT" worktree remove "$path"; then
       echo "worktree-hygiene: STEP G could not remove $path (locked?); keeping branch $branch" >&2
       rc=1
