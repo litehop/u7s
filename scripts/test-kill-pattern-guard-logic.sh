@@ -35,6 +35,7 @@ ALLOW=(
   'test-kill-sites-logic.sh::.::extracts and drives the real scripts'"'"' lines against its own sleepers'
   'release-gate/burst-gate.sh::pkill -KILL -f "\$RG_VM_KILL_PATTERN"::runs inside the gate'"'"'s dedicated VM against a line-anchored fixed /var/tmp/rg/*.sh pattern, no host workdir'
   'release-gate/test-burst-gate-logic.sh::for cmd in .bash -c sudo pkill::fixture command strings fed to the kill pattern regex; no pkill is run'
+  'conformance/run-all.sh::echo "  pkill -TERM -f ::an echo printing a hint with the expanded workdir_kill_pattern, not a pkill (the guard scans echo text; separate bug)'
   'test-kill-pattern-guard-logic.sh::.::fixtures for this guard'
 )
 
@@ -60,7 +61,7 @@ flagged_lines() {
     fi
     [[ "$line" =~ (^|[^A-Za-z0-9_-])(pkill|pgrep)[[:space:]]([^\|\;\&]*[[:space:]])?(-[A-Za-z0-9]*f|--full)([^A-Za-z0-9_-]|$)(.*)$ ]] || continue
     arg="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[![:space:]]*}"}"
-    if [[ "$arg" =~ ^[\"\']?\$\(workdir_kill_pattern([^A-Za-z0-9_]|$) ]]; then continue; fi
+    if [[ "$arg" =~ ^\"?\$\(workdir_kill_pattern([^A-Za-z0-9_]|$) ]]; then continue; fi
     if [[ "$arg" =~ ^\"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\"?([^A-Za-z0-9_]|$) ]]; then
       var="${BASH_REMATCH[1]}"
       [[ "$wkp_vars" == *" $var "* ]] && continue
@@ -136,6 +137,11 @@ pkill -f "u7s-$(workdir_kill_pattern a "$WORKDIR")-extra"
 EOF
 assert_true "a raw pattern is still flagged when workdir_kill_pattern merely appears elsewhere on the line" \
   [ "$(flagged_lines "$T/subst.sh" | wc -l | tr -d ' ')" = 2 ]
+cat > "$T/squote.sh" <<'EOF'
+pkill -f '$(workdir_kill_pattern scheduler "$WORKDIR")'
+EOF
+assert_true "a single-quoted \$(workdir_kill_pattern ...) is flagged: pkill would get the literal unexpanded text and match nothing, silently leaving the peer-safe kill a no-op" \
+  [ "$(flagged_lines "$T/squote.sh" | wc -l | tr -d ' ')" = 1 ]
 assert_true "guard accepts workdir_kill_pattern lines, comments and pkill -P" \
   [ -z "$(flagged_lines "$T/good.sh")" ]
 assert_true "an un-allowlisted file with a raw line is reported" \

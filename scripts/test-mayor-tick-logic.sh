@@ -1759,6 +1759,16 @@ assert "a dotted child id still matches, with trailing punctuation stripped" \
   "$([ "$(call extract_bead_ids "fix: ${B}74j3.6, done." | tr '\n' ' ')" = "${B}74j3.6 " ] && echo 1 || echo 0)"
 assert "a 6+ char over-long token is not truncated into a bogus id" \
   "$([ -z "$(call extract_bead_ids "fix: ${B}abcdefg")" ] && echo 1 || echo 0)"
+assert "space-separated adjacent ids all extract, so no bead in a cluster title is left un-closed" \
+  "$([ "$(call extract_bead_ids "x (${B}abc1 ${B}def2 ${B}ghi3)" | tr '\n' ' ')" = "${B}abc1 ${B}def2 ${B}ghi3 " ] && echo 1 || echo 0)"
+assert "bare-comma separated ids both extract" \
+  "$([ "$(call extract_bead_ids "x (${B}abc1,${B}def2)" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
+assert "slash separated ids both extract" \
+  "$([ "$(call extract_bead_ids "x ${B}abc1/${B}def2" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
+assert "adjacent dotted child ids both extract" \
+  "$([ "$(call extract_bead_ids "x ${B}ab1.2 ${B}cd3.4.5" | tr '\n' ' ')" = "${B}ab1.2 ${B}cd3.4.5 " ] && echo 1 || echo 0)"
+assert "an id followed by mayor-tick.sh does not yield a bogus id" \
+  "$([ "$(call extract_bead_ids "${B}abc1 mayor-tick.sh ${B}def2" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
