@@ -387,6 +387,25 @@ assert "same idle with no allowance (pre-flight, no VM) is contention" "$([ -n "
 rg_quiet_line 1 40 0 12 > "$TMP/q-own.log"
 assert "foreign load beyond the allowance still reads as contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
 
+# Idle judged only before the gate's own load starts (load_t0): the thrashing guest's hypervisor
+# disk reads cost host cores that are not a neighbour.
+Q="$TMP/q-phase.log"; : > "$Q"
+for t in 100 130 160; do rg_quiet_line "$t" 80 0 8 >> "$Q"; done
+for t in 190 220 250; do rg_quiet_line "$t" 48 0 8 >> "$Q"; done
+printf 'load_t0=170\n' > "$TMP/lt.env"
+assert "idle dropping only after load_t0 with no other VMs is VALID: the gate VM's own hypervisor disk-read load must not make overload runs INVALID" \
+  "$([ -z "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+assert "without load_t0 (VM died before the load began) the same log is judged in full" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/empty.env")" ] && echo 1 || echo 0)"
+: > "$Q"
+rg_quiet_line 100 55 0 8 >> "$Q"; rg_quiet_line 190 80 0 8 >> "$Q"
+assert "foreign load before load_t0 is still INVALID" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+: > "$Q"
+rg_quiet_line 100 80 0 8 >> "$Q"; rg_quiet_line 190 48 1 8 >> "$Q"
+assert "another Lima VM starting during the bursts is still INVALID (only the idle floor is waived after load_t0)" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+
 # Marker write failure is a harness error.
 # The vm-gate call site: fake `k` answers the two failure-time probes (API_MODE, POD_MODE).
 k() {

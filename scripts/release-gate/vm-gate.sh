@@ -444,6 +444,7 @@ run_full() {
 }
 
 snap pre-burst
+res load_t0 "$(date +%s)"
 if [ "$OVERLOAD_PODS" -gt 0 ]; then run_overload; elif [ -n "$RAMP" ]; then run_ramp; else run_full; fi
 
 phase collect

@@ -293,13 +293,16 @@ rg_quiet_line() {
 
 # Prints a reason for every contended line of a quiet.log; an unmeasurable sample counts
 # as contended because quiet cannot be proven. The idle floor is lowered by the gate VM's
-# own possible CPU share ($4).
+# own possible CPU share ($4 of the line). Optional $2 = epoch the gate's own load began
+# (results.env load_t0): host idle in samples ending after it is not judged, because the
+# thrashing guest makes the hypervisor burn host cores on virtual-disk reads, which is the
+# load under test, not a neighbour. Other running VMs are judged throughout.
 rg_quiet_log_reasons() {
   [ -f "$1" ] || return 0
-  awk -v min="$RG_IDLE_MIN_PCT" '
+  awk -v min="$RG_IDLE_MIN_PCT" -v lt="${2:-}" '
     $2 !~ /^[0-9]+$/ {printf "host idle CPU not measurable at %s\n", $1; next}
     {floor = min - ($4 ~ /^[0-9]+$/ ? $4 : 0)}
-    $2 < floor {printf "host idle CPU %d%% < %d%% (gate VM allowance %d%%) at %s\n", $2, floor, min - floor, $1}
+    $2 < floor && !(lt ~ /^[0-9]+$/ && $1 > lt) {printf "host idle CPU %d%% < %d%% (gate VM allowance %d%%) at %s\n", $2, floor, min - floor, $1}
     $3 != 0 {printf "other Lima VMs running (%s) at %s\n", $3, $1}' "$1"
 }
 
@@ -378,7 +381,7 @@ rg_steal_reason() {
 
 # Contention evidence for a run: $1 quiet.log, $2 results file. Empty output = none.
 rg_contention_reasons() {
-  rg_quiet_log_reasons "$1"
+  rg_quiet_log_reasons "$1" "$(rg_get "$2" load_t0)"
   rg_cal_reason "$2"
   rg_steal_reason "$2"
 }
