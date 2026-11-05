@@ -18,6 +18,10 @@
 #   cal_ref_ms / cal_ref_n   median / count of in-guest CPU calibration loops before install (baseline)
 #   cal_idle_ms / cal_idle_n same, at the idle boundary before the first burst (contention probe)
 #   steal_idle_pct=N.N       in-guest steal time over the idle window (a shared-core host's noise)
+#   steal_run_pct=N.N        steal over the whole run so far (informational; never judged)
+#   watch_t0=EPOCH           when the node-ready watch started (notready_events counts from here)
+#   wedge_reason=TEXT        the burst was aborted early because the guest wedged (rg_wedge_reason)
+#   tally_note=TEXT         set when the node tally was rebuilt host-side (rg_fill_tally)
 #   marker_fail=TEXT        why the marker could not be written (set with marker_ok=0)
 #   harness_error=TEXT       the harness itself broke before the bursts (not a u7s verdict)
 # Ramp mode writes install_ok plus, per burst size N: ramp_N_secs (N|timeout),
@@ -34,6 +38,9 @@ RG_IDLE_MIN_PCT=70
 RG_CAL_MAX_RATIO_X10=15
 RG_CAL_MIN_SAMPLES=3
 RG_STEAL_MAX_PCT=10
+RG_WEDGE_SECS=60
+RG_WEDGE_IOWAIT_PCT=90
+RG_JIFFIES_PER_SEC=100
 # Pattern for pkill -f inside the VM: every script the gate runs there is started as
 # `bash /var/tmp/rg/<name>.sh`. Anchored so the pkill's own wrapper shell never matches.
 RG_VM_KILL_PATTERN='^bash /var/tmp/rg/[a-z-]+\.sh'
@@ -123,6 +130,59 @@ rg_node_watch_stamp() {
 # An "unreachable" poll (API down: a dead apiserver is the worst not-Ready) counts too.
 rg_notready_since() {
   awk -v t0="$2" '$1 >= t0 && ($2 == "False" || $2 == "Unknown" || $2 == "unreachable") {n++} END {print n + 0}' "$1"
+}
+
+# Wedge detection during a burst. $1 now (epoch), $2 node-ready.log, $3 attrib.tsv (STAT rows,
+# jiffies; see vm-sampler.sh). Prints a reason when the node has been not Ready / the API
+# unreachable for >= RG_WEDGE_SECS, or the CPU spent >= RG_WEDGE_IOWAIT_PCT of the last
+# RG_WEDGE_SECS in iowait (RG_JIFFIES_PER_SEC = vCPUs x USER_HZ). Prints nothing otherwise.
+# RG_WEDGE_SECS=0 disables it.
+rg_wedge_reason() {
+  local now="$1" w="${RG_WEDGE_SECS:-60}" r
+  [ "$w" -gt 0 ] 2>/dev/null || return 0
+  r="$(awk -v now="$now" -v w="$w" '
+    $2 == "True" {run = 0; next}
+    NF >= 2 {if (!run) {run = 1; start = $1}; st = $2}
+    END {
+      if (run && now - start >= w) {
+        if (st == "unreachable") printf "API unreachable for %ds\n", now - start
+        else printf "node Ready=%s for %ds\n", st, now - start
+      }
+    }' "$2" 2>/dev/null)"
+  if [ -n "$r" ]; then echo "$r"; return 0; fi
+  awk -F'\t' -v now="$now" -v w="$w" -v thr="${RG_WEDGE_IOWAIT_PCT:-90}" -v jps="${RG_JIFFIES_PER_SEC:-100}" '
+    $3 == "STAT" {n++; ts[n] = $1; io[n] = $6}
+    END {
+      if (!n || now - ts[n] > w) exit
+      for (i = 1; i < n && ts[i] < ts[n] - w; i++) ;
+      span = ts[n] - ts[i]
+      if (span < w * 0.8) exit
+      pct = 100 * (io[n] - io[i]) / (span * jps)
+      if (pct >= thr) printf "iowait %.0f%% over the last %ds\n", pct, span
+    }' "$3" 2>/dev/null
+  return 0
+}
+
+# Reads `kubectl get pods -A` lines "<ns> <name> <phase> <Ready status>" on stdin and prints
+# "<ns> <name>" of pods that are not Ready (finished pods and the burst workload excluded), max 20.
+rg_notready_pods() {
+  awk '{r = (NF >= 4 ? $4 : "")} $3 != "Succeeded" && r != "True" && $2 !~ /^rg-burst-/ {print $1, $2}' | head -n 20
+}
+
+# Fills the node tally into results file $1 from node-ready.log $2 when the run died before the
+# final tally was written (no notready_events key). A dead guest's last Ready=True is stale, so
+# node_ready_final stays "unconfirmed" unless the last observation was itself not Ready.
+rg_fill_tally() {
+  local f="$1" log="$2" last t0
+  [ -z "$(rg_get "$f" notready_events)" ] && [ -s "$log" ] || return 0
+  last="$(tail -n 1 "$log" | cut -d' ' -f2)" || true
+  t0="$(rg_get "$f" watch_t0)" || true
+  {
+    echo "notready_events=$(rg_notready_since "$log" "${t0:-0}")"
+    echo "api_unreachable_polls=$(grep -c ' unreachable$' "$log")"
+    echo "node_ready_final=$([ "$last" = True ] && echo unconfirmed || echo "$last")"
+    echo "tally_note=run died before the final tally; node figures rebuilt from node-ready.log, OOM counts unknown"
+  } >> "$f"
 }
 
 # --- collectors (pure: take kernel-log / kubectl text on stdin) ---
@@ -433,6 +493,7 @@ rg_ramp_verdict() {
     [ -n "$(rg_get "$f" "ramp_${n}_ready_final")" ] || unreach="${unreach:-$n}"
   done
   echo "RAMP: criterion (e) webhook-smoke is NOT evaluated per size; it runs only in the full-gate confirmation runs"
+  [ -z "$(rg_get "$f" wedge_reason)" ] || echo "RAMP: WEDGE, burst aborted early: $(rg_get "$f" wedge_reason)"
   if [ -n "$unreach" ]; then
     echo "RAMP: API unreachable at the end of the $unreach-pod step (VM or control plane died); later sizes were not tested"
   elif [ -n "$failed" ]; then
@@ -506,7 +567,9 @@ rg_verdict() {
   _check "(e)" "$([ "$wh" = 1 ] && echo 1 || echo 0)" "webhook-smoke.sh passes (webhook_ok=${wh:-missing})"
 
   # Not a criterion: kubelet memory-pressure evictions delete pods without an OOM kill.
-  _rg_row INFO "" "evicted pods: $(rg_get "$f" evicted_pods) api-unreachable polls: $(rg_get "$f" api_unreachable_polls)"
+  _rg_row INFO "" "evicted pods: $(rg_get "$f" evicted_pods) api-unreachable polls: $(rg_get "$f" api_unreachable_polls) steal-run: $(rg_get "$f" steal_run_pct)%"
+  [ -z "$(rg_get "$f" wedge_reason)" ] || _rg_row INFO "" "WEDGE: burst aborted early, $(rg_get "$f" wedge_reason)"
+  [ -z "$(rg_get "$f" tally_note)" ] || _rg_row INFO "" "$(rg_get "$f" tally_note)"
 
   if [ "$rc" -eq 0 ]; then echo "RESULT: PASS (${np:-?}-pod burst)"; else echo "RESULT: FAIL (${np:-?}-pod burst)"; fi
   return "$rc"

@@ -19,16 +19,23 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; HOG_MIB=0
-INSTALL_TARBALL=""; INSTALL_ONLY=0
+INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
+RG_WEDGE_SECS="$WEDGE_SECS"
+RG_JIFFIES_PER_SEC=$(( $(nproc 2>/dev/null || echo 1) * 100 ))
 
 mkdir -p "$OUT"
 : > "$OUT/results.env"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
-res() { echo "$1=$2" >> "$OUT/results.env"; }
+# Last write wins: the tally is rewritten after every burst so a dead guest leaves what was
+# observed so far, and rg_get reads the first match.
+res() {
+  { grep -v "^$1=" "$OUT/results.env" 2>/dev/null; echo "$1=$2"; } > "$OUT/results.tmp"
+  mv "$OUT/results.tmp" "$OUT/results.env"
+}
 phase() { echo "$1" > "$OUT/phase"; log "phase: $1"; }
-k() { timeout 30 kubectl --kubeconfig "$KCFG" "$@"; }
+k() { timeout "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
 # Scales deployment rg-burst to $1 replicas; echoes seconds until all Ready or "timeout".
@@ -40,10 +47,12 @@ run_burst() {
   k scale deployment/rg-burst --replicas="$n" >/dev/null 2>&1
   while :; do
     now="$(date +%s)"
+    if [ -e "$OUT/wedge.txt" ]; then echo wedge; return; fi
     if [ $((now - start)) -ge "$HARD_KILL_SECS" ]; then echo timeout; return; fi
     exec 3< <(exec timeout $((HARD_KILL_SECS - (now - start))) kubectl --kubeconfig "$KCFG" \
       get deployment rg-burst -w -o jsonpath='{.status.readyReplicas}{"\n"}' 2>/dev/null)
     wpid=$!
+    echo "$wpid" > "$OUT/burst-watch.pid"
     if rg_wait_ready "$n" <&3; then
       kill "$wpid" 2>/dev/null; exec 3<&-
       echo $(( $(date +%s) - start )); return
@@ -126,6 +135,57 @@ wait_node_ready() {
   return 1
 }
 
+# While a burst phase runs, checks every 5 s whether the guest has wedged (rg_wedge_reason from
+# node-ready.log and the sampler's STAT rows: no new processes beyond one awk pass over the
+# sampler's last rows). On a wedge writes wedge.txt and kills the burst watch so run_burst returns.
+wedge_monitor() {
+  local why
+  while [ ! -e "$OUT/watch-stop" ]; do
+    sleep 5
+    case "$(cat "$OUT/phase" 2>/dev/null)" in burst*) ;; *) continue ;; esac
+    why="$(rg_wedge_reason "$(date +%s)" "$OUT/node-ready.log" <(tail -n 4000 "$OUT/attrib.tsv"))"
+    [ -n "$why" ] || continue
+    echo "$why" > "$OUT/wedge.txt"
+    kill "$(cat "$OUT/burst-watch.pid" 2>/dev/null)" 2>/dev/null
+    return
+  done
+}
+
+# Run after a wedged burst: the guest is barely answering, so keep each kubectl short.
+note_wedge() {
+  K_TIMEOUT=10
+  res wedge_reason "$(cat "$OUT/wedge.txt")"
+  log "WEDGE: $(cat "$OUT/wedge.txt"); aborting the burst and collecting evidence"
+}
+
+# Node tally and run-wide steal as observed so far. Rewritten after each burst and at collect.
+write_tally() {
+  local oomh oomk
+  journalctl -k --no-pager 2>/dev/null | rg_oom_victims "$(rg_uids_cgroup "$OUT/ks-uids.txt")" | rg_oom_counts > "$OUT/tally-oom.tmp"
+  read -r oomh oomk < "$OUT/tally-oom.tmp"
+  res oom_host "$oomh"
+  res oom_kubesystem "$oomk"
+  res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
+  res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
+  res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+  res steal_run_pct "$(rg_steal_pct "$CPU_RUN0" "$(head -1 /proc/stat)")"
+}
+
+# describe + logs of every pod that is not Ready, into pod-diag/<tag>/, so the cause (OOM, probe
+# timeout, image pull, CPU) can be read after the VM is deleted.
+diag_pods() {
+  local d="$OUT/pod-diag/$1" ns name
+  mkdir -p "$d"
+  k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {.status.phase} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
+    | rg_notready_pods > "$d/pods.txt"
+  while read -r ns name; do
+    { k -n "$ns" describe pod "$name"
+      k -n "$ns" logs "$name" --all-containers --tail=200
+      k -n "$ns" logs "$name" --all-containers --previous --tail=200
+    } > "$d/${ns}_$name.txt" 2>&1 < /dev/null
+  done < "$d/pods.txt"
+}
+
 if [ "$ZRAM_MIB" -gt 0 ]; then
   zram_fail() {
     log "zram_setup=failed:$1"; res zram_setup "failed:$1"; res install_ok 0
@@ -143,12 +203,13 @@ if [ "$ZRAM_MIB" -gt 0 ]; then
 fi
 
 phase install
+CPU_RUN0="$(head -1 /proc/stat)"
 calibrate_boundary
-WATCH_PID=""; CAPTURE_PID=""
+WATCH_PID=""; CAPTURE_PID=""; MONITOR_PID=""
 stop_bg() {
   touch "$OUT/watch-stop"
   [ -n "$WATCH_PID" ] && pkill -P "$WATCH_PID" 2>/dev/null
-  kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID 2>/dev/null
+  kill $WATCH_PID $SAMPLER_PID $CAPTURE_PID $MONITOR_PID 2>/dev/null
 }
 trap stop_bg EXIT
 bash "$RG/vm-sampler.sh" "$OUT" 5 </dev/null >> "$OUT/sampler.log" 2>&1 &
@@ -181,6 +242,7 @@ record_uids
 # leaves the replay of install-time Unknown/False flaps out. A watch that ends while the API
 # does not answer is logged as "unreachable" (counted by criterion (b)) and re-established.
 WATCH_T0="$(date +%s)"
+res watch_t0 "$WATCH_T0"
 ( while :; do
     kubectl --kubeconfig "$KCFG" get node "$NODE" -w \
       -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}' 2>/dev/null \
@@ -190,6 +252,7 @@ WATCH_T0="$(date +%s)"
     sleep 5
   done ) &
 WATCH_PID=$!
+wedge_monitor & MONITOR_PID=$!
 [ "$CAPTURE" = 1 ] && { bash "$RG/vm-capture.sh" "$OUT" "$KCFG" 5 & CAPTURE_PID=$!; }
 if [ "$COREDNS_REQ" = 1 ]; then
   k -n kube-system set resources deployment/coredns --requests=cpu=100m,memory=70Mi >> "$OUT/run.log" 2>&1
@@ -207,7 +270,7 @@ phase wordpress
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
 for _ in $(seq 1 60); do k -n default get pod mariadb-0 >/dev/null 2>&1 && break; sleep 2; done
 MARIADB_READY=1
-kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; }
+kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; diag_pods mariadb-not-ready; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
 wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
@@ -265,6 +328,7 @@ run_ramp() {
     t0="$(date +%s)"
     phase "burst$n"
     secs="$(run_burst "$n")"; log "$n-pod burst: $secs s"
+    if [ "$secs" = wedge ]; then res "ramp_${n}_secs" wedge; note_wedge; break; fi
     snap "burst$n"
     burst_cleanup; phase "settle$n"; wait_node_ready || log "node not Ready after $n-pod burst"
     sleep "$SETTLE_STEP"
@@ -277,6 +341,7 @@ run_ramp() {
     res "ramp_${n}_ready_final" "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
     res "ramp_${n}_wp_ok" "$(wp_ok_poll)"
     res "ramp_${n}_marker_ok" "$(marker_ok)"
+    write_tally
     if ! rg_ramp_step "$OUT/results.env" "$n" >/dev/null; then log "ramp stopped: $n-pod burst failed"; break; fi
   done
 }
@@ -284,19 +349,24 @@ run_ramp() {
 run_full() {
   phase burst20
   b20="$(run_burst 20)"; res burst20_secs "$b20"; log "20-pod burst: $b20 s"
+  if [ "$b20" = wedge ]; then note_wedge; return; fi
   snap burst20
   burst_cleanup; phase settle20; sleep "$SETTLE_STEP"
   record_uids
+  write_tally
 
   phase burstn
   bn="$(run_burst "$BURST_PODS")"; res burst_pods "$BURST_PODS"; res burst_secs "$bn"; log "$BURST_PODS-pod burst: $bn s"
+  if [ "$bn" = wedge ]; then note_wedge; return; fi
   snap burstn
   burst_cleanup; phase settlen; sleep "$SETTLE_STEP"
   record_uids
+  write_tally
 
   phase wpcheck
   wp_ok="$(wp_ok_poll)"
   res wp_ok "$wp_ok"; log "WordPress after settle: ok=$wp_ok"
+  diag_pods wpcheck
   res marker_ok "$(marker_ok)"; log "DB marker after settle: marker_ok=$(rg_get "$OUT/results.env" marker_ok)"
 
   phase webhook
@@ -332,8 +402,7 @@ res oom_kubesystem "$oomk"
 read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" install)"; res cal_ref_ms "$cal_ms"; res cal_ref_n "$cal_n"
 read -r cal_ms cal_n <<< "$(rg_cal_summary "$OUT/cal.log" idle)"; res cal_idle_ms "$cal_ms"; res cal_idle_n "$cal_n"
 res oom_victims "$(awk '{print $1":"$2}' "$OUT/oom-victims.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res notready_events "$(rg_notready_since "$OUT/node-ready.log" "$WATCH_T0")"
-res api_unreachable_polls "$(grep -c ' unreachable$' "$OUT/node-ready.log")"
 res evicted_pods "$(awk '{print $1"/"$2}' "$OUT/evictions.txt" | sort | uniq -c | awk '{printf "%s x%s; ", $2, $1}')"
-res node_ready_final "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)"
+write_tally
+diag_pods collect
 log "collected"
