@@ -2,8 +2,8 @@
 
 Bead: mayor-g28ic
 
-**Answer: no — concurrent transient growth of the sampled control-plane/node components does not explain the squeeze.**
-Their summed PSS is flat through a burst (mean +27 MiB, max +65 MiB over 41 bursts of >= 30 s), the refault storm starts at burst start while summed PSS is 20-46 MiB *below* its pre-burst level, component peaks are staggered across the whole burst rather than concurrent, and the "+46 kcm / +44 crio" numbers in the GCP gate summary are install/idle-phase peaks, not burst growth.
+**Answer: the existing data shows no concurrent growth in the sampled components' PSS, but PSS cannot exclude anon growth, so sampled-component anon growth during bursts is unknown (bounded by roughly 30-45 MiB, up to ~40% of the A2-2 MemAvailable fall).**
+Summed PSS is flat through a burst (mean +27 MiB, max +65 MiB over 41 Lima bursts of >= 30 s). On Lima the refault storm starts at burst start while summed PSS is 20-46 MiB *below* its pre-burst level; PSS includes file pages, so that fall can hide equal anon growth. Component PSS peaks are staggered across the burst rather than concurrent, and the "+46 kcm / +44 crio" numbers in the GCP gate summary are install/idle-phase peaks, not burst growth. On GCP (one passing burst) PSI full rose at t=-6 s, during warmup, before the burst phase.
 
 ## Method and data
 
@@ -19,7 +19,8 @@ Scripts (bash+awk, no VMs, read-only on `temp/e2e/`), all in this directory as `
   Passing 20-pod Lima bursts finish in 5-11 s (1-3 samples): they cannot resolve peak timing and are excluded from the timing aggregates (`dur >= 30 s`).
   Counters are cumulative; rates are deltas over the previous attrib row (5-10 s windows).
 - Outcome: ramp-table runs = (a)-(d) all PASS; legacy runs only record "burst finished < 300 s" (`c-ok`).
-- One artefact: `hg1xx gate3 burst80` has a duplicated epoch row (sum 750 MiB); excluded from aggregates.
+- Duplicate-epoch artefacts: `hg1xx gate3 burst80` has a duplicated epoch row (sum 750 MiB), excluded from aggregates. `i4bvb-base` run-1 and run-2 also carry duplicate rows (outside burst phases: settle80/wpcheck/webhook), so aggregates are unaffected.
+- Ramp "baselines": ramp-table bursts follow settle phases of earlier bursts, so the "pre-burst baseline" PSS may be a post-burst recovery state rather than a clean one (A2-2 baseline sum 374 vs 332 at A2-1 start). Not checked against the idle/wordpress-phase sum of the same run.
 
 ## 1. Per-component peak timing, five representative bursts (MiB PSS; start = first sample of the burst phase, off = peak offset / phase length in s)
 
@@ -68,6 +69,8 @@ Bursts >= 30 s (41 phases, all Lima; gate3-burst80 duplicate-epoch row excluded)
 | FAIL (ramp table) | 11 | 604 | +20.9 / +49 | 148 | 49 |
 | legacy 80-pod / `c-ok` | 18 | 676 | +35.1 / +65 | 134 | n/a (no attrib) |
 
+Stratified by observer state (ramp-table runs, mean summed growth MiB / mean duration s): streamed PASS n=6 +16.2 / 234, FAIL n=7 +14.6 / 659; unstreamed PASS n=4 +25.0 / 187, FAIL n=3 +26.3 / 523; unknown PASS n=2, FAIL n=1. Within each stratum pass and fail growth are equal, and n is too small to say more; the legacy runs cannot be stratified (observer state unrecorded).
+
 Per-component growth within a burst (peak minus first sample, only bursts where the component grew >= 3 MiB; offset = peak position as a fraction of the burst):
 
 | component | bursts | mean +MiB | max +MiB | mean peak position | peak in last 20 % | peak in first 20 % |
@@ -86,7 +89,7 @@ Findings:
 
 - **Staggered, not concurrent.** Within one burst the component peaks are spread over most of the burst (e.g. A2-2 burst50: kube-proxy @27 s, flanneld @139 s, kubelet @356 s, crio @406 s, kcm @491 s, mariadb/php-fpm @508 s). Only php-fpm/mariadb/crio cluster early (the first seconds after warmup); apiserver/kcm/kubelet grow slowly and peak late, i.e. they track burst *duration* (a stuck burst keeps creating/updating objects), not burst start.
 - **Passing vs failing:** the summed growth is the same (+20.6 vs +20.9 MiB); what differs is duration (205 vs 604 s) and MemAvailable min (186 vs 148 MiB). Component growth is a symptom of a long burst, not a discriminator.
-- **Lima vs GCP:** Lima pre-burst refault is already 33k-110k pages/s and 1.0-2.0 M pages/s in the storm (pgscan ~ refault: pure file-cache thrash); GCP e5idl is 0.3-1.8k/s at rest and 3.4-6.3k/s in the burst with mem PSI full up to 79 %. Refault count is therefore not comparable across the two (Lima refaults appear cheap, host-backed); use PSI full. Only one GCP burst (passing) exists, so no GCP fail/pass contrast is possible from this data.
+- **Lima vs GCP:** Lima pre-burst refault is already 33k-110k pages/s and 1.0-2.0 M pages/s in the storm (pgscan ~ refault: pure file-cache thrash); GCP e5idl is 0.3-1.8k/s at rest and 3.4-6.3k/s in the burst with mem PSI full up to 79 %. Refault and pgscan counts are both ~200x apart (pgscan ~ refault on each), so neither is comparable across the two; Lima's idle baseline is already 40-50k pages/s. Why Lima refaults at ~1-1.6M pages/s (4-6 GB/s on a 970 MB VM) is unexplained; "cheap, host-backed" is an untested hypothesis (Lima disk/page-cache path). PSI full is the only cross-platform signal. Only one GCP burst (passing) exists, so no GCP fail/pass contrast is possible from this data.
 - 20-pod bursts that pass in 5-11 s on Lima (17 runs) have 1-3 samples; summed PSS +0..+23 there.
 
 ## 3. Aligned burst timeline (t=0 = first `burst*` sample; refault in pages/s, PSI in %)
@@ -131,7 +134,8 @@ Lima, failing, no observers (A2 run-2 burst50, 50 pods; every 5-6 s for the firs
 | 311 | 344 | 195 | 1346891 | 38.6 | 65.1 |
 | 508 | 383 | 231 | 951756 | 29.4 | 55.0 |
 
-Summed PSS stays 340-365 for the whole 500 s while the refault rate is 1.0-1.6 M/s and MemAvailable slides 246 -> 168 MiB (-78 MiB) within ~170 s. The ~78 MiB goes somewhere the sampler does not see.
+Summed PSS stays 340-365 for the whole 500 s while the refault rate is 1.0-1.6 M/s and MemAvailable slides 246 -> 168 MiB (-78 MiB) within ~170 s.
+Units differ: MemAvailable counts reclaimable file cache as available, so its fall tracks anon + slab + pagetables growth; PSS is anon + file. The ~30 MiB of file eviction visible in the PSS sum could mask equal anon growth in the sampled components, i.e. up to ~40% of the -78 MiB could be sampled-component anon. The sampled-anon share is unknown, not zero.
 
 ### Cause vs effect (`onset-all.sh`; 11 runs with attrib, first burst20; thresholds: refault > 5x pre-burst mean, PSI full > 10 %, summed PSS > baseline + 15 MiB)
 
@@ -149,14 +153,14 @@ Summed PSS stays 340-365 for the whole 500 s while the refault rate is 1.0-1.6 M
 | Lima kutwm | +7 | +7 | -37 | never |
 | GCP e5idl | none (5x of a low base) | +7 (-6 in the table above) | 0 | +25 s |
 
-In all 10 Lima runs the storm begins in the first 5-7 s of the burst (pods are being sandboxed/started) while the component sum is 20-46 MiB under baseline: growth does not precede the refaults; the sum falls with them.
-Resolution caveat: 5-6 s sampling cannot order events within one interval, but a 5 s lead of the storm over a PSS drop and the absence of any rise in 120 s rules out growth-as-cause at that resolution.
+In all 10 Lima runs the storm begins in the first 5-7 s of the burst (pods are being sandboxed/started) while the component sum is 20-46 MiB under baseline: summed PSS does not rise before the refaults; it falls with them. On GCP the pressure starts earlier (t=-6 s, warmup), so "storm at burst start" is Lima-only.
+Caveat: PSS includes file pages, so a fall in the sum can mask anon growth of similar size; this table cannot show whether anon grew first. 5-6 s sampling also cannot order events within one interval.
 
 ## Verdict
 
-1. Concurrent transient growth of kubelet/crio/kcm/apiserver/flanneld/kube-proxy/mariadb (the sampled set) is not what squeezes the ~260 MiB of reclaimable cache. Total growth is <= 65 MiB (mean 27) even summing non-simultaneous peaks, equal in passing and failing bursts, and absent at the refault onset. Kubelet is the one real grower (+21 mean, +51 max, slow, late) and scales with burst duration/pod count; crio +14 early.
+1. The data does not show concurrent growth of kubelet/crio/kcm/apiserver/flanneld/kube-proxy/mariadb, but it cannot exclude it either: summed PSS growth is <= 65 MiB (mean 27) even summing non-simultaneous peaks, equal in passing and failing bursts, and not rising at the refault onset, yet PSS includes file pages that are being evicted, so anon growth up to ~30-45 MiB could hide behind it. Kubelet is the one visible grower (+21 mean, +51 max, slow, late) and scales with burst duration/pod count; crio +14 early.
 2. The gate summary's "+46 kcm +44 crio" reading is an artefact of comparing install/idle peaks (page-cache-inflated file PSS) with the post-reclaim wordpress-phase value.
-3. MemAvailable falls 70-160 MiB in failing bursts while sampled-component PSS is flat, so the squeeze lives in memory the sampler does not attribute: new pod sandboxes/containers (pause + app processes, conmon), unsampled processes (u7s-scheduler, conmon, containerd-shim-like helpers), kernel memory (slab, pagetables, netns/cgroup structures), and the page-cache composition itself (Active(file) vs Inactive(file) protecting hot pages). `kubepods.slice` memory.current is flat ~240-255 MiB (it includes cache), so it does not discriminate either.
+3. MemAvailable falls 70-160 MiB in failing bursts while sampled-component PSS is flat; because of the unit mismatch (MemAvailable tracks anon + slab + pagetables, PSS is anon + file) part of that fall may be sampled-component anon (bound: up to ~40% in A2-2), and the rest lives in memory the sampler does not attribute: new pod sandboxes/containers (pause + app processes, conmon), unsampled processes (u7s-scheduler, conmon, containerd-shim-like helpers), kernel memory (slab, pagetables, netns/cgroup structures), and the page-cache composition itself (Active(file) vs Inactive(file) protecting hot pages). `kubepods.slice` memory.current is flat ~240-255 MiB (it includes cache), so it does not discriminate either.
 
 ## Next measurement
 
@@ -165,5 +169,5 @@ Replace PSS-of-named-components by a whole-system split, sampled at <= 2 s throu
 1. `/proc/meminfo` in the sampler: AnonPages, Active(file), Inactive(file), Slab/SReclaimable/SUnreclaim, PageTables, KernelStack, Shmem, Mapped. The question is how fast Active(file)+Inactive(file) shrink and whether anon+slab+pagetables absorb the loss.
 2. Per-process `Pss_Anon`/`Pss_File` (smaps_rollup) for the same components plus conmon, pause, u7s-scheduler, and every pod process aggregated, so anon growth is separated from file residency (PSS conflates them, shown above).
 3. If anon is flat and file shrinks: the squeeze is file cache being displaced by pod/kernel memory, so test which file set is being refaulted (`workingset_refault_file` per cgroup via `memory.stat` in `u7s.slice` vs `kubepods.slice`), and the mem PSI per cgroup, rather than component heap snapshots. KCM/apiserver `/metrics` heap snapshots are low value now: their burst growth is <= 17 MiB.
-4. For Lima vs GCP comparability, record PSI full and `pgscan`/`pgsteal` rather than refaults (refault counts differ by 200x between platforms).
+4. For Lima vs GCP comparability use mem PSI full only; refault and pgscan counts both differ ~200x between platforms.
 5. Add a GCP failing burst (n >= 1; this data only has a passing GCP 20-pod burst) with the same sampler at <= 2 s.
