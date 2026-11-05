@@ -38,12 +38,35 @@ ALLOW=(
   'test-kill-pattern-guard-logic.sh::.::fixtures for this guard'
 )
 
-# flagged_lines <file>: non-comment lines that run pkill/pgrep with -f, or any
-# killall, without workdir_kill_pattern. Prints "line_no:line".
+# flagged_lines <file>: non-comment commands (backslash continuations joined)
+# that run pkill/pgrep with -f/--full, or any killall, unless the pattern
+# argument is itself a workdir_kill_pattern call or a variable assigned from
+# one earlier in the file. Prints "line_no:line" (first physical line).
 flagged_lines() {
-  sed -E "s/[[:space:]]+#.*$//" "$1" | grep -nE '(\b(pkill|pgrep)\b[^|;&]* -[A-Za-z0-9]*f\b|\bkillall\b)' \
-    | grep -vE '^[0-9]+:[[:space:]]*#' \
-    | grep -v 'workdir_kill_pattern' || true
+  local joined n line arg var wkp_vars=" "
+  joined="$(sed -E "s/[[:space:]]+#.*$//" "$1" | awk '
+    { if (sub(/\\$/, "")) { if (!start) start = NR; buf = buf $0; next }
+      print (start ? start : NR) ":" buf $0; buf = ""; start = 0 }
+    END { if (start) print start ":" buf }')"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n="${line%%:*}"; line="${line#*:}"
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(workdir_kill_pattern ]]; then
+      wkp_vars+="${BASH_REMATCH[1]} "
+    fi
+    if [[ "$line" =~ (^|[^A-Za-z0-9_-])killall([^A-Za-z0-9_-]|$) ]]; then
+      printf '%s:%s\n' "$n" "$line"; continue
+    fi
+    [[ "$line" =~ (^|[^A-Za-z0-9_-])(pkill|pgrep)[[:space:]]([^\|\;\&]*[[:space:]])?(-[A-Za-z0-9]*f|--full)([^A-Za-z0-9_-]|$)(.*)$ ]] || continue
+    arg="${BASH_REMATCH[6]#"${BASH_REMATCH[6]%%[![:space:]]*}"}"
+    if [[ "$arg" =~ ^[\"\']?\$\(workdir_kill_pattern([^A-Za-z0-9_]|$) ]]; then continue; fi
+    if [[ "$arg" =~ ^\"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\"?([^A-Za-z0-9_]|$) ]]; then
+      var="${BASH_REMATCH[1]}"
+      [[ "$wkp_vars" == *" $var "* ]] && continue
+    fi
+    printf '%s:%s\n' "$n" "$line"
+  done <<< "$joined"
 }
 
 # unallowed_lines <rel-path> <file>: flagged lines no ALLOW entry covers.
@@ -88,9 +111,31 @@ cat > "$T/good.sh" <<'EOF'
 # pkill -f "$WORKDIR" in a comment is not a kill
 pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR")" 2>/dev/null || true
 pkill -9 -P "$pid"
+pat="$(workdir_kill_pattern apiserver "$WORKDIR")"
+pkill --full "$pat"
+pkill \
+  -f \
+  "$(workdir_kill_pattern kcm "$WORKDIR")"
 EOF
 assert_true "guard flags every raw pkill/pgrep -f and killall line (5 of 5)" \
   [ "$(flagged_lines "$T/bad.sh" | wc -l | tr -d ' ')" = 5 ]
+cat > "$T/long.sh" <<'EOF'
+pkill --full "$WORKDIR"
+EOF
+assert_true "guard flags the long option --full, which is -f spelled out and kills the same peer stacks" \
+  [ "$(flagged_lines "$T/long.sh" | wc -l | tr -d ' ')" = 1 ]
+cat > "$T/cont.sh" <<'EOF'
+pkill -9 \
+  -f "u7s.*${WORKDIR}"
+EOF
+assert_true "guard flags a pkill whose -f sits on a backslash-continued line, reported at the first line" \
+  [ "$(flagged_lines "$T/cont.sh")" = '1:pkill -9   -f "u7s.*${WORKDIR}"' ]
+cat > "$T/subst.sh" <<'EOF'
+pkill -f "$WORKDIR"; x=$(workdir_kill_pattern a "$WORKDIR")
+pkill -f "u7s-$(workdir_kill_pattern a "$WORKDIR")-extra"
+EOF
+assert_true "a raw pattern is still flagged when workdir_kill_pattern merely appears elsewhere on the line" \
+  [ "$(flagged_lines "$T/subst.sh" | wc -l | tr -d ' ')" = 2 ]
 assert_true "guard accepts workdir_kill_pattern lines, comments and pkill -P" \
   [ -z "$(flagged_lines "$T/good.sh")" ]
 assert_true "an un-allowlisted file with a raw line is reported" \
