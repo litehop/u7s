@@ -1,172 +1,159 @@
 ---
-as_of: 2026-10-01
+as_of: 2026-11-05
 kind: initiative-state
 ---
 
 # Memory management state
 
-**AS OF 2026-10-01** (see `ai/extended-context/README.md` for the refresh
+**AS OF 2026-11-05** (see `ai/extended-context/README.md` for the refresh
 cycle).
+
+## 1 GiB burst gate (mayor-hjwdo)
+
+**A 1 GiB / 1 vCPU node wedges under a 40-50 pod burst because it sits at a
+headroom cliff: with no swap, the only reclaimable memory is file pages, so
+pressure evicts control-plane code and the node refault-thrashes. Which
+mitigation ships is undecided.**
+
+Mechanism (mayor-kutwm, mayor-6bw98/36soz via #2117):
+- A killable 30x25 MiB BestEffort overload shows the `MemAvailable` drop is the
+  overload's own anon, paid for by evicting file cache. Control-plane
+  anon/slab/pagetables stay ~flat; control-plane `Pss_File` -> 0, then
+  refaults.
+- Pre-burst `MemAvailable` predicts the knee regardless of arm. A trimmed
+  Lima VM (-60-70 MiB idle) passed a 50-pod burst that wedged before
+  (#2115); knees were 20 observed / 40-50 unobserved.
+- Symptom differs by platform: GCP pd-standard shows ~95% iowait (ltido);
+  Lima shows ~100% sys CPU with iowait ~0 (#2114 live run).
+- The kernel OOM killer does fire, ordered by `oom_score_adj`: pods die
+  first, killed BestEffort pods restart-loop and the node never recovers
+  (L2: 26 kills; GCP G1 not recovered). One Lima run froze ~380 s with no
+  kill (L1).
+- Recovery therefore needs an earlier pressure-driven kill/evict trigger and
+  back-pressure against restart/replacement.
+
+Disproven (do not re-investigate):
+
+| Claim | Evidence |
+|---|---|
+| ~5 MiB/pod burst cost | settled <~1 MiB/pod (Lima 0.4-0.5); transient not captured (mayor-e5idl) |
+| u7s idle regression | none; the ~100 MiB was observer load (mayor-adwea) |
+| Lima-specific u7s bloat | Lima +75 MiB is guest daemons, trimmed by #2115 (mayor-18a8g) |
+| concurrent control-plane growth in bursts | ~+21 MiB summed PSS in PASS and FAIL (mayor-g28ic, corrected by mayor-6bw98) |
+| MGLRU `min_ttl_ms` | made the wedge worse, killed apiserver/KCM (mayor-65y7s) |
+| MemoryMin + early kubelet eviction | kubelet starved, 0 evictions, no taint (mayor-j1ao0) |
+| MemoryLow-only (#2039) | knee unchanged in pause bursts (mayor-9ygmh, corrected in PR body) |
+
+Userspace responders cannot act once the node is starved; containment has to
+be kernel cgroup limits.
+
+Landed:
+- #2113 contention makes a run INVALID regardless of outcome; truthful ramp
+  knee summary (mayor-a0e9q).
+- #2114 evidence survives a wedged/dead guest; wedge abort (mayor-hxuqo).
+- #2115 Lima trim to GCP parity; stall wedge past the 300 s cap; evidence on
+  host kill (mayor-3fvb7, mayor-nqkjp).
+- #2116 `OOMScoreAdjust=-997` on u7s-apiserver and u7s-kcm (mayor-5ljmf).
+- #2117 sampler with anon/file split, per-cgroup refault/PSI, OOM victims;
+  killable overload repro; recovery metric (mayor-6bw98, mayor-36soz).
+
+Open / next:
+- mayor-st8o2: probe timeouts make the recovery metric unable to observe
+  recovery.
+- mayor-pzhtd: experiment E, `kubepods.slice` `memory.max` via
+  `enforceNodeAllocatable` (#2039's other half), on GCP.
+- mayor-pj20g (limit concurrent sandbox creation), mayor-y7xy9 (GCP wedge
+  calibration), mayor-xseef (VM reuse, CPU calibration).
+- Operator decision: add an overload/recovery criterion to the release gate
+  after the experiments, with targets set from what they show achievable.
+  Gate size (50 vs 80 pods) is open with the operator. #2039 stays open as a
+  draft.
+
+Methodology rules:
+- In-VM sampler only; off-VM observers cost ~79 MiB and skew A/B.
+- n=1, time-boxed runs; one Lima VM at a time.
+- Lima runs need an operator-granted quiet window; every 2026-11-05 Lima
+  run was INVALID for host contention.
+- GCP is release-authoritative.
+- Workers TERM their own burst-gate PID.
+- Gate builds from main need `cosign` on the host; build at a tag to run an
+  old release.
 
 ## 1 GiB VPS fit (measured 2026-10-01, mayor-g0qp7)
 
-**The shipped install fits a real 1 GiB / 1 vCPU VM at idle and with one small
-app; pod bursts on a workload cause OOM kills and CPU thrash. A KCM/kubelet
-Rust rewrite saves ~17-50 MB each and does not fix that failure mode.**
-
-Setup: Lima aarch64 VM, 947 MiB `MemTotal`, no swap, unmodified
-`scripts/install.sh`, k8s 1.36.4; node Ready in 57 s.
+The shipped install fits a 1 GiB VM at idle and with one small app. Lima
+aarch64, 947 MiB, no swap, k8s 1.36.4, node Ready in 57 s.
 
 Idle PSS (MB): KCM 62, kubelet 61, cri-o 34, kube-proxy 23, CoreDNS 22,
-flanneld 21, u7s apiserver+scheduler 17; stack 240. OS userspace ~163, kernel
-slab 76.
+flanneld 21, u7s apiserver+scheduler 17; stack 240. `MemAvailable` idle
+462 MiB; 80-pod burst 187; minimum 103. Below ~150-200 MiB the vCPU
+re-faults code pages and BestEffort pods incl. CoreDNS are OOM-killed.
 
-`MemAvailable`: idle 462 MiB (49%) -> +WordPress/MariaDB 319 -> after churn
-262 -> 80-pod burst 187 -> run minimum 103. Each extra pod costs ~1.7 MB of
-slab/page tables/cgroups, plus kubelet and cri-o growth. Below ~150-200 MiB
-the single vCPU re-faults code pages (sys 93-97%; an 80-pod rollout took
-4.5 min), and BestEffort pods including CoreDNS are OOM-killed. Control-plane
-units were never killed.
-
-Levers, ranked: (1) swapfile (`failSwapOn: false` already set); (2) memory
-requests on CoreDNS so it is not first to die; (3) trim the OS baseline
-(udisksd, multipathd, ModemManager, unattended-upgrades, ~100 MB; tracked in
-mayor-elrly). Flannel+kube-proxy+CoreDNS alone (65 MB) outweigh the rewrite
-gain.
-
-CoreDNS: its earlier ~145 MiB footprint was a self-forward loop (kubelet
-resolvConf detection fed CoreDNS its own address), fixed in PR #1706
-(mayor-rtx3q, mayor-0e1gr): 58 MiB idle, <80 MiB under load. `GOMEMLIMIT`
-tuning did not help; the plateau was hard-consumed memory, not lazily freed
-(MADV_FREE refuted).
-
-Rewrite decision (mayor-vc844): Phase 1 verdict was KCM plausible, kubelet not.
-Phase 2 is OPEN, awaiting operator decision; the mayor recommends no-go for the
-1 GiB goal.
-
-Caveats: single run on one VM; OOM reproduced twice, thrash once; aarch64 not
-x86_64 (mayor-ed4dv); probe scripts added ~18 MB transient load and may have
-contributed to the first OOM. Full write-up: `git show
+Levers: swapfile (`failSwapOn: false` set); CoreDNS memory requests; OS
+baseline trim (mayor-elrly). A KCM/kubelet Rust rewrite saves ~17-50 MB
+each and does not fix the burst failure; mayor-vc844 Phase 2 awaits the
+operator (mayor recommends no-go). CoreDNS ~145 MiB was a self-forward loop,
+fixed in #1706. Single run; aarch64 only (mayor-ed4dv). Write-up: `git show
 archive/mayor-g0qp7-findings:ai/findings/2026-10-01-mayor-g0qp7-1gib-vps-fit.md`
+
 ## Go-runtime tuning (kubelet / KCM / kube-proxy)
 
-Round-1 tuple `GOMEMLIMIT=200MiB GOGC=50 GOMAXPROCS=2` (set via each unit's
-systemd env in `scripts/conformance/lima-start.sh`) was verified 2026-08-28
-against a real full-conformance load: 5 untuned runs vs. one fresh run with
-all three components tuned, ground-truthed per-run from each component's own
-"Golang settings" log line (not commit dates — dirty worktrees ran tuned
-tuples on live VMs before some tuning PRs merged).
+`GOMEMLIMIT=200MiB GOGC=50 GOMAXPROCS=2` (systemd env in
+`scripts/conformance/lima-start.sh`), verified 2026-08-28 against full
+conformance, 0/7616 sonobuoy failures, no OOM:
+- kubelet peak RSS 204 -> 118 MB; KCM 132 -> 113 MB (128MiB Round-2 target);
+  kube-proxy 53 -> 49 MB.
+- kube-proxy `syncProxyRules` latency not degraded (tuned p95 86.5 ms vs
+  untuned 70-87 ms; n=1 tuned run).
 
-Peak RSS improved on all three, no correctness regression:
-- kubelet: 204.3MB → 118.0MB (-42%)
-- KCM: 132.3MB → 112.8MB, one transient tick to 115.48MB (-15%); steady-state
-  112.8MB across n=2 tuned runs supports a 128MiB Round-2 retune target
-- kube-proxy: 52.7MB → 48.9MB (-7.2%) — real but small; the tuple isn't
-  miscalibrated for kube-proxy's smaller heap, the effect is just
-  proportionally smaller
+## Apiserver RSS (2026-08-12)
 
-No OOM/eviction signal in any host log; sonobuoy 0/7616 failures in both the
-tuned checkpoint and the fresh fully-tuned run.
+Peak RSS 137 -> 82 MB from Fat LTO + `codegen-units=1` (~20 MB) and
+`RING_CAPACITY` 10_000 -> 512 (a full conformance run needed 25 replayed
+events; zero 410s or `Lagged`). An undersized ring is not a correctness
+risk: stale clients get 410 and re-LIST. Remaining ~82 MB: ~16 MB SQLite page
+cache, ~16 MB `__TEXT`, rest heap.
 
-**EndpointSlice sync-latency (kube-proxy's own risk):** no degradation found.
-`syncProxyRules complete elapsed=` log-line percentiles across the same runs
-(~1100-1150 events/run): pre-tuning median 52-55ms / p95 70-87ms / p99
-97-138ms across 5 runs; the one tuned run measured median 57.7ms / p95
-86.5ms / p99 119.7ms — inside, or barely above, the pre-tuning spread, with
-p99 mid-pack (below 2 of the 5 untuned samples). Matches the previously
-measured idle-stack per-event cost of 45-70ms
-(`memory:clusterip-session-affinity-race-is-kube-proxy-syncproxyrules-cost`):
-full-suite churn runs the sync loop more often, not more expensively per
-event. Caveat: only one tuned run exists; no further re-runs are planned
-(Go-component memory is already established as run-to-run consistent, so no
-more stability sampling).
-
-## Headline: peak apiserver RSS 137 MB → 82 MB (2026-08-12 measurement)
-
-Two measured changes: **Fat LTO + `codegen-units=1`** (`[profile.release]`,
-commit `617fc0dd`, ~20MB — the workspace previously had no `[profile.*]` at
-all), and **`RING_CAPACITY` 10_000 → 512** (commit `62070e12`), sized from the
-`u7s_watch_replay_depth` histogram: a full conformance run's worst-case
-client only ever needed 25 replayed events, and old 10_000 was ~400× that.
-Retained events dropped 30,550 → 8,037. Verified at 512: zero failures, zero
-revision-expiry 410s, zero `Lagged` recoveries.
-
-Ring undersizing is *not* a correctness risk — a client whose resourceVersion
-aged out gets 410 and re-LISTs (the protocol's designed recovery path).
-Sizing the ring is a memory-vs-relist-load trade, not a safety threshold.
-Remaining ~82MB: ~16MB SQLite page cache (C-side malloc, invisible to dhat),
-~16MB resident `__TEXT`, rest live heap/allocator arenas.
-
-## Executive summary
-
-The 08-06 dhat baseline (17.0GB/60.5min churn) was dominated by
-`serde_json::Value` tree construction (44.2% of bytes). Fixes against that
-baseline dropped serde_json's share 10.65pp and num_bigint_dig+jsonwebtoken's
-5.18pp; the freed budget was absorbed by SqliteStore's global-bookmark
-broadcast fan-out, addressed by the sharding work below. The
-typed-struct-migration effort is fully complete (raw `Value` no longer backs
-reasoned-about fields in the audited surface).
-
-**Caveat on every dhat figure in this doc:** these are *churn* totals (bytes
-ever allocated), not retained memory, captured under profiling that itself
-perturbs the run (RSS under dhat was 52-88% instrumentation overhead) — for
-actual footprint use dhat's live-byte counters or measure un-profiled
-(`memory:conformance-suite-wall-clock-budget`).
+dhat figures are churn totals (bytes ever allocated) under profiling that
+inflates RSS 52-88%; for footprint use live-byte counters or measure
+un-profiled. The 08-06 baseline was dominated by `serde_json::Value`
+trees; typed-struct migration is complete.
 
 ## Memory subsystems that matter
 
-**SqliteStore ring/broadcast/deletion_log.** The ring, `deletion_log`, and
-compaction horizon are **sharded per resource type** (`SqliteStore::shards`,
-~73 shards in a conformance run) — `find_shard` bounds each scan to one
-shard. The broadcast `tx` channel is deliberately *un*sharded: every watch
-subscribes to one channel and filters to its own prefix, so a busy resource
-type can still lag a quiet watcher. `RING_CAPACITY` is 512 (per shard);
-`BROADCAST_CAPACITY` is 1024. Shards are created lazily on first write and
-never reclaimed (accepted trade-off, not an open bug).
-
-**`serde_json::Value` in handler logic.** Reasoned-about fields must be typed
-structs, not raw `Value`
-(`memory:typing-guideline-no-raw-json-for-reasoned-fields`) — this guideline
-has been forgotten and rediscovered more than once; watch for new
-Value-wrangling creeping back into reasoned fields.
-
-**Protobuf decode adapters.** Sentinel-completeness (decode every
-generated-struct field or fail a completeness test) is the standing
-convention for new adapters.
-
-**Watch observability.** `u7s_watch_ring_occupancy`, `u7s_watch_ring_span_seconds`,
-and `u7s_watch_replay_depth` are live; `apiserver_request_total` is recorded
-on both watch and non-watch paths.
-
-**Discovery cache & JWT sig-cache.** Both live: a bytes-cache for discovery
-(3-order speedup, 18μs→15ns steady-state) and cached JWT signature
-verification.
-
-**glibc arena / RSS-vs-heap gap.** dhat measures heap churn only, not host
-RSS — do not conflate the two when citing a coverage percentage.
+- **SqliteStore** ring/`deletion_log`/compaction are sharded per resource
+  type (~73 shards in conformance; lazily created, never reclaimed). The
+  broadcast channel is deliberately unsharded, so a busy type can lag a quiet
+  watcher. `RING_CAPACITY` 512 per shard, `BROADCAST_CAPACITY` 1024.
+- **Typing**: reasoned-about fields must be typed structs, not raw `Value`
+  (`memory:typing-guideline-no-raw-json-for-reasoned-fields`); watch for
+  regressions.
+- **Protobuf adapters**: decode every generated field or fail a completeness
+  test.
+- **Observability**: `u7s_watch_ring_occupancy`, `u7s_watch_ring_span_seconds`,
+  `u7s_watch_replay_depth`, `apiserver_request_total`.
+- **Caches**: discovery bytes-cache (18 us -> 15 ns) and JWT signature cache.
+- dhat measures heap churn, not host RSS; do not conflate.
 
 ## Known issues (unfixed)
 
-The only item in this doc's tracked surface that is not closed: recapturing
-dhat at backtrace depth 50 to de-anonymize the ~4.46GB "depth-truncated
-recursion" bucket from the 08-06 profile. A full-suite run at depth 50 costs
-+82% wall-clock and +318% RSS, causes cascading watchdog reaps, and still
-leaves 60% of stacks truncated. Deferred by the operator until a concrete
-memory hotspot needs sub-depth-10 attribution — do not run depth-50 against
-the full conformance suite in the meantime.
+Recapturing dhat at backtrace depth 50 to de-anonymize the ~4.46 GB
+"depth-truncated recursion" bucket is deferred by the operator; on the full
+suite it costs +82% wall-clock and +318% RSS and still truncates 60% of
+stacks. Do not run it until a concrete hotspot needs it.
 
 ## Diagnostic playbook
 
-dmesg first, never kubelet's own OOM log
+dmesg first, never kubelet's OOM log
 (`memory:dmesg-first-for-oom-investigation`). The OOM victim is often not the
-actual hog — check cgroup-level totals first
-(`memory:oom-victim-is-not-necessarily-the-memory-hog`). A dhat `eb==mb`
-program point is not automatically a leak; confirm the retention structure is
-actually unbounded before filing a bead
-(`memory:dhat-eb-equals-mb-not-necessarily-a-leak`). Any statistic cited into
-a new bead must be grep-verified at the moment of citation, never recited
-from memory
+hog; check cgroup totals first
+(`memory:oom-victim-is-not-necessarily-the-memory-hog`). dhat `eb==mb` is not
+automatically a leak
+(`memory:dhat-eb-equals-mb-not-necessarily-a-leak`). Grep-verify any
+statistic at citation time
 (`memory:statistics-from-findings-docs-must-be-grep-verified-never-recited`).
-Regression bench scenario: saturate at max-inflight=50/max-mutating=20, hold
-30s, sample RSS delta
-(`memory:memory-bench-scenario-saturate-server-at-max-inflight`).
+Regression bench: saturate at max-inflight=50/max-mutating=20, hold 30 s,
+sample RSS delta
+(`memory:memory-bench-scenario-saturate-server-at-max-inflight`). PSS
+includes file pages and falls under eviction: split anon/file before
+concluding a component did not grow.
