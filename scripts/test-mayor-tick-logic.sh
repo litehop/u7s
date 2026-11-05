@@ -1751,6 +1751,24 @@ assert "a Shape 2 cluster title lists every full bead ID, so extract_bead_ids re
   "$([ "$(call extract_bead_ids "$CLUSTER_TITLE" | tr '\n' ' ')" = "${B}aa001 ${B}bb002 ${B}cc003 " ] && echo 1 || echo 0)"
 assert "the old '(N beads incl. <id>)' title style yields at most the highlighted ID, never the whole cluster" \
   "$([ "$(call extract_bead_ids "x: y (3 beads incl. ${B}fkj56)" | wc -l | tr -d ' ')" = "1" ] && echo 1 || echo 0)"
+assert "the script name mayor-tick in a PR title is not a bead id, so the tick does not log a bogus 'bead mayor-tick not closed'" \
+  "$([ "$(call extract_bead_ids "fix(scripts): mayor-tick regex (${B}fkj56)" | tr '\n' ' ')" = "${B}fkj56 " ] && echo 1 || echo 0)"
+assert "mayor-tick.sh and mayor-tick-foo in a title yield no ids" \
+  "$([ -z "$(call extract_bead_ids "fix: mayor-tick.sh and mayor-tick-foo")" ] && echo 1 || echo 0)"
+assert "a dotted child id still matches, with trailing punctuation stripped" \
+  "$([ "$(call extract_bead_ids "fix: ${B}74j3.6, done." | tr '\n' ' ')" = "${B}74j3.6 " ] && echo 1 || echo 0)"
+assert "a 6+ char over-long token is not truncated into a bogus id" \
+  "$([ -z "$(call extract_bead_ids "fix: ${B}abcdefg")" ] && echo 1 || echo 0)"
+assert "space-separated adjacent ids all extract, so no bead in a cluster title is left un-closed" \
+  "$([ "$(call extract_bead_ids "x (${B}abc1 ${B}def2 ${B}ghi3)" | tr '\n' ' ')" = "${B}abc1 ${B}def2 ${B}ghi3 " ] && echo 1 || echo 0)"
+assert "bare-comma separated ids both extract" \
+  "$([ "$(call extract_bead_ids "x (${B}abc1,${B}def2)" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
+assert "slash separated ids both extract" \
+  "$([ "$(call extract_bead_ids "x ${B}abc1/${B}def2" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
+assert "adjacent dotted child ids both extract" \
+  "$([ "$(call extract_bead_ids "x ${B}ab1.2 ${B}cd3.4.5" | tr '\n' ' ')" = "${B}ab1.2 ${B}cd3.4.5 " ] && echo 1 || echo 0)"
+assert "an id followed by mayor-tick.sh does not yield a bogus id" \
+  "$([ "$(call extract_bead_ids "${B}abc1 mayor-tick.sh ${B}def2" | tr '\n' ' ')" = "${B}abc1 ${B}def2 " ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
