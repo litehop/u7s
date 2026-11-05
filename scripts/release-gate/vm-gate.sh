@@ -18,8 +18,8 @@ PAUSE_IMAGE=registry.k8s.io/pause:3.10
 
 # shellcheck source=lib.sh
 . "$RG/lib.sh"
-COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=50; OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0
-OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=15
+COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; RAMP_KILL_SECS=180; BURST_PODS=20; OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0
+OVERLOAD_WINDOW_SECS=600; RECOVERY_HOLD_SECS=120; RECOVERY_MAX_GAP_SECS=$RG_PROBE_MAX_GAP
 INSTALL_TARBALL=""; INSTALL_ONLY=0; WEDGE_SECS=60; WEDGE_STALL_SECS=120
 [ -f "$RG/gate.env" ] && . "$RG/gate.env"
 [ -n "$RAMP" ] && HARD_KILL_SECS="$RAMP_KILL_SECS"
@@ -37,7 +37,7 @@ res() {
   mv "$OUT/results.tmp" "$OUT/results.env"
 }
 phase() { { echo "# $(cat "$OUT/phase" 2>/dev/null)"; cat "$OUT/burst-progress.log" 2>/dev/null; } >> "$OUT/burst-progress.hist"; : > "$OUT/burst-progress.log"; echo "$1" > "$OUT/phase"; log "phase: $1"; }
-k() { timeout "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
+k() { timeout -k 1 "${K_TIMEOUT:-30}" kubectl --kubeconfig "$KCFG" "$@"; }
 kw() { kubectl --kubeconfig "$KCFG" "$@"; }
 
 # Scales deployment rg-burst to $1 replicas; echoes seconds until all Ready or "timeout".
@@ -282,7 +282,7 @@ MARIADB_READY=1
 kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; diag_pods mariadb-not-ready; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
-wp_code() { curl -s -o /dev/null -m 10 -w '%{http_code}' "http://$WP_IP/"; }
+wp_code() { curl -s -o /dev/null -m "${WP_TIMEOUT:-10}" -w '%{http_code}' "http://$WP_IP/"; }
 for _ in $(seq 1 100); do wp_code >/dev/null; done
 log "wordpress warm-up GET / -> $(wp_code)"
 
@@ -344,24 +344,23 @@ fi
 # have held RECOVERY_HOLD_SECS, or OVERLOAD_WINDOW_SECS pass. The overload pods stay: a user's overload
 # does not go away on its own.
 run_overload() {
-  local t0 ok fin
+  local t0 c0 ok fin
   phase overload
   t0="$(date +%s)"
   res overload_t0 "$t0"; res overload_pods "$OVERLOAD_PODS"; res overload_mib "$OVERLOAD_MIB"
   res overload_window_secs "$OVERLOAD_WINDOW_SECS"; res recovery_hold_secs "$RECOVERY_HOLD_SECS"
   : > "$OUT/recovery.log"
   k scale deployment/rg-overload --replicas="$OVERLOAD_PODS" >/dev/null 2>&1
+  : > "$OUT/probes.log"
   while [ $(( $(date +%s) - t0 )) -lt "$OVERLOAD_WINDOW_SECS" ]; do
+    c0="$(date +%s)"
     ok=0
-    if [ "$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ] \
-      && k get --raw /readyz >/dev/null 2>&1 \
-      && { [ "$NO_WORKLOAD" = 1 ] || case "$(wp_code)" in 200|301|302) true ;; *) false ;; esac; }; then ok=1; fi
+    if rg_probe_cycle "$OUT/probes.log" "$NO_WORKLOAD"; then ok=1; fi
     echo "$(date +%s) $ok" >> "$OUT/recovery.log"
     [ "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")" != none ] && break
-    sleep 5
+    [ $(( $(date +%s) - c0 )) -lt 5 ] && sleep $(( 5 - ($(date +%s) - c0) ))
   done
   res recovery_secs "$(rg_recovery_secs "$OUT/recovery.log" "$t0" "$RECOVERY_HOLD_SECS" "$RECOVERY_MAX_GAP_SECS")"
-  K_TIMEOUT=10
   fin="$(k get pods -l app=rg-overload -o jsonpath='{range .items[*]}{.status.phase} {.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null \
     | awk '{c[$1]++; r += $2} END {for (p in c) printf "%s=%d ", p, c[p]; printf "restarts=%d", r}')"
   res overload_final "node=$(k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null) overload-pods: $fin"
@@ -437,6 +436,8 @@ run_full() {
 }
 
 snap pre-burst
+# Guest clock; quiet.log is host clock, so a few seconds of skew only shifts the judged boundary.
+res load_t0 "$(date +%s)"
 if [ "$OVERLOAD_PODS" -gt 0 ]; then run_overload; elif [ -n "$RAMP" ]; then run_ramp; else run_full; fi
 
 phase collect

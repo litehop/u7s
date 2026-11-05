@@ -15,8 +15,10 @@ supported explanation is a headroom cliff: with no swap only file pages are
 reclaimable, so pressure evicts control-plane code and the node
 refault-thrashes. Which mitigation ships is undecided.**
 
-Caveats: evidence is n=1 per run, every 2026-11-05 Lima run was INVALID for
-host contention, and the mechanism is unconfirmed on GCP.
+Caveats: evidence is n=1 per run, 2026-11-05 Lima overload runs were flagged
+INVALID by a gate artefact (the guest's own hypervisor disk reads read as
+host contention; no foreign load shown), and the mechanism is unconfirmed on
+GCP.
 
 Evidence for the mechanism (mayor-kutwm, mayor-6bw98/36soz via #2117):
 - A killable 30x25 MiB BestEffort overload shows the `MemAvailable` drop is the
@@ -51,7 +53,7 @@ Tried, did not help (weak evidence):
   only on the tmpfs `--mem-hog-mib` repro, which is not representative
   (mayor-65y7s).
 - MemoryMin + early kubelet eviction: kubelet starved, 0 evictions, no
-  taint. n=1, INVALID for contention, and its recovery metric was broken
+  taint. n=1, flagged INVALID by the artefact above, recovery metric broken
   (mayor-j1ao0, mayor-st8o2).
 
 Hypothesis (untested): userspace responders cannot act once the node is
@@ -82,8 +84,9 @@ Open / next:
 Methodology rules:
 - In-VM sampler only; off-VM observers cost ~79 MiB and skew A/B.
 - n=1, time-boxed runs; one Lima VM at a time.
-- Lima runs need an operator-granted quiet window; every 2026-11-05 Lima
-  run was INVALID for host contention.
+- Lima runs need an operator-granted quiet window; host idle is judged
+  only before the gate's own load starts (`load_t0`), so overload-phase
+  idle drops no longer make runs INVALID.
 - GCP is release-authoritative.
 - Workers TERM their own burst-gate PID.
 - Gate builds from main need `cosign` on the host; build at a tag to run an

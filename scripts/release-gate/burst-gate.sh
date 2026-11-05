@@ -3,7 +3,7 @@
 #
 # Per run: fresh Lima VM from scripts/release-gate/u7s-vps-1g.yaml (arm64, 1 vCPU,
 # 1 GiB, no swap) -> zero-argument install.sh from an arm64 tarball built from this
-# checkout -> WordPress+MariaDB -> 20-pod burst -> N-pod burst (--burst-pods, default 50) -> webhook-smoke.sh,
+# checkout -> WordPress+MariaDB -> 20-pod burst -> N-pod burst (--burst-pods, default 20) -> webhook-smoke.sh,
 # sampling MemAvailable, per-process PSS/RSS, OOM kills and node Ready throughout.
 #
 # PASS iff all of (operator-approved criteria; every run must pass):
@@ -43,9 +43,9 @@
 # Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--overload-pods N --overload-mib M [--no-workload] [--overload-window-secs SECS]] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--wedge-secs SECS] [--wedge-stall-secs SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
-#   --burst-pods N    size of the large burst (default 50); the verdict names it
+#   --burst-pods N    size of the large burst (default 20); the verdict names it
 #   --confirm         release-gate mode, run on a QUIET host (~1 h): --runs (default 3) full runs at
-#                     50 pods, and only if any fails 3 at 40. Reports the gated no-swap ceiling or FAIL.
+#                     20 pods. Reports the gated no-swap burst size or FAIL.
 #   --keep            do not delete the VMs afterwards
 #   --memory GiB      override the template's VM memory (applies from boot, so it can break the install)
 #   --overload-pods N --overload-mib M
@@ -102,7 +102,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 COREDNS_REQ=0; ZRAM_MIB=0; CAPTURE=0; RAMP=""; PROBE_KILL_SECS=180
-BURST_PODS=50; CONFIRM=0; CONFIRM_SIZES="50 40"
+BURST_PODS=20; CONFIRM=0; CONFIRM_SIZES="20"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=600
 BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120

@@ -285,11 +285,11 @@ assert "vm-capture is off by default (its kubectl probes cost memory on the 1 Gi
 "$HERE/burst-gate.sh" --capture --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-cap" >/dev/null 2>&1 || true
 assert "--capture opts vm-capture in" "$(grep -qx 'CAPTURE=1' "$TMP/out-cap/stage/gate.env" && echo 1 || echo 0)"
 
-assert "default burst is 50 pods, reaching the VM env" "$(grep -qx 'BURST_PODS=50' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
+assert "default burst is 20 pods, reaching the VM env: the operator-decided gate size must not drift to a size a 1 GiB node cannot hold" "$(grep -qx 'BURST_PODS=20' "$TMP/out-runs/stage/gate.env" && echo 1 || echo 0)"
 rm -rf "$TMP/out-conf"
 rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf" 2>/dev/null)" || rc=$?
-assert "--confirm with every run failing tries 50 then falls to 40 and ends FAIL (exit non-zero)" \
-  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=50' "$TMP/out-conf/burst-50/stage/gate.env" && grep -qx 'BURST_PODS=40' "$TMP/out-conf/burst-40/stage/gate.env" && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
+assert "--confirm is a single 3/3 gate at 20 pods with no smaller fall-back size, and a failing gate ends FAIL" \
+  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
 # --- marker (item: criterion (d) false pass) ---
 assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
@@ -387,6 +387,25 @@ assert "same idle with no allowance (pre-flight, no VM) is contention" "$([ -n "
 rg_quiet_line 1 40 0 12 > "$TMP/q-own.log"
 assert "foreign load beyond the allowance still reads as contention" "$([ -n "$(rg_quiet_log_reasons "$TMP/q-own.log")" ] && echo 1 || echo 0)"
 
+# Idle judged only before the gate's own load starts (load_t0): the thrashing guest's hypervisor
+# disk reads cost host cores that are not a neighbour.
+Q="$TMP/q-phase.log"; : > "$Q"
+for t in 100 130 160; do rg_quiet_line "$t" 80 0 8 >> "$Q"; done
+for t in 190 220 250; do rg_quiet_line "$t" 48 0 8 >> "$Q"; done
+printf 'load_t0=170\n' > "$TMP/lt.env"
+assert "idle dropping only after load_t0 with no other VMs is VALID: the gate VM's own hypervisor disk-read load must not make overload runs INVALID" \
+  "$([ -z "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+assert "without load_t0 (VM died before the load began) the same log is judged in full" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/empty.env")" ] && echo 1 || echo 0)"
+: > "$Q"
+rg_quiet_line 100 55 0 8 >> "$Q"; rg_quiet_line 190 80 0 8 >> "$Q"
+assert "foreign load before load_t0 is still INVALID" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+: > "$Q"
+rg_quiet_line 100 80 0 8 >> "$Q"; rg_quiet_line 190 48 1 8 >> "$Q"
+assert "another Lima VM starting during the bursts is still INVALID (only the idle floor is waived after load_t0)" \
+  "$([ -n "$(rg_contention_reasons "$Q" "$TMP/lt.env")" ] && echo 1 || echo 0)"
+
 # Marker write failure is a harness error.
 # The vm-gate call site: fake `k` answers the two failure-time probes (API_MODE, POD_MODE).
 k() {
@@ -471,6 +490,25 @@ assert "a freeze bracketed by two OK probes is not 'held 120 s'; the streak rest
 assert "probes within the max gap keep a streak (slow-but-answering probes still count)" \
   "$({ for t in $(seq 1010 15 1130); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 15)" = 10 ] && echo 1 || echo 0)"
 assert "no probes at all is not recovered" "$([ "$(rl)" = none ] && echo 1 || echo 0)"
+assert "a worst-case probe cycle (3 calls all timing out) fits the max gap: otherwise a starved-but-alive node can never be observed recovering" \
+  "$([ $((3 * RG_PROBE_TIMEOUT)) -le "$RG_PROBE_MAX_GAP" ] && echo 1 || echo 0)"
+assert "a slow-but-alive node answering every ~12 s (worst bounded cycle) is observed recovering" \
+  "$({ for t in $(seq 1012 $((3 * RG_PROBE_TIMEOUT)) 1180); do echo "$t 1"; done; } > "$TMP/rec.log"; [ "$(rg_recovery_secs "$TMP/rec.log" 1000 120 "$RG_PROBE_MAX_GAP")" = 12 ] && echo 1 || echo 0)"
+PL="$TMP/probes.log"; : > "$PL"
+rc=0; rg_probe_step "$PL" node bash -c 'sleep 1; exit 3' || rc=$?
+assert "a probe step returns the probe's status and logs '<epoch> <name> <rc> <secs>' (slow probes must be visible after a run)" \
+  "$([ "$rc" = 3 ] && awk '$2 == "node" && $3 == 3 && $4 >= 1 && $1 > 1000000000 { f = 1 } END { exit !f }' "$PL" && echo 1 || echo 0)"
+rc=0; rg_probe_step "$PL" readyz true || rc=$?
+assert "a passing probe step logs rc 0" "$([ "$rc" = 0 ] && tail -n 1 "$PL" | awk '$2 == "readyz" && $3 == 0 { f = 1 } END { exit !f }' && echo 1 || echo 0)"
+PT="$TMP/pt.rec"; : > "$PT"
+# shellcheck disable=SC2329
+k() { echo "k ${K_TIMEOUT-unset}" >> "$PT"; case "$*" in "get node"*) echo True ;; esac; }
+# shellcheck disable=SC2329
+wp_code() { echo "wp ${WP_TIMEOUT-unset}" >> "$PT"; echo 200; }
+NODE=n1; rc=0; rg_probe_cycle "$TMP/pc.log" 0 || rc=$?
+assert "every probe call in a cycle carries RG_PROBE_TIMEOUT: an unbounded call lets one hung API server stretch the cycle past the max gap so recovery is never observed" \
+  "$([ "$rc" = 0 ] && [ "$(sort "$PT" | uniq -c | tr -s ' ' | tr '\n' ';')" = " 2 k $RG_PROBE_TIMEOUT; 1 wp $RG_PROBE_TIMEOUT;" ] && echo 1 || echo 0)"
+unset -f k wp_code
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
 assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \

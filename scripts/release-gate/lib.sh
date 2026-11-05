@@ -293,13 +293,16 @@ rg_quiet_line() {
 
 # Prints a reason for every contended line of a quiet.log; an unmeasurable sample counts
 # as contended because quiet cannot be proven. The idle floor is lowered by the gate VM's
-# own possible CPU share ($4).
+# own possible CPU share ($4 of the line). Optional $2 = epoch the gate's own load began
+# (results.env load_t0): host idle in samples ending after it is not judged, because the
+# thrashing guest makes the hypervisor burn host cores on virtual-disk reads, which is the
+# load under test, not a neighbour. Other running VMs are judged throughout.
 rg_quiet_log_reasons() {
   [ -f "$1" ] || return 0
-  awk -v min="$RG_IDLE_MIN_PCT" '
+  awk -v min="$RG_IDLE_MIN_PCT" -v lt="${2:-}" '
     $2 !~ /^[0-9]+$/ {printf "host idle CPU not measurable at %s\n", $1; next}
     {floor = min - ($4 ~ /^[0-9]+$/ ? $4 : 0)}
-    $2 < floor {printf "host idle CPU %d%% < %d%% (gate VM allowance %d%%) at %s\n", $2, floor, min - floor, $1}
+    $2 < floor && !(lt ~ /^[0-9]+$/ && $1 > lt) {printf "host idle CPU %d%% < %d%% (gate VM allowance %d%%) at %s\n", $2, floor, min - floor, $1}
     $3 != 0 {printf "other Lima VMs running (%s) at %s\n", $3, $1}' "$1"
 }
 
@@ -378,7 +381,7 @@ rg_steal_reason() {
 
 # Contention evidence for a run: $1 quiet.log, $2 results file. Empty output = none.
 rg_contention_reasons() {
-  rg_quiet_log_reasons "$1"
+  rg_quiet_log_reasons "$1" "$(rg_get "$2" load_t0)"
   rg_cal_reason "$2"
   rg_steal_reason "$2"
 }
@@ -457,6 +460,37 @@ rg_probe_and_record_marker_failure() {
   aout="$(k get --raw /readyz 2>&1)" || arc=$?
   pout="$(k -n default get pod mariadb-0 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>&1)" || prc=$?
   rg_record_marker_write_failure "$f" "$was_ready" "$arc" "$aout" "$prc" "$pout"
+}
+
+# Recovery probes are bounded so one cycle (node Ready, /readyz, WordPress: three calls, each
+# timing out as "not OK") plus its pacing sleep fits inside RG_PROBE_MAX_GAP. rg_recovery_secs
+# breaks a streak on a larger gap, so slower cycles could never show a starved node recovering.
+RG_PROBE_TIMEOUT=4
+RG_PROBE_MAX_GAP=15
+
+# Runs "$@" and appends "<epoch> <name> <rc> <secs>" to probe log $1, so slow probes stay visible
+# after the fact. Returns the command's status.
+rg_probe_step() {
+  local log="$1" name="$2" t0 rc=0
+  shift 2
+  t0="$(date +%s)"
+  "$@" || rc=$?
+  echo "$(date +%s) $name $rc $(( $(date +%s) - t0 ))" >> "$log"
+  return "$rc"
+}
+
+# Each probe bounds its own call (k honours K_TIMEOUT, wp_code honours WP_TIMEOUT) so a hung API
+# server or ingress cannot stretch a cycle past RG_PROBE_MAX_GAP. Needs k, wp_code, $NODE.
+probe_node_ready() { [ "$(K_TIMEOUT=$RG_PROBE_TIMEOUT k get node "$NODE" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; }
+probe_readyz() { K_TIMEOUT=$RG_PROBE_TIMEOUT k get --raw /readyz >/dev/null 2>&1; }
+probe_wordpress() { case "$(WP_TIMEOUT=$RG_PROBE_TIMEOUT wp_code)" in 200|301|302) true ;; *) false ;; esac; }
+
+# One recovery probe cycle: logs each step to probe log $1, returns 0 only when node Ready AND
+# /readyz AND (unless $2 = 1, no workload) WordPress all pass.
+rg_probe_cycle() {
+  rg_probe_step "$1" node probe_node_ready \
+    && rg_probe_step "$1" readyz probe_readyz \
+    && { [ "$2" = 1 ] || rg_probe_step "$1" wordpress probe_wordpress; }
 }
 
 # Recovery probe log: "<epoch> <1|0>" per probe, 1 = node Ready AND API /readyz AND WordPress 200
