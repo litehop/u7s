@@ -438,7 +438,8 @@ rg_probe_kind() {
 # Mapping: any probe showing u7s misbehaving (API unreachable or answering an error, pod not
 # Ready) is marker_ok=0 (FAIL), checked first so ambiguity goes to FAIL. Only when no probe shows
 # u7s failing is it harness_error (INVALID): a probe command that itself errored, or everything
-# healthy while the write still failed.
+# healthy while the write still failed. If the earlier Ready wait already failed (was_ready=0),
+# ambiguity also goes to FAIL: a broken release must not be discarded as INVALID.
 rg_record_marker_write_failure() {
   local f="$1" was_ready="$2" ak rk pod=ready
   ak="$(rg_probe_kind "$3" "$4")"
@@ -460,6 +461,9 @@ rg_record_marker_write_failure() {
   elif [ "$pod" = notready ]; then
     echo "marker_ok=0" >> "$f"
     echo "marker_fail=mariadb-0 never became Ready, marker not written (u7s pod-start failure)" >> "$f"
+  elif [ "$was_ready" = 0 ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=mariadb-0 never became Ready and the probes could not say why, marker not written (counted as u7s failure)" >> "$f"
   elif [ "$ak" = error ] || [ "$pod" = error ]; then
     echo "harness_error=marker write failed and a probe command errored (kubectl/kubeconfig), cannot attribute to u7s" >> "$f"
   else

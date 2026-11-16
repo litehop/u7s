@@ -445,6 +445,8 @@ marker_case cmderr 1 cmderr cmderr INVALID "probe command errored" \
   "kubectl command error (bad kubeconfig) -> INVALID: the harness broke, nothing says u7s failed"
 marker_case podgone 1 cmderr False FAIL "became not Ready" \
   "a probe command error never hides a u7s failure seen by the other probe -> FAIL"
+marker_case nopodcmderr 0 cmderr cmderr FAIL "never became Ready" \
+  "mariadb-0 never Ready and the probes also errored -> FAIL: a broken release passing the gate because its failures were discarded as INVALID"
 assert "a failed marker READ after the bursts (marker_ok=0, no harness error) stays FAIL" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$(mutate marker_ok 0)")" = FAIL ] && echo 1 || echo 0)"
 
