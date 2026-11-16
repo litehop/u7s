@@ -43,7 +43,7 @@ Run it only if openssl prints `Signature Verified Successfully`
 ## Resolving the release tag
 
 Every release is still a prerelease, so the unpinned `/install.sh` URL
-returns 404 by design; pin a release tag instead. The README lookup uses
+returns 404 by design; pin a release tag instead. The tag lookup uses
 `curl`, `grep` and `cut` (unauthenticated GitHub API calls are
 rate-limited; if it fails, set `TAG` by hand from
 <https://github.com/litehop/u7s/releases>).
