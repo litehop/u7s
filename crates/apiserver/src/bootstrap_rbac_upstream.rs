@@ -562,3 +562,39 @@ async fn seeded_namespace_rolebindings_match_upstream_except_listed_deviations()
         assert_eq!(subject_set(&seeded[id]), subject_set(up), "{id} subjects");
     }
 }
+
+// Regenerate after an explicit re-vendor from upstream release-1.37:
+//   cd crates/apiserver/testdata/rbac-upstream-1.37 && shasum -a 256 *.yaml > SHA256SUMS
+#[test]
+fn vendored_upstream_yaml_matches_pinned_sha256() {
+    use sha2::{Digest, Sha256};
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/rbac-upstream-1.37");
+    let pinned: BTreeMap<String, String> =
+        include_str!("../testdata/rbac-upstream-1.37/SHA256SUMS")
+            .lines()
+            .map(|l| {
+                let (sum, name) = l
+                    .split_once("  ")
+                    .expect("SHA256SUMS line: `<sha256>  <file>`");
+                (name.to_string(), sum.to_string())
+            })
+            .collect();
+    let actual: BTreeMap<String, String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
+        .map(|p| {
+            let sum = Sha256::digest(std::fs::read(&p).unwrap());
+            let hex: String = sum.iter().map(|b| format!("{b:02x}")).collect();
+            (p.file_name().unwrap().to_string_lossy().into_owned(), hex)
+        })
+        .collect();
+    assert_eq!(
+        actual, pinned,
+        "vendored rbac-upstream-1.37 YAML was modified, added or removed without re-vendoring: \
+         the golden test compares the seeded RBAC against these same files, so the seeded RBAC \
+         would silently diverge from upstream 1.37. Re-vendor from upstream release-1.37 and \
+         regenerate SHA256SUMS (see comment above this test)."
+    );
+}
