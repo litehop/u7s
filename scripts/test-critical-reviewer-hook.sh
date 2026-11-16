@@ -566,8 +566,7 @@ rm -f "$LOCK_LIVENESS"
 # but is hit under CI load. An implementation that records the owner PID
 # after creating the lock (mkdir + pid file) looks ownerless for the whole
 # delay, so a waiter breaks it: two hooks in the critical section, a crashed
-# hook and a dropped decision -- a PR that never gets reviewed. STALE_LOCK_TIMEOUT_SEC=0
-# makes such an implementation break ownerless locks at its first poll.
+# hook and a dropped decision -- a PR that never gets reviewed.
 SLOWDIR=$(mktemp -d)
 for tool in mkdir ln; do
   cat > "$SLOWDIR/$tool" <<'STUBEOF'
@@ -591,7 +590,7 @@ for i in 1 2 3; do
     INPUT_SLOW=$(jq -n --arg id "agent-slow$i" \
       '{agent_id:$id, agent_type:"worker", cwd:"/tmp/wt", session_id:"sessSlow", hook_event_name:"SubagentStop", last_assistant_message:"nothing to do"}')
     RC=0
-    STALE_LOCK_TIMEOUT_SEC=0 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$SLOWDIR:$STUBDIR:$PATH" \
+    CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$SLOWDIR:$STUBDIR:$PATH" \
       bash "$HOOK" <<< "$INPUT_SLOW" >/dev/null 2>&1 || RC=$?
     echo "$RC" > "$SANDBOX/slow-rc-$i"
   ) &
@@ -611,6 +610,100 @@ if [ "$SLOW_BAD" -eq 0 ]; then
   pass "hooks that are slow to take the decisions lock are not evicted: all 3 exit 0 and record their decision (no missed reviews)"
 else
   fail "$SLOW_BAD crash/drop(s) when waiters met a lock whose owner was not yet recorded -- a dropped decision means a PR silently never gets a critical review"
+fi
+
+# Case 18: release must be owner-only. A hook whose lock was replaced by
+# another live holder (e.g. it was wrongly evicted) must not delete the new
+# holder's lock on its way out; doing so lets a waiter in while that holder is
+# still writing, and a decision is dropped (a PR silently never gets a
+# critical review). A `wc` stub, which runs inside the critical section,
+# swaps the lock for one naming a live process.
+REL_LOG="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+clear_sandbox
+rm -f "$REL_LOG" "$REL_LOG.1" "$REL_LOG.2" "$REL_LOG.lock" "$REL_LOG.lock.break"
+echo "seed" > "$REL_LOG"
+sleep 30 & REL_OTHER_PID=$!
+RELDIR=$(mktemp -d)
+cat > "$RELDIR/wc" <<STUBEOF
+#!/usr/bin/env bash
+rm -f "$REL_LOG.lock"
+ln -s "$REL_OTHER_PID" "$REL_LOG.lock"
+PATH=\${PATH#*:}
+exec wc "\$@"
+STUBEOF
+chmod +x "$RELDIR/wc"
+INPUT_REL=$(jq -n '{agent_id:"agent-rel", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessRel", hook_event_name:"SubagentStop", last_assistant_message:"nothing to do"}')
+CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$RELDIR:$STUBDIR:$PATH" \
+  bash "$HOOK" <<< "$INPUT_REL" >/dev/null 2>&1 || true
+REL_SURVIVED=$(readlink "$REL_LOG.lock" 2>/dev/null || true)
+kill "$REL_OTHER_PID" 2>/dev/null || true
+wait "$REL_OTHER_PID" 2>/dev/null || true
+rm -rf "$RELDIR"
+rm -f "$REL_LOG.lock"
+if [ "$REL_SURVIVED" = "$REL_OTHER_PID" ]; then
+  pass "a hook that no longer owns the decisions lock does not delete the real holder's lock on release"
+else
+  fail "release removed a lock owned by another live holder (a waiter enters mid-write and a decision is dropped, so a PR silently never gets a critical review): lock owner=$REL_SURVIVED, expected=$REL_OTHER_PID"
+fi
+
+# Case 19: breaking a dead holder's lock must not remove a fresh holder's
+# lock. Breaker B reads dead holder H, is paused (readlink stub), meanwhile C
+# takes the lock; B then resumes. A break that renames/removes whatever is at
+# the lock path admits waiter D alongside C (the `mv` stub widens the window
+# in which the lock is absent): two hooks in the critical section and a
+# dropped decision -- a PR silently never gets a critical review. Expected:
+# C's lock survives while C is alive, D waits, and after C finishes both B
+# and D record their decisions.
+BRK_LOG="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+clear_sandbox
+rm -f "$BRK_LOG" "$BRK_LOG.1" "$BRK_LOG.2" "$BRK_LOG.lock" "$BRK_LOG.lock.break"
+BRKDIR=$(mktemp -d)
+BRK_PAUSE="$BRKDIR/pause-once"
+touch "$BRK_PAUSE"
+cat > "$BRKDIR/readlink" <<STUBEOF
+#!/usr/bin/env bash
+PATH=\${PATH#*:}
+out=\$(readlink "\$@")
+rc=\$?
+printf '%s\n' "\$out"
+case "\$*" in *decisions.tsv.lock) rm "$BRK_PAUSE" 2>/dev/null && sleep 1.5 ;; esac
+exit \$rc
+STUBEOF
+cat > "$BRKDIR/mv" <<'STUBEOF'
+#!/usr/bin/env bash
+PATH=${PATH#*:}
+mv "$@" || exit $?
+case "$*" in *decisions.tsv.lock*) sleep 1.5 ;; esac
+STUBEOF
+chmod +x "$BRKDIR/readlink" "$BRKDIR/mv"
+( : ) & BRK_DEAD_PID=$!
+wait "$BRK_DEAD_PID" 2>/dev/null || true
+sleep 30 & BRK_C_PID=$!
+ln -s "$BRK_DEAD_PID" "$BRK_LOG.lock"
+INPUT_B=$(jq -n '{agent_id:"agent-brkB", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessBrk", hook_event_name:"SubagentStop", last_assistant_message:"nothing to do"}')
+INPUT_D=$(jq -n '{agent_id:"agent-brkD", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessBrk", hook_event_name:"SubagentStop", last_assistant_message:"nothing to do"}')
+CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$BRKDIR:$STUBDIR:$PATH" \
+  bash "$HOOK" <<< "$INPUT_B" >/dev/null 2>&1 &
+BRK_B_PID=$!
+sleep 0.5
+rm -f "$BRK_LOG.lock"
+ln -s "$BRK_C_PID" "$BRK_LOG.lock"
+sleep 1.5
+CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
+  bash "$HOOK" <<< "$INPUT_D" >/dev/null 2>&1 &
+BRK_D_PID=$!
+sleep 1.2
+BRK_OWNER=$(readlink "$BRK_LOG.lock" 2>/dev/null || true)
+BRK_EARLY=$(grep -c 'agent-brk' "$BRK_LOG" 2>/dev/null || true)
+kill "$BRK_C_PID" 2>/dev/null || true
+wait "$BRK_C_PID" 2>/dev/null || true
+wait "$BRK_B_PID" "$BRK_D_PID" 2>/dev/null || true
+BRK_FINAL=$(grep -c 'agent-brk' "$BRK_LOG" 2>/dev/null || true)
+rm -rf "$BRKDIR"
+if [ "$BRK_OWNER" = "$BRK_C_PID" ] && [ "${BRK_EARLY:-0}" = "0" ] && [ "$BRK_FINAL" = "2" ]; then
+  pass "breaking a dead holder's lock never removes a fresh holder's lock: one owner at a time and both decisions recorded"
+else
+  fail "dead-lock break admitted a second owner or dropped a decision (a PR silently never gets a critical review): owner=$BRK_OWNER expected=$BRK_C_PID, decisions written while C held the lock=$BRK_EARLY (want 0), final=$BRK_FINAL (want 2)"
 fi
 
 if [ "$FAILURES" -eq 0 ]; then

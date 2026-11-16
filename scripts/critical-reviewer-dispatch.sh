@@ -88,31 +88,69 @@ DECISIONS_LOG_LOCK="$DECISIONS_LOG.lock"
 # decision). `flock` is avoided because it is absent on a stock macOS install
 # and this hook runs on both.
 #
-# A lock is only broken when its recorded PID is no longer running (checked
-# on every poll, so a crashed holder never wedges later fires). The break is
-# a rename to a private name, which only one waiter can win; if the renamed
-# lock belongs to a different holder than the one judged dead (it was
-# replaced in between), it is put back.
+# A lock naming a dead PID is broken on every poll, so a crashed holder never
+# wedges later fires. Safety of the break: release is owner-only, so a lock
+# naming a dead PID can only disappear through a break; breaks are serialized
+# by a second symlink-to-PID mutex; and under that mutex the lock is re-read
+# and removed only if it still names the PID judged dead. A lock replaced by
+# a live holder in between names a different PID and is left alone, so no
+# live holder's lock is ever removed.
+#
+# A break mutex whose holder died (killed between taking and dropping it) is
+# cleared by renaming it away and checking the renamed link still names the
+# dead PID. That rename misfires only if a live breaker takes the mutex
+# between the dead-PID read and the rename, and the damage then needs a
+# second break race on top; reachable only after a hook was SIGKILLed
+# mid-break.
+#
+# Known limitation: if a dead holder's PID is reused by an unrelated live
+# process, `kill -0` succeeds and the lock stays wedged.
+DECISIONS_LOG_BREAK="$DECISIONS_LOG.lock.break"
+
+pid_alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+
+release_if_owner() {
+  if [ "$(readlink "$1" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$1"
+  fi
+  return 0
+}
+
+break_dead_lock() {
+  local dead="$1" mh moved
+  if ln -s "$$" "$DECISIONS_LOG_BREAK" 2>/dev/null; then
+    if [ "$(readlink "$DECISIONS_LOG_LOCK" 2>/dev/null || true)" = "$dead" ]; then
+      rm -f "$DECISIONS_LOG_LOCK"
+    fi
+    release_if_owner "$DECISIONS_LOG_BREAK"
+    return 0
+  fi
+  mh=$(readlink "$DECISIONS_LOG_BREAK" 2>/dev/null || true)
+  if [ -n "$mh" ] && ! pid_alive "$mh"; then
+    moved="$DECISIONS_LOG_BREAK.stale.$$"
+    if mv "$DECISIONS_LOG_BREAK" "$moved" 2>/dev/null; then
+      if [ "$(readlink "$moved" 2>/dev/null || true)" != "$mh" ]; then
+        ln -s "$(readlink "$moved")" "$DECISIONS_LOG_BREAK" 2>/dev/null || true
+      fi
+      rm -f "$moved"
+    fi
+  fi
+}
+
 acquire_decisions_lock() {
-  local holder stale
+  local holder
   until ln -s "$$" "$DECISIONS_LOG_LOCK" 2>/dev/null; do
     holder=$(readlink "$DECISIONS_LOG_LOCK" 2>/dev/null || true)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      stale="$DECISIONS_LOG_LOCK.stale.$$"
-      if mv "$DECISIONS_LOG_LOCK" "$stale" 2>/dev/null; then
-        if [ "$(readlink "$stale" 2>/dev/null || true)" != "$holder" ]; then
-          ln -s "$(readlink "$stale")" "$DECISIONS_LOG_LOCK" 2>/dev/null || true
-        fi
-        rm -f "$stale"
-      fi
-      continue
+    if pid_alive "$holder"; then
+      sleep 0.1
+    elif [ -n "$holder" ]; then
+      break_dead_lock "$holder"
     fi
-    sleep 0.1
   done
 }
 
 release_decisions_lock() {
-  rm -f "$DECISIONS_LOG_LOCK"
+  release_if_owner "$DECISIONS_LOG_LOCK"
 }
 
 # Concurrent subagents can hit SubagentStop within the same second (multiple
