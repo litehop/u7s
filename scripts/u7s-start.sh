@@ -466,7 +466,12 @@ EXTEOF
   # Restart apiserver with proxy flag now that konnectivity is up.
   if nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && [ "$BACKGROUND" -eq 1 ]; then
     kill "$SERVER_PID" 2>/dev/null || true
-    sleep 1
+    # dhat flushes on Drop after SIGTERM; wait for exit so the scratch file
+    # is not recreated after the rm below.
+    for _ in $(seq 1 10); do
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 1
+    done
     # Restore the operator-requested dhat path (diverted above) — this is
     # Phase 2, the real, long-running instance whose heap is the one that
     # matters.
