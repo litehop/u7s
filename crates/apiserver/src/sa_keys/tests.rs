@@ -117,7 +117,7 @@ fn token_with_unknown_or_missing_kid_or_wrong_alg_is_rejected() {
 
     let mut hs = Header::new(Algorithm::HS256);
     hs.kid = Some(ring.signing_kid());
-    let t = jsonwebtoken::encode(&hs, &claims(), &EncodingKey::from_secret(b"s")).unwrap();
+    let t = jsonwebtoken::encode(&hs, &claims(), &EncodingKey::from_secret(b"s").unwrap()).unwrap();
     assert!(
         ring.decoding_key_for(&t).is_none(),
         "a known kid must not unlock any algorithm other than ES256"
