@@ -40,16 +40,16 @@ assert() {
 # given the operator-requested U7S_DHAT_HEAP_FILE, whether this is a
 # --background launch, and whether ca.crt exists yet, print the env value
 # Phase 1 (this launch) and Phase 2 (the restart, if one happens) would each
-# see. scratch_pid stands in for u7s-start.sh's own "$$".
+# see. scratch_dir stands in for the workdir the scratch file is created in.
 # ---------------------------------------------------------------------------
 resolve_phase_env() {
-  local dhat_heap_file="$1" background="$2" ca_crt_exists="$3" scratch_pid="$4"
+  local dhat_heap_file="$1" background="$2" ca_crt_exists="$3" scratch_dir="$4"
   local diverted=0 heap_file_final="" phase1_env="$dhat_heap_file" phase2_env="$dhat_heap_file"
 
   if [ -n "$dhat_heap_file" ] && [ "$background" -eq 1 ] && [ "$ca_crt_exists" -eq 0 ]; then
     diverted=1
     heap_file_final="$dhat_heap_file"
-    phase1_env="/tmp/u7s-dhat-phase1-${scratch_pid}.json"
+    phase1_env="${scratch_dir}/dhat-phase1.XXXXXX"
   fi
 
   [ "$diverted" -eq 1 ] && phase2_env="$heap_file_final"
@@ -70,11 +70,11 @@ resolve_phase_env_old_buggy() {
 #    scratch path DISTINCT from the operator-requested path, so its bootstrap
 #    heap can't clobber it; Phase 2 must get the operator-requested path back.
 # ---------------------------------------------------------------------------
-RESULT=$(resolve_phase_env "/run/dhat-heap.json" 1 0 4242)
+RESULT=$(resolve_phase_env "/run/dhat-heap.json" 1 0 /wd)
 PHASE1="${RESULT%%|*}"
 PHASE2="${RESULT##*|}"
 assert "Phase 1 (ca.crt absent, dhat build) is diverted to a scratch path" \
-  "$([ "$PHASE1" = "/tmp/u7s-dhat-phase1-4242.json" ] && echo 1 || echo 0)"
+  "$([ "$PHASE1" = "/wd/dhat-phase1.XXXXXX" ] && echo 1 || echo 0)"
 assert "Phase 1's scratch path differs from the operator-requested path" \
   "$([ "$PHASE1" != "/run/dhat-heap.json" ] && echo 1 || echo 0)"
 assert "Phase 2 is restored to the operator-requested path" \
@@ -93,7 +93,7 @@ assert "(regression guard) pre-fix logic shares one path across both phases" \
 #    restart happens at all in u7s-start.sh, so the single launch must use
 #    the operator-requested path directly -- no diversion needed or wanted.
 # ---------------------------------------------------------------------------
-RESULT=$(resolve_phase_env "/run/dhat-heap.json" 1 1 4242)
+RESULT=$(resolve_phase_env "/run/dhat-heap.json" 1 1 /wd)
 assert "ca.crt pre-existing (single launch, no Phase 2 restart) is not diverted" \
   "$([ "$RESULT" = "/run/dhat-heap.json|/run/dhat-heap.json" ] && echo 1 || echo 0)"
 
@@ -102,7 +102,7 @@ assert "ca.crt pre-existing (single launch, no Phase 2 restart) is not diverted"
 #    complete no-op -- must stay unset through both phases, never
 #    accidentally introducing a scratch path for a non-dhat build.
 # ---------------------------------------------------------------------------
-RESULT=$(resolve_phase_env "" 1 0 4242)
+RESULT=$(resolve_phase_env "" 1 0 /wd)
 assert "no U7S_DHAT_HEAP_FILE set (non-dhat build) stays unset through both phases" \
   "$([ "$RESULT" = "|" ] && echo 1 || echo 0)"
 
@@ -113,8 +113,14 @@ assert "no U7S_DHAT_HEAP_FILE set (non-dhat build) stays unset through both phas
 # (fixed-string, not regex -- the pattern contains shell-special characters).
 # ---------------------------------------------------------------------------
 U7S_START="$(cd "$(dirname "$0")/.." && pwd)/u7s-start.sh"
-assert "u7s-start.sh actually diverts Phase 1 to a distinct scratch path" \
-  "$(grep -qF '/tmp/u7s-dhat-phase1-$$.json' "$U7S_START" && echo 1 || echo 0)"
+assert "u7s-start.sh diverts Phase 1 to an mktemp file under \$WORKDIR" \
+  "$(grep -qF 'mktemp "$WORKDIR/dhat-phase1.XXXXXX"' "$U7S_START" && echo 1 || echo 0)"
+# A PID-derived /tmp name is guessable and attacker-pre-creatable (symlink
+# clobber of the operator's files when dhat's Profiler drops).
+assert "u7s-start.sh no longer uses a predictable /tmp dhat path" \
+  "$(grep -qE '/tmp/u7s-dhat' "$U7S_START" && echo 0 || echo 1)"
+assert "u7s-start.sh removes the Phase 1 scratch file" \
+  "$(grep -qF 'rm -f "$_DHAT_PHASE1_FILE"' "$U7S_START" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

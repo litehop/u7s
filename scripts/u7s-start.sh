@@ -319,7 +319,8 @@ _DHAT_PHASE1_DIVERTED=0
 if [ -n "${U7S_DHAT_HEAP_FILE:-}" ] && [ "$BACKGROUND" -eq 1 ] && [ ! -f "$WORKDIR/ca.crt" ]; then
   _DHAT_PHASE1_DIVERTED=1
   _DHAT_HEAP_FILE_FINAL="$U7S_DHAT_HEAP_FILE"
-  export U7S_DHAT_HEAP_FILE="/tmp/u7s-dhat-phase1-$$.json"
+  _DHAT_PHASE1_FILE="$(mktemp "$WORKDIR/dhat-phase1.XXXXXX")"
+  export U7S_DHAT_HEAP_FILE="$_DHAT_PHASE1_FILE"
 fi
 
 if [ "$BACKGROUND" -eq 1 ]; then
@@ -471,6 +472,7 @@ EXTEOF
     # matters.
     if [ "$_DHAT_PHASE1_DIVERTED" -eq 1 ]; then
       export U7S_DHAT_HEAP_FILE="$_DHAT_HEAP_FILE_FINAL"
+      rm -f "$_DHAT_PHASE1_FILE"
     fi
     "$BINARY" \
       --db         "$WORKDIR/state.db" \
