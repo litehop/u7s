@@ -1659,7 +1659,8 @@ case "\$1" in
           '[{id:\$id,status:\$st,notes:\$notes,issue_type:\$type}]' ;;
   children) n=\$(cat "$BEAD_DB/\$2.children" 2>/dev/null || echo 0)
             jq -nc --argjson n "\$n" '[range(\$n) | {status:"open"}] + [{status:"closed"}]' ;;
-  list) cat "$BEAD_DB/inprogress.json" 2>/dev/null || echo '[]' ;;
+  list) [ -f "$BEAD_DB/FAILLIST" ] && exit 1
+        cat "$BEAD_DB/inprogress.json" 2>/dev/null || echo '[]' ;;
   close) [ -f "$BEAD_DB/FAIL" ] && exit 1
          printf '%s\n' "\$*" >> "$BEAD_CLOSE_LOG"; printf closed > "$BEAD_DB/\$2" ;;
   *) exit 1 ;;
@@ -1708,13 +1709,71 @@ assert "the next tick scans from the cursor, not from a fixed lookback, so a lon
 
 # A failed close must not advance the cursor, or the retry the failure promises
 # would never see that PR again.
+NOW_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 setup_bead_stubs cursorfail \
-  "[{\"number\":81,\"title\":\"fix: a (${B}cf81)\",\"mergeCommit\":{\"oid\":\"5656565656\"},\"mergedAt\":\"2020-02-01T10:00:00Z\"}]" \
+  "[{\"number\":81,\"title\":\"fix: a (${B}cf81)\",\"mergeCommit\":{\"oid\":\"5656565656\"},\"mergedAt\":\"$NOW_TS\"}]" \
   ${B}cf81=in_progress "${B}cf81.notes=PR #81 opened: u"
 touch "$BEAD_DB/FAIL"
 bead_tick
 assert "a failed bd close does not advance the cursor, so the PR is rescanned" \
   "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
+
+# A held cursor must keep its prior value, not reset to empty (which would
+# re-trigger the 3-day lookback and rescan or lose history).
+setup_bead_stubs cursorheld \
+  "[{\"number\":90,\"title\":\"chore(deps): renovate\",\"mergeCommit\":{\"oid\":\"9090909090\"},\"mergedAt\":\"2020-01-01T00:00:00Z\"}]"
+build_scratch_repo
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+printf '%s' "[{\"number\":90,\"title\":\"chore(deps): renovate\",\"mergeCommit\":{\"oid\":\"9090909090\"},\"mergedAt\":\"2020-01-01T00:00:00Z\"},{\"number\":91,\"title\":\"fix: a (${B}ch91)\",\"mergeCommit\":{\"oid\":\"9191919191\"},\"mergedAt\":\"$NOW_TS\"}]" > "$BEAD_DB/prs.json"
+printf in_progress > "$BEAD_DB/${B}ch91"; printf 'PR #91 opened: u' > "$BEAD_DB/${B}ch91.notes"
+touch "$BEAD_DB/FAIL"
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+assert "a held cursor keeps its non-empty prior value" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "2020-01-01T00:00:00Z" ] && echo 1 || echo 0)"
+
+# One persistently failing close must not pin the cursor forever: past the
+# lookback window it still raises the gate exception but stops holding.
+OLD_TS=$(date -u -v-10d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "10 days ago" +%Y-%m-%dT%H:%M:%SZ)
+setup_bead_stubs stalefail \
+  "[{\"number\":92,\"title\":\"fix: a (${B}sf92)\",\"mergeCommit\":{\"oid\":\"9292929292\"},\"mergedAt\":\"$OLD_TS\"}]" \
+  ${B}sf92=in_progress "${B}sf92.notes=PR #92 opened: u"
+touch "$BEAD_DB/FAIL"
+bead_tick
+assert "a close failing past the lookback window still raises bead-close-failed (exit 20) but no longer holds the cursor" \
+  "$([ "$TICK_RC" -eq 20 ] && [ "$(jq -r '.gate_exceptions[0].reason' "$TICK_STATE")" = "bead-close-failed" ] && [ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "$OLD_TS" ] && echo 1 || echo 0)"
+
+# Two PRs sharing mergedAt (the cursor boundary, since merged:>= is inclusive):
+# a held one must still be rescanned and closed once its note appears.
+setup_bead_stubs sharedts \
+  "[{\"number\":93,\"title\":\"fix: a (${B}st93)\",\"mergeCommit\":{\"oid\":\"9393939393\"},\"mergedAt\":\"$NOW_TS\"},{\"number\":94,\"title\":\"fix: b (${B}st94)\",\"mergeCommit\":{\"oid\":\"9494949494\"},\"mergedAt\":\"$NOW_TS\"}]" \
+  ${B}st93=in_progress ${B}st94=in_progress "${B}st93.notes=PR #93 opened: u" "${B}st94.notes=PR #94 mentioned only"
+build_scratch_repo
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+assert "a PR whose bead lacks its 'PR #N opened' note holds the cursor (retryable), even when a sibling at the same mergedAt closed" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && grep -q "st93" "$BEAD_CLOSE_LOG" && echo 1 || echo 0)"
+printf 'PR #94 opened: u' > "$BEAD_DB/${B}st94.notes"
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+assert "...and once the note appears the same-mergedAt PR is rescanned and closed, then the cursor advances to that shared timestamp" \
+  "$(grep -q "st94" "$BEAD_CLOSE_LOG" && [ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "$NOW_TS" ] && echo 1 || echo 0)"
+
+setup_bead_stubs notfound \
+  "[{\"number\":95,\"title\":\"fix: a (${B}nf95)\",\"mergeCommit\":{\"oid\":\"9595959595\"},\"mergedAt\":\"$NOW_TS\"}]"
+bead_tick
+assert "a title bead ID that bd cannot show holds the cursor (bd failure is transient)" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
+
+setup_bead_stubs listfail \
+  "[{\"number\":96,\"title\":\"fix: no id here\",\"mergeCommit\":{\"oid\":\"9696969696\"},\"mergedAt\":\"$NOW_TS\"}]"
+touch "$BEAD_DB/FAILLIST"
+bead_tick
+assert "a failing bd list holds the cursor, since in_progress notes could not be matched to the PR" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
+
+setup_bead_stubs nobead \
+  "[{\"number\":97,\"title\":\"chore(deps): renovate\",\"mergeCommit\":{\"oid\":\"9797979797\"},\"mergedAt\":\"$NOW_TS\"}]"
+bead_tick
+assert "a PR with no bead ID and no noting bead (renovate) advances the cursor, or it would pin forever" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "$NOW_TS" ] && echo 1 || echo 0)"
 
 # Silent truncation at --limit would leave the oldest unscanned merges' beads
 # open with nothing telling the mayor. Limit 5 (retry 50): 51 merges exceed even

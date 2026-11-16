@@ -758,14 +758,24 @@ extract_bead_ids() {
 # no bead ID. A close failure is recorded as a gate exception (exit 20); the
 # scan repeats every tick, so it retries naturally. Every skip logs a reason.
 INPROGRESS_BEADS_JSON='[]'
+BEAD_LIST_OK=1
+BEAD_CLOSE_HOLD=0
+BEAD_HOLD_FLOOR=""
+
+# Flags a retryable skip: the cursor holds so the PR is rescanned, but only while
+# it is inside the lookback window, so one stale PR cannot pin the cursor.
+hold_cursor() {
+  [[ "$1" < "$BEAD_HOLD_FLOOR" ]] || BEAD_CLOSE_HOLD=1
+}
 
 close_merged_pr_beads() {
-  local num="$1" title="$2" sha="$3" id ids show status type notes
+  local num="$1" title="$2" sha="$3" merged_at="$4" id ids show status type notes
   ids=$({ extract_bead_ids "$title"
     printf '%s' "$INPROGRESS_BEADS_JSON" | jq -r --arg re "PR #${num} opened([^0-9]|\$)" \
       '.[]? | select((.notes // "") | test($re)) | .id' 2>/dev/null || true; } | sort -u)
   if [ -z "$ids" ]; then
     echo "mayor-tick: PR #$num has no bead to close (no bead ID in title, no in_progress bead notes it)"
+    [ "$BEAD_LIST_OK" -eq 1 ] || hold_cursor "$merged_at"
     return 0
   fi
   for id in $ids; do
@@ -773,7 +783,7 @@ close_merged_pr_beads() {
     status=$(printf '%s' "$show" | jq -r '.[0].status // empty' 2>/dev/null || true)
     case "$status" in
       closed) continue ;;
-      "") echo "mayor-tick: bead $id not closed: not found (PR #$num)"; continue ;;
+      "") echo "mayor-tick: bead $id not closed: not found (PR #$num)"; hold_cursor "$merged_at"; continue ;;
     esac
     type=$(printf '%s' "$show" | jq -r '.[0].issue_type // empty' 2>/dev/null || true)
     if [ "$type" = "epic" ]; then
@@ -784,7 +794,7 @@ close_merged_pr_beads() {
     fi
     notes=$(printf '%s' "$show" | jq -r '.[0].notes // ""' 2>/dev/null | { grep -E "PR #${num} opened([^0-9]|\$)" || true; })
     if [ -z "$notes" ]; then
-      echo "mayor-tick: bead $id not closed: no 'PR #$num opened' note"; continue
+      echo "mayor-tick: bead $id not closed: no 'PR #$num opened' note"; hold_cursor "$merged_at"; continue
     fi
     if printf '%s' "$notes" | grep -q '(partial'; then
       echo "mayor-tick: bead $id not closed: marked partial by PR #$num"; continue
@@ -794,6 +804,7 @@ close_merged_pr_beads() {
     else
       echo "mayor-tick: bd close $id failed (PR #$num); retrying next tick" >&2
       GATE_EXCEPTIONS+=("$(jq -nc --argjson pr "$num" --arg bead "$id" '{pr:$pr, bead:$bead, reason:"bead-close-failed"}')")
+      hold_cursor "$merged_at"
     fi
   done
 }
@@ -815,7 +826,7 @@ max_merged_at() {
 }
 
 close_beads_of_merged_prs() {
-  local since prior prs_json row limit="$BEAD_CLOSE_LIMIT" failures_before newest
+  local since prior prs_json row limit="$BEAD_CLOSE_LIMIT" newest
   prior=$(jq -r '.bead_close_cursor // empty' "$STATE_FILE" 2>/dev/null || true)
   BEAD_CLOSE_CURSOR="$prior"
   since="$prior"
@@ -823,6 +834,9 @@ close_beads_of_merged_prs() {
     since=$(date -u -v-"${BEAD_CLOSE_LOOKBACK_DAYS}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
       || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
   fi
+  BEAD_HOLD_FLOOR=$(date -u -v-"${BEAD_CLOSE_LOOKBACK_DAYS}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+  BEAD_CLOSE_HOLD=0
   prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit "$limit" \
     --json number,title,mergeCommit,mergedAt 2>/dev/null || echo '[]')
   if [ "$(printf '%s' "$prs_json" | jq 'length' 2>/dev/null || echo 0)" -ge "$limit" ]; then
@@ -830,22 +844,24 @@ close_beads_of_merged_prs() {
     prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit "$limit" \
       --json number,title,mergeCommit,mergedAt 2>/dev/null || echo '[]')
   fi
-  failures_before=${#GATE_EXCEPTIONS[@]}
-  INPROGRESS_BEADS_JSON=$(bd list --status in_progress --limit 0 --json 2>/dev/null || echo '[]')
-  printf '%s' "$INPROGRESS_BEADS_JSON" | jq -e 'type=="array"' >/dev/null 2>&1 || INPROGRESS_BEADS_JSON='[]'
+  BEAD_LIST_OK=1
+  INPROGRESS_BEADS_JSON=$(bd list --status in_progress --limit 0 --json 2>/dev/null) || BEAD_LIST_OK=0
+  printf '%s' "$INPROGRESS_BEADS_JSON" | jq -e 'type=="array"' >/dev/null 2>&1 || BEAD_LIST_OK=0
+  [ "$BEAD_LIST_OK" -eq 1 ] || INPROGRESS_BEADS_JSON='[]'
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     close_merged_pr_beads \
       "$(printf '%s' "$row" | jq -r '.number')" \
       "$(printf '%s' "$row" | jq -r '.title // ""')" \
-      "$(printf '%s' "$row" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)"
+      "$(printf '%s' "$row" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)" \
+      "$(printf '%s' "$row" | jq -r '.mergedAt // ""')"
   done < <(printf '%s' "$prs_json" | jq -c '.[]?' 2>/dev/null || true)
   if [ "$(printf '%s' "$prs_json" | jq 'length' 2>/dev/null || echo 0)" -ge "$limit" ]; then
     echo "mayor-tick: WARNING bead-close scan hit --limit $limit; merged PRs since $since may be unscanned, cursor not advanced" >&2
     GATE_EXCEPTIONS+=("$(jq -nc --argjson limit "$limit" --arg since "$since" '{reason:"bead-close-scan-truncated", limit:$limit, since:$since}')")
     return 0
   fi
-  [ "${#GATE_EXCEPTIONS[@]}" -eq "$failures_before" ] || return 0
+  [ "$BEAD_CLOSE_HOLD" -eq 0 ] || return 0
   newest=$(max_merged_at "$prs_json")
   if [ -n "$newest" ] && [[ "$newest" > "$prior" ]]; then BEAD_CLOSE_CURSOR="$newest"; fi
 }
