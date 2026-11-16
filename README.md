@@ -10,9 +10,20 @@ u7s is pre-alpha. There is no stable release, the API surface is bounded to
 what the project's current milestones need, and behavior changes without
 notice. Do not run production workloads against it yet.
 
+## Prerequisites
+
+1. Ubuntu 24.04 or newer (kernel 6.6+; 22.04's 5.15 kernel is refused).
+2. x86_64 (release assets are published for linux/amd64 only).
+3. systemd as PID 1, root access, and OpenSSL 3+.
+4. Outbound HTTPS to `u7s.dekiru.tech`, GitHub, and the CRI-O apt mirror
+   (`slc-mirror.opensuse.org`).
+5. At least 1 dedicated vCPU, 1 GiB RAM and about 10 GB of disk. First boot to
+   Ready takes 4-10 minutes on a 10 GB e2-micro; the install waits up to 20
+   minutes.
+
 ## Quick start
 
-The install script bootstraps a single-node cluster on a fresh Ubuntu LTS
+The install script bootstraps a single-node cluster on a fresh Ubuntu
 host: it installs CRI-O, stages the u7s binaries and the vendored kubelet
 and kube-controller-manager, and writes a systemd unit for each.
 
@@ -64,8 +75,9 @@ and kube-controller-manager, and writes a systemd unit for each.
    (OpenSSL >= 3.0; macOS's LibreSSL cannot verify Ed25519).
 
 2. With no flags, the node name defaults to the host's hostname and the
-   cluster network binds to the first non-loopback interface. Override
-   either with `--node-name` or `--iface` (see `scripts/install.sh --help`
+   cluster network binds to the first physical interface (name starting
+   with `en`, `wl`, `ww` or `eth`). Override either with `--node-name` or
+   `--iface` (see `bash install.sh --help` on the downloaded script
    for the full flag list, including `--manifest-output-dir` for GitOps
    setups).
 3. Connect with `kubectl` using the kubeconfig the script writes, at

@@ -120,7 +120,8 @@ Usage:
                          one baked into this copy at release time.
   --node-name <name>    Node identity (default: hostname).
   --iface <iface>       Network interface used for cluster traffic
-                         (default: first non-loopback interface).
+                         (default: first physical interface: en, wl, ww or
+                         eth prefix).
   --node-ip <ip>[,<ip>] Node addresses instead of the interface's: one IP, or
                          one per IP family (e.g. 10.0.0.5,fd00::5). The first
                          is the primary. A dual-stack cluster needs one of
