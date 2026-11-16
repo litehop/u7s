@@ -1175,10 +1175,7 @@ fn pod_matches_quota_scope(quota: &Value, pod: &Value) -> bool {
         }
     }
     let scope_selector = &quota["spec"]["scopeSelector"];
-    if scope_selector.is_object() && !object_matches_scope_selector(scope_selector, Some(pod)) {
-        return false;
-    }
-    true
+    !(scope_selector.is_object() && !object_matches_scope_selector(scope_selector, Some(pod)))
 }
 
 /// Adjust every ResourceQuota's `status.used` in `namespace` for a pod whose write just
@@ -1487,10 +1484,7 @@ pub fn quota_resource_covers(quota_resource: &str, group: &str, resource: &str) 
         }
     }
     // "deployments.apps" style (no count/ prefix)
-    if resource_group_matches(quota_resource, resource, group) {
-        return true;
-    }
-    false
+    resource_group_matches(quota_resource, resource, group)
 }
 
 // ---------------------------------------------------------------------------
