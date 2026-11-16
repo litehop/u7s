@@ -445,6 +445,22 @@ marker_case cmderr 1 cmderr cmderr INVALID "probe command errored" \
   "kubectl command error (bad kubeconfig) -> INVALID: the harness broke, nothing says u7s failed"
 marker_case podgone 1 cmderr False FAIL "became not Ready" \
   "a probe command error never hides a u7s failure seen by the other probe -> FAIL"
+marker_case nopodcmderr 0 cmderr cmderr FAIL "never became Ready" \
+  "wait TIMED OUT (API answered, pod never Ready) and the probes then errored -> FAIL: a broken release passing the gate because its failures were discarded as INVALID"
+marker_case waitcmderr error cmderr cmderr INVALID "probe command errored" \
+  "wait COMMAND ERROR (broken kubeconfig) with erroring probes -> INVALID: a harness fault must not fail a release"
+marker_case waitcmderrdown error down True FAIL "API unreachable" \
+  "wait command error but the API is positively unreachable at failure time -> FAIL, consistent with mid-run unreachable"
+wait_state() { rg_wait_ready_state "$1" "$2"; }
+assert "wait ok -> 1" "$([ "$(wait_state 0 '')" = 1 ] && echo 1 || echo 0)"
+assert "wait timeout (API answered, pod not Ready) -> 0: u7s evidence, must not become a harness error" \
+  "$([ "$(wait_state 1 'error: timed out waiting for the condition on pods/mariadb-0')" = 0 ] && echo 1 || echo 0)"
+assert "wait NotFound from the server -> 0: the API answered, the pod never appeared" \
+  "$([ "$(wait_state 1 'Error from server (NotFound): pods "mariadb-0" not found')" = 0 ] && echo 1 || echo 0)"
+assert "wait API refused -> 0: unreachable is u7s, same as rg_probe_kind" \
+  "$([ "$(wait_state 1 'The connection to the server 127.0.0.1:6443 was refused')" = 0 ] && echo 1 || echo 0)"
+assert "wait bad kubeconfig -> error: the harness broke, not u7s" \
+  "$([ "$(wait_state 1 'error: stat /nonexistent: no such file or directory')" = error ] && echo 1 || echo 0)"
 assert "a failed marker READ after the bursts (marker_ok=0, no harness error) stays FAIL" \
   "$([ "$(rg_run_status 1 "$TMP/quiet.log" "$(mutate marker_ok 0)")" = FAIL ] && echo 1 || echo 0)"
 
@@ -626,6 +642,11 @@ rm -rf "$TMP/out-conf2"
 rc=0; out="$(RG_IDLE_PROBE="$TMP/bin/idle30" "$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf2" 2>/dev/null)" || rc=$?
 assert "--confirm on a noisy host: INVALID exit 3, and it never falls through to 40 pods" \
   "$([ "$rc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && [ ! -e "$TMP/out-conf2/burst-40" ] && echo 1 || echo 0)"
+mkdir -p "$TMP/tb2"; : > "$TMP/tb2/u7s-gate-a.tar.gz"; : > "$TMP/tb2/u7s-gate-b.tar.gz"
+rm -rf "$TMP/out-conf3"
+rc=0; err="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb2" --out "$TMP/out-conf3" 2>&1 >/dev/null)" || rc=$?
+assert "--confirm whose sub-run hits a setup error (exit 2) aborts with exit 2, not 'INVALID only 0/N valid runs (host contention)'" \
+  "$([ "$rc" = 2 ] && echo "$err" | grep -q 'setup error' && echo 1 || echo 0)"
 
 # --- gcp backend: steal-based INVALID, PREEMPTED, backend selection ---
 CPU_A='cpu  1000 0 500 8000 100 0 0 0 0 0'
@@ -1016,6 +1037,18 @@ if [ "$(has_args "$sub" "--backend gcp --release v1.2.3")" = 1 ] && [[ "$sub" !=
 assert "--confirm on gcp forwards --backend gcp --release and omits unset --memory" "$gcp_ok"
 assert "burst-gate.sh --confirm builds the sub-run arguments with rg_confirm_sub_args (no private copy that can drift)" \
   "$(grep -q 'rg_confirm_sub_args "\$size"' "$HERE/burst-gate.sh" && grep -q '"\${SUB_ARGS\[@\]}"' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
+
+MARIADB_SRC="$HERE/../../examples/e2e/wordpress/mariadb.yaml"
+rg_mariadb_emptydir_rewrite "$MARIADB_SRC" "$TMP/mariadb-ok.yaml" && rw=1 || rw=0
+assert "the real mariadb manifest rewrites to an emptyDir data volume with no PVC left (the gate must run the workload the operator gated on)" "$rw"
+sed 's/^        - name: temp$/        - name: scratch/' "$MARIADB_SRC" > "$TMP/mariadb-noanchor.yaml"
+rg_mariadb_emptydir_rewrite "$TMP/mariadb-noanchor.yaml" "$TMP/mariadb-bad.yaml" && rw=1 || rw=0
+assert "a manifest whose rewrite anchor is missing fails the guard (else the gate silently runs a PVC-backed MariaDB, a different workload than gated; the volumeMount alone also says 'name: data')" "$([ "$rw" = 0 ] && echo 1 || echo 0)"
+sed 's/^  volumeClaimTemplates:$/  xvolumeClaimTemplates:/' "$MARIADB_SRC" > "$TMP/mariadb-nopvcanchor.yaml"
+rg_mariadb_emptydir_rewrite "$TMP/mariadb-nopvcanchor.yaml" "$TMP/mariadb-bad2.yaml" && rw=1 || rw=0
+assert "a leftover PVC definition fails the guard even when the emptyDir volume was added (a gate that still claims storage is not the gated workload)" "$([ "$rw" = 0 ] && echo 1 || echo 0)"
+assert "burst-gate.sh uses the rewrite guard rather than a bare grep" \
+  "$(grep -q 'rg_mariadb_emptydir_rewrite' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

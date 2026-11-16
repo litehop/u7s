@@ -250,6 +250,21 @@ rg_marker_ok() {
   [ -n "$1" ] && [ "$1" = "$2" ] && echo 1 || echo 0
 }
 
+# Rewrites the MariaDB StatefulSet manifest $1 to $2 with its data volume on emptyDir (the gate
+# VM has no csi-hostpath, and the PVC is not what is under test). Fails unless the output has
+# an emptyDir volume named data and no PVC left: the volumeMount also says "name: data", so a
+# bare grep cannot tell a rewritten manifest from an untouched one.
+rg_mariadb_emptydir_rewrite() {
+  awk '
+    /^  volumeClaimTemplates:/ {skip=1}
+    /^  updateStrategy:/ {skip=0}
+    /^        - name: temp$/ {print "        - name: data"; print "          emptyDir: {}"}
+    !skip {print}
+  ' "$1" > "$2" || return 1
+  grep -A1 '^        - name: data$' "$2" | grep -q '^          emptyDir: {}$' || return 1
+  ! grep -q 'volumeClaimTemplates\|PersistentVolumeClaim' "$2"
+}
+
 # --- host contention (INVALID verdict) ---
 
 # Reads `limactl list` on stdin, prints names of Running VMs other than $1.
@@ -417,13 +432,26 @@ rg_probe_kind() {
   fi
 }
 
-# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 was Ready at the
-# earlier wait (1|0). Probes taken now, at failure time: $3/$4 = exit code/output of
+# Classifies the `kubectl wait --for=condition=Ready` on mariadb-0: $1 exit code, $2 combined
+# output. Echoes 1 (Ready), 0 (the cluster answered and the pod was not Ready: wait timeout, API
+# error, or API unreachable, all u7s per rg_probe_kind) or error (kubectl/kubeconfig broke: harness).
+rg_wait_ready_state() {
+  local rc="$1" out="$2"
+  if [ "$rc" = 0 ]; then echo 1
+  elif [[ "$out" == *"timed out waiting"* ]]; then echo 0
+  elif [ "$(rg_probe_kind "$rc" "$out")" = error ]; then echo error
+  else echo 0
+  fi
+}
+
+# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 state at the
+# earlier wait (1 Ready, 0 not Ready, error wait command itself failed). Probes taken now, at failure time: $3/$4 = exit code/output of
 # `kubectl get --raw /readyz`, $5/$6 = exit code/output of the mariadb-0 Ready-condition status.
 # Mapping: any probe showing u7s misbehaving (API unreachable or answering an error, pod not
 # Ready) is marker_ok=0 (FAIL), checked first so ambiguity goes to FAIL. Only when no probe shows
 # u7s failing is it harness_error (INVALID): a probe command that itself errored, or everything
-# healthy while the write still failed.
+# healthy while the write still failed. If the earlier Ready wait already failed (was_ready=0),
+# ambiguity also goes to FAIL: a broken release must not be discarded as INVALID.
 rg_record_marker_write_failure() {
   local f="$1" was_ready="$2" ak rk pod=ready
   ak="$(rg_probe_kind "$3" "$4")"
@@ -445,6 +473,9 @@ rg_record_marker_write_failure() {
   elif [ "$pod" = notready ]; then
     echo "marker_ok=0" >> "$f"
     echo "marker_fail=mariadb-0 never became Ready, marker not written (u7s pod-start failure)" >> "$f"
+  elif [ "$was_ready" = 0 ]; then
+    echo "marker_ok=0" >> "$f"
+    echo "marker_fail=mariadb-0 never became Ready and the probes could not say why, marker not written (counted as u7s failure)" >> "$f"
   elif [ "$ak" = error ] || [ "$pod" = error ]; then
     echo "harness_error=marker write failed and a probe command errored (kubectl/kubeconfig), cannot attribute to u7s" >> "$f"
   else

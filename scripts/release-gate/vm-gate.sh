@@ -278,8 +278,11 @@ if [ "$NO_WORKLOAD" = 1 ]; then
 else
 k apply -f "$RG/wordpress/mariadb-emptydir.yaml" -f "$RG/wordpress/wordpress.yaml" >> "$OUT/run.log" 2>&1
 for _ in $(seq 1 60); do k -n default get pod mariadb-0 >/dev/null 2>&1 && break; sleep 2; done
-MARIADB_READY=1
-kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s >> "$OUT/run.log" 2>&1 || { MARIADB_READY=0; log "mariadb-0 not Ready in 300s"; diag_pods mariadb-not-ready; }
+wait_rc=0
+wait_out="$(kw -n default wait --for=condition=Ready pod/mariadb-0 --timeout=300s 2>&1)" || wait_rc=$?
+echo "$wait_out" >> "$OUT/run.log"
+MARIADB_READY="$(rg_wait_ready_state "$wait_rc" "$wait_out")"
+[ "$MARIADB_READY" = 1 ] || { log "mariadb-0 not Ready in 300s (wait state=$MARIADB_READY)"; diag_pods mariadb-not-ready; }
 kw -n default wait --for=condition=Available deployment/pehelypress --timeout=300s >> "$OUT/run.log" 2>&1 || log "pehelypress not Available in 300s"
 WP_IP="$(k get svc pehelypress -o jsonpath='{.spec.clusterIP}')"
 wp_code() { curl -s -o /dev/null -m "${WP_TIMEOUT:-10}" -w '%{http_code}' "http://$WP_IP/"; }

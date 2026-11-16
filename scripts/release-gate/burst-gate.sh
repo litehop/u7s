@@ -245,7 +245,9 @@ if [ "$CONFIRM" = 1 ]; then
   tried=()
   for size in $CONFIRM_SIZES; do
     rg_confirm_sub_args "$size"
-    "$0" "${SUB_ARGS[@]}" >&2 || true
+    sub_rc=0
+    "$0" "${SUB_ARGS[@]}" >&2 || sub_rc=$?
+    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; exit 2; }
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")
@@ -283,14 +285,8 @@ cp "$HERE/lib.sh" "$HERE/vm-gate.sh" "$HERE/vm-sampler.sh" "$HERE/vm-capture.sh"
 printf 'COREDNS_REQ=%s\nZRAM_MIB=%s\nCAPTURE=%s\nRAMP=%s\nRAMP_KILL_SECS=%s\nBURST_PODS=%s\nOVERLOAD_PODS=%s\nOVERLOAD_MIB=%s\nNO_WORKLOAD=%s\nOVERLOAD_WINDOW_SECS=%s\nINSTALL_TARBALL=%s\nINSTALL_ONLY=%s\nWEDGE_SECS=%s\nWEDGE_STALL_SECS=%s\nBURST_CAP_SECS=%s\n' \
   "$COREDNS_REQ" "$ZRAM_MIB" "$CAPTURE" "$RAMP" "$PROBE_KILL_SECS" "$BURST_PODS" "$OVERLOAD_PODS" "$OVERLOAD_MIB" "$NO_WORKLOAD" "$OVERLOAD_WINDOW_SECS" "$INSTALL_TARBALL" "$INSTALL_ONLY" "$WEDGE_SECS" "$WEDGE_STALL_SECS" "$BURST_CAP_SECS" > "$STAGE/gate.env"
 cp "$ROOT/examples/e2e/wordpress/wordpress.yaml" "$STAGE/wordpress/"
-# MariaDB data on emptyDir: the gate VM has no csi-hostpath, and the PVC is not what is under test.
-awk '
-  /^  volumeClaimTemplates:/ {skip=1}
-  /^  updateStrategy:/ {skip=0}
-  /^        - name: temp$/ {print "        - name: data"; print "          emptyDir: {}"}
-  !skip {print}
-' "$ROOT/examples/e2e/wordpress/mariadb.yaml" > "$STAGE/wordpress/mariadb-emptydir.yaml"
-grep -q 'name: data' "$STAGE/wordpress/mariadb-emptydir.yaml" || { echo "mariadb emptyDir rewrite failed" >&2; exit 2; }
+rg_mariadb_emptydir_rewrite "$ROOT/examples/e2e/wordpress/mariadb.yaml" "$STAGE/wordpress/mariadb-emptydir.yaml" \
+  || { echo "mariadb emptyDir rewrite failed: the gate would run a PVC-backed MariaDB" >&2; exit 2; }
 
 # Appends one "<epoch> <host idle %> <other running VMs>" line to $1 (blocks for the CPU sample).
 quiet_sample() {
