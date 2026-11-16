@@ -87,7 +87,7 @@ To run the Kubernetes conformance suite against u7s locally:
 
 With `burst-gate.sh --confirm`, leaks from every size's sub-gate are aggregated into the top-level `leaked-vps.txt`.
 
-Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 2026-10-15). It boots fresh 1 vCPU / 1 GiB arm64 Lima VMs from `scripts/release-gate/u7s-vps-1g.yaml`, installs a tarball built from the current checkout with the zero-argument `install.sh`, deploys WordPress+MariaDB, then runs a 20-pod warm-up burst and an N-pod burst (`--burst-pods`, default 20) and `scripts/e2e-workload/webhook-smoke.sh`. The gated size is ~20-pod bursts on a 1 GiB / 1 vCPU node (operator decision 2026-11-05): 3/3 runs at 20 pods on a quiet host, confirmed with `--confirm` before cutting a minor release (patch releases skip it). Denser workloads need swap/zram (see the README).
+Every release must pass `scripts/release-gate/burst-gate.sh` (operator decision 2026-10-15). It boots fresh 1 vCPU / 1 GiB arm64 Lima VMs from `scripts/release-gate/u7s-vps-1g.yaml`, installs a tarball built from the current checkout with the zero-argument `install.sh`, deploys WordPress+MariaDB, then runs a 20-pod warm-up burst and an N-pod burst (`--burst-pods`, default 20) and `scripts/e2e-workload/webhook-smoke.sh`. The gated size is ~20-pod bursts on a 1 GiB / 1 vCPU node (operator decision 2026-11-05): 3/3 runs at 20 pods on a quiet host, confirmed with `--confirm` before cutting a minor release (patch releases skip it). Denser workloads need swap/zram (see [docs/install.md](install.md#running-on-a-1-gib-host)).
 
 ```sh
 scripts/release-gate/burst-gate.sh                  # 3 runs, VMs deleted afterwards

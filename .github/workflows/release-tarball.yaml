@@ -177,7 +177,7 @@ jobs:
 
       - name: Sign tarball, checksum and install.sh with Ed25519
         # install.sh verifies the tarball signatures against the key embedded in
-        # the script; users verify install.sh.sig by hand against the README key.
+        # the script; users verify install.sh.sig by hand against the key in docs/install.md#verifying-the-release.
         # Fails if that key is unset or is not the public half of the signing
         # key, so a release no installer could verify is never published.
         env:

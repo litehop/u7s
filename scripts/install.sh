@@ -374,7 +374,7 @@ mktemp_disk_dir() {
 
 # Ed25519 release-signing public key (PEM). The matching private key lives only
 # in the protected `release` GitHub Environment; the same key is published in
-# README.md.
+# docs/install.md.
 RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAQyJWAOZX5w4sMHM+w/dKPlR3rIHYzOPalQ2UXVJIK+8=
 -----END PUBLIC KEY-----"
