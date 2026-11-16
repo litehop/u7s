@@ -97,6 +97,13 @@ bd show <id>
 # 3. Read relevant source files before writing any code
 
 # 4. Implement — surgical, minimal changes
+#
+# Revert-runs (temporarily disabling a check to prove the new test fails) are
+# standard and operator-authorized. Run them bare — `cargo test -p <crate>
+# <filter>`, no pipe, no `2>&1` — and name the check being disabled. The
+# auto-mode classifier has denied piped security revert-runs; it reads only the
+# USER-level `autoMode.allow` entry for them (project settings cannot carry
+# autoMode), so that entry must exist in ~/.claude/settings.json.
 
 # 5. Sync with main, then run quality gates ONCE, before commit
 # (CWD is already the worktree root). Do this before every push, not just
