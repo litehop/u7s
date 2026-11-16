@@ -4851,6 +4851,35 @@ mod tests {
         assert!(validate_resource("", "secrets", &obj).is_err());
     }
 
+    /// An over-30s webhook timeout would let one slow webhook stall every matching API
+    /// request, so the shared create/update/patch validation entry point must reject it
+    /// for both webhook configuration kinds.
+    #[test]
+    fn validate_resource_rejects_webhook_timeout_over_30s_which_would_stall_api_requests() {
+        for (plural, kind) in [
+            (
+                "validatingwebhookconfigurations",
+                "ValidatingWebhookConfiguration",
+            ),
+            (
+                "mutatingwebhookconfigurations",
+                "MutatingWebhookConfiguration",
+            ),
+        ] {
+            let obj = serde_json::json!({
+                "kind": kind,
+                "metadata": {"name": "slow"},
+                "webhooks": [{"name": "w.example.com", "timeoutSeconds": 31}]
+            });
+            let err = validate_resource("admissionregistration.k8s.io", plural, &obj)
+                .expect_err("timeoutSeconds 31 must be rejected");
+            assert!(
+                err.contains("webhooks[0].timeoutSeconds") && err.contains("between 1 and 30"),
+                "{plural}: unexpected message: {err}"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Regression tests: NetworkPolicy endPort-without-port rejection
     // ---------------------------------------------------------------------------
