@@ -1930,13 +1930,14 @@ pub(crate) fn matches_match_constraints(
     // Match if ANY rule matches (OR across rules).
     rules
         .iter()
-        .any(|rule| matches_rule(rule, group, version, resource, None, operation))
+        .any(|rule| matches_rule(rule, group, version, resource, namespace, operation))
 }
 
 /// The roots a ValidatingAdmissionPolicy or `matchConditions` expression is evaluated
 /// against. `device` is the DRA selector alias: selectors never reference `object`, so
 /// callers evaluating one pass the device in the `object` slot.
 fn vap_env<'a>(
+    namespace: Option<&str>,
     object: &'a serde_json::Value,
     variables: &'a serde_json::Map<String, serde_json::Value>,
     request: &'a serde_json::Value,
@@ -2353,7 +2354,14 @@ pub async fn run_cel_mutating_policies<S: Store>(
         };
 
         // Check policy matchConstraints (resourceRules).
-        if !matches_match_constraints(policy, ctx.group, ctx.version, ctx.resource, ctx.operation) {
+        if !matches_match_constraints(
+            policy,
+            ctx.group,
+            ctx.version,
+            ctx.resource,
+            ctx.namespace,
+            ctx.operation,
+        ) {
             continue;
         }
 
@@ -2903,7 +2911,14 @@ async fn run_validating_admission_policies<S: Store>(
         };
 
         // Check policy matchConstraints (resourceRules).
-        if !matches_match_constraints(policy, ctx.group, ctx.version, ctx.resource, ctx.operation) {
+        if !matches_match_constraints(
+            policy,
+            ctx.group,
+            ctx.version,
+            ctx.resource,
+            ctx.namespace,
+            ctx.operation,
+        ) {
             continue;
         }
 
@@ -9061,7 +9076,7 @@ mod tests {
             }
         });
         assert!(
-            matches_match_constraints(&policy, "apps", "v1", "deployments", "CREATE"),
+            matches_match_constraints(&policy, "apps", "v1", "deployments", Some("ns"), "CREATE"),
             "wildcard matchConstraints must match any resource"
         );
     }
@@ -9071,7 +9086,7 @@ mod tests {
     fn matches_match_constraints_absent_matches_all() {
         let policy = json!({"spec": {}});
         assert!(
-            matches_match_constraints(&policy, "apps", "v1", "deployments", "CREATE"),
+            matches_match_constraints(&policy, "apps", "v1", "deployments", Some("ns"), "CREATE"),
             "absent matchConstraints must match all resources"
         );
     }
@@ -9099,6 +9114,42 @@ mod tests {
             "resources": ["deployments"], "operations": ["CREATE", "UPDATE"]
         }]}});
         for (k, v) in spec.as_object().expect("spec object") {
+    /// A policy scoped to `Namespaced` that never matched namespaced requests (and a
+    /// `Cluster` one that matched them) silently failed open; each scope must agree
+    /// with the request's namespace.
+    #[test]
+    fn matches_match_constraints_honours_rule_scope() {
+        let policy_with = |scope: &str| {
+            json!({"spec": {"matchConstraints": {"resourceRules": [{
+                "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+                "operations": ["*"], "scope": scope
+            }]}}})
+        };
+        let m = |scope: &str, ns: Option<&str>| {
+            matches_match_constraints(&policy_with(scope), "", "v1", "pods", ns, "CREATE")
+        };
+        assert!(
+            m("Namespaced", Some("ns")),
+            "Namespaced must match a namespaced request"
+        );
+        assert!(
+            !m("Namespaced", None),
+            "Namespaced must not match a cluster-scoped request"
+        );
+        assert!(
+            !m("Cluster", Some("ns")),
+            "Cluster must not match a namespaced request"
+        );
+        assert!(
+            m("Cluster", None),
+            "Cluster must match a cluster-scoped request"
+        );
+        assert!(
+            m("*", Some("ns")) && m("*", None),
+            "* must match both scopes"
+        );
+    }
+
             full[k] = v.clone();
         }
         let policy = json!({"apiVersion": "admissionregistration.k8s.io/v1",
