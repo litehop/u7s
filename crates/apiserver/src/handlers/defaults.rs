@@ -1085,6 +1085,9 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if let ("apps", "statefulsets") = (group, plural) {
         validate_selector(obj, "StatefulSet")?;
     }
+    if group == "admissionregistration.k8s.io" {
+        crate::admission::validate_rule_scopes(plural, obj)?;
+    }
     if group == "admissionregistration.k8s.io"
         && (plural == "validatingwebhookconfigurations"
             || plural == "mutatingwebhookconfigurations")
@@ -4876,6 +4879,81 @@ mod tests {
             assert!(
                 err.contains("webhooks[0].timeoutSeconds") && err.contains("between 1 and 30"),
                 "{plural}: unexpected message: {err}"
+            );
+        }
+    }
+
+    /// An unknown rule scope on any admissionregistration kind must be rejected on the shared
+    /// create/update/patch entry point; stored, the rule would match nothing with no feedback
+    /// to the author.
+    #[test]
+    fn validate_resource_rejects_unknown_rule_scope_for_every_admissionregistration_kind() {
+        let rule = |s: &str| serde_json::json!({"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "scope": s});
+        let mc =
+            |f: &str| serde_json::json!({"spec": {"matchConstraints": {(f): [rule("Bogus")]}}});
+        let mr =
+            |f: &str, s: &str| serde_json::json!({"spec": {"matchResources": {(f): [rule(s)]}}});
+        let cases = [
+            (
+                "validatingwebhookconfigurations",
+                serde_json::json!({"webhooks": [{"name": "a.example.com"}, {"name": "b.example.com", "rules": [rule("*"), rule("Bogus")]}]}),
+                "webhooks[1].rules[1].scope",
+            ),
+            (
+                "mutatingwebhookconfigurations",
+                serde_json::json!({"webhooks": [{"name": "a.example.com", "rules": [rule("Bogus")]}]}),
+                "webhooks[0].rules[0].scope",
+            ),
+            (
+                "validatingadmissionpolicies",
+                mc("resourceRules"),
+                "spec.matchConstraints.resourceRules[0].scope",
+            ),
+            (
+                "validatingadmissionpolicies",
+                mc("excludeResourceRules"),
+                "spec.matchConstraints.excludeResourceRules[0].scope",
+            ),
+            (
+                "mutatingadmissionpolicies",
+                mc("resourceRules"),
+                "spec.matchConstraints.resourceRules[0].scope",
+            ),
+            (
+                "mutatingadmissionpolicies",
+                mc("excludeResourceRules"),
+                "spec.matchConstraints.excludeResourceRules[0].scope",
+            ),
+            (
+                "validatingadmissionpolicybindings",
+                mr("resourceRules", "bogus"),
+                "spec.matchResources.resourceRules[0].scope",
+            ),
+            (
+                "mutatingadmissionpolicybindings",
+                mr("excludeResourceRules", ""),
+                "spec.matchResources.excludeResourceRules[0].scope",
+            ),
+        ];
+        for (plural, obj, path) in cases {
+            let err = validate_resource("admissionregistration.k8s.io", plural, &obj)
+                .expect_err("unknown scope must be rejected");
+            assert!(
+                err.starts_with(path)
+                    && err.contains("supported values: \"*\", \"Cluster\", \"Namespaced\""),
+                "{plural}: unexpected message: {err}"
+            );
+        }
+        for s in ["*", "Cluster", "Namespaced"] {
+            let obj = mr("resourceRules", s);
+            assert!(
+                validate_resource(
+                    "admissionregistration.k8s.io",
+                    "validatingadmissionpolicybindings",
+                    &obj
+                )
+                .is_ok(),
+                "{s} must be accepted"
             );
         }
     }
