@@ -319,7 +319,8 @@ _DHAT_PHASE1_DIVERTED=0
 if [ -n "${U7S_DHAT_HEAP_FILE:-}" ] && [ "$BACKGROUND" -eq 1 ] && [ ! -f "$WORKDIR/ca.crt" ]; then
   _DHAT_PHASE1_DIVERTED=1
   _DHAT_HEAP_FILE_FINAL="$U7S_DHAT_HEAP_FILE"
-  export U7S_DHAT_HEAP_FILE="/tmp/u7s-dhat-phase1-$$.json"
+  _DHAT_PHASE1_FILE="$(mktemp "$WORKDIR/dhat-phase1.XXXXXX")"
+  export U7S_DHAT_HEAP_FILE="$_DHAT_PHASE1_FILE"
 fi
 
 if [ "$BACKGROUND" -eq 1 ]; then
@@ -465,12 +466,18 @@ EXTEOF
   # Restart apiserver with proxy flag now that konnectivity is up.
   if nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && [ "$BACKGROUND" -eq 1 ]; then
     kill "$SERVER_PID" 2>/dev/null || true
-    sleep 1
+    # dhat flushes on Drop after SIGTERM; wait for exit so the scratch file
+    # is not recreated after the rm below.
+    for _ in $(seq 1 10); do
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 1
+    done
     # Restore the operator-requested dhat path (diverted above) — this is
     # Phase 2, the real, long-running instance whose heap is the one that
     # matters.
     if [ "$_DHAT_PHASE1_DIVERTED" -eq 1 ]; then
       export U7S_DHAT_HEAP_FILE="$_DHAT_HEAP_FILE_FINAL"
+      rm -f "$_DHAT_PHASE1_FILE"
     fi
     "$BINARY" \
       --db         "$WORKDIR/state.db" \
