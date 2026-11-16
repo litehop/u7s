@@ -1428,6 +1428,31 @@ fn webhook_connect_timeout(request_timeout: std::time::Duration) -> std::time::D
 /// Default per-attempt webhook timeout when the webhook config declares none.
 pub(crate) const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 10;
 
+/// Upstream's maximum admission webhook `timeoutSeconds`.
+const MAX_WEBHOOK_TIMEOUT_SECS: u64 = 30;
+
+/// Effective per-call webhook timeout: default 10s, clamped to 1..=30.
+pub(crate) fn webhook_timeout_secs(timeout_seconds: Option<i64>) -> u64 {
+    timeout_seconds
+        .map_or(DEFAULT_WEBHOOK_TIMEOUT_SECS, |s| s.max(1) as u64)
+        .min(MAX_WEBHOOK_TIMEOUT_SECS)
+}
+
+/// Reject `webhooks[*].timeoutSeconds` outside 1..=30, as upstream validation does.
+pub(crate) fn validate_webhook_timeouts(obj: &serde_json::Value) -> Result<(), String> {
+    for (i, webhook) in obj["webhooks"].as_array().into_iter().flatten().enumerate() {
+        match webhook["timeoutSeconds"].as_i64() {
+            Some(t) if !(1..=MAX_WEBHOOK_TIMEOUT_SECS as i64).contains(&t) => {
+                return Err(format!(
+                    "webhooks[{i}].timeoutSeconds: Invalid value: {t}: the timeout value must be between 1 and {MAX_WEBHOOK_TIMEOUT_SECS} seconds"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
@@ -1437,9 +1462,7 @@ fn build_webhook_call_client(
     fallback: &reqwest::Client,
     timeout_seconds: Option<i64>,
 ) -> reqwest::Client {
-    let request_timeout = std::time::Duration::from_secs(
-        timeout_seconds.map_or(DEFAULT_WEBHOOK_TIMEOUT_SECS, |s| s.max(1) as u64),
-    );
+    let request_timeout = std::time::Duration::from_secs(webhook_timeout_secs(timeout_seconds));
     let connect_timeout = webhook_connect_timeout(request_timeout);
 
     // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
@@ -1783,7 +1806,7 @@ async fn invoke_mutating_webhook<S: Store>(
         WebhookTarget::DirectUrl(u) => u.as_str(),
         WebhookTarget::ServiceResolved { url, .. } => url.as_str(),
     };
-    let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+    let secs = webhook_timeout_secs(webhook.timeout_seconds) as i64;
     // Append timeout=Ns so the URL in error messages matches what the conformance
     // test checks for (strings.Contains(err, "/path?timeout=1s")).
     let call_url = webhook_url_with_timeout(base_url, secs);
@@ -1914,6 +1937,7 @@ pub(crate) fn matches_match_constraints(
     group: &str,
     version: &str,
     resource: &str,
+    namespace: Option<&str>,
     operation: &str,
 ) -> bool {
     let mc = &policy["spec"]["matchConstraints"];
@@ -1937,7 +1961,6 @@ pub(crate) fn matches_match_constraints(
 /// against. `device` is the DRA selector alias: selectors never reference `object`, so
 /// callers evaluating one pass the device in the `object` slot.
 fn vap_env<'a>(
-    namespace: Option<&str>,
     object: &'a serde_json::Value,
     variables: &'a serde_json::Map<String, serde_json::Value>,
     request: &'a serde_json::Value,
@@ -3368,7 +3391,7 @@ pub async fn run_validating_webhooks<S: Store>(
                 WebhookTarget::DirectUrl(u) => u.as_str(),
                 WebhookTarget::ServiceResolved { url, .. } => url.as_str(),
             };
-            let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+            let secs = webhook_timeout_secs(webhook.timeout_seconds) as i64;
             // Append timeout=Ns so the URL in error messages matches what the conformance
             // test checks for (strings.Contains(err, "/path?timeout=1s")).
             let call_url = webhook_url_with_timeout(base_url, secs);
@@ -9091,29 +9114,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // MutatingAdmissionPolicy evaluation: same engine and error semantics as VAP
-    // ---------------------------------------------------------------------------
-
-    /// Runs one MutatingAdmissionPolicy (`spec` merged over a match-all-deployments base)
-    /// against `object`, the way the mutating chain does.
-    async fn run_map(
-        spec: serde_json::Value,
-        object: serde_json::Value,
-        old_object: Option<serde_json::Value>,
-    ) -> Result<serde_json::Value, StatusError> {
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-        let mut full = json!({"matchConstraints": {"resourceRules": [{
-            "apiGroups": ["apps"], "apiVersions": ["v1"],
-            "resources": ["deployments"], "operations": ["CREATE", "UPDATE"]
-        }]}});
-        for (k, v) in spec.as_object().expect("spec object") {
     /// A policy scoped to `Namespaced` that never matched namespaced requests (and a
     /// `Cluster` one that matched them) silently failed open; each scope must agree
     /// with the request's namespace.
@@ -9150,6 +9150,29 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // MutatingAdmissionPolicy evaluation: same engine and error semantics as VAP
+    // ---------------------------------------------------------------------------
+
+    /// Runs one MutatingAdmissionPolicy (`spec` merged over a match-all-deployments base)
+    /// against `object`, the way the mutating chain does.
+    async fn run_map(
+        spec: serde_json::Value,
+        object: serde_json::Value,
+        old_object: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, StatusError> {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut full = json!({"matchConstraints": {"resourceRules": [{
+            "apiGroups": ["apps"], "apiVersions": ["v1"],
+            "resources": ["deployments"], "operations": ["CREATE", "UPDATE"]
+        }]}});
+        for (k, v) in spec.as_object().expect("spec object") {
             full[k] = v.clone();
         }
         let policy = json!({"apiVersion": "admissionregistration.k8s.io/v1",
@@ -9960,6 +9983,43 @@ mod tests {
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
         );
+    }
+
+    /// An unclamped timeoutSeconds lets a webhook config pin an admission request thread
+    /// for arbitrarily long; upstream bounds it to 1..=30 and defaults to 10.
+    #[test]
+    fn webhook_timeout_is_defaulted_and_clamped_to_30() {
+        assert_eq!(
+            webhook_timeout_secs(None),
+            10,
+            "absent timeout must default to 10s"
+        );
+        assert_eq!(webhook_timeout_secs(Some(0)), 1);
+        assert_eq!(webhook_timeout_secs(Some(5)), 5);
+        assert_eq!(webhook_timeout_secs(Some(30)), 30);
+        assert_eq!(
+            webhook_timeout_secs(Some(3600)),
+            30,
+            "timeouts above 30s must be clamped so a webhook cannot stall admission"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_timeouts_rejects_outside_1_to_30() {
+        let with = |t: serde_json::Value| json!({"webhooks": [{"timeoutSeconds": t}]});
+        for bad in [0, -1, 31, 3600] {
+            assert!(
+                validate_webhook_timeouts(&with(json!(bad))).is_err(),
+                "timeoutSeconds {bad} must be rejected at create/update like upstream"
+            );
+        }
+        for ok in [1, 10, 30] {
+            assert!(
+                validate_webhook_timeouts(&with(json!(ok))).is_ok(),
+                "{ok} is valid"
+            );
+        }
+        assert!(validate_webhook_timeouts(&json!({"webhooks": [{}]})).is_ok());
     }
 
     /// A webhook matchCondition containing a lone & must be rejected at creation time.

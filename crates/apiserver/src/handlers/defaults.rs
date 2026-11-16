@@ -1089,6 +1089,7 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
         && (plural == "validatingwebhookconfigurations"
             || plural == "mutatingwebhookconfigurations")
     {
+        crate::admission::validate_webhook_timeouts(obj)?;
         crate::admission::validate_webhook_match_conditions_cel(obj)?;
     }
     if group == "admissionregistration.k8s.io" && plural == "validatingadmissionpolicies" {
