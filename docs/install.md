@@ -57,6 +57,10 @@ with `en`, `wl`, `ww` or `eth`). Override either with `--node-name` or
 for the full flag list, including `--manifest-output-dir` for GitOps
 setups).
 
+To run cluster traffic over a WireGuard (VPN) mesh, pass the tunnel
+interface with `--iface`, e.g. `--iface wg0`. See
+[networking-vpn.md](networking-vpn.md).
+
 The kubeconfig is written to `/var/lib/u7s/kubeconfig` by default. It refers
 to `ca-bundle.pem` and `admin.pem` beside it by path, so a rotated
 certificate is picked up without rewriting it. To use it on another machine,
