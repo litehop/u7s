@@ -406,7 +406,7 @@ RACE_CRASH_TOTAL=0
 RACE_LOSS_TOTAL=0
 RACE_MISSING_TOTAL=0
 for round in 1 2 3; do
-  rm -f "$DECISIONS_LOG_RACE" "$DECISIONS_LOG_RACE.1" "$DECISIONS_LOG_RACE.2" "$DECISIONS_LOG_RACE.lock.d"
+  rm -f "$DECISIONS_LOG_RACE" "$DECISIONS_LOG_RACE.1" "$DECISIONS_LOG_RACE.2" "$DECISIONS_LOG_RACE.lock"
   dd if=/dev/zero of="$DECISIONS_LOG_RACE" bs=1024 count=1100 2>/dev/null
   printf 'RACE_SURVIVOR_MARKER_%s\n' "$round" >> "$DECISIONS_LOG_RACE"
   clear_sandbox
@@ -481,22 +481,20 @@ fi
 
 # Case 16: stale-lock liveness check regression case. The steal mechanism
 # above must only evict a holder whose recorded PID is actually dead --
-# stealing from a live holder past STALE_LOCK_TIMEOUT_SEC would reintroduce
-# the exact unlocked-mv race case 15 above proves is fixed. Uses a short
-# STALE_LOCK_TIMEOUT_SEC (env override) so both branches run in ~1-2s
-# instead of the real 5s default.
+# stealing from a live holder would reintroduce the exact unlocked-mv race
+# case 15 above proves is fixed.
 DECISIONS_LOG_LIVENESS="$SANDBOX/.claude/review-queue/log/decisions.tsv"
-LOCK_DIR_LIVENESS="$DECISIONS_LOG_LIVENESS.lock.d"
+LOCK_LIVENESS="$DECISIONS_LOG_LIVENESS.lock"
 
-# 16a. A DEAD holder PID: the lockdir must be stolen once the timeout
-# elapses, and the hook must complete normally (not hang).
+# 16a. A DEAD holder PID: the lock must be broken, and the hook must
+# complete normally (not hang) -- a crashed hook must not wedge every later
+# fire and silently stop all review queueing.
 clear_sandbox
 rm -f "$DECISIONS_LOG_LIVENESS" "$DECISIONS_LOG_LIVENESS.1" "$DECISIONS_LOG_LIVENESS.2"
-rm -rf "$LOCK_DIR_LIVENESS"
+rm -rf "$LOCK_LIVENESS"
 ( : ) & DEAD_PID=$!
 wait "$DEAD_PID" 2>/dev/null || true  # guarantees DEAD_PID has already exited
-mkdir -p "$LOCK_DIR_LIVENESS"
-printf '%s' "$DEAD_PID" > "$LOCK_DIR_LIVENESS/pid"
+ln -s "$DEAD_PID" "$LOCK_LIVENESS"
 
 INPUT_DEAD=$(jq -n --arg msg 'Nothing to review here.' \
   '{agent_id:"agent-deadlock", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessDead", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
@@ -507,7 +505,7 @@ INPUT_DEAD=$(jq -n --arg msg 'Nothing to review here.' \
 DEAD_RC_FILE="$SANDBOX/dead-lock-rc"
 (
   RC=0
-  STALE_LOCK_TIMEOUT_SEC=1 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
+  CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
     bash "$HOOK" <<< "$INPUT_DEAD" >/dev/null 2>&1 || RC=$?
   echo "$RC" > "$DEAD_RC_FILE"
 ) &
@@ -521,22 +519,21 @@ kill "$DEAD_HOOK_PID" 2>/dev/null || true
 wait "$DEAD_HOOK_PID" 2>/dev/null || true
 DEAD_RC=$(cat "$DEAD_RC_FILE" 2>/dev/null || echo "timed-out")
 
-if [ "$DEAD_RC" = "0" ] && [ ! -d "$LOCK_DIR_LIVENESS" ] && grep -q 'agent-deadlock' "$DECISIONS_LOG_LIVENESS" 2>/dev/null; then
-  pass "a lockdir whose recorded PID is dead is stolen once the timeout elapses, and the hook completes normally"
+if [ "$DEAD_RC" = "0" ] && [ ! -e "$LOCK_LIVENESS" ] && [ ! -L "$LOCK_LIVENESS" ] && grep -q 'agent-deadlock' "$DECISIONS_LOG_LIVENESS" 2>/dev/null; then
+  pass "a lock whose recorded PID is dead is broken, and the hook completes normally and records its decision"
 else
-  fail "dead-PID lockdir was not stolen within the timeout: hook_rc=$DEAD_RC, lockdir present=$([ -d "$LOCK_DIR_LIVENESS" ] && echo yes || echo no)"
+  fail "dead-PID lock was not broken (a crashed hook would wedge all later review queueing): hook_rc=$DEAD_RC, lock present=$([ -L "$LOCK_LIVENESS" ] && echo yes || echo no)"
 fi
-rm -rf "$LOCK_DIR_LIVENESS"
+rm -f "$LOCK_LIVENESS"
 
-# 16b. A LIVE holder PID: the lockdir must survive PAST the timeout
-# unchanged -- the exact bug this bead fixes (the old unconditional steal
-# would have evicted this live holder at the timeout regardless).
+# 16b. A LIVE holder PID: the lock must never be broken while its holder is
+# alive -- evicting it puts two hooks in the critical section, which drops
+# decisions (a PR silently never gets a critical review).
 clear_sandbox
 rm -f "$DECISIONS_LOG_LIVENESS" "$DECISIONS_LOG_LIVENESS.1" "$DECISIONS_LOG_LIVENESS.2"
-rm -rf "$LOCK_DIR_LIVENESS"
+rm -rf "$LOCK_LIVENESS"
 sleep 30 & LIVE_PID=$!
-mkdir -p "$LOCK_DIR_LIVENESS"
-printf '%s' "$LIVE_PID" > "$LOCK_DIR_LIVENESS/pid"
+ln -s "$LIVE_PID" "$LOCK_LIVENESS"
 
 INPUT_LIVE=$(jq -n --arg msg 'Nothing to review here.' \
   '{agent_id:"agent-livelock", agent_type:"worker", cwd:"/tmp/wt", session_id:"sessLive", hook_event_name:"SubagentStop", last_assistant_message:$msg}')
@@ -545,23 +542,76 @@ INPUT_LIVE=$(jq -n --arg msg 'Nothing to review here.' \
 # (the holder never releases it) and would wait forever -- the explicit
 # `kill` after the assertion below is what reaps it, same as the live
 # holder process itself.
-STALE_LOCK_TIMEOUT_SEC=1 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
+CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$STUBDIR:$PATH" \
   bash "$HOOK" <<< "$INPUT_LIVE" >/dev/null 2>&1 &
 LIVE_HOOK_PID=$!
-sleep 2.5  # >2x the 1s timeout: the steal decision point has fired at least twice
+sleep 2.5  # many poll cycles: a wrongly-breaking waiter would have fired by now
 
-LIVE_SURVIVED_PID=$(cat "$LOCK_DIR_LIVENESS/pid" 2>/dev/null || true)
-if [ -d "$LOCK_DIR_LIVENESS" ] && [ "$LIVE_SURVIVED_PID" = "$LIVE_PID" ]; then
-  pass "a lockdir whose recorded PID is still alive is NOT stolen even after the timeout elapses"
+LIVE_SURVIVED_PID=$(readlink "$LOCK_LIVENESS" 2>/dev/null || true)
+if [ "$LIVE_SURVIVED_PID" = "$LIVE_PID" ]; then
+  pass "a lock whose recorded PID is still alive is NOT broken while the waiter polls"
 else
-  fail "live-PID lockdir was stolen despite the holder still being alive (lockdir present=$([ -d "$LOCK_DIR_LIVENESS" ] && echo yes || echo no), pid=$LIVE_SURVIVED_PID, expected=$LIVE_PID)"
+  fail "live-PID lock was broken despite the holder still being alive (two hooks in the critical section drop decisions): lock owner=$LIVE_SURVIVED_PID, expected=$LIVE_PID"
 fi
 
 kill "$LIVE_PID" 2>/dev/null || true
 kill "$LIVE_HOOK_PID" 2>/dev/null || true
 wait "$LIVE_PID" 2>/dev/null || true
 wait "$LIVE_HOOK_PID" 2>/dev/null || true
-rm -rf "$LOCK_DIR_LIVENESS"
+rm -f "$LOCK_LIVENESS"
+
+# Case 17: a hook that wins the lock but is slow to finish taking it must
+# not be evicted by waiters. `mkdir`/`ln` stubs sleep after creating the lock
+# path, widening the acquire window that is a few microseconds in reality
+# but is hit under CI load. An implementation that records the owner PID
+# after creating the lock (mkdir + pid file) looks ownerless for the whole
+# delay, so a waiter breaks it: two hooks in the critical section, a crashed
+# hook and a dropped decision -- a PR that never gets reviewed. STALE_LOCK_TIMEOUT_SEC=0
+# makes such an implementation break ownerless locks at its first poll.
+SLOWDIR=$(mktemp -d)
+for tool in mkdir ln; do
+  cat > "$SLOWDIR/$tool" <<'STUBEOF'
+#!/usr/bin/env bash
+tool=$(basename "$0")
+PATH=${PATH#*:}
+"$tool" "$@" || exit $?
+for a in "$@"; do
+  case "$a" in *decisions.tsv.lock*) sleep 1 ;; esac
+done
+STUBEOF
+  chmod +x "$SLOWDIR/$tool"
+done
+
+SLOW_LOG="$SANDBOX/.claude/review-queue/log/decisions.tsv"
+clear_sandbox
+rm -rf "$SLOW_LOG" "$SLOW_LOG.1" "$SLOW_LOG.2" "$SLOW_LOG.lock" "$SLOW_LOG.lock.d"
+SLOW_PIDS=()
+for i in 1 2 3; do
+  (
+    INPUT_SLOW=$(jq -n --arg id "agent-slow$i" \
+      '{agent_id:$id, agent_type:"worker", cwd:"/tmp/wt", session_id:"sessSlow", hook_event_name:"SubagentStop", last_assistant_message:"nothing to do"}')
+    RC=0
+    STALE_LOCK_TIMEOUT_SEC=0 CLAUDE_PROJECT_DIR="$SANDBOX" PATH="$SLOWDIR:$STUBDIR:$PATH" \
+      bash "$HOOK" <<< "$INPUT_SLOW" >/dev/null 2>&1 || RC=$?
+    echo "$RC" > "$SANDBOX/slow-rc-$i"
+  ) &
+  SLOW_PIDS+=($!)
+done
+for pid in "${SLOW_PIDS[@]}"; do
+  wait "$pid" || true
+done
+rm -rf "$SLOWDIR"
+
+SLOW_BAD=0
+for i in 1 2 3; do
+  [ "$(cat "$SANDBOX/slow-rc-$i" 2>/dev/null || echo missing)" = "0" ] || SLOW_BAD=$((SLOW_BAD + 1))
+  grep -q "agent-slow$i" "$SLOW_LOG" 2>/dev/null || SLOW_BAD=$((SLOW_BAD + 1))
+done
+if [ "$SLOW_BAD" -eq 0 ]; then
+  pass "hooks that are slow to take the decisions lock are not evicted: all 3 exit 0 and record their decision (no missed reviews)"
+else
+  fail "$SLOW_BAD crash/drop(s) when waiters met a lock whose owner was not yet recorded -- a dropped decision means a PR silently never gets a critical review"
+fi
 
 if [ "$FAILURES" -eq 0 ]; then
   printf '\nall tests passed\n'

@@ -77,49 +77,42 @@ rotate_decisions_log() {
   mv "$DECISIONS_LOG" "$DECISIONS_LOG.1"
 }
 
-DECISIONS_LOG_LOCK_DIR="$DECISIONS_LOG.lock.d"
-DECISIONS_LOG_LOCK_PID_FILE="$DECISIONS_LOG_LOCK_DIR/pid"
-# Tunable so ops can adjust without patching the guts. 5s is generous for a
-# critical section that's a handful of syscalls.
-STALE_LOCK_TIMEOUT_SEC="${STALE_LOCK_TIMEOUT_SEC:-5}"
+DECISIONS_LOG_LOCK="$DECISIONS_LOG.lock"
 
-# `mkdir` is atomic on every POSIX filesystem, so it doubles as a lock
-# primitive without an extra binary -- unlike `flock`, which ships on Linux
-# but not on a stock macOS install (this hook runs on both). Bounded retry:
-# a holder that crashed mid-critical-section (the critical section is a
-# handful of syscalls, so this should never legitimately take
-# STALE_LOCK_TIMEOUT_SEC) has its lock stolen rather than wedging every
-# future hook fire forever.
+# The lock is a symlink whose target is the holder's PID. `ln -s` is atomic
+# on every POSIX filesystem and creates the name and the PID in one step, so
+# there is no moment where the lock is held but its owner is unknown (unlike
+# `mkdir` + a PID file written afterwards, where a waiter could read an empty
+# PID, judge the holder dead, and evict a live one -- two writers in the
+# critical section, one crashing on the vanished lockdir and dropping its
+# decision). `flock` is avoided because it is absent on a stock macOS install
+# and this hook runs on both.
 #
-# Liveness check (PR #1416 follow-on): a genuinely slow hook fire that's
-# still alive past the timeout must NOT get evicted -- that would
-# reintroduce the exact unlocked-race the lock exists to prevent. The
-# holder's PID is written into the lockdir at acquire time; a steal only
-# proceeds if `kill -0` confirms that PID is no longer running. A missing
-# PID file (holder crashed between mkdir and the PID write, a window of a
-# few bash builtins) is treated as no-liveness-info -- steal, matching the
-# original crashed-holder rationale above.
+# A lock is only broken when its recorded PID is no longer running (checked
+# on every poll, so a crashed holder never wedges later fires). The break is
+# a rename to a private name, which only one waiter can win; if the renamed
+# lock belongs to a different holder than the one judged dead (it was
+# replaced in between), it is put back.
 acquire_decisions_lock() {
-  local attempts=0 max_attempts=$((STALE_LOCK_TIMEOUT_SEC * 10)) holder_pid
-  until mkdir "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null; do
-    attempts=$((attempts + 1))
-    if [ "$attempts" -ge "$max_attempts" ]; then
-      holder_pid=$(cat "$DECISIONS_LOG_LOCK_PID_FILE" 2>/dev/null || true)
-      if [ -n "$holder_pid" ] && kill -0 "$holder_pid" 2>/dev/null; then
-        : # holder still alive past the timeout -- do not steal, keep waiting
-      else
-        rm -rf "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null || true
+  local holder stale
+  until ln -s "$$" "$DECISIONS_LOG_LOCK" 2>/dev/null; do
+    holder=$(readlink "$DECISIONS_LOG_LOCK" 2>/dev/null || true)
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      stale="$DECISIONS_LOG_LOCK.stale.$$"
+      if mv "$DECISIONS_LOG_LOCK" "$stale" 2>/dev/null; then
+        if [ "$(readlink "$stale" 2>/dev/null || true)" != "$holder" ]; then
+          ln -s "$(readlink "$stale")" "$DECISIONS_LOG_LOCK" 2>/dev/null || true
+        fi
+        rm -f "$stale"
       fi
-      attempts=0
+      continue
     fi
     sleep 0.1
   done
-  printf '%s' "$$" > "$DECISIONS_LOG_LOCK_PID_FILE"
 }
 
 release_decisions_lock() {
-  rm -f "$DECISIONS_LOG_LOCK_PID_FILE"
-  rmdir "$DECISIONS_LOG_LOCK_DIR" 2>/dev/null || true
+  rm -f "$DECISIONS_LOG_LOCK"
 }
 
 # Concurrent subagents can hit SubagentStop within the same second (multiple
