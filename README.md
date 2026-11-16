@@ -16,8 +16,11 @@ notice. Do not run production workloads against it yet.
 2. x86_64 (release assets are published for linux/amd64 only).
 3. systemd as PID 1 and root access. OpenSSL 3+ is needed only to verify a
    downloaded tarball.
-4. Outbound HTTPS to `u7s.dekiru.tech`, GitHub, and the CRI-O apt mirror
-   (`slc-mirror.opensuse.org`).
+4. Outbound HTTPS to `u7s.dekiru.tech` (installer and release tarball),
+   `ghcr.io` (flannel images; IPv4-only today, no AAAA record),
+   `registry.k8s.io` and `registry-1.docker.io` (other images), and
+   `slc-mirror.opensuse.org` (CRI-O apt mirror). `ghcr.io` redirects blob
+   downloads to `pkg-containers.githubusercontent.com`.
 5. At least 1 dedicated vCPU, 1 GiB RAM and about 10 GB of disk. First boot to
    Ready takes 4-10 minutes on a 10 GB e2-micro; the install waits up to 20
    minutes.
@@ -31,25 +34,16 @@ below uses the downloaded script; the join step needs it, because the token
 is read from stdin. For flags, signature verification, upgrades and
 reinstalling, see [docs/install.md](docs/install.md).
 
-1. Resolve the release tag. Every release is still a prerelease, so the
-   unpinned `/install.sh` URL returns 404 by design. If the lookup fails
-   (unauthenticated GitHub API calls are rate-limited), set `TAG` by hand
-   from <https://github.com/litehop/u7s/releases>:
-
-   ```bash
-   TAG=$(curl --proto '=https' --tlsv1.2 -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
-   ```
-
-2. Install the control plane as root. The script verifies the release
+1. Install the control plane as root. The script verifies the release
    tarball against the signing key embedded in it and refuses to install if
    that fails:
 
    ```bash
-   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG:?could not resolve the latest release tag - set TAG manually}/install.sh"
+   curl --proto '=https' --tlsv1.2 -fsSLO https://u7s.dekiru.tech/install.sh
    sudo bash install.sh
    ```
 
-3. Check the node. The kubeconfig is written to `/var/lib/u7s/kubeconfig`
+2. Check the node. The kubeconfig is written to `/var/lib/u7s/kubeconfig`
    and is readable by root only, so the examples in this README run
    `kubectl` with `sudo`:
 
@@ -57,7 +51,7 @@ reinstalling, see [docs/install.md](docs/install.md).
    sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get nodes
    ```
 
-4. To add a worker, mint a single-use token on the control plane. The
+3. To add a worker, mint a single-use token on the control plane. The
    output holds the token (valid 24 hours), the API server URL and the CA
    certificate hash (`sha256:...`):
 
@@ -65,17 +59,25 @@ reinstalling, see [docs/install.md](docs/install.md).
    sudo bash install.sh --mint-join-token
    ```
 
-5. On the worker, set `TAG` to the same release as in step 1, download
-   `install.sh`, then join with a `--node-name` other than the control plane's:
+   The worker must run the same release as the control plane, and the
+   unpinned URL follows the newest release. Print the installed release tag:
 
    ```bash
+   /opt/u7s/bin/u7s-apiserver --version | grep -oE '\+u7s-[^ ]+' | sed 's/^+u7s-/v/'
+   ```
+
+4. On the worker, set `TAG` to that tag, download `install.sh`, then join
+   with a `--node-name` other than the control plane's:
+
+   ```bash
+   TAG=<tag from step 3>
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
    echo '<token>' | sudo bash install.sh --join https://<control-plane-ip>:6443 \
      --ca-cert-hash sha256:<hash> --node-name <worker-name> --token -
    ```
 
-6. On the control plane, check that the worker is Ready with the command
-   from step 3.
+5. On the control plane, check that the worker is Ready with the command
+   from step 2.
 
 More in [docs/install.md](docs/install.md):
 

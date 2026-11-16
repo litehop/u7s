@@ -1,8 +1,9 @@
 # Installing u7s
 
 Detailed install, join, reinstall and upgrade instructions. For the short
-path, see Quick start in the [README](../README.md); its `TAG` and
-`install.sh` download are assumed throughout.
+path, see Quick start in the [README](../README.md); its `install.sh`
+download is assumed throughout. Pinning a release is covered in
+[Pinning a release tag](#pinning-a-release-tag).
 
 ## Verifying the release
 
@@ -31,8 +32,8 @@ key. Save the public key above (copied from GitHub, a different channel
 from the proxy) as `release.pub`, then:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
-curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh.sig"
+curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/install.sh"
+curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/install.sh.sig"
 openssl pkeyutl -verify -pubin -inkey release.pub -rawin -in install.sh -sigfile install.sh.sig
 sudo bash install.sh
 ```
@@ -40,13 +41,20 @@ sudo bash install.sh
 Run it only if openssl prints `Signature Verified Successfully`
 (OpenSSL >= 3.0; macOS's LibreSSL cannot verify Ed25519).
 
-## Resolving the release tag
+## Pinning a release tag
 
-Every release is still a prerelease, so the unpinned `/install.sh` URL
-returns 404 by design; pin a release tag instead. The tag lookup uses
-`curl`, `grep` and `cut` (unauthenticated GitHub API calls are
-rate-limited; if it fails, set `TAG` by hand from
-<https://github.com/litehop/u7s/releases>).
+The unpinned `https://u7s.dekiru.tech/install.sh` is the default and serves
+the newest non-prerelease. To install a specific release, put its tag in
+the URL: `https://u7s.dekiru.tech/${TAG}/install.sh`. Read the tag of an
+installed control plane with
+`/opt/u7s/bin/u7s-apiserver --version | grep -oE '\+u7s-[^ ]+' | sed 's/^+u7s-/v/'`.
+To look up the latest tag instead (this uses `api.github.com`, which has no
+IPv6 address, and unauthenticated calls are rate-limited; if it fails, set
+`TAG` by hand from <https://github.com/litehop/u7s/releases>):
+
+```bash
+TAG=$(curl --proto '=https' --tlsv1.2 -sf "https://api.github.com/repos/litehop/u7s/releases?per_page=1" | grep -m1 '"tag_name"' | cut -d'"' -f4)
+```
 
 ## Flags and defaults
 
@@ -84,10 +92,10 @@ Prerequisites:
 - The Service range and the pod range each have two entries, one per
   family. The first entry is the primary family.
 
-1. Download `install.sh` for your release tag (see Quick start for `TAG`):
+1. Download `install.sh` (the unpinned URL, or a pinned `${TAG}` as above):
 
    ```bash
-   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/install.sh"
    ```
 
 2. Run it with a range of each family. Add `--node-ip <ipv4>,<ipv6>` if the
@@ -130,7 +138,8 @@ script reads the token from stdin, which is the script itself in the one-liner.
    The output holds a token that expires after 24 hours and works once, the
    API server URL, and the CA certificate hash (`sha256:...`).
 
-2. On the worker, download `install.sh` of the same release tag:
+2. On the worker, download `install.sh` of the same release tag as the
+   control plane (see [Pinning a release tag](#pinning-a-release-tag)):
 
    ```bash
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
