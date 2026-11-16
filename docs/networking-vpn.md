@@ -22,7 +22,9 @@ Verified on GCP with two nodes in separate VPCs (public IPs only) on
    VPN interfaces (it takes `en*`, `wl*`, `ww*`, `eth*`), so `--iface` is
    mandatory; without it install.sh picks the public NIC (not run).
 4. Mint a token on the control plane (`install.sh --mint-join-token`). It
-   prints a join URL on the tunnel address (`https://10.200.0.1:6443`).
+   prints the token, the server URL on the tunnel address
+   (`https://10.200.0.1:6443`) and the `sha256:` CA hash that
+   `--ca-cert-hash` takes.
 5. Each worker: `echo <token> | sudo bash install.sh --join https://10.200.0.1:6443
    --token - --ca-cert-hash sha256:<hash> --node-name <name> --iface wg0`.
 
@@ -54,9 +56,10 @@ Nothing to set. flannel derives the pod MTU from the interface: `wg0` came up
 at 1380 (the NIC's 1460 minus WireGuard's 80), `flannel.1` and pod `eth0` at
 1330 (minus 50 for VXLAN). From the control plane, `ping -M do -s 1302 <worker pod IP>`
 passed and `-s 1303` failed locally; a 1 MB cross-node transfer and the LB
-transfers completed. Lowering the MTU is only needed if the underlay is
-smaller than 1460; set `MTU = <n>` in `wg0.conf` before installing so flannel
-inherits it. A wrong `wg0` MTU after install was not tested.
+transfers completed. Only this auto-derived path was tested, on a 1460
+underlay. Setting `MTU` in `wg0.conf` for a smaller underlay, or a wrong `wg0`
+MTU after install, was not tested; check the boundary with the `ping -M do`
+probe above (`-s` = pod MTU minus 28).
 
 ## Firewall
 
