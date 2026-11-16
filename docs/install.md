@@ -138,10 +138,11 @@ script reads the token from stdin, which is the script itself in the one-liner.
    The output holds a token that expires after 24 hours and works once, the
    API server URL, and the CA certificate hash (`sha256:...`).
 
-2. On the worker, download `install.sh` of the same release tag as the
-   control plane (see [Pinning a release tag](#pinning-a-release-tag)):
+2. On the worker, set `TAG` to the control plane's release tag (read it as in
+   [Pinning a release tag](#pinning-a-release-tag)), then download `install.sh`:
 
    ```bash
+   TAG=<tag>
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
    ```
 
