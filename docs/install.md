@@ -138,7 +138,11 @@ script reads the token from stdin, which is the script itself in the one-liner.
    The output holds a token that expires after 24 hours and works once, the
    API server URL, and the CA certificate hash (`sha256:...`).
 
-2. On the worker, set `TAG` to the control plane's release tag (read it as in
+2. On the worker, install the control plane's release (the default), because a
+   worker must never be newer than the control plane. An older worker is fine
+   during a rolling upgrade, within upstream's kubelet skew policy (up to 3
+   minor versions older); see [Upgrading](#upgrading). Set `TAG` to the
+   control plane's release tag (read it as in
    [Pinning a release tag](#pinning-a-release-tag)), then download `install.sh`:
 
    ```bash

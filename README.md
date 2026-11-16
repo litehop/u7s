@@ -58,8 +58,11 @@ reinstalling, see [docs/install.md](docs/install.md).
    sudo bash install.sh --mint-join-token
    ```
 
-   The worker must run the same release as the control plane, and the
-   unpinned URL follows the newest release. Print the installed release tag:
+   Install the control plane's release (the default), because a worker must
+   never be newer than the control plane. An older worker is fine during a
+   rolling upgrade, within upstream's kubelet skew policy (up to 3 minor
+   versions older); see [Upgrading](docs/install.md#upgrading). Print the
+   installed release tag:
 
    ```bash
    /opt/u7s/bin/u7s-apiserver --version | grep -oE '\+u7s-[^ ]+' | sed 's/^+u7s-/v/'
