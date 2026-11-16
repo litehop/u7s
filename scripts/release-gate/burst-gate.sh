@@ -244,9 +244,8 @@ fi
 if [ "$CONFIRM" = 1 ]; then
   tried=()
   for size in $CONFIRM_SIZES; do
-    sub_args=(--runs "$RUNS" --burst-pods "$size" --burst-cap "$BURST_CAP_SECS" --wedge-secs "$WEDGE_SECS" --wedge-stall-secs "$WEDGE_STALL_SECS" --out "$OUT/burst-$size")
-    if [ "$BACKEND" = gcp ]; then sub_args+=(--backend gcp --release "$RELEASE"); else sub_args+=(--tarball-dir "$TARBALL_DIR"); fi
-    "$0" "${sub_args[@]}" >&2 || true
+    rg_confirm_sub_args "$size"
+    "$0" "${SUB_ARGS[@]}" >&2 || true
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")
