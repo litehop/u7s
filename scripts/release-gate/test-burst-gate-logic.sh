@@ -1004,14 +1004,16 @@ confirm_args() (
   rg_confirm_sub_args 30
   echo "${SUB_ARGS[*]}"
 )
+has_args() { if [[ " $1 " == *" $2 "* ]]; then echo 1; else echo 0; fi; }
 sub="$(confirm_args :)"
 for want in "--memory 2" "--zram-mib 512" "--probe-kill 77" "--capture" "--keep" "--coredns-requests" "--tarball-dir /tb" "--burst-pods 30" "--runs 2"; do
   assert "--confirm sub-run receives '$want' (a dropped flag makes the release gate measure a different config than asked)" \
-    "$(case " $sub " in *" $want "*) echo 1 ;; *) echo 0 ;; esac)"
+    "$(has_args "$sub" "$want")"
 done
 sub="$(confirm_args 'BACKEND=gcp; RELEASE=v1.2.3; MEMORY=; TARBALL_DIR=')"
-assert "--confirm on gcp forwards --backend gcp --release and omits unset --memory" \
-  "$(case " $sub " in *" --backend gcp --release v1.2.3 "*) case "$sub" in *--memory*|*--tarball-dir*) echo 0 ;; *) echo 1 ;; esac ;; *) echo 0 ;; esac)"
+gcp_ok=0
+if [ "$(has_args "$sub" "--backend gcp --release v1.2.3")" = 1 ] && [[ "$sub" != *--memory* ]] && [[ "$sub" != *--tarball-dir* ]]; then gcp_ok=1; fi
+assert "--confirm on gcp forwards --backend gcp --release and omits unset --memory" "$gcp_ok"
 assert "burst-gate.sh --confirm builds the sub-run arguments with rg_confirm_sub_args (no private copy that can drift)" \
   "$(grep -q 'rg_confirm_sub_args "\$size"' "$HERE/burst-gate.sh" && grep -q '"\${SUB_ARGS\[@\]}"' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
 
