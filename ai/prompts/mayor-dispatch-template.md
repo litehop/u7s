@@ -56,6 +56,9 @@ Your assigned worktree: <ASSIGNED_WORKTREE>
 The mayor checkout: <MAYOR_CHECKOUT>
 ```
 
+Revert-runs (disabling a check to prove a new test fails) are authorized; see
+the note in worker.md step 4.
+
 ### Mayor checks after dispatch
 
 - Check the mayor checkout immediately after dispatching:
