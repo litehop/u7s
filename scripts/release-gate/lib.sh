@@ -714,3 +714,17 @@ rg_experiment_tag() {
   [ -n "$ref" ] && [ -n "$sha" ] || return 1
   echo "EXPERIMENT (unpublished tarball, ref=$ref sha=${sha:0:12}; NOT a release verdict)"
 }
+
+# Fills SUB_ARGS with the burst-gate.sh arguments for one --confirm size ($1), forwarding every
+# option the parent accepted so the sub-run measures the config that was asked for. Reads the
+# parent's option variables (RUNS, BURST_CAP_SECS, WEDGE_SECS, WEDGE_STALL_SECS, OUT, BACKEND,
+# RELEASE, TARBALL_DIR, MEMORY, ZRAM_MIB, PROBE_KILL_SECS, CAPTURE, KEEP, COREDNS_REQ).
+rg_confirm_sub_args() {
+  SUB_ARGS=(--runs "$RUNS" --burst-pods "$1" --burst-cap "$BURST_CAP_SECS" --wedge-secs "$WEDGE_SECS" --wedge-stall-secs "$WEDGE_STALL_SECS" --out "$OUT/burst-$1" --zram-mib "$ZRAM_MIB" --probe-kill "$PROBE_KILL_SECS")
+  if [ "$BACKEND" = gcp ]; then SUB_ARGS+=(--backend gcp --release "$RELEASE"); else SUB_ARGS+=(--tarball-dir "$TARBALL_DIR"); fi
+  [ -z "$MEMORY" ] || SUB_ARGS+=(--memory "$MEMORY")
+  [ "$CAPTURE" != 1 ] || SUB_ARGS+=(--capture)
+  [ "$KEEP" != 1 ] || SUB_ARGS+=(--keep)
+  [ "$COREDNS_REQ" != 1 ] || SUB_ARGS+=(--coredns-requests)
+  return 0
+}

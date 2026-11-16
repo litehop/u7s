@@ -997,5 +997,25 @@ RG_RUN_WALL_SECS=30 "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tbl" --ou
 assert "the Lima gate trims the VM after boot and before the gate scripts run (otherwise the trim never reaches a real run)" \
   "$(awk '/mask --now/ {t = NR} /vm-gate.sh/ {g = NR} END {exit !(t && g && t < g)}' "$LIMA_CALLS" && echo 1 || echo 0)"
 
+confirm_args() (
+  RUNS=2; BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120; OUT="$TMP/c"; BACKEND=lima; RELEASE=""
+  TARBALL_DIR=/tb; MEMORY=2; ZRAM_MIB=512; PROBE_KILL_SECS=77; CAPTURE=1; KEEP=1; COREDNS_REQ=1
+  eval "$1"
+  rg_confirm_sub_args 30
+  echo "${SUB_ARGS[*]}"
+)
+has_args() { if [[ " $1 " == *" $2 "* ]]; then echo 1; else echo 0; fi; }
+sub="$(confirm_args :)"
+for want in "--memory 2" "--zram-mib 512" "--probe-kill 77" "--capture" "--keep" "--coredns-requests" "--tarball-dir /tb" "--burst-pods 30" "--runs 2"; do
+  assert "--confirm sub-run receives '$want' (a dropped flag makes the release gate measure a different config than asked)" \
+    "$(has_args "$sub" "$want")"
+done
+sub="$(confirm_args 'BACKEND=gcp; RELEASE=v1.2.3; MEMORY=; TARBALL_DIR=')"
+gcp_ok=0
+if [ "$(has_args "$sub" "--backend gcp --release v1.2.3")" = 1 ] && [[ "$sub" != *--memory* ]] && [[ "$sub" != *--tarball-dir* ]]; then gcp_ok=1; fi
+assert "--confirm on gcp forwards --backend gcp --release and omits unset --memory" "$gcp_ok"
+assert "burst-gate.sh --confirm builds the sub-run arguments with rg_confirm_sub_args (no private copy that can drift)" \
+  "$(grep -q 'rg_confirm_sub_args "\$size"' "$HERE/burst-gate.sh" && grep -q '"\${SUB_ARGS\[@\]}"' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
