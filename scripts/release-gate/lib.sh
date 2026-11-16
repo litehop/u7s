@@ -250,6 +250,21 @@ rg_marker_ok() {
   [ -n "$1" ] && [ "$1" = "$2" ] && echo 1 || echo 0
 }
 
+# Rewrites the MariaDB StatefulSet manifest $1 to $2 with its data volume on emptyDir (the gate
+# VM has no csi-hostpath, and the PVC is not what is under test). Fails unless the output has
+# an emptyDir volume named data and no PVC left: the volumeMount also says "name: data", so a
+# bare grep cannot tell a rewritten manifest from an untouched one.
+rg_mariadb_emptydir_rewrite() {
+  awk '
+    /^  volumeClaimTemplates:/ {skip=1}
+    /^  updateStrategy:/ {skip=0}
+    /^        - name: temp$/ {print "        - name: data"; print "          emptyDir: {}"}
+    !skip {print}
+  ' "$1" > "$2" || return 1
+  grep -A1 '^        - name: data$' "$2" | grep -q '^          emptyDir: {}$' || return 1
+  ! grep -q 'volumeClaimTemplates\|PersistentVolumeClaim' "$2"
+}
+
 # --- host contention (INVALID verdict) ---
 
 # Reads `limactl list` on stdin, prints names of Running VMs other than $1.

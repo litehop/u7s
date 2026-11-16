@@ -1017,5 +1017,17 @@ assert "--confirm on gcp forwards --backend gcp --release and omits unset --memo
 assert "burst-gate.sh --confirm builds the sub-run arguments with rg_confirm_sub_args (no private copy that can drift)" \
   "$(grep -q 'rg_confirm_sub_args "\$size"' "$HERE/burst-gate.sh" && grep -q '"\${SUB_ARGS\[@\]}"' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
 
+MARIADB_SRC="$HERE/../../examples/e2e/wordpress/mariadb.yaml"
+rg_mariadb_emptydir_rewrite "$MARIADB_SRC" "$TMP/mariadb-ok.yaml" && rw=1 || rw=0
+assert "the real mariadb manifest rewrites to an emptyDir data volume with no PVC left (the gate must run the workload the operator gated on)" "$rw"
+sed 's/^        - name: temp$/        - name: scratch/' "$MARIADB_SRC" > "$TMP/mariadb-noanchor.yaml"
+rg_mariadb_emptydir_rewrite "$TMP/mariadb-noanchor.yaml" "$TMP/mariadb-bad.yaml" && rw=1 || rw=0
+assert "a manifest whose rewrite anchor is missing fails the guard (else the gate silently runs a PVC-backed MariaDB, a different workload than gated; the volumeMount alone also says 'name: data')" "$([ "$rw" = 0 ] && echo 1 || echo 0)"
+sed 's/^  volumeClaimTemplates:$/  xvolumeClaimTemplates:/' "$MARIADB_SRC" > "$TMP/mariadb-nopvcanchor.yaml"
+rg_mariadb_emptydir_rewrite "$TMP/mariadb-nopvcanchor.yaml" "$TMP/mariadb-bad2.yaml" && rw=1 || rw=0
+assert "a leftover PVC definition fails the guard even when the emptyDir volume was added (a gate that still claims storage is not the gated workload)" "$([ "$rw" = 0 ] && echo 1 || echo 0)"
+assert "burst-gate.sh uses the rewrite guard rather than a bare grep" \
+  "$(grep -q 'rg_mariadb_emptydir_rewrite' "$HERE/burst-gate.sh" && echo 1 || echo 0)"
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
