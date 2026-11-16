@@ -17,10 +17,8 @@
 #   - --pod-cidr and --uplink-iface are the placeholders above (upstream: k3s's 10.42.0.0/16
 #     and eth0).
 # Everything else, including the privileged node-prep initContainer, the hostPath mounts and
-# AppArmor Unconfined, is upstream's security posture unchanged. beep's v0.6.0 CHANGELOG records
-# the externalTrafficPolicy=Local semantics that differ from kube-proxy (a node with no local
-# endpoint forwards cross-node, client IP preserved); sessionAffinity ClientIP is honoured but
-# timeoutSeconds is not.
+# AppArmor Unconfined, is upstream's security posture unchanged. Behavioural differences from
+# kube-proxy (externalTrafficPolicy=Local, sessionAffinity) are listed in the top-level README.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
