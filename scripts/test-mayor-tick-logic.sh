@@ -1643,7 +1643,8 @@ setup_bead_stubs() {
 #!/usr/bin/env bash
 if [[ " \$* " == *" --state merged "* ]]; then
   printf '%s\n' "\$*" > "$BEAD_DB/gh-args"
-  cat "$BEAD_DB/prs.json"
+  limit=\$(printf '%s' "\$*" | sed -E 's/.*--limit ([0-9]+).*/\1/')
+  jq -c --argjson n "\$limit" '.[:\$n]' "$BEAD_DB/prs.json"
 else
   printf '[]'
 fi
@@ -1685,8 +1686,58 @@ bead_tick
 assert "a second tick over the same merged PR does not close again (idempotent)" \
   "$([ "$(wc -l < "$BEAD_CLOSE_LOG" | tr -d ' ')" = "2" ] && echo 1 || echo 0)"
 EXPECT_SINCE=$(date -u -v-3d +%Y-%m-%d 2>/dev/null || date -u -d "3 days ago" +%Y-%m-%d)
-assert "the scan asks gh only for MERGED PRs since the 3-day lookback, with a limit (no unbounded history scan)" \
-  "$(grep -q -- "--state merged" "$BEAD_DB/gh-args" && grep -q -- "merged:>=$EXPECT_SINCE" "$BEAD_DB/gh-args" && grep -q -- "--limit" "$BEAD_DB/gh-args" && echo 1 || echo 0)"
+assert "with no cursor (first run) the scan asks gh only for MERGED PRs since the 3-day lookback, with a limit (no unbounded history scan)" \
+  "$(grep -q -- "--state merged" "$BEAD_DB/gh-args" && grep -q -- "merged:>=${EXPECT_SINCE}T" "$BEAD_DB/gh-args" && grep -q -- "--limit" "$BEAD_DB/gh-args" && echo 1 || echo 0)"
+
+# A fixed 3-day window silently drops merges when no tick runs for longer (a
+# gap between sessions), leaving their beads in_progress. The cursor makes the
+# scan start where the last clean one ended, however long ago that was.
+setup_bead_stubs cursor \
+  "[{\"number\":71,\"title\":\"fix: a (${B}cur71)\",\"mergeCommit\":{\"oid\":\"1212121212\"},\"mergedAt\":\"2020-01-01T10:00:00Z\"},{\"number\":72,\"title\":\"fix: b (${B}cur72)\",\"mergeCommit\":{\"oid\":\"3434343434\"},\"mergedAt\":\"2020-01-02T11:30:00Z\"}]" \
+  ${B}cur71=in_progress ${B}cur72=in_progress \
+  "${B}cur71.notes=PR #71 opened: u" "${B}cur72.notes=PR #72 opened: u"
+build_scratch_repo
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+assert "a clean scan persists the newest mergedAt as bead_close_cursor in the state file" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "2020-01-02T11:30:00Z" ] && echo 1 || echo 0)"
+assert "...alongside the existing state keys the mayor reads" \
+  "$([ "$(jq -r 'has("gate_exceptions") and has("exit_code") and has("merged_prs")' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
+invoke_tick "$BEAD_BIN" "$SCRATCH_REPO" 0
+assert "the next tick scans from the cursor, not from a fixed lookback, so a long gap between ticks loses no merge" \
+  "$(grep -q -- "merged:>=2020-01-02T11:30:00Z" "$BEAD_DB/gh-args" && echo 1 || echo 0)"
+
+# A failed close must not advance the cursor, or the retry the failure promises
+# would never see that PR again.
+setup_bead_stubs cursorfail \
+  "[{\"number\":81,\"title\":\"fix: a (${B}cf81)\",\"mergeCommit\":{\"oid\":\"5656565656\"},\"mergedAt\":\"2020-02-01T10:00:00Z\"}]" \
+  ${B}cf81=in_progress "${B}cf81.notes=PR #81 opened: u"
+touch "$BEAD_DB/FAIL"
+bead_tick
+assert "a failed bd close does not advance the cursor, so the PR is rescanned" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
+
+# Silent truncation at --limit would leave the oldest unscanned merges' beads
+# open with nothing telling the mayor. Limit 5 (retry 50): 51 merges exceed even
+# the retry page.
+export MAYOR_TICK_BEAD_LIMIT=5
+BIG_PRS=$(jq -nc '[range(51) | {number:(1000+.), title:"chore: x", mergeCommit:{oid:"0000000000"}, mergedAt:"2020-03-01T00:00:00Z"}]')
+setup_bead_stubs trunc "$BIG_PRS"
+bead_tick
+assert "a result that fills --limit exits 20 with a bead-close-scan-truncated gate exception" \
+  "$([ "$TICK_RC" -eq 20 ] && [ "$(jq -r '.gate_exceptions[0].reason' "$TICK_STATE")" = "bead-close-scan-truncated" ] && echo 1 || echo 0)"
+assert "...logs the truncation loudly" \
+  "$(printf '%s' "$TICK_OUT" | grep -q 'WARNING bead-close scan hit --limit' && echo 1 || echo 0)"
+assert "...and does not advance the cursor past unscanned PRs" \
+  "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
+
+# 20 merges overflow the first page (5) but fit the retry page (50), so the scan
+# completes without alarming the mayor.
+MID_PRS=$(jq -nc '[range(20) | {number:(1000+.), title:"chore: x", mergeCommit:{oid:"0000000000"}, mergedAt:"2020-03-01T00:00:00Z"}]')
+setup_bead_stubs retry "$MID_PRS"
+bead_tick
+assert "a first page that fills --limit is retried larger and, once complete, raises no exception and advances the cursor" \
+  "$([ "$TICK_RC" -eq 0 ] && [ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "2020-03-01T00:00:00Z" ] && echo 1 || echo 0)"
+unset MAYOR_TICK_BEAD_LIMIT
 
 setup_bead_stubs skip \
   "[{\"number\":11,\"title\":\"fix: y (${B}ccc3, ${B}ddd4)\",\"mergeCommit\":{\"oid\":\"1111111111\"}},{\"number\":12,\"title\":\"chore(deps): update renovate\",\"mergeCommit\":{\"oid\":\"2222222222\"}},{\"number\":13,\"title\":\"feat: z x${B}eee5\",\"mergeCommit\":{\"oid\":\"3333333333\"}}]" \

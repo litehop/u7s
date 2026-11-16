@@ -176,7 +176,11 @@ a redundant CI cycle per PR.
      yourself once the note lands; for each `gate_exceptions` entry,
      investigate why it didn't qualify (no review yet vs. a
      needs-changes/needs-discussion verdict on record) — do not merge it
-     yourself without resolving that first; for each `queue_warnings`
+     yourself without resolving that first (exceptions with reason
+     `bead-close-failed` are retried by the script each tick; reason
+     `bead-close-scan-truncated` means merged PRs since the scan cursor
+     overflowed `gh --limit`, so rerun the script once with
+     `MAYOR_TICK_BEAD_LIMIT` raised); for each `queue_warnings`
      entry, investigate the queue file — either a broken/missing
      `queued_at` or an unrecognized `deliverable_type`, both of which
      never auto-drain until fixed or removed by hand.

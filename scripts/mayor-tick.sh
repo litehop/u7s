@@ -407,8 +407,9 @@ write_state() {
   local exit_code="$1" queue_files_json="$2" pending_reviews_json="$3" \
     merged_prs_json="$4" bd_ready_json="$5" worktree_anomalies_json="$6" \
     gate_exceptions_json="$7" pending_non_pr_json="${8:-[]}" \
-    queue_warnings_json="${9:-[]}"
+    queue_warnings_json="${9:-[]}" bead_close_cursor="${10:-}"
   jq -n \
+    --arg bead_close_cursor "$bead_close_cursor" \
     --arg ts "$TICK_TIMESTAMP" \
     --argjson exit_code "$exit_code" \
     --argjson queue_files "$queue_files_json" \
@@ -424,7 +425,8 @@ write_state() {
       bd_ready_ids:$bd_ready_ids, worktree_anomalies:$worktree_anomalies,
       gate_exceptions:$gate_exceptions,
       pending_non_pr_reviews:$pending_non_pr_reviews,
-      queue_warnings:$queue_warnings}' \
+      queue_warnings:$queue_warnings,
+      bead_close_cursor:$bead_close_cursor}' \
     > "$STATE_FILE"
 }
 
@@ -796,18 +798,39 @@ close_merged_pr_beads() {
   done
 }
 
-# Independent of any worktree or branch name: scans PRs merged within the
-# lookback window, so a failed close is retried and non-worker branches are
-# covered. Already-closed beads are skipped, which bounds repeat work to the
-# window and keeps re-scans idempotent.
+# Independent of any worktree or branch name, so a failed close is retried and
+# non-worker branches are covered. The scan starts at the persisted
+# bead_close_cursor (newest mergedAt of the last clean scan), so a gap between
+# ticks loses nothing; with no cursor (first run) it looks back
+# MAYOR_TICK_BEAD_LOOKBACK_DAYS. The cursor stays put when a close failed or the
+# gh result hit its limit, so those PRs are rescanned next tick.
 BEAD_CLOSE_LOOKBACK_DAYS="${MAYOR_TICK_BEAD_LOOKBACK_DAYS:-3}"
+BEAD_CLOSE_LIMIT="${MAYOR_TICK_BEAD_LIMIT:-100}"
+BEAD_CLOSE_RETRY_LIMIT=$((BEAD_CLOSE_LIMIT * 10))
+BEAD_CLOSE_CURSOR=""
+
+# Newest mergedAt in a gh PR JSON array, or empty. ISO-8601 UTC sorts lexically.
+max_merged_at() {
+  printf '%s' "$1" | jq -r '[.[]?.mergedAt // empty] | max // empty' 2>/dev/null || true
+}
 
 close_beads_of_merged_prs() {
-  local since prs_json row
-  since=$(date -u -v-"${BEAD_CLOSE_LOOKBACK_DAYS}"d +%Y-%m-%d 2>/dev/null \
-    || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%d)
-  prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit 100 \
-    --json number,title,mergeCommit 2>/dev/null || echo '[]')
+  local since prior prs_json row limit="$BEAD_CLOSE_LIMIT" failures_before newest
+  prior=$(jq -r '.bead_close_cursor // empty' "$STATE_FILE" 2>/dev/null || true)
+  BEAD_CLOSE_CURSOR="$prior"
+  since="$prior"
+  if [ -z "$since" ]; then
+    since=$(date -u -v-"${BEAD_CLOSE_LOOKBACK_DAYS}"d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+      || date -u -d "$BEAD_CLOSE_LOOKBACK_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+  fi
+  prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit "$limit" \
+    --json number,title,mergeCommit,mergedAt 2>/dev/null || echo '[]')
+  if [ "$(printf '%s' "$prs_json" | jq 'length' 2>/dev/null || echo 0)" -ge "$limit" ]; then
+    limit="$BEAD_CLOSE_RETRY_LIMIT"
+    prs_json=$(gh pr list --state merged --search "merged:>=$since" --limit "$limit" \
+      --json number,title,mergeCommit,mergedAt 2>/dev/null || echo '[]')
+  fi
+  failures_before=${#GATE_EXCEPTIONS[@]}
   INPROGRESS_BEADS_JSON=$(bd list --status in_progress --limit 0 --json 2>/dev/null || echo '[]')
   printf '%s' "$INPROGRESS_BEADS_JSON" | jq -e 'type=="array"' >/dev/null 2>&1 || INPROGRESS_BEADS_JSON='[]'
   while IFS= read -r row; do
@@ -817,6 +840,14 @@ close_beads_of_merged_prs() {
       "$(printf '%s' "$row" | jq -r '.title // ""')" \
       "$(printf '%s' "$row" | jq -r '.mergeCommit.oid // "unknown"' | cut -c1-10)"
   done < <(printf '%s' "$prs_json" | jq -c '.[]?' 2>/dev/null || true)
+  if [ "$(printf '%s' "$prs_json" | jq 'length' 2>/dev/null || echo 0)" -ge "$limit" ]; then
+    echo "mayor-tick: WARNING bead-close scan hit --limit $limit; merged PRs since $since may be unscanned, cursor not advanced" >&2
+    GATE_EXCEPTIONS+=("$(jq -nc --argjson limit "$limit" --arg since "$since" '{reason:"bead-close-scan-truncated", limit:$limit, since:$since}')")
+    return 0
+  fi
+  [ "${#GATE_EXCEPTIONS[@]}" -eq "$failures_before" ] || return 0
+  newest=$(max_merged_at "$prs_json")
+  if [ -n "$newest" ] && [[ "$newest" > "$prior" ]]; then BEAD_CLOSE_CURSOR="$newest"; fi
 }
 
 cleanup_merged_worktrees() {
@@ -1051,7 +1082,8 @@ main() {
     "$(json_raw_array "${WORKTREE_ANOMALIES[@]+"${WORKTREE_ANOMALIES[@]}"}")" \
     "$(json_raw_array "${GATE_EXCEPTIONS[@]+"${GATE_EXCEPTIONS[@]}"}")" \
     "$(json_raw_array "${PENDING_NON_PR_REVIEWS[@]+"${PENDING_NON_PR_REVIEWS[@]}"}")" \
-    "$(json_raw_array "${QUEUE_WARNINGS[@]+"${QUEUE_WARNINGS[@]}"}")"
+    "$(json_raw_array "${QUEUE_WARNINGS[@]+"${QUEUE_WARNINGS[@]}"}")" \
+    "$BEAD_CLOSE_CURSOR"
 
   echo "mayor-tick: exit_code=$exit_code state=$STATE_FILE"
   exit "$exit_code"
