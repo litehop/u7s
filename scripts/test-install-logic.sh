@@ -1108,6 +1108,9 @@ assert_true "kernel 6.12+deb is accepted (a suffixed minor must not make the int
 assert_false "kernel 6.5+deb is still rejected (the suffix strip must not weaken the floor)" kernel_ok "6.5+deb"
 assert_false "kernel 6.5.13 is rejected" kernel_ok "6.5.13"
 assert_false "kernel 5.15.0-100-generic is rejected (a high minor does not beat a lower major)" kernel_ok "5.15.0-100-generic"
+kernel_quiet_reject() { [ -z "$(bash -c '. "$1"; kernel_supports_beep "$2"' _ "$KERNEL_FN" "$1" 2>&1 >/dev/null)" ] && ! kernel_ok "$1"; }
+assert_true "kernel '6' (no minor) is rejected without an 'integer expression expected' stderr line" kernel_quiet_reject "6"
+assert_true "an empty kernel string is rejected without stderr noise" kernel_quiet_reject ""
 assert_true "install.sh refuses to proceed when the kernel check fails" \
   grep -qF 'if ! kernel_supports_beep "$(uname -r)"; then' "$INSTALL"
 

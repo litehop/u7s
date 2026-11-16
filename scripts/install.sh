@@ -268,6 +268,7 @@ kernel_supports_beep() {
   local major minor
   IFS=. read -r major minor _ <<< "${1%%-*}"
   minor="${minor//[!0-9]/}"
+  [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
   [ "$major" -gt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -ge 6 ]; }
 }
 if ! kernel_supports_beep "$(uname -r)"; then

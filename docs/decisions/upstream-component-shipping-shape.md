@@ -58,7 +58,8 @@ default-bloat failure mode the packaging philosophy exists to avoid.
 
 - CRI-O beyond Ubuntu is unaddressed until there is demand.
 - HPA requires a user-applied manifest.
-- beep deviates from upstream for `externalTrafficPolicy: Local` and
-  `sessionAffinity: ClientIP`; see the top-level README.
+- beep deviates from upstream for `externalTrafficPolicy: Local` (a node with
+  no local endpoint forwards cross-node, client IP preserved, instead of
+  dropping) and honours `sessionAffinity: ClientIP` but not `timeoutSeconds`.
 - kube-proxy replacement is out of u7s scope (beep-side, post-v1.0); this
   ADR governs only the upstream-binary path.

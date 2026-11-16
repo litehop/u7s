@@ -12,9 +12,10 @@ notice. Do not run production workloads against it yet.
 
 ## Prerequisites
 
-1. Ubuntu 24.04 or newer (kernel 6.6+; 22.04's 5.15 kernel is refused).
+1. Ubuntu 24.04 or newer (kernel 6.6+).
 2. x86_64 (release assets are published for linux/amd64 only).
-3. systemd as PID 1, root access, and OpenSSL 3+.
+3. systemd as PID 1 and root access. OpenSSL 3+ is needed only to verify a
+   downloaded tarball.
 4. Outbound HTTPS to `u7s.dekiru.tech`, GitHub, and the CRI-O apt mirror
    (`slc-mirror.opensuse.org`).
 5. At least 1 dedicated vCPU, 1 GiB RAM and about 10 GB of disk. First boot to
@@ -193,7 +194,7 @@ consumed; mint a new one.
 
 u7s applies beep as its LoadBalancer provider by default, so a Service of
 `type: LoadBalancer` gets an external address with no extra install. beep
-needs kernel >= 6.6, and `install.sh` refuses to run on an older kernel.
+needs kernel >= 6.6 (see Prerequisites).
 
 1. Create the Service. Add `ipFamilyPolicy: PreferDualStack` on a dual-stack
    cluster to get an address of each family:
