@@ -30,12 +30,8 @@ klipper-lb role; litehop/beep, image pinned by digest; the vendored
 version is in the header of `beep.yaml`), alongside
 kube-proxy. It carries `__IFACE__` and `__POD_CLUSTER_CIDR__`, and needs
 kernel >= 6.6 (`install.sh` refuses older). Differences from upstream
-Kubernetes behaviour:
-
-- `externalTrafficPolicy: Local`: a node with no local ready endpoint
-  forwards cross-node to ready endpoints (client IP preserved) instead of
-  dropping the traffic.
-- `sessionAffinity: ClientIP` is honoured; `timeoutSeconds` is not.
+Kubernetes behaviour are listed in the top-level
+[README](../README.md#expose-a-service-with-a-loadbalancer).
 
 Uninstalling beep is beep's responsibility; see
 the deploy README in the <https://github.com/litehop/beep> repository, at the

@@ -1104,6 +1104,8 @@ kernel_ok() { bash -c '. "$1"; kernel_supports_beep "$2"' _ "$KERNEL_FN" "$1"; }
 assert_true "kernel 6.6.0 (the floor) is accepted" kernel_ok "6.6.0"
 assert_true "kernel 6.8.0-31-generic is accepted (suffix ignored)" kernel_ok "6.8.0-31-generic"
 assert_true "kernel 7.0.0-31 is accepted (a higher major beats a lower minor)" kernel_ok "7.0.0-31"
+assert_true "kernel 6.12+deb is accepted (a suffixed minor must not make the integer compare error and falsely refuse the install)" kernel_ok "6.12+deb"
+assert_false "kernel 6.5+deb is still rejected (the suffix strip must not weaken the floor)" kernel_ok "6.5+deb"
 assert_false "kernel 6.5.13 is rejected" kernel_ok "6.5.13"
 assert_false "kernel 5.15.0-100-generic is rejected (a high minor does not beat a lower major)" kernel_ok "5.15.0-100-generic"
 assert_true "install.sh refuses to proceed when the kernel check fails" \

@@ -225,5 +225,5 @@ jobs:
           gh release create "$VERSION" dist/* \
             --target "$GITHUB_SHA" \
             --title "$VERSION" \
-            --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh" \
+            --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh. Requires Linux kernel 6.6 or newer (Ubuntu 22.04's 5.15 is refused, including on workers and upgrades)." \
             $prerelease_flag
