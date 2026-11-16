@@ -9533,6 +9533,15 @@ mod tests {
                 extra: Default::default(),
             },
         );
+        tokens.insert(
+            "root-token".to_owned(),
+            auth::UserInfo {
+                username: "root".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            },
+        );
         let state = state::AppState::new(
             std::sync::Arc::clone(store),
             None,
@@ -9551,6 +9560,28 @@ mod tests {
             std::sync::Arc::clone(&state.resource_registry),
             std::sync::Arc::clone(&state.discovery_cache),
         ))
+    }
+
+    async fn impersonated_status_of(
+        app: &axum::Router,
+        path: &str,
+        token: &str,
+        user: &str,
+        groups: &[&str],
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder()
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("Impersonate-User", user);
+        for g in groups {
+            req = req.header("Impersonate-Group", *g);
+        }
+        app.clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .expect("router must not error")
+            .status()
     }
 
     async fn status_of(
@@ -10236,6 +10267,45 @@ mod tests {
             StatusCode::FORBIDDEN,
             "system:discovery must not leak resource access"
         );
+    }
+
+    /// Discovery must be authorized as the impersonated identity, not the credential that
+    /// made the request: otherwise `kubectl --as=system:anonymous` by a cluster admin would
+    /// show the admin's view, and an operator could not use impersonation to verify that an
+    /// unprivileged identity is denied discovery.
+    #[tokio::test]
+    async fn impersonated_discovery_uses_the_impersonated_identity_not_the_caller() {
+        use axum::http::StatusCode;
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+        let app = seeded_rbac_app(&store).await;
+
+        for path in ["/api", "/apis", "/openapi/v2"] {
+            assert_ne!(
+                status_of(&app, path, Some("root-token")).await,
+                StatusCode::FORBIDDEN,
+                "{path}: the unimpersonated caller is cluster-admin and must see discovery"
+            );
+            assert_eq!(
+                impersonated_status_of(
+                    &app,
+                    path,
+                    "root-token",
+                    "system:anonymous",
+                    &["system:unauthenticated"]
+                )
+                .await,
+                StatusCode::FORBIDDEN,
+                "{path}: impersonating system:anonymous must get anonymous's 403, not the \
+                 caller's cluster-admin view"
+            );
+            assert_ne!(
+                impersonated_status_of(&app, path, "root-token", "bob", &[]).await,
+                StatusCode::FORBIDDEN,
+                "{path}: an impersonated plain user is system:authenticated and must pass \
+                 system:discovery"
+            );
+        }
     }
 
     /// The seeded roles, not a hard-coded bypass, decide: deleting the seeded rule makes the
