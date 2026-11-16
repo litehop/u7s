@@ -147,5 +147,5 @@ certificate signature failure
 ```bash
 # Correct diagnostic — if this works, the server and cert are fine:
 kubectl get namespaces
-curl --cacert ./temp/u7s/ca.crt https://127.0.0.1:6443/api   # ./temp/u7s/ relative to CWD
+curl --cacert ./temp/u7s/ca.crt https://127.0.0.1:6443/version   # ./temp/u7s/ relative to CWD; /api needs credentials (anonymous discovery is 403)
 ```
