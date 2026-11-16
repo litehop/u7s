@@ -245,7 +245,9 @@ if [ "$CONFIRM" = 1 ]; then
   tried=()
   for size in $CONFIRM_SIZES; do
     rg_confirm_sub_args "$size"
-    "$0" "${SUB_ARGS[@]}" >&2 || true
+    sub_rc=0
+    "$0" "${SUB_ARGS[@]}" >&2 || sub_rc=$?
+    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; exit 2; }
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")

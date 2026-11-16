@@ -432,8 +432,20 @@ rg_probe_kind() {
   fi
 }
 
-# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 was Ready at the
-# earlier wait (1|0). Probes taken now, at failure time: $3/$4 = exit code/output of
+# Classifies the `kubectl wait --for=condition=Ready` on mariadb-0: $1 exit code, $2 combined
+# output. Echoes 1 (Ready), 0 (the cluster answered and the pod was not Ready: wait timeout, API
+# error, or API unreachable, all u7s per rg_probe_kind) or error (kubectl/kubeconfig broke: harness).
+rg_wait_ready_state() {
+  local rc="$1" out="$2"
+  if [ "$rc" = 0 ]; then echo 1
+  elif [[ "$out" == *"timed out waiting"* ]]; then echo 0
+  elif [ "$(rg_probe_kind "$rc" "$out")" = error ]; then echo error
+  else echo 0
+  fi
+}
+
+# Records a failed pre-burst marker write into results file $1. $2 = mariadb-0 state at the
+# earlier wait (1 Ready, 0 not Ready, error wait command itself failed). Probes taken now, at failure time: $3/$4 = exit code/output of
 # `kubectl get --raw /readyz`, $5/$6 = exit code/output of the mariadb-0 Ready-condition status.
 # Mapping: any probe showing u7s misbehaving (API unreachable or answering an error, pod not
 # Ready) is marker_ok=0 (FAIL), checked first so ambiguity goes to FAIL. Only when no probe shows
