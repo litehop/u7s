@@ -931,6 +931,28 @@ fn resource_rule_matches(rule: &str, request: &str) -> bool {
     (rule_res == "*" || rule_res == req_res) && (rule_sub == "*" || rule_sub == req_sub)
 }
 
+/// Upstream `Matcher.scope`: absent/"*" matches everything, "Namespaced" needs a namespace
+/// and is never a Namespace object, "Cluster" matches no-namespace requests and Namespace
+/// objects (whose request carries their own name as namespace). Any other value matches
+/// nothing, so a typo'd scope cannot widen a rule to every resource. Subresources do not
+/// affect scope: `pods/status` is namespaced because the request carries a namespace.
+fn scope_matches(
+    scope: Option<&str>,
+    group: &str,
+    version: &str,
+    resource: &str,
+    namespace: Option<&str>,
+) -> bool {
+    let is_namespace_object =
+        group.is_empty() && version == "v1" && split_subresource(resource).0 == "namespaces";
+    match scope {
+        None | Some("*") => true,
+        Some("Namespaced") => !is_namespace_object && namespace.is_some(),
+        Some("Cluster") => is_namespace_object || namespace.is_none(),
+        Some(_) => false,
+    }
+}
+
 /// Returns true if the webhook rule matches the given resource/operation/group/version.
 ///
 /// Wildcard "*" matches anything. An empty rules list means no rules — does not match.
@@ -964,15 +986,7 @@ pub fn matches_rule(
         s == "*" || s == operation
     });
 
-    // scope field: "Namespaced" → only match namespaced resources (namespace is Some);
-    // "Cluster" → only match cluster-scoped resources (namespace is None);
-    // "*" or absent → match both. The `namespace` param is None for cluster-scoped requests.
-    let scope = rule["scope"].as_str().unwrap_or("*");
-    let scope_match = match scope {
-        "Namespaced" => namespace.is_some(),
-        "Cluster" => namespace.is_none(),
-        _ => true,
-    };
+    let scope_match = scope_matches(rule["scope"].as_str(), group, version, resource, namespace);
 
     group_match && version_match && resource_match && operation_match && scope_match
 }
@@ -1003,11 +1017,7 @@ fn matches_rule_typed(
         .iter()
         .any(|r| resource_rule_matches(r, resource));
     let operation_match = rule.operations.iter().any(|o| o == "*" || o == operation);
-    let scope_match = match rule.scope.as_deref().unwrap_or("*") {
-        "Namespaced" => namespace.is_some(),
-        "Cluster" => namespace.is_none(),
-        _ => true,
-    };
+    let scope_match = scope_matches(rule.scope.as_deref(), group, version, resource, namespace);
 
     group_match && version_match && resource_match && operation_match && scope_match
 }
@@ -2183,6 +2193,46 @@ pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> 
             check_cel_syntax(expr, CEL_WEBHOOK_ROOTS)
                 .map_err(|e| format!("webhooks[{wi}].matchConditions[{ci}].expression: {e}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Upstream `validateRule`'s scope check, applied to every rule list of an
+/// admissionregistration object: webhook `rules`, policy `matchConstraints` and binding
+/// `matchResources` (`resourceRules` and `excludeResourceRules`). The matchers fail closed
+/// on an unknown scope, so storing one would silently turn the rule into a no-op.
+pub(crate) fn validate_rule_scopes(plural: &str, obj: &serde_json::Value) -> Result<(), String> {
+    fn check(rules: &serde_json::Value, path: &str) -> Result<(), String> {
+        for (i, rule) in rules.as_array().into_iter().flatten().enumerate() {
+            if let Some(scope) = rule["scope"].as_str() {
+                if !matches!(scope, "*" | "Cluster" | "Namespaced") {
+                    return Err(format!(
+                        "{path}[{i}].scope: Unsupported value: \"{scope}\": supported values: \"*\", \"Cluster\", \"Namespaced\""
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    match plural {
+        "validatingwebhookconfigurations" | "mutatingwebhookconfigurations" => {
+            for (i, wh) in obj["webhooks"].as_array().into_iter().flatten().enumerate() {
+                check(&wh["rules"], &format!("webhooks[{i}].rules"))?;
+            }
+        }
+        "validatingadmissionpolicies" | "mutatingadmissionpolicies" => {
+            let mc = &obj["spec"]["matchConstraints"];
+            for f in ["resourceRules", "excludeResourceRules"] {
+                check(&mc[f], &format!("spec.matchConstraints.{f}"))?;
+            }
+        }
+        "validatingadmissionpolicybindings" | "mutatingadmissionpolicybindings" => {
+            let mr = &obj["spec"]["matchResources"];
+            for f in ["resourceRules", "excludeResourceRules"] {
+                check(&mr[f], &format!("spec.matchResources.{f}"))?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -4231,6 +4281,151 @@ mod tests {
             matches_rule(&rule, "", "v1", "nodes", None, "CREATE"),
             "scope=Cluster must match a cluster-scoped resource (namespace=None)"
         );
+    }
+
+    /// A typo'd scope (`"Bogus"`) used to match everything, so a policy meant to be narrow
+    /// silently applied cluster-wide. Both matchers must fail closed, as upstream does.
+    #[test]
+    fn unknown_scope_matches_nothing_in_both_matchers() {
+        let rule = json!({
+            "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+            "operations": ["*"], "scope": "Bogus"
+        });
+        let typed = RuleWithOperations {
+            api_groups: vec!["*".into()],
+            api_versions: vec!["*".into()],
+            resources: vec!["*".into()],
+            operations: vec!["*".into()],
+            scope: Some("Bogus".into()),
+        };
+        for ns in [None, Some("default")] {
+            assert!(
+                !matches_rule(&rule, "", "v1", "pods", ns, "CREATE"),
+                "unknown scope must not widen a rule to every resource (ns={ns:?})"
+            );
+            assert!(
+                !matches_rule_typed(&typed, "", "v1", "pods", ns, "CREATE"),
+                "typed matcher must also fail closed on unknown scope (ns={ns:?})"
+            );
+        }
+    }
+
+    /// Upstream treats Namespace objects as cluster-scoped even though the request carries
+    /// the namespace's own name, and scope ignores subresources (`pods/status` is namespaced).
+    #[test]
+    fn scope_namespace_objects_are_cluster_scoped_and_subresources_follow_parent() {
+        let mk = |scope: &str, res: &str| {
+            json!({
+                "apiGroups": ["*"], "apiVersions": ["*"], "resources": [res],
+                "operations": ["*"], "scope": scope
+            })
+        };
+        let typed = |scope: &str, res: &str| RuleWithOperations {
+            api_groups: vec!["*".into()],
+            api_versions: vec!["*".into()],
+            resources: vec![res.into()],
+            operations: vec!["*".into()],
+            scope: Some(scope.into()),
+        };
+        let ns = Some("foo");
+        let d = Some("default");
+        assert!(!matches_rule(
+            &mk("Namespaced", "namespaces"),
+            "",
+            "v1",
+            "namespaces",
+            ns,
+            "CREATE"
+        ));
+        assert!(matches_rule(
+            &mk("Cluster", "namespaces"),
+            "",
+            "v1",
+            "namespaces",
+            ns,
+            "CREATE"
+        ));
+        assert!(!matches_rule_typed(
+            &typed("Namespaced", "namespaces"),
+            "",
+            "v1",
+            "namespaces",
+            ns,
+            "CREATE"
+        ));
+        assert!(matches_rule_typed(
+            &typed("Cluster", "namespaces"),
+            "",
+            "v1",
+            "namespaces",
+            ns,
+            "CREATE"
+        ));
+        assert!(matches_rule(
+            &mk("Cluster", "namespaces/finalize"),
+            "",
+            "v1",
+            "namespaces/finalize",
+            ns,
+            "UPDATE"
+        ));
+        assert!(matches_rule(
+            &mk("Namespaced", "namespaces"),
+            "example.com",
+            "v1",
+            "namespaces",
+            ns,
+            "CREATE"
+        ));
+        assert!(matches_rule(
+            &mk("Namespaced", "pods/status"),
+            "",
+            "v1",
+            "pods/status",
+            d,
+            "UPDATE"
+        ));
+        assert!(!matches_rule(
+            &mk("Cluster", "pods/status"),
+            "",
+            "v1",
+            "pods/status",
+            d,
+            "UPDATE"
+        ));
+        assert!(matches_rule_typed(
+            &typed("Namespaced", "pods/status"),
+            "",
+            "v1",
+            "pods/status",
+            d,
+            "UPDATE"
+        ));
+        assert!(!matches_rule_typed(
+            &typed("Cluster", "pods/status"),
+            "",
+            "v1",
+            "pods/status",
+            d,
+            "UPDATE"
+        ));
+    }
+
+    /// A stored policy with a typo'd scope must not match any request.
+    #[test]
+    fn match_constraints_with_unknown_scope_matches_no_request() {
+        let policy = json!({"spec": {"matchConstraints": {"resourceRules": [{
+            "apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+            "operations": ["*"], "scope": "Namespace"
+        }]}}});
+        assert!(!matches_match_constraints(
+            &policy,
+            "",
+            "v1",
+            "pods",
+            Some("default"),
+            "CREATE"
+        ));
     }
 
     /// A rule with scope "*" (or absent) must match both namespaced and cluster-scoped resources.
