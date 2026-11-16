@@ -101,8 +101,7 @@ bd show <id>
 # Revert-runs (temporarily disabling a check to prove the new test fails) are
 # standard and operator-authorized. Run them bare (`cargo test -p <crate>
 # <filter>`) and name the check being disabled. They need the USER-level
-# `autoMode.allow` entry in ~/.claude/settings.json (project settings cannot
-# carry autoMode).
+# `autoMode.allow` entry in ~/.claude/settings.json.
 
 # 5. Sync with main, then run quality gates ONCE, before commit
 # (CWD is already the worktree root). Do this before every push, not just
