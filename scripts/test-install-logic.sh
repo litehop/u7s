@@ -2886,6 +2886,20 @@ assert "the control-plane install waits after labelling the node, as its last st
 assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
   "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
 
+# u7s-default AppArmor profile: without the stacked-peer rules MariaDB and
+# other self-signalling workloads hang on AppArmor 5 kernels.
+AA_BODY="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$INSTALL")"
+for rule in \
+  'signal (send,receive) peer=u7s-default//&*,' \
+  'ptrace (trace,read) peer=u7s-default//&*,'; do
+  assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
+    "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
+done
+assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
+  "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
+assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
+  "$(grep -qF 'command -v apparmor_parser' "$INSTALL" && grep -qF '/sys/module/apparmor/parameters/enabled' "$INSTALL" && echo 1 || echo 0)"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
