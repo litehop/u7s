@@ -76,6 +76,7 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${U7S_E2E_RUN_ID:-$(date -u +%m%d%H%M%S)-$$}"
 OUT="${U7S_E2E_RESULTS_DIR:-$ROOT/temp/e2e-install/$TS}"
 SLEEP="${U7S_E2E_POLL_SLEEP:-10}"
+RESTORE_TIMEOUT="${U7S_E2E_RESTORE_TIMEOUT:-60}"
 CP="u7s-e2e-$RUN_ID-cp"
 W1="u7s-e2e-$RUN_ID-w1"
 CLIENT="u7s-e2e-$RUN_ID-client"
@@ -135,6 +136,28 @@ step() {
   fi
 }
 
+# bounded SECONDS cmd...: runs cmd (a function is fine), killing it and its children after SECONDS;
+# returns its status, 124 on timeout. (No coreutils timeout on macOS, and it cannot run functions.)
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+  kill "$1" 2>/dev/null || true
+}
+
+bounded() {
+  local secs="$1" p w rc=0
+  shift
+  "$@" &
+  p=$!
+  { sleep "$secs"; kill_tree "$p"; } >/dev/null 2>&1 &
+  w=$!
+  wait "$p" || rc=$?
+  kill_tree "$w"
+  wait "$w" 2>/dev/null || true
+  [ "$rc" -lt 128 ] || rc=124
+  return "$rc"
+}
+
 finish() {
   local rc=$? v pre
   trap - EXIT
@@ -152,8 +175,17 @@ finish() {
   fi
   echo "$RESULT" >"$OUT/result.txt"
   echo "RESULT: $RESULT"
+  # Best effort and bounded: a hung ssh or rollout must not keep the VPSes alive below.
   if [ "$POD_CIDR_DROPPED" = 1 ]; then
-    pod_cidr_v6 add || echo "NOT RESTORED: servicelb-controller on $CP may still have only the v4 --pod-cidr" >&2
+    case "$RESULT" in
+      PREEMPTED|INVALID) echo "NOT RESTORED: $RESULT, so $CP is gone or unusable" >&2 ;;
+      *)
+        if ! bounded 30 on_cp true >/dev/null 2>&1; then
+          echo "NOT RESTORED: $CP is unreachable" >&2
+        else
+          bounded "$RESTORE_TIMEOUT" pod_cidr_v6 add || echo "NOT RESTORED: servicelb-controller on $CP may still have only the v4 --pod-cidr" >&2
+        fi ;;
+    esac
   fi
   for v in ${CREATED[@]+"${CREATED[@]}"}; do
     if [ "$KEEP" = 1 ]; then
@@ -457,27 +489,39 @@ fetch_evidence() {
     && vps scp "$1:/tmp/beep-ev.tgz" "$dest.tgz" && tar -xzf "$dest.tgz" -C "$dest" && rm -f "$dest.tgz"
 }
 
+# evidence_fail ITEM REASON: fails the run, except under RECORD_ONLY=1, where the reason is appended
+# to $OUT/ITEM/collect_failed.txt as "collect_failed: REASON" and the run goes on.
+evidence_fail() {
+  if [ "$RECORD_ONLY" = 1 ]; then
+    mkdir -p "$OUT/$1"
+    echo "collect_failed: $2" | tee -a "$OUT/$1/collect_failed.txt"
+  else
+    fail "$1: $2"
+  fi
+}
+
 # collect_around ITEM INGRESS_VM FRONT_IP FRONT_PORT "CARRIER_VMS" PCAP cmd...: beep's (B) evidence
 # around one request. cmd must print "<client ip> <client port>" last. Every node is snapshotted
 # before and after (with a Geneve pcap when PCAP=1) into $OUT/ITEM/<cp|w1>/; the collector's
 # geneve0-growth gate counts only on CARRIER_VMS, since a node the flow does not cross sees no
-# Geneve. Fails unless INGRESS_VM's FLOW_TABLE holds the request's 5-tuple.
+# Geneve. Fails unless INGRESS_VM's FLOW_TABLE holds the request's 5-tuple. With RECORD_ONLY=1
+# nothing fails: collector, request and fetch errors go to $OUT/ITEM/collect_failed.txt instead.
 collect_around() {
   local item="$1" ingress="$2" front="$3" fport="$4" carriers="$5" pcap="$6" n out tuple bad=
   shift 6
   for n in "$CP" "$W1"; do
-    ev "$n" before "$item" || fail "$item: collector 'before' on $n"
-    [ "$pcap" = 0 ] || ev "$n" pcap-start "$item" || fail "$item: collector 'pcap-start' on $n"
+    ev "$n" before "$item" || evidence_fail "$item" "collector 'before' on $n"
+    [ "$pcap" = 0 ] || ev "$n" pcap-start "$item" || evidence_fail "$item" "collector 'pcap-start' on $n"
   done
-  out="$("$@")" || fail "$item: request failed"
+  out="$("$@")" || { evidence_fail "$item" "request failed"; out="- 0"; }
   echo "$out"
   tuple="$(tail -n 1 <<<"$out")"
   for n in "$CP" "$W1"; do
-    [ "$pcap" = 0 ] || ev "$n" pcap-stop "$item" || fail "$item: collector 'pcap-stop' on $n"
+    [ "$pcap" = 0 ] || ev "$n" pcap-stop "$item" || evidence_fail "$item" "collector 'pcap-stop' on $n"
     if ! ev "$n" after "$item"; then
       case " $carriers " in *" $n "*) bad="$bad $n" ;; *) echo "$item: no geneve0 growth on $n, which the flow does not cross" ;; esac
     fi
-    fetch_evidence "$n" "$item" || fail "$item: fetching the evidence from $n"
+    fetch_evidence "$n" "$item" || evidence_fail "$item" "fetching the evidence from $n"
   done
   [ -z "$bad" ] || fail "$item: geneve0 rx/tx did not grow on$bad, which the flow crosses (evidence: $OUT/$item)"
   if [ "$RECORD_ONLY" = 1 ]; then
@@ -593,9 +637,11 @@ $policy  selector: {app: bulk}
 YAML
 }
 
-# Interface MTUs on both nodes. The NIC must carry the VPC MTU; geneve0 sits below it by the
-# encapsulation overhead: outer IPv4 20 + UDP 8 + Geneve 8 + inner Ethernet 14 = 50 B, or 70 B with an
-# outer IPv6 header (40).
+# Interface MTUs on both nodes. The NIC must carry the VPC MTU. geneve0 is recorded only: beep sets
+# no MTU on it (a collect_md device keeps the kernel default, ~64 KiB), so the real limit is the
+# tunnel PMTU: inner L3 <= underlay MTU - overhead, overhead = inner Ethernet 14 + outer IP (20 v4,
+# 40 v6) + UDP 8 + Geneve 8 + beep pod-id option 24 = 74 B over a v4 underlay, 94 B over v6 (inner
+# budget 1386 / 1366 at 1460). The 100 MiB transfers below prove full-size segments get through.
 mtu_table() {
   local n out nic nic_mtu gen_mtu
   for n in "$CP" "$W1"; do
@@ -607,18 +653,16 @@ mtu_table() {
     nic_mtu="$(awk -v n="$nic:" '$1 == n && $2 == "mtu" {print $3}' <<<"$out")"
     gen_mtu="$(awk '$1 == "geneve0:" && $2 == "mtu" {print $3}' <<<"$out")"
     [ "$nic_mtu" = "$VPC_MTU" ] || fail "$(role_of "$n") $nic MTU is '$nic_mtu', not the $VPC_MTU VPC MTU"
-    case "$gen_mtu" in
-      "$((VPC_MTU - 50))") echo "PASS: $(role_of "$n") $nic $nic_mtu, geneve0 $gen_mtu = $VPC_MTU - 50 (IPv4 underlay)" ;;
-      "$((VPC_MTU - 70))") echo "PASS: $(role_of "$n") $nic $nic_mtu, geneve0 $gen_mtu = $VPC_MTU - 70 (IPv6 underlay)" ;;
-      *) fail "$(role_of "$n") geneve0 MTU is '$gen_mtu', neither $((VPC_MTU - 50)) (IPv4 underlay) nor $((VPC_MTU - 70)) (IPv6 underlay)" ;;
-    esac
+    echo "PASS: $(role_of "$n") $nic MTU $nic_mtu"
+    echo "RECORD: $(role_of "$n") geneve0 MTU ${gen_mtu:-absent} (informational, not asserted; tunnel inner L3 budget $((VPC_MTU - 74)) over a v4 underlay, $((VPC_MTU - 94)) over v6)"
   done
 }
 
 # mtu_ping_table: cp pings w1 with the DF bit at stepped payload sizes, per family, and records
 # $OUT/e-mtu-v<N>/ping-table.txt. The underlay must carry exactly VPC_MTU minus the IP and ICMP
-# headers (v4: 20 + 8, v6: 40 + 8): one byte more must not pass, else the VPC MTU is not what the
-# path enforces. Geneve then leaves the tunnel 50 B (v4) / 70 B (v6) less, the geneve0 MTU above.
+# headers (v4: 20 + 8, v6: 40 + 8); the largest passing payload at or below that is asserted. Sizes
+# above it are recorded only: they fail with EMSGSIZE at the sender's own NIC, which says nothing
+# about the path.
 mtu_ping_table() {
   local fam dst hdr max sizes s out best dir
   for fam in 4 6; do
@@ -631,12 +675,12 @@ mtu_ping_table() {
     dir="$OUT/e-mtu-v$fam"
     mkdir -p "$dir"
     {
-      echo "ping -$fam -M do cp -> w1 $dst; expected max payload $max = $VPC_MTU - $hdr; tunnelled payload $((max - (fam == 4 ? 50 : 70)))"
+      echo "ping -$fam -M do cp -> w1 $dst; expected max payload $max = $VPC_MTU - $hdr; tunnel inner L3 budget $((VPC_MTU - (fam == 4 ? 74 : 94))) (overhead $((fam == 4 ? 74 : 94)) B); sizes above $max are recorded only"
       echo "$out"
     } | tee "$dir/ping-table.txt"
-    best="$(awk -F'[= ]' '$3 == "ok" && $2 + 0 > m {m = $2 + 0} END {print m + 0}' <<<"$out")"
+    best="$(awk -F'[= ]' -v max="$max" '$3 == "ok" && $2 + 0 <= max && $2 + 0 > m {m = $2 + 0} END {print m + 0}' <<<"$out")"
     [ "$best" = "$max" ] || fail "largest DF ping payload over IPv$fam is $best, expected $max ($VPC_MTU - $hdr)"
-    echo "PASS: IPv$fam DF ping passes up to $best B and fails at $((max + 1)) B (VPC MTU $VPC_MTU)"
+    echo "PASS: IPv$fam DF ping passes up to $best B (VPC MTU $VPC_MTU); larger sizes recorded only"
   done
 }
 
@@ -654,6 +698,7 @@ bulk_fetch() {
   [ "$sum" = "$BULK_SHA" ] || fail "bulk download through $2 has sha256 '$sum', the pod serves $BULK_SHA"
   [[ "$port" =~ ^[0-9]+$ ]] || fail "no source port from the bulk download on $1"
   echo "PASS: 100 MiB through $2 matches sha256 $sum; last retransmit sample: $(grep -oE '(^| )retrans:[0-9/]+' <<<"$out" | tail -n 1 | tr -d ' ')"
+  echo "RECORD: client TCP to $2, not asserted (a clamped v4 path shows ~$((VPC_MTU - 74 - 40))): $(grep -oE '(^| )(mss|advmss|pmtu):[0-9]+' <<<"$out" | tr -d ' ' | sort -u | paste -sd' ' -)"
   echo "$3 $port"
 }
 

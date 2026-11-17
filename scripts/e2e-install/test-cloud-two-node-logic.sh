@@ -74,6 +74,7 @@ case "$*" in
     in="$(cat)"
     [ -z "$in" ] || printf '%s\n' "$in" >>"$STUB_LOG.stdin"
     case "$in" in *"externalTrafficPolicy: Local"*) touch "$STUB_LOG.local" ;; esac
+    [ -z "${STUB_HANG_MATCH:-}" ] || case "$*" in *"$STUB_HANG_MATCH"*) sleep 30 ;; esac
     [ -z "${STUB_TERM_MATCH:-}" ] || case "$*" in *"$STUB_TERM_MATCH"*) kill -TERM "$(ps -axo pid=,command= | grep -F "bash $STUB_SCRIPT" | sort -n | awk 'NR==1{print $1}')" ;; esac
     [ -z "${STUB_FAIL_MATCH:-}" ] || case "$*" in
       *"$STUB_FAIL_MATCH"*)
@@ -105,8 +106,8 @@ case "$*" in
       *"get ds servicelb-controller -o json"*"+= ["*) rm -f "$STUB_LOG.v4only" ;;
       *"logs -l app.kubernetes.io/name=servicelb-controller"*) echo "${STUB_CTRL_LOG-[pod/servicelb-controller-x] controller: WARN 1 endpoint(s) rejected from POD_TARGETS: pod_ip [fd00:244:0:1::2] outside every --pod-cidr}" ;;
       *"exec bulk -- sha256sum"*) echo "${STUB_BULK_SHA-$FIXED_SHA}  /www/f" ;;
-      *"ip -d link show"*) echo "2: ens4: <BROADCAST,UP> mtu ${STUB_NIC_MTU-1460} qdisc mq"; echo "ens4: mtu ${STUB_NIC_MTU-1460}"; echo "geneve0: mtu ${STUB_GENEVE_MTU-1410}"; echo "nic=ens4" ;;
-      *"/tmp/bulk"*) echo "port=${STUB_CPORT-51234}"; echo "${STUB_GOT_SHA-$FIXED_SHA}  /tmp/bulk"; echo "cubic wscale:7,7 rto:204 retrans:0/3 bytes_retrans:4200" ;;
+      *"ip -d link show"*) echo "2: ens4: <BROADCAST,UP> mtu ${STUB_NIC_MTU-1460} qdisc mq"; echo "ens4: mtu ${STUB_NIC_MTU-1460}"; echo "geneve0: mtu ${STUB_GENEVE_MTU-65000}"; echo "nic=ens4" ;;
+      *"/tmp/bulk"*) echo "port=${STUB_CPORT-51234}"; echo "${STUB_GOT_SHA-$FIXED_SHA}  /tmp/bulk"; echo "cubic wscale:7,7 rto:204 mss:1346 pmtu:1460 retrans:0/3 bytes_retrans:4200" ;;
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
@@ -514,27 +515,27 @@ sha256_of() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a
 mtu_log() { cat "$TMP/res/e-mtu-table.log" 2>/dev/null; }
 ping_log() { cat "$TMP/res/e-mtu-ping.log" 2>/dev/null; }
 
-# Gap: MTU. The ping table pins the VPC MTU minus IP+ICMP headers; geneve0 sits 50/70 B below the NIC.
+# Gap: MTU. The ping table pins the VPC MTU minus IP+ICMP headers; geneve0 is recorded only (beep sets no MTU on it).
 run "${EV_ARGS[@]}"
 assert "the DF ping table steps around 1460-28=1432 (v4) and 1460-48=1412 (v6) and is archived under each e-mtu item dir (beep's MTU sign-off reads the table, not just a PASS)" \
   "$(rc_is 0)$(has 'for s in 1000 1200 1400 1431 1432 1433 1472; do if ping -4 -M do' "$LOG")$(has 'for s in 1000 1200 1400 1411 1412 1413 1472; do if ping -6 -M do' "$LOG")$(has 'size=1432 ok' "$(cat "$TMP/res/e-mtu-v4/ping-table.txt")")$(has 'size=1433 fail' "$(cat "$TMP/res/e-mtu-v4/ping-table.txt")")$(has 'size=1412 ok' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")$(has 'size=1413 fail' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")"
 assert "the ping table pings w1's address of each family from cp (node to node, across the Geneve-free underlay)" \
   "$(has ' -s $s 10.80.0.3' "$LOG")$(has ' -s $s 2600:1900::3' "$LOG")"
-assert "the NIC and geneve0 MTUs are asserted per node: 1460 and 1460-50 (the encapsulation overhead is what the pods lose)" \
-  "$(has 'PASS: cp ens4 1460, geneve0 1410 = 1460 - 50' "$(mtu_log)")$(has 'PASS: w1 ens4 1460, geneve0 1410 = 1460 - 50' "$(mtu_log)")"
+assert "the NIC MTU is asserted per node and geneve0 is recorded with the real tunnel budgets 1386 (v4 underlay, 74 B overhead) and 1366 (v6, 94 B), not asserted" \
+  "$(has 'PASS: cp ens4 MTU 1460' "$(mtu_log)")$(has 'PASS: w1 ens4 MTU 1460' "$(mtu_log)")$(has 'RECORD: cp geneve0 MTU 65000 (informational, not asserted; tunnel inner L3 budget 1386 over a v4 underlay, 1366 over v6)' "$(mtu_log)")"
+assert "the bulk download records the client's negotiated MSS from ss -ti" \
+  "$(has 'RECORD: client TCP to 10.80.0.2, not asserted (a clamped v4 path shows ~1346): mss:1346 pmtu:1460' "$(cat "$TMP/res/e-mtu-v4.log")")"
 STUB_PING_MAX4=1400 run "${EV_ARGS[@]}"
 assert "an IPv4 path that drops DF pings below 1432 fails (a smaller path MTU than the VPC's would hide behind a passing transfer)" \
   "$(rc_is 1)$(has 'largest DF ping payload over IPv4 is 1400, expected 1432' "$(ping_log)")"
 STUB_PING_MAX6=1450 run "${EV_ARGS[@]}"
-assert "an IPv6 path that still passes 1413 B fails (a larger MTU than the VPC's means the 1460 is not what is enforced)" \
-  "$(rc_is 1)$(has 'largest DF ping payload over IPv6 is 1413, expected 1412' "$(ping_log)")"
+assert "pings above the expected max are recorded only (they fail with EMSGSIZE at the sender's own NIC, so passing or failing says nothing about the path)" \
+  "$(rc_is 0)$(has 'size=1413 ok' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")$(has 'sizes above 1412 are recorded only' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")"
 STUB_NIC_MTU=1500 run "${EV_ARGS[@]}"
 assert "a NIC that is not at the 1460 VPC MTU fails" "$(rc_is 1)$(has "ens4 MTU is '1500', not the 1460 VPC MTU" "$(mtu_log)")"
 STUB_GENEVE_MTU=1460 run "${EV_ARGS[@]}"
-assert "a geneve0 MTU with no encapsulation headroom fails (every full-size packet would fragment or drop)" \
-  "$(rc_is 1)$(has "geneve0 MTU is '1460'" "$(mtu_log)")"
-STUB_GENEVE_MTU=1390 run "${EV_ARGS[@]}"
-assert "geneve0 at 1460-70 is accepted as an IPv6 underlay" "$(rc_is 0)$(has '1390 = 1460 - 70 (IPv6 underlay)' "$(mtu_log)")"
+assert "any geneve0 MTU passes (beep sets none; the tunnel PMTU is not geneve0's MTU) and is recorded" \
+  "$(rc_is 0)$(has 'RECORD: cp geneve0 MTU 1460 (informational' "$(mtu_log)")"
 
 # Gap: the bulk file is the same bytes every run.
 run "${EV_ARGS[@]}"
@@ -570,6 +571,12 @@ assert "a cp that does not answer under Local is recorded and does not fail the 
 STUB_CP_SEEN=10.80.0.9 run "${EV_ARGS[@]}"
 assert "a cp answer that lost the client IP is recorded as such, not failed" \
   "$(rc_is 0)$(has "NOT the probe's address" "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")"
+STUB_FAIL_MATCH=b-cp-unpublished-local-v4 run "${EV_ARGS[@]}"
+assert "a failing collector or evidence fetch on the cp-under-Local item is recorded as collect_failed and the run still passes (beep's open question must not cost the paid run)" \
+  "$(rc_is 0)$(has 'RESULT: PASS' "$OUT")$(has "collect_failed: collector 'before' on u7s-e2e-t-cp" "$(cat "$TMP/res/b-cp-unpublished-local-v4/collect_failed.txt")")$(has 'collect_failed: fetching the evidence' "$(cat "$TMP/res/b-cp-unpublished-local-v4/collect_failed.txt")")"
+STUB_FAIL_MATCH=b-external-local-v4 run "${EV_ARGS[@]}"
+assert "the same collector failure on a normal item still fails the run (only the cp-under-Local item is soft)" \
+  "$(rc_is 1)$(has "collector 'before' on u7s-e2e-t-cp" "$OUT")"
 run --release v0.4.0-snapshot.1 --dual-stack --w1-subnet u7s-test-b --external-traffic-policy Cluster --beep-evidence "$TMP/collector.sh" --skip-sonobuoy
 assert "the cp check only runs under Local" "$(rc_is 0)$([ ! -e "$TMP/res/b-cp-unpublished-local-v4.log" ] && echo 1 || echo 0)"
 
@@ -609,6 +616,15 @@ assert "SIGTERM while the DaemonSet is v4-only restores the v6 --pod-cidr and ke
 STUB_FAIL_MATCH="select(" run "${EV_ARGS[@]}"
 assert "a failed drop still triggers the restore (idempotent: the flag may already be absent)" \
   "$(rc_is 1)$(has '+= [' "$LOG")"
+STUB_CTRL_LOG="all quiet" STUB_HANG_MATCH='+= [' U7S_E2E_RESTORE_TIMEOUT=1 run "${EV_ARGS[@]}"
+assert "a restore that hangs is cut off and the VPSes are still deleted (a stuck ssh would otherwise leave billable VMs running)" \
+  "$(rc_is 1)$(has 'NOT RESTORED: servicelb-controller' "$OUT")$(has 'instances delete u7s-e2e-t-cp ' "$LOG")$(has 'instances delete u7s-e2e-t-w1 ' "$LOG")"
+STUB_CTRL_LOG="all quiet" STUB_FAIL_MATCH='+= [' run "${EV_ARGS[@]}"
+assert "a restore that fails still lets the VPSes be deleted" \
+  "$(rc_is 1)$(has 'NOT RESTORED: servicelb-controller' "$OUT")$(has 'instances delete u7s-e2e-t-cp ' "$LOG")$(has 'instances delete u7s-e2e-t-w1 ' "$LOG")"
+STUB_CTRL_LOG="all quiet" STUB_OPS="x preempted" run "${EV_ARGS[@]}"
+assert "a preempted run skips the restore (cp is gone) and still deletes the VPSes" \
+  "$(rc_is 3)$(has 'RESULT: PREEMPTED' "$OUT")$(has 'NOT RESTORED: PREEMPTED' "$OUT")$(hasnt '+= [' "$LOG")$(has 'instances delete u7s-e2e-t-cp ' "$LOG")"
 unset STUB_BEEP STUB_INGRESS STUB_INGRESS_LOCAL STUB_EVIDENCE
 
 # --- redaction and interrupts
