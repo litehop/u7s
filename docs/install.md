@@ -305,9 +305,9 @@ On a 1 vCPU / 1 GiB Ubuntu host the stack boots to Ready in about a minute
 and leaves roughly 450 MiB of `MemAvailable` idle, and about 320 MiB with a
 small app (WordPress + MariaDB) running. Large pod bursts on top of that
 push the host into page-cache thrash. u7s needs SSD-class storage:
-HDD-class or very low-IOPS disks can wedge a 1 GiB node under pod bursts.
-`install.sh` deliberately does not
-touch the host OS, so these node-level mitigations are yours to apply:
+HDD-class disks (observed on GCP pd-standard) can wedge a 1 GiB node under
+pod bursts. `install.sh` deliberately does not touch the host OS, so these
+node-level mitigations are yours to apply:
 
 - Recommended for bursty or dense workloads: provide swap yourself (zram or
   a swapfile). u7s's installer never creates, enables or tunes swap, and leaves any
