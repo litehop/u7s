@@ -2895,6 +2895,12 @@ for rule in \
   assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
     "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
 done
+assert "the Lima rig ships the same u7s-default profile as install.sh -- without it kernel 7.0 DENIES self-signalling (BIND nslookup/dig die rc 139) and the DNS/ExternalName conformance specs fail on the rig" \
+  "$([ -n "$AA_BODY" ] && [ "$AA_BODY" = "$(cat "$DIR/conformance/u7s-default.apparmor")" ] && echo 1 || echo 0)"
+assert "lima-start.sh installs that profile and points CRI-O at it -- the rig's golden clones skip the provision script" \
+  "$(grep -qF 'u7s-default.apparmor' "$DIR/conformance/lima-start.sh" && grep -qF 'apparmor_profile = \"u7s-default\"' "$DIR/conformance/lima-start.sh" && echo 1 || echo 0)"
+assert "lima-start.sh disables the Ubuntu host dig/nslookup AppArmor profiles -- they attach to the binaries inside containers and DENY self-signalling even under u7s-default, so the DNS conformance specs still die rc 139" \
+  "$(grep -qF 'for p in dig nslookup' "$DIR/conformance/lima-start.sh" && grep -qF 'apparmor.d/disable/$p' "$DIR/conformance/lima-start.sh" && echo 1 || echo 0)"
 assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
   "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
 assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
