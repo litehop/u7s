@@ -365,17 +365,17 @@ if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enab
   # their signal rules lack the stacked-peer form, so BIND's self-signal is
   # DENIED under AppArmor 5 stacking even with u7s-default (arm64 rig; real
   # x86_64 installs were verified unaffected). Add only that rule via the
-  # profiles' local overrides (as canonical/k8s-snap#2750 does); everything
+  # profiles' local overrides; everything
   # else stays enforced. Also undoes an earlier disable of these profiles.
   limactl shell "$VM_NAME" sudo bash -c 'set -euo pipefail
 for p in dig nslookup; do
   [ -f /etc/apparmor.d/$p ] || continue
   rm -f /etc/apparmor.d/disable/$p
-  want="signal (send,receive) peer=@{profile_name}//&*,"
+  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
   if [ "$(cat /etc/apparmor.d/local/$p 2>/dev/null || true)" != "$want" ] \
     || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
     printf "%s\n" "$want" > /etc/apparmor.d/local/$p
-    apparmor_parser -r /etc/apparmor.d/$p
+    apparmor_parser -r /etc/apparmor.d/$p || { rm -f /etc/apparmor.d/local/$p; exit 1; }
   fi
 done'
 fi

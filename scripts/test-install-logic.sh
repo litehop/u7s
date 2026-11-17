@@ -2909,13 +2909,13 @@ assert "lima-start.sh reloads when the installed profile differs from install.sh
   "$(printf '%s\n' "$LS_CODE" | grep -qF '"$AA_INSTALLED" != "$AA_PROFILE"' && echo 1 || echo 0)"
 L_HOSTLOOP="$(ls_line 'for p in dig nslookup')"
 L_UNDO="$(ls_line 'rm -f /etc/apparmor.d/disable/$p')"
-L_WANT="$(ls_line 'want="signal (send,receive) peer=@{profile_name}//&*,"')"
+L_WANT="$(ls_line 'want="signal (send,receive) peer=@{profile_name}//&u7s-default,"')"
 L_WRITE="$(ls_line '> /etc/apparmor.d/local/$p')"
 L_HOSTRELOAD="$(ls_line 'apparmor_parser -r /etc/apparmor.d/$p')"
 assert "lima-start.sh adds the stacked-peer signal rule to the host dig/nslookup profiles' local overrides -- without it BIND's self-signal is DENIED and the DNS conformance specs die rc 139 on the arm64 rig" \
   "$([ -n "$L_HOSTLOOP" ] && [ -n "$L_WANT" ] && [ -n "$L_WRITE" ] && echo 1 || echo 0)"
-assert "the host-profile rule is the narrow stacked-peer form only -- a wider peer would weaken the Ubuntu profiles that must keep enforcing everything else" \
-  "$(printf '%s\n' "$LS_CODE" | grep -F 'want=' | grep -qxF '  want="signal (send,receive) peer=@{profile_name}//&*,"' && [ "$(printf '%s\n' "$LS_CODE" | grep -c 'want=')" -eq 1 ] && echo 1 || echo 0)"
+assert "the host-profile rule is the narrow form (only the u7s-default stacked peer) -- a wider peer would weaken the Ubuntu profiles that must keep enforcing everything else" \
+  "$(printf '%s\n' "$LS_CODE" | grep -F 'want=' | grep -qxF '  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"' && [ "$(printf '%s\n' "$LS_CODE" | grep -c 'want=')" -eq 1 ] && echo 1 || echo 0)"
 L_AAADD="$(ls_line 'peer={dig,nslookup}//&u7s-default,')"
 assert "lima-start.sh also lets u7s-default signal stacked dig/nslookup peers, before installing the profile -- the stacked label 'dig//&u7s-default' does not match peer=u7s-default//&*, so u7s-default itself still DENIES BIND's self-signal (rc 139) even once the host profiles allow it" \
   "$([ -n "$L_AAADD" ] && [ -n "$L_LOAD" ] && [ "$L_AAADD" -lt "$L_LOAD" ] && printf '%s\n' "$LS_CODE" | grep -qF 'stacked-peer signal rule not found in install.sh' && echo 1 || echo 0)"
@@ -2927,6 +2927,19 @@ assert "lima-start.sh writes the local override before reloading the profile -- 
   "$([ -n "$L_WRITE" ] && [ -n "$L_HOSTRELOAD" ] && [ "$L_WRITE" -lt "$L_HOSTRELOAD" ] && echo 1 || echo 0)"
 assert "the host-profile block fails loud (set -euo pipefail) -- a silent failed write/reload leaves the rig broken with no signal" \
   "$(printf '%s\n' "$LS_CODE" | grep -A1 'bash -c .set -euo pipefail' | grep -qF 'for p in dig nslookup' && ! printf '%s\n' "$LS_CODE" | grep -F 'apparmor_parser -r /etc/apparmor.d/$p' | grep -qF '|| true' && echo 1 || echo 0)"
+HB_DIR="$(mktemp -d)"
+mkdir -p "$HB_DIR/aa/local" "$HB_DIR/bin"
+: > "$HB_DIR/aa/dig"; : > "$HB_DIR/aa/nslookup"; : > "$HB_DIR/profiles"
+{ echo 'set -euo pipefail'; awk '/^for p in dig nslookup/ {p=1} p {print} /^done/ {p=0}' <<<"$LS_CODE" | sed "s|/etc/apparmor.d|$HB_DIR/aa|g; s|/sys/kernel/security/apparmor/profiles|$HB_DIR/profiles|g; s|^done'|done|"; } > "$HB_DIR/block.sh"
+printf '#!/bin/sh\nexit 1\n' > "$HB_DIR/bin/apparmor_parser"; chmod +x "$HB_DIR/bin/apparmor_parser"
+PATH="$HB_DIR/bin:$PATH" bash "$HB_DIR/block.sh" >/dev/null 2>&1 && hb_rc=0 || hb_rc=$?
+assert "a failed host-profile reload exits non-zero and leaves no local override behind -- otherwise the next run sees the file correct, skips the reload and the rig silently keeps the old rules" \
+  "$([ "$hb_rc" -ne 0 ] && [ ! -e "$HB_DIR/aa/local/dig" ] && echo 1 || echo 0)"
+printf '#!/bin/sh\nexit 0\n' > "$HB_DIR/bin/apparmor_parser"
+PATH="$HB_DIR/bin:$PATH" bash "$HB_DIR/block.sh" >/dev/null 2>&1 && hb_rc=0 || hb_rc=$?
+assert "a successful host-profile reload keeps the narrow local override on disk -- the failure-path cleanup must not remove converged state" \
+  "$([ "$hb_rc" -eq 0 ] && grep -qxF 'signal (send,receive) peer=@{profile_name}//&u7s-default,' "$HB_DIR/aa/local/dig" && echo 1 || echo 0)"
+rm -rf "$HB_DIR"
 assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
   "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
 assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
