@@ -8,7 +8,8 @@ updated: 2026-11-17T15:10Z
 ## 🎯 Waiting on you
 1. (Optional) post the cri-o issue drafted in `temp/cri-o-issue-apparmor-stacked-peer.md`.
 
-## ⏭ Next session → v0.4.6 once all three are on main
+## ⏭ Next session → v0.4.6 once all three are on main and audit is green
+- **`mayor-bekfa` (P1) cargo audit red on main**: chrono + chrono-tz newly "unmaintained" (RUSTSEC-2026-0543/0555), via u7s-apiserver and cel 0.16
 - `mayor-1diau` pod MTU = NIC − 74/94 (beep Geneve); then notify beep mayor (earlier notice undelivered)
 - `mayor-u015m` download_mirror status-branch tests, overall time cap, temp-file trap
 - `mayor-na818` flannel from docker.io/flannel, digest-pinned
