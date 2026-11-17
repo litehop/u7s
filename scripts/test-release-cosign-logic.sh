@@ -65,6 +65,78 @@ COSIGN_LOG="$WORK/bad.log" COSIGN_RC=1 bash "$RUNNER" "$BIN" > "$WORK/bad.out" 2
 assert "a signature cosign rejects aborts the build before the unverified binary is packaged" \
   "$([ "$bad_status" -ne 0 ] && ! grep -q VERIFIED "$WORK/bad.out" && grep -q 'cosign signature verification failed for kubelet' "$WORK/bad.out" && echo 1 || echo 0)"
 
+# End to end through fetch_k8s_binary with real PATH lookup: cosign is optional,
+# but when present it must gate the build, and the output must say which
+# verification ran.
+STUBS="$WORK/stubs"
+NOCOSIGN="$WORK/nocosign"
+mkdir -p "$STUBS" "$NOCOSIGN"
+CONTENT_SHA="$(printf 'x\n' | { sha256sum 2>/dev/null || shasum -a 256; } | cut -d' ' -f1)"
+cat > "$STUBS/curl" <<STUB
+#!/usr/bin/env bash
+out=""
+while [ \$# -gt 0 ]; do [ "\$1" = -o ] && out="\$2"; shift; done
+if [ -n "\$out" ]; then echo x > "\$out"; else echo $CONTENT_SHA; fi
+STUB
+cat > "$STUBS/cosign" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$COSIGN_LOG"
+exit "$COSIGN_RC"
+STUB
+chmod +x "$STUBS/curl" "$STUBS/cosign"
+cp "$STUBS/curl" "$NOCOSIGN/curl"
+for tool in bash cut chmod basename dirname sha256sum shasum; do
+  p="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$p" ] && ln -sf "$p" "$NOCOSIGN/$tool"
+done
+
+FETCH_RUNNER="$WORK/fetch-runner.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'K8S_VERSION=1.37.1'
+  echo ". '$LIB'"
+  echo 'fetch_k8s_binary "$1" amd64 kubelet'
+  echo 'echo FETCHED'
+} > "$FETCH_RUNNER"
+
+run_fetch() { # <name> <PATH> <cosign-rc>
+  mkdir -p "$WORK/$1"
+  local st=0
+  COSIGN_LOG="$WORK/$1.log" COSIGN_RC="$3" PATH="$2" bash "$FETCH_RUNNER" "$WORK/$1" > "$WORK/$1.out" 2>&1 || st=$?
+  echo "$st" > "$WORK/$1.status"
+}
+
+run_fetch pass "$STUBS:$PATH" 0
+assert "with cosign on PATH and a good signature the binary is fetched and the output says cosign verified" \
+  "$([ "$(cat "$WORK/pass.status")" -eq 0 ] && grep -q FETCHED "$WORK/pass.out" && grep -q 'kubelet: sha256 + cosign signature verified' "$WORK/pass.out" && [ -s "$WORK/pass.log" ] && echo 1 || echo 0)"
+
+run_fetch fail "$STUBS:$PATH" 1
+assert "with cosign on PATH a bad signature aborts the build, so a tampered kubelet with a matching sha256 is never packaged" \
+  "$([ "$(cat "$WORK/fail.status")" -ne 0 ] && ! grep -q FETCHED "$WORK/fail.out" && grep -q 'cosign signature verification failed for kubelet' "$WORK/fail.out" && echo 1 || echo 0)"
+
+run_fetch absent "$NOCOSIGN" 1
+assert "without cosign the build still succeeds on sha256 and says cosign verification was skipped, so the operator knows the weaker check ran" \
+  "$([ "$(cat "$WORK/absent.status")" -eq 0 ] && grep -q FETCHED "$WORK/absent.out" && grep -q 'cosign verification SKIPPED (cosign is not installed)' "$WORK/absent.out" && [ ! -e "$WORK/absent/kubelet.sig" ] && echo 1 || echo 0)"
+
+sha_runner="$WORK/sha-runner.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo 'K8S_VERSION=1.37.1'
+  echo ". '$LIB'"
+  echo 'sha256_of() { echo deadbeef; }'
+  echo 'fetch_k8s_binary "$1" amd64 kubelet'
+} > "$sha_runner"
+mkdir -p "$WORK/shabad"
+sha_status=0
+PATH="$NOCOSIGN" bash "$sha_runner" "$WORK/shabad" > "$WORK/shabad.out" 2>&1 || sha_status=$?
+assert "without cosign a sha256 mismatch still aborts, so skipping signatures never weakens the checksum gate" \
+  "$([ "$sha_status" -ne 0 ] && grep -q 'checksum mismatch for kubelet' "$WORK/shabad.out" && echo 1 || echo 0)"
+
+assert "the build script announces which verification will run (cosign present or skipped)" \
+  "$(grep -qF "cosign verification skipped because cosign isn't installed" "$SCRIPT" && ! grep -q 'cosign not found on PATH' "$SCRIPT" && echo 1 || echo 0)"
+
 # The function is useless unless every fetched binary goes through it.
 loop_body="$(awk '/^for bin in kubelet kube-controller-manager kubectl; do/,/^done/' "$SCRIPT")"
 fetch_body="$(awk '/^fetch_k8s_binary\(\) \{/,/^\}/' "$LIB")"
