@@ -426,7 +426,7 @@ assert_true "--tarball short-circuits the download entirely, rather than fetchin
 # non-prerelease release exists) left the host half-configured. Fetching
 # first means a bad URL leaves it untouched.
 fetch_line="$(grep -n 'fetch_tarball "$TARBALL_URL"' "$INSTALL" | cut -d: -f1)"
-apt_line="$(grep -n '^apt-get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
+apt_line="$(grep -n '^apt_get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
 assert "the tarball is downloaded before apt installs anything, so an unreachable or wrong URL aborts with the host untouched instead of half-configured with CRI-O running" \
   "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
 
@@ -2085,7 +2085,7 @@ assert "the file wait sits between the apiserver restart and the KCM/kubelet res
 
 # A curl without --proto '=https...' follows an https->http redirect, handing a
 # network attacker the bytes that become root-run binaries or apt keys.
-curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install' || true)"
+curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install|apt_install' || true)"
 bad_curls="$(printf '%s\n' "$curl_lines" | grep -vE "curl --proto '=https(,file)?'( --proto-redir '=https')? --tlsv1\.2 " || true)"
 assert "every curl in install.sh is https-only with TLS >= 1.2, so a MITM cannot downgrade a fetch that feeds root-run code (offenders: ${bad_curls:-none})" \
   "$([ -n "$curl_lines" ] && [ -z "$bad_curls" ] && echo 1 || echo 0)"
@@ -2902,6 +2902,52 @@ assert "u7s-default loading is guarded on the apparmor kernel module and apparmo
 
 assert "install.sh removes a stale 10-apparmor.conf when AppArmor is unavailable -- otherwise CRI-O stays pointed at an unloaded profile and sandbox creation fails" \
   "$(awk '/^else$/ {e=1; next} /^fi$/ {e=0} e && /^  rm -f \/etc\/crio\/crio.conf.d\/10-apparmor.conf$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
+
+# apt resilience: apt-get calls outside the apt_get wrapper bypass the shared
+# timeout/retry/lock-wait options.
+bare_apt="$(grep -nE '^[^#]*\bapt-get ' "$INSTALL" | grep -vE 'echo |"\$\{APT_OPTS\[@\]\}"' || true)"
+assert "every apt-get in install.sh goes through the shared APT_OPTS wrapper -- a bare call hangs or fails on the dpkg lock held by unattended-upgrades on a fresh cloud VM" \
+  "$([ -z "$bare_apt" ] && echo 1 || { echo "$bare_apt" >&2; echo 0; })"
+assert "APT_OPTS carries the HTTP timeout, Acquire::Retries and dpkg lock wait -- without them install hangs on a silent mirror or aborts on the lock" \
+  "$(grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::http::Timeout=30' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::Retries=3' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'DPkg::Lock::Timeout=300' && echo 1 || echo 0)"
+assert "the pinned cri-o install passes --allow-downgrades -- otherwise re-running install.sh on a host with a newer cri-o aborts instead of converging to the pin" \
+  "$(grep -E '^apt_install .*cri-o=' "$INSTALL" | grep -qF -- '--allow-downgrades' && echo 1 || echo 0)"
+
+# apt_install behaviour against a stubbed apt-get on PATH (the stub counts
+# install attempts in $STUB_DIR/installs and fails the first $FAIL_FIRST).
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$STUB_DIR"' EXIT
+cat > "$STUB_DIR/apt-get" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" update "*) echo update >> "$STUB_DIR/updates"; exit 0 ;;
+esac
+echo install >> "$STUB_DIR/installs"
+n="$(wc -l < "$STUB_DIR/installs")"
+if [ "$n" -le "$FAIL_FIRST" ]; then
+  echo "E: Failed to fetch http://mirror.example/ubuntu/pool/crun.deb  404  Not Found [IP: 192.0.2.1 80]" >&2
+  exit 100
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/apt-get"
+APT_FUNCS="$(awk '/^APT_OPTS=/ {p=1} p {print} p && /^apt_install\(\) \{$/ {f=1} f && /^}$/ {exit}' "$INSTALL")"
+run_apt_install() { # $1 = FAIL_FIRST; prints combined output, returns apt_install's status
+  rm -f "$STUB_DIR/installs" "$STUB_DIR/updates"
+  PATH="$STUB_DIR:$PATH" STUB_DIR="$STUB_DIR" FAIL_FIRST="$1" bash -c "$APT_FUNCS"'
+    APT_INSTALL_RETRY_DELAY=0
+    apt_install crun' 2>&1
+}
+rc=0; out="$(run_apt_install 2)" || rc=$?
+assert "a 404 that clears on the third attempt still installs -- a lagging mirror must not abort a first install" \
+  "$([ "$rc" -eq 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
+assert "apt-get update re-runs before each retry -- retrying against stale indexes repeats the same 404" \
+  "$([ "$(wc -l < "$STUB_DIR/updates")" -eq 2 ] && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99)" || rc=$?
+assert "a persistent 404 fails non-zero after exactly 3 attempts -- the installer must not loop forever or report success" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
+assert "the final error names the failing URL and the attempt count -- the user needs both to tell a mirror problem from a typo" \
+  "$(printf '%s\n' "$out" | grep -q 'failed after 3 attempt.*http://mirror.example/ubuntu/pool/crun.deb' && echo 1 || echo 0)"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

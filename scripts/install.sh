@@ -356,12 +356,46 @@ wait_for_authentication_configmap() {
   fi
 }
 
+# Every apt-get goes through apt_get: bounded connect/read time, retry of
+# transient network errors, and a wait for the dpkg lock that fresh cloud VMs
+# hold at first boot (unattended-upgrades).
+APT_OPTS=(-o Acquire::http::Timeout=30 -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300)
+apt_get() {
+  apt-get "${APT_OPTS[@]}" "$@"
+}
+
+# Mirrors behind one name can disagree about a file for a while, and apt's
+# Acquire::Retries does not retry a 404. Re-run `apt-get update` and try
+# again, for 404s only; any other failure aborts at once.
+APT_INSTALL_ATTEMPTS=3
+APT_INSTALL_RETRY_DELAY=20
+apt_install() {
+  local attempt log rc
+  log="$(mktemp)"
+  for attempt in $(seq 1 "$APT_INSTALL_ATTEMPTS"); do
+    ( set -o pipefail; apt_get install -y "$@" 2>&1 | tee "$log" >&2 ) && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$log"
+      return 0
+    fi
+    grep -q '404' "$log" || break
+    if [ "$attempt" -lt "$APT_INSTALL_ATTEMPTS" ]; then
+      echo "apt-get install hit a 404 (attempt $attempt/$APT_INSTALL_ATTEMPTS); re-running apt-get update and retrying in ${APT_INSTALL_RETRY_DELAY}s" >&2
+      sleep "$APT_INSTALL_RETRY_DELAY"
+      apt_get update -qq || true
+    fi
+  done
+  echo "error: apt-get install $* failed after $attempt attempt(s); failing URL(s): $(grep -oE 'Failed to fetch [^ ]+' "$log" | sort -u | tr '\n' ' ')" >&2
+  rm -f "$log"
+  exit 1
+}
+
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
 # default path's apt footprint stays unchanged.
 ensure_jq() {
   if ! command -v jq >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y jq
+    apt_get update -qq
+    apt_install jq
   fi
 }
 
@@ -1975,8 +2009,8 @@ fi
 # real deployment) and its containerd-disabling step (a fresh Ubuntu box ships
 # no containerd package at all; the unit Lima VMs have is injected by Lima's
 # guest agent, so a real install has nothing to conflict with).
-apt-get update -qq
-apt-get install -y apt-transport-https ca-certificates curl gpg
+apt_get update -qq
+apt_install apt-transport-https ca-certificates curl gpg
 
 install -d -m 0755 /etc/apt/keyrings
 # Pinned fingerprint of the isv:cri-o OBS project key (fetched and read with
@@ -1986,11 +2020,12 @@ install_apt_key https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:
   85B67D5C50100B1AC8CEFE49CBA9C85640A2B579 /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
-apt-get update -qq
+apt_get update -qq
 # Pinned so user installs run the same runtime the Lima rig tests; bump with
-# lima/kubelet.yaml.
+# lima/kubelet.yaml. --allow-downgrades lets a re-run on a host carrying a
+# newer cri-o converge to the pin instead of aborting.
 CRIO_VERSION="1.37.3-1.1"
-apt-get install -y "cri-o=${CRIO_VERSION}" crun conmon
+apt_install --allow-downgrades "cri-o=${CRIO_VERSION}" crun conmon
 # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun: CRI-O ships its
 # own crun at /usr/libexec/crio/crun matching the OCI spec version it generates
 # (1.2.x), while the system crun accepts only 1.0/1.1 and fails every sandbox
