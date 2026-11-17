@@ -28,6 +28,23 @@ mkdir "$TMP/bin"
 TOKEN=abc123.0123456789abcdef
 HASH="sha256:$(printf 'ab%.0s' $(seq 1 32))"
 
+export FIXED_SHA="$(sed -n 's/^BULK_SHA_FIXED=//p' "$SCRIPT")"
+
+# Fake ping: DF pings pass up to the path's max payload (STUB_PING_MAX4 / STUB_PING_MAX6).
+mkdir "$TMP/pingbin"
+cat >"$TMP/pingbin/ping" <<'EOF'
+#!/usr/bin/env bash
+fam=4; size=
+while [ $# -gt 0 ]; do
+  case "$1" in -6) fam=6 ;; -s) size="$2"; shift ;; esac
+  shift
+done
+if [ "$fam" = 6 ]; then max="${STUB_PING_MAX6-1412}"; else max="${STUB_PING_MAX4-1432}"; fi
+[ "$size" -le "$max" ]
+EOF
+chmod +x "$TMP/pingbin/ping"
+export STUB_PINGBIN="$TMP/pingbin"
+
 cat >"$TMP/bin/gcloud" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"$STUB_LOG"
@@ -50,7 +67,9 @@ case "$*" in
   "compute instances describe "*) echo 1; exit 0 ;;
   "compute instances delete "*) [ -z "${STUB_DELETE_FAIL:-}" ] || exit 1; exit 0 ;;
   "compute operations list "*) [ -z "${STUB_OPS_FAIL:-}" ] || { echo "ERROR: denied" >&2; exit 1; }; echo "${STUB_OPS:-}"; exit 0 ;;
-  "compute scp "*":/tmp/beep-ev.tgz "*) tar -czf "${@: -1}" -C "$STUB_EVIDENCE" .; exit 0 ;;
+  "compute scp "*":/tmp/beep-ev.tgz "*)
+    src="$STUB_EVIDENCE"; case "$*" in *-w1:/tmp/beep-ev.tgz*) [ -z "${STUB_EVIDENCE_W1:-}" ] || src="$STUB_EVIDENCE_W1" ;; esac
+    tar -czf "${@: -1}" -C "$src" .; exit 0 ;;
   "compute ssh "*)
     in="$(cat)"
     [ -z "$in" ] || printf '%s\n' "$in" >>"$STUB_LOG.stdin"
@@ -66,6 +85,14 @@ case "$*" in
     # curl -w ,%{local_port} appends the client's source port.
     sfx=; case "$*" in *"-w ,"*) sfx=",${STUB_CPORT-51234}" ;; esac
     case "$*" in
+      *"ssh u7s-e2e-t-probe "*"cp-rc="*)
+        if [ "${STUB_CP_LOCAL-answer}" = answer ]; then
+          case "$*" in *"curl -6"*) cpseen="[2600:1900::4]:41234" ;; *) cpseen="${STUB_CP_SEEN-203.0.113.9}:41234" ;; esac
+          printf 'cp-rc=0\nclientip=%s,%s\nhostname=lb-backend\n' "$cpseen" "${STUB_CP_PORT-51234}"
+        else printf 'cp-rc=28\nclientip=,0\nhostname=\n'; fi ;;
+      # The DF ping loop really runs, against a fake ping that passes up to the stub's path limit.
+      *"for s in "*"ping -"*)
+        all="$*"; PATH="$STUB_PINGBIN:$PATH" bash -c "${all#* -- }" ;;
       *"ssh u7s-e2e-t-probe "*"curl-rc="*) [ "$admitted" = 1 ] && echo curl-rc=0 || echo "curl-rc=${STUB_PROBE_RC-28}" ;;
       # Beep with only the v4 --pod-cidr drops v6 to the pod.
       *"ssh u7s-e2e-t-client "*"curl-rc="*) { [ -e "$STUB_LOG.v4only" ] && [ -z "${STUB_V6_LEAK:-}" ]; } && echo curl-rc=28 || echo curl-rc=0 ;;
@@ -76,10 +103,10 @@ case "$*" in
       *"patch svc lb"*) case "$*" in *Local*) touch "$STUB_LOG.local" ;; *) rm -f "$STUB_LOG.local" ;; esac ;;
       *"get ds servicelb-controller -o json"*"select("*) touch "$STUB_LOG.v4only" ;;
       *"get ds servicelb-controller -o json"*"+= ["*) rm -f "$STUB_LOG.v4only" ;;
-      *"logs -l app.kubernetes.io/name=servicelb-controller"*) echo "${STUB_CTRL_LOG-servicelb-controller-x WARN endpoint fd00:244:0:1::2 rejected: outside every --pod-cidr}" ;;
-      *"exec bulk -- sha256sum"*) echo "${STUB_BULK_SHA-$(printf 'ab%.0s' $(seq 1 32))}  /www/f" ;;
-      *"ip -d link show"*) echo "2: ens4: <BROADCAST,UP> mtu 1460 qdisc mq"; echo "ens4: mtu 1460"; echo "geneve0: mtu 1410" ;;
-      *"/tmp/bulk"*) echo "port=${STUB_CPORT-51234}"; echo "${STUB_GOT_SHA-$(printf 'ab%.0s' $(seq 1 32))}  /tmp/bulk"; echo "cubic wscale:7,7 rto:204 retrans:0/3 bytes_retrans:4200" ;;
+      *"logs -l app.kubernetes.io/name=servicelb-controller"*) echo "${STUB_CTRL_LOG-[pod/servicelb-controller-x] controller: WARN 1 endpoint(s) rejected from POD_TARGETS: pod_ip [fd00:244:0:1::2] outside every --pod-cidr}" ;;
+      *"exec bulk -- sha256sum"*) echo "${STUB_BULK_SHA-$FIXED_SHA}  /www/f" ;;
+      *"ip -d link show"*) echo "2: ens4: <BROADCAST,UP> mtu ${STUB_NIC_MTU-1460} qdisc mq"; echo "ens4: mtu ${STUB_NIC_MTU-1460}"; echo "geneve0: mtu ${STUB_GENEVE_MTU-1410}"; echo "nic=ens4" ;;
+      *"/tmp/bulk"*) echo "port=${STUB_CPORT-51234}"; echo "${STUB_GOT_SHA-$FIXED_SHA}  /tmp/bulk"; echo "cubic wscale:7,7 rto:204 retrans:0/3 bytes_retrans:4200" ;;
       *--mint-join-token*)
         echo "Join token created in kube-system, expires 2026-10-20T00:00:00Z (single-use): $STUB_TOKEN"
         echo "  install.sh --join https://127.0.0.1:6443 \\"
@@ -468,7 +495,7 @@ assert "v6 reaching the pod with only the v4 --pod-cidr fails the negative contr
   "$(rc_is 1)$(has 'the admission gate is not what admits it' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
 STUB_CTRL_LOG="all quiet" run "${EV_ARGS[@]}"
 assert "a v6 refusal without the controller's rejection log fails (the drop could have another cause)" \
-  "$(rc_is 1)$(has 'no controller log rejecting' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+  "$(rc_is 1)$(has "no controller log 'rejected from POD_TARGETS'" "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
 STUB_EVIDENCE="$TMP/ev-empty" run "${EV_ARGS[@]}"
 assert "an empty ingress FLOW_TABLE fails: a 200 that beep did not track proves nothing about beep" \
   "$(rc_is 1)$(has 'cp FLOW_TABLE has no TCP flow 10.80.0.4:51234 -> 10.80.0.2:80' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")"
@@ -483,6 +510,105 @@ assert "no geneve0 growth under Local (the pod is on the ingress node) is expect
 STUB_GOT_SHA=0000 run "${EV_ARGS[@]}"
 assert "a bulk download whose sha256 differs from the served file fails (MTU trouble can corrupt or truncate silently)" \
   "$(rc_is 1)$(has "has sha256 '0000'" "$(cat "$TMP/res/e-mtu-v4.log")")"
+sha256_of() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | awk '{print $1}'; }
+mtu_log() { cat "$TMP/res/e-mtu-table.log" 2>/dev/null; }
+ping_log() { cat "$TMP/res/e-mtu-ping.log" 2>/dev/null; }
+
+# Gap: MTU. The ping table pins the VPC MTU minus IP+ICMP headers; geneve0 sits 50/70 B below the NIC.
+run "${EV_ARGS[@]}"
+assert "the DF ping table steps around 1460-28=1432 (v4) and 1460-48=1412 (v6) and is archived under each e-mtu item dir (beep's MTU sign-off reads the table, not just a PASS)" \
+  "$(rc_is 0)$(has 'for s in 1000 1200 1400 1431 1432 1433 1472; do if ping -4 -M do' "$LOG")$(has 'for s in 1000 1200 1400 1411 1412 1413 1472; do if ping -6 -M do' "$LOG")$(has 'size=1432 ok' "$(cat "$TMP/res/e-mtu-v4/ping-table.txt")")$(has 'size=1433 fail' "$(cat "$TMP/res/e-mtu-v4/ping-table.txt")")$(has 'size=1412 ok' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")$(has 'size=1413 fail' "$(cat "$TMP/res/e-mtu-v6/ping-table.txt")")"
+assert "the ping table pings w1's address of each family from cp (node to node, across the Geneve-free underlay)" \
+  "$(has ' -s $s 10.80.0.3' "$LOG")$(has ' -s $s 2600:1900::3' "$LOG")"
+assert "the NIC and geneve0 MTUs are asserted per node: 1460 and 1460-50 (the encapsulation overhead is what the pods lose)" \
+  "$(has 'PASS: cp ens4 1460, geneve0 1410 = 1460 - 50' "$(mtu_log)")$(has 'PASS: w1 ens4 1460, geneve0 1410 = 1460 - 50' "$(mtu_log)")"
+STUB_PING_MAX4=1400 run "${EV_ARGS[@]}"
+assert "an IPv4 path that drops DF pings below 1432 fails (a smaller path MTU than the VPC's would hide behind a passing transfer)" \
+  "$(rc_is 1)$(has 'largest DF ping payload over IPv4 is 1400, expected 1432' "$(ping_log)")"
+STUB_PING_MAX6=1450 run "${EV_ARGS[@]}"
+assert "an IPv6 path that still passes 1413 B fails (a larger MTU than the VPC's means the 1460 is not what is enforced)" \
+  "$(rc_is 1)$(has 'largest DF ping payload over IPv6 is 1413, expected 1412' "$(ping_log)")"
+STUB_NIC_MTU=1500 run "${EV_ARGS[@]}"
+assert "a NIC that is not at the 1460 VPC MTU fails" "$(rc_is 1)$(has "ens4 MTU is '1500', not the 1460 VPC MTU" "$(mtu_log)")"
+STUB_GENEVE_MTU=1460 run "${EV_ARGS[@]}"
+assert "a geneve0 MTU with no encapsulation headroom fails (every full-size packet would fragment or drop)" \
+  "$(rc_is 1)$(has "geneve0 MTU is '1460'" "$(mtu_log)")"
+STUB_GENEVE_MTU=1390 run "${EV_ARGS[@]}"
+assert "geneve0 at 1460-70 is accepted as an IPv6 underlay" "$(rc_is 0)$(has '1390 = 1460 - 70 (IPv6 underlay)' "$(mtu_log)")"
+
+# Gap: the bulk file is the same bytes every run.
+run "${EV_ARGS[@]}"
+bulk_prog="${STDIN#*awk \'}"; bulk_prog="${bulk_prog%%\' >/www/f*}"
+assert "the served file is generated, not read from /dev/urandom (a random file has a new sha256 every run, so runs cannot be compared)" \
+  "$(rc_is 0)$(hasnt 'urandom' "$STDIN")$(has '20260101' "$STDIN")"
+assert "the generator program yields exactly 100 MiB whose sha256 is the pinned one (checked here with this machine's awk, as the pod's busybox awk must agree)" \
+  "$([ "$(awk "$bulk_prog" | sha256_of)" = "$FIXED_SHA" ] && echo 1 || echo 0)$([ "$(awk "$bulk_prog" | wc -c | tr -d ' ')" = 104857600 ] && echo 1 || echo 0)"
+assert "the expected sha256 is recorded in the evidence" "$(has "$FIXED_SHA" "$(cat "$TMP/res/e-mtu-bulk-sha256.txt")")"
+STUB_BULK_SHA="$(printf 'cd%.0s' $(seq 1 32))" run "${EV_ARGS[@]}"
+assert "a pod serving a file other than the fixed-seed one fails before any transfer (else the sha256 comparison proves nothing across runs)" \
+  "$(rc_is 1)$(has 'not the fixed-seed file' "$OUT")$(hasnt 'bulk download' "$OUT")"
+
+# Gap: cp's unpublished address under Local is recorded, never asserted.
+flow_fixture "$TMP/ev-p40000" '"0x9c","0x40"'
+mkdir -p "$TMP/ev-both/after"
+jq -s 'add' "$TMP/ev-good/after/flow_table.json" "$TMP/ev-p40000/after/flow_table.json" >"$TMP/ev-both/after/flow_table.json"
+run "${EV_ARGS[@]}"
+cp_log="$(cat "$TMP"/res/b-cp-unpublished-local-v[46].log 2>/dev/null || true)"
+assert "under Local the probe asks cp (no backend) on its external v4 and its v6 address and records what answered, the client IP seen and the backend" \
+  "$(rc_is 0)$(has "http://34.0.0.2/clientip); echo cp-rc" "$LOG")$(has "'http://[2600:1900::2]/clientip'); echo cp-rc" "$LOG")$(has 'RECORD: cp 34.0.0.2 answered under Local: backend saw 203.0.113.9 (client IP preserved), hostname '"'lb-backend'" "$cp_log")$(has 'RECORD: cp 2600:1900::2 answered under Local' "$cp_log")"
+assert "the cp request's 5-tuple is looked up in cp's FLOW_TABLE, the node it entered, and recorded (it answers or not; beep needs to see cp's conntrack row)" \
+  "$(has 'RECORD: b-cp-unpublished-local-v4: cp FLOW_TABLE holds TCP 203.0.113.9:51234 -> 10.80.0.2:80' "$cp_log")$(has 'RECORD: b-cp-unpublished-local-v6: cp FLOW_TABLE holds TCP 2600:1900::4:51234 -> 2600:1900::2:80' "$cp_log")"
+STUB_CP_PORT=40000 STUB_EVIDENCE="$TMP/ev-both" STUB_EVIDENCE_W1="$TMP/ev-good" run "${EV_ARGS[@]}"
+assert "a flow only cp's table holds is found there" \
+  "$(rc_is 0)$(has 'cp FLOW_TABLE holds TCP 203.0.113.9:40000' "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")"
+STUB_CP_PORT=40000 STUB_EVIDENCE="$TMP/ev-good" STUB_EVIDENCE_W1="$TMP/ev-both" run "${EV_ARGS[@]}"
+assert "a flow that only w1's table holds is not credited to cp (the row must be on the node the packet entered); the missing row is recorded, not failed" \
+  "$(rc_is 0)$(has 'cp FLOW_TABLE has NO TCP flow 203.0.113.9:40000' "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")"
+STUB_CP_LOCAL=silent run "${EV_ARGS[@]}"
+assert "a cp that does not answer under Local is recorded and does not fail the run (beep's open question has either answer)" \
+  "$(rc_is 0)$(has 'RECORD: cp 34.0.0.2 did not answer under Local (curl exit 28)' "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")$(has 'no answer, so no flow' "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")"
+STUB_CP_SEEN=10.80.0.9 run "${EV_ARGS[@]}"
+assert "a cp answer that lost the client IP is recorded as such, not failed" \
+  "$(rc_is 0)$(has "NOT the probe's address" "$(cat "$TMP/res/b-cp-unpublished-local-v4.log")")"
+run --release v0.4.0-snapshot.1 --dual-stack --w1-subnet u7s-test-b --external-traffic-policy Cluster --beep-evidence "$TMP/collector.sh" --skip-sonobuoy
+assert "the cp check only runs under Local" "$(rc_is 0)$([ ! -e "$TMP/res/b-cp-unpublished-local-v4.log" ] && echo 1 || echo 0)"
+
+# Gap: the 5-tuple is looked up on the node the request entered.
+STUB_EVIDENCE="$TMP/ev-good" STUB_EVIDENCE_W1="$TMP/ev-empty" run "${EV_ARGS[@]}"
+assert "under Local the probe's request enters w1, so an empty w1 FLOW_TABLE fails even though cp's table holds the flow (checking cp would pass vacuously)" \
+  "$(rc_is 1)$(has 'w1 FLOW_TABLE has no TCP flow 203.0.113.9:51234 -> 10.80.0.3:80' "$(cat "$TMP/res/b-external-local-v4.log")")"
+STUB_EVIDENCE="$TMP/ev-empty" STUB_EVIDENCE_W1="$TMP/ev-good" run "${EV_ARGS[@]}"
+assert "under Cluster the request enters cp, so an empty cp FLOW_TABLE fails even though w1's table holds the flow" \
+  "$(rc_is 1)$(has 'cp FLOW_TABLE has no TCP flow' "$(cat "$TMP/res/a-disjoint-cluster-v4.log")")"
+
+# Gap: the negative control matches beep's exact controller line (beep#353 smoke step 13).
+STUB_CTRL_LOG="[pod/servicelb-controller-x] WARN endpoint fd00:244:0:1::2 rejected: outside every pod_cidr" run "${EV_ARGS[@]}"
+assert "a loose 'rejected'/pod_cidr log naming the pod is not beep's admission-gate line and fails (any unrelated warning would otherwise satisfy the control)" \
+  "$(rc_is 1)$(has "'rejected from POD_TARGETS'" "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+STUB_CTRL_LOG="[pod/servicelb-controller-x] controller: WARN 1 endpoint(s) rejected from POD_TARGETS: pod_ip [fd00:244:0:1::99] outside every --pod-cidr" run "${EV_ARGS[@]}"
+assert "the rejection line must name the backend pod's v6 address (a rejection of another pod proves nothing about lb-backend)" \
+  "$(rc_is 1)$(has 'no controller log' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+STUB_CTRL_LOG="WARN 1 endpoint(s) rejected from POD_TARGETS: x
+fd00:244:0:1::2 elsewhere" run "${EV_ARGS[@]}"
+assert "the rejection text and the pod IP must share one log line" "$(rc_is 1)$(has 'no controller log' "$(cat "$TMP/res/d-pod-cidr-negative-control.log")")"
+
+# Gap: the v6 --pod-cidr comes back however the run ends.
+run "${EV_ARGS[@]}"
+assert "a passing run restores the v6 --pod-cidr exactly once, in the negative control (the trap must not roll the DaemonSet out again)" \
+  "$([ "$(grep -c 'get ds servicelb-controller -o json.*+= \[' <<<"$LOG")" = 1 ] && echo 1 || echo 0)"
+STUB_CTRL_LOG="all quiet" run "${EV_ARGS[@]}"
+drop_n="$(grep -n 'get ds servicelb-controller -o json.*select(' <<<"$LOG" | head -1 | cut -d: -f1)" || true
+rest_n="$(grep -n 'get ds servicelb-controller -o json.*+= \[' <<<"$LOG" | tail -1 | cut -d: -f1)" || true
+del_n="$(grep -n 'instances delete' <<<"$LOG" | head -1 | cut -d: -f1)" || true
+assert "a run that fails in the negative control still restores the v6 --pod-cidr, before the VPSes go (with --keep the cluster would stay v4-only)" \
+  "$(rc_is 1)$([ -n "$drop_n" ] && [ -n "$rest_n" ] && [ "$drop_n" -lt "$rest_n" ] && [ "$rest_n" -lt "$del_n" ] && echo 1 || echo 0)"
+STUB_TERM_MATCH="ssh u7s-e2e-t-client --tunnel-through-iap -- curl -4" run "${EV_ARGS[@]}"
+rest_n="$(grep -n 'get ds servicelb-controller -o json.*+= \[' <<<"$LOG" | tail -1 | cut -d: -f1)" || true
+assert "SIGTERM while the DaemonSet is v4-only restores the v6 --pod-cidr and keeps the exit status (finish is not clobbered)" \
+  "$(rc_is 143)$([ -n "$rest_n" ] && echo 1 || echo 0)$(has 'RESULT: FAIL' "$OUT")"
+STUB_FAIL_MATCH="select(" run "${EV_ARGS[@]}"
+assert "a failed drop still triggers the restore (idempotent: the flag may already be absent)" \
+  "$(rc_is 1)$(has '+= [' "$LOG")"
 unset STUB_BEEP STUB_INGRESS STUB_INGRESS_LOCAL STUB_EVIDENCE
 
 # --- redaction and interrupts

@@ -89,6 +89,11 @@ DUAL_SERVICE_CIDR=10.96.0.0/12,fd00:96::/108
 LB_PORT=80
 BULK_PORT=8081
 BUSYBOX=docker.io/library/busybox:1.37.0
+# The served file is the same bytes every run: a minstd LCG (seed 20260101) printed as 32-byte hex
+# lines, 100 MiB, deterministic in busybox and any other awk (all state stays below 2^53).
+BULK_AWK='BEGIN { x = 20260101; for (i = 0; i < 3276800; i++) { x = (x * 48271) % 2147483647; a = x; x = (x * 48271) % 2147483647; b = x; x = (x * 48271) % 2147483647; c = x; x = (x * 48271) % 2147483647; printf "%08x%08x%08x%07x\n", a, b, c, x % 268435456 } }'
+BULK_SHA_FIXED=9a9d51d71548adf01a4cdfcc6ed472bfeacb6396b8fca69bc03dfef7d50f81a6
+VPC_MTU=1460
 EV_SCRIPT=/tmp/real-cloud-evidence.sh
 EV_DIR=/tmp/beep-evidence
 SONOBUOY_VERSION="${U7S_E2E_SONOBUOY_VERSION:-0.57.3}"
@@ -112,6 +117,8 @@ FW_RULES=()
 STACK_ARGS=()
 [ "$DUAL" = 0 ] || STACK_ARGS=(--stack-type IPV4_IPV6)
 RESULT=FAIL
+POD_CIDR_DROPPED=0
+RECORD_ONLY=0
 
 vps() { "$GCP/vps.sh" "$@"; }
 on_cp() { vps ssh "$CP" -- "$@"; }
@@ -145,6 +152,9 @@ finish() {
   fi
   echo "$RESULT" >"$OUT/result.txt"
   echo "RESULT: $RESULT"
+  if [ "$POD_CIDR_DROPPED" = 1 ]; then
+    pod_cidr_v6 add || echo "NOT RESTORED: servicelb-controller on $CP may still have only the v4 --pod-cidr" >&2
+  fi
   for v in ${CREATED[@]+"${CREATED[@]}"}; do
     if [ "$KEEP" = 1 ]; then
       echo "kept: scripts/gcp/vps.sh ssh $v (delete: scripts/gcp/vps.sh down $v)"
@@ -470,6 +480,17 @@ collect_around() {
     fetch_evidence "$n" "$item" || fail "$item: fetching the evidence from $n"
   done
   [ -z "$bad" ] || fail "$item: geneve0 rx/tx did not grow on$bad, which the flow crosses (evidence: $OUT/$item)"
+  if [ "$RECORD_ONLY" = 1 ]; then
+    case "$tuple" in -*) echo "RECORD: $item: no answer, so no flow to look up on $(role_of "$ingress")"; return 0 ;; esac
+    # shellcheck disable=SC2086 # tuple is "<ip> <port>"
+    if flow_in_table "$OUT/$item/$(role_of "$ingress")/after/flow_table.json" $tuple "$front" "$fport"; then
+      echo "RECORD: $item: $(role_of "$ingress") FLOW_TABLE holds TCP ${tuple% *}:${tuple#* } -> $front:$fport"
+    else
+      echo "RECORD: $item: $(role_of "$ingress") FLOW_TABLE has NO TCP flow ${tuple% *}:${tuple#* } -> $front:$fport"
+    fi
+    return 0
+  fi
+  # The node the request entered holds its flow, so the table read is the ingress node's, not cp's.
   # shellcheck disable=SC2086 # tuple is "<ip> <port>"
   flow_in_table "$OUT/$item/$(role_of "$ingress")/after/flow_table.json" $tuple "$front" "$fport" \
     || fail "$item: $(role_of "$ingress") FLOW_TABLE has no TCP flow ${tuple% *}:${tuple#* } -> $front:$fport"
@@ -478,13 +499,20 @@ collect_around() {
 
 controller_logs() { on_cp "$KC -n kube-system logs -l app.kubernetes.io/name=servicelb-controller -c servicelb-controller --prefix --tail=500"; }
 
+# v6_rejected IP: one controller log line holds beep's admission-gate warning and IP.
+v6_rejected() {
+  local logs
+  logs="$(controller_logs)" || return 1
+  grep -F 'rejected from POD_TARGETS' <<<"$logs" | grep -F "$1" >/dev/null
+}
+
 # pod_cidr_v6 drop|add: the beep DaemonSet without/with the v6 --pod-cidr, rolled out.
 pod_cidr_v6() {
   local edit
   if [ "$1" = drop ]; then
     edit='(.spec.template.spec.containers[0].args | index($a)) as $i | if $i == null then error("no " + $a) else .spec.template.spec.containers[0].args |= map(select(. != $a)) end'
   else
-    edit='.spec.template.spec.containers[0].args += [$a]'
+    edit='(.spec.template.spec.containers[0].args | index($a)) as $i | if $i == null then .spec.template.spec.containers[0].args += [$a] else . end'
   fi
   on_cp "$KC -n kube-system get ds servicelb-controller -o json | jq -e --arg a '--pod-cidr=${DUAL_CLUSTER_CIDR#*,}' '$edit' | $KC replace -f - && $KC -n kube-system rollout status ds/servicelb-controller --timeout=300s"
 }
@@ -503,15 +531,38 @@ pod_cidr_negative_control() {
   [ -n "$seen" ] || seen="$(lb_request "$CLIENT" "$CP_IP" "$CLIENT_SEEN_IPS")" || exit 1
   echo "PASS: v4 via $CP_IP reached lb-backend with only the v4 --pod-cidr (client seen as ${seen% *})"
   for _ in $(seq 1 30); do
-    controller_logs | grep -F "$pod_v6" | grep -qiE 'pod_cidr|rejected' && break
+    v6_rejected "$pod_v6" && break
     sleep "$SLEEP"
   done
-  controller_logs | grep -F "$pod_v6" | grep -iE 'pod_cidr|rejected' \
-    || fail "no controller log rejecting the pod's v6 address $pod_v6 with only the v4 --pod-cidr"
+  v6_rejected "$pod_v6" \
+    || fail "no controller log 'rejected from POD_TARGETS' naming the pod's v6 address $pod_v6 with only the v4 --pod-cidr"
   rc="$(curl_rc "$CLIENT" "$cp_v6")" || exit 1
   [ "$rc" != 0 ] || fail "v6 via $cp_v6 reached lb-backend ($pod_v6) with only the v4 --pod-cidr: the admission gate is not what admits it"
   echo "PASS: v6 via $cp_v6 refused (curl exit $rc) while beep has only the v4 --pod-cidr"
   pod_cidr_v6 add || fail "restoring the v6 --pod-cidr"
+}
+
+# record_cp_unpublished TARGET: under Local cp has no backend and is not published; the probe asks
+# it on its external address TARGET anyway. Only records what happens (answered or not, the client
+# IP the backend saw, which backend), never fails; prints "<client ip> <port>" last ("- 0" when
+# unanswered) for collect_around's record mode.
+record_cp_unpublished() {
+  local ip="$1" fam url hurl out rc seen host port
+  probe_target "$ip"; fam="$PROBE_FAM"; url="$PROBE_URL"
+  probe_target "$ip" /hostname; hurl="$PROBE_URL"
+  out="$(vps ssh "$PROBE" -- "c=\$(curl $fam -g -sS --max-time 10 -w ',%{local_port}' $url); echo cp-rc=\$?; echo clientip=\$c; h=\$(curl $fam -g -sS --max-time 10 $hurl); echo hostname=\$h")" \
+    || { echo "RECORD: cp $ip: unknown (ssh to $PROBE failed)"; echo "- 0"; return 0; }
+  rc="$(sed -n 's/^cp-rc=//p' <<<"$out")"
+  seen="$(sed -n 's/^clientip=//p' <<<"$out")"; port="${seen##*,}"; seen="${seen%,*}"; seen="${seen%:*}"; seen="${seen#[}"; seen="${seen%]}"
+  host="$(sed -n 's/^hostname=//p' <<<"$out")"
+  if [ "$rc" = 0 ]; then
+    case " $PROBE_SEEN_IPS " in *" $seen "*) echo "RECORD: cp $ip answered under Local: backend saw $seen (client IP preserved), hostname '$host' (the pod runs on $W1, so cp forwarded to it)" ;;
+      *) echo "RECORD: cp $ip answered under Local: backend saw $seen (NOT the probe's address), hostname '$host' (the pod runs on $W1, so cp forwarded to it)" ;; esac
+    echo "$seen $port"
+  else
+    echo "RECORD: cp $ip did not answer under Local (curl exit ${rc:-?})"
+    echo "- 0"
+  fi
 }
 
 bulk_yaml() {
@@ -526,7 +577,10 @@ spec:
   containers:
   - name: c
     image: $BUSYBOX
-    command: [sh, -c, 'mkdir -p /www && head -c 104857600 /dev/urandom >/www/f && exec httpd -f -p $BULK_PORT -h /www']
+    command: [sh, -c]
+    args:
+    - |
+      mkdir -p /www && awk '$BULK_AWK' >/www/f && exec httpd -f -p $BULK_PORT -h /www
     readinessProbe: {tcpSocket: {port: $BULK_PORT}, periodSeconds: 2}
 ---
 apiVersion: v1
@@ -539,12 +593,50 @@ $policy  selector: {app: bulk}
 YAML
 }
 
-# Interface MTUs on both nodes: the underlay NIC against geneve0 shows the encapsulation overhead.
+# Interface MTUs on both nodes. The NIC must carry the VPC MTU; geneve0 sits below it by the
+# encapsulation overhead: outer IPv4 20 + UDP 8 + Geneve 8 + inner Ethernet 14 = 50 B, or 70 B with an
+# outer IPv6 header (40).
 mtu_table() {
-  local n
+  local n out nic nic_mtu gen_mtu
   for n in "$CP" "$W1"; do
     echo "== $(role_of "$n")"
-    vps ssh "$n" -- "ip -d link show; ip -o link show | awk '{print \$2, \$4, \$5}'" || return 1
+    out="$(vps ssh "$n" -- "ip -d link show; ip -o link show | awk '{print \$2, \$4, \$5}'; ip -o route show default | awk '{print \"nic=\" \$5; exit}'")" || return 1
+    echo "$out"
+    nic="$(sed -n 's/^nic=//p' <<<"$out")"
+    [ -n "$nic" ] || fail "no default-route NIC on $(role_of "$n")"
+    nic_mtu="$(awk -v n="$nic:" '$1 == n && $2 == "mtu" {print $3}' <<<"$out")"
+    gen_mtu="$(awk '$1 == "geneve0:" && $2 == "mtu" {print $3}' <<<"$out")"
+    [ "$nic_mtu" = "$VPC_MTU" ] || fail "$(role_of "$n") $nic MTU is '$nic_mtu', not the $VPC_MTU VPC MTU"
+    case "$gen_mtu" in
+      "$((VPC_MTU - 50))") echo "PASS: $(role_of "$n") $nic $nic_mtu, geneve0 $gen_mtu = $VPC_MTU - 50 (IPv4 underlay)" ;;
+      "$((VPC_MTU - 70))") echo "PASS: $(role_of "$n") $nic $nic_mtu, geneve0 $gen_mtu = $VPC_MTU - 70 (IPv6 underlay)" ;;
+      *) fail "$(role_of "$n") geneve0 MTU is '$gen_mtu', neither $((VPC_MTU - 50)) (IPv4 underlay) nor $((VPC_MTU - 70)) (IPv6 underlay)" ;;
+    esac
+  done
+}
+
+# mtu_ping_table: cp pings w1 with the DF bit at stepped payload sizes, per family, and records
+# $OUT/e-mtu-v<N>/ping-table.txt. The underlay must carry exactly VPC_MTU minus the IP and ICMP
+# headers (v4: 20 + 8, v6: 40 + 8): one byte more must not pass, else the VPC MTU is not what the
+# path enforces. Geneve then leaves the tunnel 50 B (v4) / 70 B (v6) less, the geneve0 MTU above.
+mtu_ping_table() {
+  local fam dst hdr max sizes s out best dir
+  for fam in 4 6; do
+    [ "$fam" = 4 ] || [ "$DUAL" = 1 ] || continue
+    if [ "$fam" = 4 ]; then dst="$W1_IP"; hdr=28; else dst="$(first_of 6 "$W1_IPS")" || fail "w1 has no IPv6 InternalIP"; hdr=48; fi
+    max=$((VPC_MTU - hdr))
+    sizes="1000 1200 1400 $((max - 1)) $max $((max + 1)) 1472"
+    out="$(vps ssh "$CP" -- "for s in $sizes; do if ping -$fam -M do -c 2 -W 2 -s \$s $dst >/dev/null 2>&1; then echo size=\$s ok; else echo size=\$s fail; fi; done")" \
+      || fail "ping table from $CP to $dst"
+    dir="$OUT/e-mtu-v$fam"
+    mkdir -p "$dir"
+    {
+      echo "ping -$fam -M do cp -> w1 $dst; expected max payload $max = $VPC_MTU - $hdr; tunnelled payload $((max - (fam == 4 ? 50 : 70)))"
+      echo "$out"
+    } | tee "$dir/ping-table.txt"
+    best="$(awk -F'[= ]' '$3 == "ok" && $2 + 0 > m {m = $2 + 0} END {print m + 0}' <<<"$out")"
+    [ "$best" = "$max" ] || fail "largest DF ping payload over IPv$fam is $best, expected $max ($VPC_MTU - $hdr)"
+    echo "PASS: IPv$fam DF ping passes up to $best B and fails at $((max + 1)) B (VPC MTU $VPC_MTU)"
   done
 }
 
@@ -635,13 +727,15 @@ POLICY_LIST="${POLICIES:-Cluster}"
 if [ -n "$EVIDENCE" ]; then
   step evidence-tools install_evidence_tools
   # Negative control first: the backend's v6 address must be refused before beep may admit it.
-  [ "$DUAL" = 0 ] || step d-pod-cidr-v4-only pod_cidr_v6 drop
+  # Set first so the EXIT trap restores a --pod-cidr dropped by a run that fails or is interrupted.
+  [ "$DUAL" = 0 ] || { POD_CIDR_DROPPED=1; step d-pod-cidr-v4-only pod_cidr_v6 drop; }
 fi
 # Only an explicit --external-traffic-policy sets the field, so the default Service is unchanged.
 step lb-backend apply_lb ${POLICIES:+"${POLICY_LIST%%,*}"}
 [ -z "$EVIDENCE" ] || [ "$DUAL" = 0 ] || {
   step lb-backend-running on_cp "$KC wait --for=condition=Ready pod/lb-backend --timeout=300s"
   step d-pod-cidr-negative-control pod_cidr_negative_control
+  POD_CIDR_DROPPED=0
 }
 
 # One leg per policy: under Cluster every node is published and the backend is reached from cp
@@ -710,19 +804,33 @@ for policy in ${POLICY_LIST//,/ }; do
         it="b-external-$pol-v$(family_of "$ip")"
         step "$it" collect_around "$it" "$ing_vm" "$ip" "$LB_PORT" "$carriers" 1 lb_request "$PROBE" "$target" "$PROBE_SEEN_IPS"
       done
+      if [ "$policy" = Local ]; then
+        # cp holds no backend and is unpublished: record, in cp's own FLOW_TABLE, what it did.
+        RECORD_ONLY=1
+        for ip in $CP_IPS; do
+          target="$ip"; [ "$(family_of "$ip")" = 6 ] || target="$(external_ipv4 "$CP")"
+          it="b-cp-unpublished-local-v$(family_of "$ip")"
+          step "$it" collect_around "$it" "$CP" "$ip" "$LB_PORT" "" 1 record_cp_unpublished "$target"
+        done
+        RECORD_ONLY=0
+      fi
     fi
   fi
   first=0
 done
 
 if [ -n "$EVIDENCE" ]; then
-  # (e) MTU: interface MTUs, then 100 MiB from w1 through cp's front per family (no pcap: the
-  # capture would be as large as the transfer).
+  # (e) MTU: interface MTUs, the DF ping table, then the fixed-seed 100 MiB file served from w1 and
+  # fetched from the client through cp's front per family (no pcap: the capture would be as large
+  # as the transfer).
   step e-mtu-table mtu_table
+  step e-mtu-ping mtu_ping_table
   step bulk-backend on_cp "$KC apply -f -" < <(bulk_yaml)
   step bulk-running on_cp "$KC wait --for=condition=Ready pod/bulk --timeout=600s"
   BULK_SHA="$(on_cp "$KC exec bulk -- sha256sum /www/f" | awk '{print $1}')" || fail "hashing the bulk file in pod bulk"
   [[ "$BULK_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "no sha256 of the bulk file from pod bulk: '$BULK_SHA'"
+  [ "$BULK_SHA" = "$BULK_SHA_FIXED" ] || fail "pod bulk serves sha256 $BULK_SHA, not the fixed-seed file's $BULK_SHA_FIXED"
+  echo "$BULK_SHA  fixed-seed 100 MiB file (expected $BULK_SHA_FIXED)" | tee "$OUT/e-mtu-bulk-sha256.txt"
   wait_ingress bulk "$CP_IPS" >/dev/null || fail "Service bulk never published cp ($CP_IPS)"
   for ip in $CP_IPS; do
     caddr="$(first_of "$(family_of "$ip")" "$CLIENT_SEEN_IPS")" || fail "client has no IPv$(family_of "$ip") address"
