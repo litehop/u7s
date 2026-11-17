@@ -2054,6 +2054,9 @@ U7S_AA_EOF
 [crio.runtime]
 apparmor_profile = "u7s-default"
 CRIO_AA_EOF
+else
+  # A drop-in from an earlier run would point CRI-O at a profile nothing loads.
+  rm -f /etc/crio/crio.conf.d/10-apparmor.conf
 fi
 
 # Reap idle exec/attach/logs/port-forward streaming connections' goroutines and

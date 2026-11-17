@@ -2900,6 +2900,9 @@ assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- with
 assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
   "$(grep -qF 'command -v apparmor_parser' "$INSTALL" && grep -qF '/sys/module/apparmor/parameters/enabled' "$INSTALL" && echo 1 || echo 0)"
 
+assert "install.sh removes a stale 10-apparmor.conf when AppArmor is unavailable -- otherwise CRI-O stays pointed at an unloaded profile and sandbox creation fails" \
+  "$(awk '/^else$/ {e=1; next} /^fi$/ {e=0} e && /^  rm -f \/etc\/crio\/crio.conf.d\/10-apparmor.conf$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
