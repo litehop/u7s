@@ -332,26 +332,37 @@ elif [ "$VERBOSE" -eq 0 ] && [ "$CRIO_VERBOSE_PRESENT" -eq 1 ]; then
   limactl shell "$VM_NAME" sudo systemctl restart crio
 fi
 
-# Same u7s-default profile install.sh ships (scripts/test-install-logic.sh keeps
-# them identical). CRI-O's built-in crio-default lacks the AppArmor 5
-# stacked-peer signal rules, so on kernel 7.0 BIND's nslookup/dig are DENIED
-# signalling themselves and exit 139. Done here, not in the provision script,
-# so golden clones and already-provisioned VMs get it too. Idempotent.
-AA_PROFILE_SRC="$(dirname "$0")/u7s-default.apparmor"
+# The u7s-default profile is extracted from install.sh (single source). CRI-O's
+# built-in crio-default lacks the AppArmor 5 stacked-peer signal rules, so on
+# kernel 7.0 BIND's nslookup/dig are DENIED signalling themselves and exit 139.
+# Done here, not in the provision script, so golden clones and
+# already-provisioned VMs get it too. Idempotent; reloads when the profile
+# content or the CRI-O drop-in differs.
+AA_PROFILE="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$(dirname "$0")/../install.sh")"
+[ -n "$AA_PROFILE" ] || { echo "FATAL: u7s-default profile not found in install.sh" >&2; exit 1; }
 AA_CRIO_CONF="/etc/crio/crio.conf.d/10-apparmor.conf"
 if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null'; then
-  if ! limactl shell "$VM_NAME" sudo grep -qx 'apparmor_profile = "u7s-default"' "$AA_CRIO_CONF" 2>/dev/null; then
+  AA_INSTALLED="$(limactl shell "$VM_NAME" sudo cat /etc/apparmor.d/u7s-default 2>/dev/null || true)"
+  if [ "$AA_INSTALLED" != "$AA_PROFILE" ] \
+    || ! limactl shell "$VM_NAME" sudo grep -qx 'apparmor_profile = "u7s-default"' "$AA_CRIO_CONF" 2>/dev/null; then
     echo "Installing u7s-default AppArmor profile for CRI-O..."
-    limactl shell "$VM_NAME" sudo tee /etc/apparmor.d/u7s-default >/dev/null < "$AA_PROFILE_SRC"
+    printf '%s\n' "$AA_PROFILE" | limactl shell "$VM_NAME" sudo tee /etc/apparmor.d/u7s-default >/dev/null
     limactl shell "$VM_NAME" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default
     limactl shell "$VM_NAME" sudo bash -c "printf '[crio.runtime]\napparmor_profile = \"u7s-default\"\n' > $AA_CRIO_CONF"
     limactl shell "$VM_NAME" sudo systemctl restart crio
   fi
-  # Ubuntu 26.04 ships host profiles for dig/nslookup that attach by path to the
-  # same binaries inside containers; their signal rules likewise lack the
-  # stacked-peer form, so the tools are DENIED signalling themselves even under
-  # u7s-default. Disabled persistently (apparmor.d/disable) and unloaded now.
-  limactl shell "$VM_NAME" sudo bash -c 'for p in dig nslookup; do [ -f /etc/apparmor.d/$p ] || continue; ln -sf /etc/apparmor.d/$p /etc/apparmor.d/disable/$p; apparmor_parser -R /etc/apparmor.d/$p 2>/dev/null || true; done'
+  # Rig-only, not part of install.sh: Ubuntu 26.04 ships host profiles for
+  # dig/nslookup that attach by path to the same binaries inside containers;
+  # their signal rules likewise lack the stacked-peer form, so the tools are
+  # DENIED signalling themselves even under u7s-default on the arm64 rig. Real
+  # x86_64 installs were verified unaffected. Disabled persistently
+  # (apparmor.d/disable) and unloaded now.
+  limactl shell "$VM_NAME" sudo bash -c 'set -euo pipefail
+for p in dig nslookup; do
+  [ -f /etc/apparmor.d/$p ] || continue
+  ln -sf /etc/apparmor.d/$p /etc/apparmor.d/disable/$p
+  if grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then apparmor_parser -R /etc/apparmor.d/$p; fi
+done'
 fi
 
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance

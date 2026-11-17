@@ -2895,12 +2895,22 @@ for rule in \
   assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
     "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
 done
-assert "the Lima rig ships the same u7s-default profile as install.sh -- without it kernel 7.0 DENIES self-signalling (BIND nslookup/dig die rc 139) and the DNS/ExternalName conformance specs fail on the rig" \
-  "$([ -n "$AA_BODY" ] && [ "$AA_BODY" = "$(cat "$DIR/conformance/u7s-default.apparmor")" ] && echo 1 || echo 0)"
-assert "lima-start.sh installs that profile and points CRI-O at it -- the rig's golden clones skip the provision script" \
-  "$(grep -qF 'u7s-default.apparmor' "$DIR/conformance/lima-start.sh" && grep -qF 'apparmor_profile = \"u7s-default\"' "$DIR/conformance/lima-start.sh" && echo 1 || echo 0)"
-assert "lima-start.sh disables the Ubuntu host dig/nslookup AppArmor profiles -- they attach to the binaries inside containers and DENY self-signalling even under u7s-default, so the DNS conformance specs still die rc 139" \
-  "$(grep -qF 'for p in dig nslookup' "$DIR/conformance/lima-start.sh" && grep -qF 'apparmor.d/disable/$p' "$DIR/conformance/lima-start.sh" && echo 1 || echo 0)"
+LS_CODE="$(grep -vE '^[[:space:]]*#' "$DIR/conformance/lima-start.sh")"
+ls_line() { printf '%s\n' "$LS_CODE" | grep -nF -- "$1" | head -1 | cut -d: -f1; }
+L_EXTRACT="$(ls_line "U7S_AA_EOF")"
+L_LOAD="$(ls_line "apparmor_parser -r -W /etc/apparmor.d/u7s-default")"
+L_DROPIN="$(ls_line 'apparmor_profile = \"u7s-default\"\n')"
+L_RESTART="$(printf '%s\n' "$LS_CODE" | grep -nF "systemctl restart crio" | tail -1 | cut -d: -f1)"
+assert "lima-start.sh extracts the u7s-default profile from install.sh -- a second copy would drift and the rig would stop matching real installs" \
+  "$([ -n "$L_EXTRACT" ] && echo 1 || echo 0)"
+assert "lima-start.sh loads the profile before writing the CRI-O drop-in and before restarting crio -- otherwise CRI-O points at an unloaded profile and sandbox creation fails" \
+  "$([ -n "$L_LOAD" ] && [ -n "$L_DROPIN" ] && [ -n "$L_RESTART" ] && [ "$L_LOAD" -lt "$L_DROPIN" ] && [ "$L_DROPIN" -lt "$L_RESTART" ] && echo 1 || echo 0)"
+assert "lima-start.sh reloads when the installed profile differs from install.sh -- otherwise profile edits never reach already-provisioned VMs" \
+  "$(printf '%s\n' "$LS_CODE" | grep -qF '"$AA_INSTALLED" != "$AA_PROFILE"' && echo 1 || echo 0)"
+assert "lima-start.sh disables the Ubuntu host dig/nslookup AppArmor profiles persistently and unloads them -- they DENY self-signalling even under u7s-default, so the DNS conformance specs die rc 139 on the arm64 rig" \
+  "$(printf '%s\n' "$LS_CODE" | grep -qF 'for p in dig nslookup' && printf '%s\n' "$LS_CODE" | grep -qF 'apparmor.d/disable/$p' && printf '%s\n' "$LS_CODE" | grep -qF 'apparmor_parser -R /etc/apparmor.d/$p' && echo 1 || echo 0)"
+assert "the host-profile disable block fails loud (set -euo pipefail) -- a silent failed ln/apparmor_parser -R leaves the rig broken with no signal" \
+  "$(printf '%s\n' "$LS_CODE" | grep -qF "bash -c 'set -euo pipefail" && ! printf '%s\n' "$LS_CODE" | grep -F 'apparmor_parser -R' | grep -qF '|| true' && echo 1 || echo 0)"
 assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
   "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
 assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
