@@ -40,7 +40,7 @@
 # apart from FAIL and INVALID and, like INVALID, never a valid run. Exit 3 covers both.
 # A leaked VPS (<out>/leaked-vps.txt) turns a PASS into exit 4.
 #
-# Usage: burst-gate.sh [--backend lima|gcp] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--overload-pods N --overload-mib M [--no-workload] [--overload-window-secs SECS]] [--zram-mib N] [--coredns-requests]
+# Usage: burst-gate.sh [--backend lima|gcp] [--boot-disk-type TYPE] [--release TAG | --tarball PATH [--install-only]] [--confirm] [--burst-pods N] [--runs N] [--ramp LIST] [--probe-kill SECS] [--capture] [--keep] [--memory GiB] [--overload-pods N --overload-mib M [--no-workload] [--overload-window-secs SECS]] [--zram-mib N] [--coredns-requests]
 #                      [--burst-cap SECS] [--wedge-secs SECS] [--wedge-stall-secs SECS] [--tarball-dir DIR] [--out DIR]
 #   --runs N          number of independent fresh-VM runs (default 3)
 #   --burst-pods N    size of the large burst (default 20); the verdict names it
@@ -88,6 +88,8 @@
 #   --out DIR         results directory (default: ./temp/release-gate/<timestamp>)
 #   --backend B       lima (default; local arm64 VM) or gcp (needs --release; rejects --memory and
 #                     --tarball-dir)
+#   --boot-disk-type T gcp only: VM boot disk type (default pd-balanced, SSD-class; pd-standard
+#                     is HDD-class and wedges under the burst). Recorded in backend.txt and the verdict.
 #   --release TAG     gcp only: mirror release to install, e.g. v0.4.1-snapshot.1
 #   --tarball PATH    gcp only, EXPERIMENT mode, exclusive with --release and --confirm: install an
 #                     unpublished x86_64 tarball built by build-experiment-tarball.sh (its
@@ -106,7 +108,7 @@ BURST_PODS=20; CONFIRM=0; CONFIRM_SIZES="20"
 RUNS=3; KEEP=0; MEMORY=""; TARBALL_DIR=""; OUT=""
 OVERLOAD_PODS=0; OVERLOAD_MIB=0; NO_WORKLOAD=0; OVERLOAD_WINDOW_SECS=600
 BURST_CAP_SECS=300; WEDGE_SECS=60; WEDGE_STALL_SECS=120
-BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""
+BACKEND=lima; RELEASE=""; EXP_TARBALL=""; INSTALL_ONLY=0; EXP_TAG=""; BOOT_DISK_TYPE=""
 RUN_WALL_SECS="${RG_RUN_WALL_SECS:-3300}"
 MAX_INVALID_RUNS="${MAX_INVALID_RUNS:-3}"
 RG_RETRY_WAIT_SECS="${RG_RETRY_WAIT_SECS:-300}"
@@ -133,6 +135,7 @@ while [ $# -gt 0 ]; do
     --wedge-stall-secs) WEDGE_STALL_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
+    --boot-disk-type) BOOT_DISK_TYPE="$2"; shift 2 ;;
     --release) RELEASE="$2"; shift 2 ;;
     --tarball) EXP_TARBALL="$2"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
@@ -172,13 +175,16 @@ fi
 
 case "$BACKEND" in
   lima)
-    [ -z "$RELEASE" ] || { echo "--release is only for --backend gcp (lima builds the tarball from this checkout)" >&2; exit 2; } ;;
+    [ -z "$RELEASE" ] || { echo "--release is only for --backend gcp (lima builds the tarball from this checkout)" >&2; exit 2; }
+    [ -z "$BOOT_DISK_TYPE" ] || { echo "--boot-disk-type is only for --backend gcp (the lima VM disk is fixed)" >&2; exit 2; } ;;
   gcp)
     [ -n "$EXP_TARBALL" ] || [[ "$RELEASE" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "--backend gcp needs --release <tag> (e.g. v0.4.1-snapshot.1), got '$RELEASE'" >&2; exit 2; }
     [ -z "$MEMORY" ] || { echo "--memory is not supported with --backend gcp (the gate VM is fixed at 1 GiB)" >&2; exit 2; }
     [ -z "$TARBALL_DIR" ] || { echo "--tarball-dir is not supported with --backend gcp (the release is installed from the mirror)" >&2; exit 2; }
     # shellcheck source=../gcp/lib.sh
     . "$ROOT/scripts/gcp/lib.sh"
+    BOOT_DISK_TYPE="${BOOT_DISK_TYPE:-pd-balanced}"
+    export U7S_GCP_BOOT_DISK_TYPE="$BOOT_DISK_TYPE"
     gcp_require_config
     GCP_PROJECT="$(gcloud config get-value project 2>/dev/null)" ;;
   *) echo "--backend must be lima or gcp, got '$BACKEND'" >&2; exit 2 ;;
@@ -242,12 +248,17 @@ fi
 # --confirm: full gate (--runs, default 3) at each size in CONFIRM_SIZES, largest first, stopping
 # at the first size where every run passes. The passing size is the gated no-swap burst ceiling.
 if [ "$CONFIRM" = 1 ]; then
+  confirm_leak_report() {
+    cat "$OUT"/burst-*/leaked-vps.txt > "$OUT/leaked-vps.txt" 2>/dev/null
+    [ -s "$OUT/leaked-vps.txt" ] || return 1
+    echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+  }
   tried=()
   for size in $CONFIRM_SIZES; do
     rg_confirm_sub_args "$size"
     sub_rc=0
     "$0" "${SUB_ARGS[@]}" >&2 || sub_rc=$?
-    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; exit 2; }
+    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; confirm_leak_report; exit 2; }
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")
@@ -255,9 +266,7 @@ if [ "$CONFIRM" = 1 ]; then
     [ "$n_passed" = "$n_valid" ] && break
   done
   rg_confirm_verdict "${tried[@]}"; rc=$?
-  cat "$OUT"/burst-*/leaked-vps.txt > "$OUT/leaked-vps.txt" 2>/dev/null
-  if [ -s "$OUT/leaked-vps.txt" ]; then
-    echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+  if confirm_leak_report; then
     [ "$rc" != 0 ] || { rc=4; echo "CONFIRM: PASS but LEAKED VPS: exit 4"; }
   fi
   exit "$rc"
@@ -305,18 +314,16 @@ host_state() {
   echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(vm_running "$VM")"
 }
 
-knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
+NONCE="$(rg_nonce)"; PLATFORMS=""
+knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0; invalid_reasons=""
 while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ]; do
   attempt=$((attempt + 1))
-  # The guest's hostname is the VPS name plus GCE's ".c.<project>.internal"; the node's
-  # certificate CN is "system:node:<hostname>" and openssl rejects a CN over 64 characters, so
-  # the gcp name stays short.
-  if [ "$BACKEND" = gcp ]; then VM="u7s-rg-${STAMP:4:2}${STAMP:6:2}${STAMP:9:6}-$attempt"; else VM="u7s-rg-$STAMP-$attempt"; fi
+  VM="$(rg_vm_name "$BACKEND" "$STAMP" "$attempt" "$NONCE")"
   RUN_OUT="$OUT/$RUN_PREFIX-$attempt"; mkdir -p "$RUN_OUT"
   [ -z "$EXP_TAG" ] || echo "$EXP_TAG"
   echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid, preempted $preempted, cap $MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
-  status=""
+  status=""; PLATFORM=""
   VM_ALLOW_PCT=0
   : > "$RUN_OUT/quiet.log"
   if [ "$BACKEND" = lima ]; then
@@ -329,6 +336,11 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   if [ -n "$status" ]; then
     :
   elif VMS="$VMS $VM"; vm_create "$VM" "$RUN_OUT"; then
+    if [ "$BACKEND" = gcp ]; then
+      PLATFORM="$(cat "$RUN_OUT/platform.txt")"
+      echo "$PLATFORM" | tee -a "$RUN_OUT/host.txt"
+      case " $PLATFORMS " in *" ${PLATFORM/ /,} "*) ;; *) PLATFORMS="$PLATFORMS ${PLATFORM/ /,}" ;; esac
+    fi
     quiet_pid=""
     if [ "$BACKEND" = lima ]; then
       VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
@@ -375,10 +387,15 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       || echo "warning: could not copy results out of $VM" >&2
     PENDING_VM=""
   else
+    create_rc=$?
     echo "VM $VM failed to create/start (see $RUN_OUT/*-create.log)" >&2
     if [ "$BACKEND" = gcp ]; then
       status=INVALID
-      echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+      if [ "$create_rc" = 2 ]; then
+        echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): could not record the image name and uname -r of $VM, so a result could not be attributed to a platform (see $RUN_OUT/gcp-create.log)" | tee "$RUN_OUT/verdict.txt"
+      else
+        echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+      fi
     fi
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
@@ -400,6 +417,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
     fi
     [ -z "$EXP_TAG" ] || { { echo "$EXP_TAG"; cat "$RUN_OUT/verdict.txt"; } > "$RUN_OUT/verdict.tmp"; mv "$RUN_OUT/verdict.tmp" "$RUN_OUT/verdict.txt"; }
+    [ -z "$PLATFORM" ] || echo "PLATFORM: $PLATFORM" >> "$RUN_OUT/verdict.txt"
     cat "$RUN_OUT/verdict.txt"
     status="$(rg_run_status "$rc" "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env")"
   fi
@@ -424,10 +442,10 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   case "$status" in
     PASS) passed=$((passed + 1)); valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
     FAIL) overall=1; valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
-    INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
+    INVALID) invalid=$((invalid + 1)); invalid_reasons="$invalid_reasons; run $attempt: $(rg_invalid_reason "$RUN_OUT" "$harness_error")"; [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
-  [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out"; } | tee "$RUN_OUT/summary.md"
+  [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out" "$PLATFORM"; } | tee "$RUN_OUT/summary.md"
   [ "$KEEP" = 1 ] || { vm_delete "$VM" && VMS="${VMS/ $VM/}"; }
 done
 
@@ -435,14 +453,15 @@ echo "$passed" > "$OUT/passed"
 echo "$valid" > "$OUT/valid"
 if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
 elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED (only $valid/$RUNS valid runs; $preempted preempted, $invalid invalid)"; rc=3
-elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
+elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs$invalid_reasons)"; rc=3
 else verdict=PASS; rc=0; fi
+PLATFORMS="${PLATFORMS# }"; PLATFORMS="${PLATFORMS:-none-recorded}"
 if [ -n "$EXP_TAG" ]; then
-  echo "backend=gcp experiment=yes machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
+  echo "backend=gcp experiment=yes machine=$GCP_GATE_MACHINE_TYPE disk=$BOOT_DISK_TYPE platforms=$PLATFORMS arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
   verdict="EXPERIMENT $verdict [$EXP_TAG]"
 elif [ "$BACKEND" = gcp ]; then
-  echo "backend=gcp release=$RELEASE machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
-  verdict="$verdict [release-authoritative: x86_64 GCP $GCP_GATE_MACHINE_TYPE Spot, mirror release $RELEASE]"
+  echo "backend=gcp release=$RELEASE machine=$GCP_GATE_MACHINE_TYPE disk=$BOOT_DISK_TYPE platforms=$PLATFORMS arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
+  verdict="$verdict [release-authoritative: x86_64 GCP $GCP_GATE_MACHINE_TYPE $BOOT_DISK_TYPE Spot, platforms $PLATFORMS, mirror release $RELEASE]"
 fi
 if [ -s "$OUT/leaked-vps.txt" ]; then
   echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"

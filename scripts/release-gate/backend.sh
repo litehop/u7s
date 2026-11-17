@@ -3,7 +3,7 @@
 # Spot custom n1 1 GiB, installed from the release mirror). Needs BACKEND and, for lima, HERE and
 # MEMORY; for gcp, scripts/gcp/lib.sh sourced and gcp_require_config passed.
 #
-# vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable
+# vm_create NAME LOGDIR   create and start NAME; non-zero if it never became usable (2: up, but gcp image/kernel unreadable)
 # vm_trim NAME            lima: stop/mask guest daemons the GCP image lacks (no-op on gcp)
 # vm_shell NAME cmd...    run cmd as the login user; arguments keep their quoting
 # vm_copy_to NAME DIR SRC...   copy files/directories into DIR on NAME
@@ -25,12 +25,31 @@ vm_create() {
     gcp)
       U7S_GCP_MACHINE_TYPE="$GCP_GATE_MACHINE_TYPE" gcp_vps_create "$name" "$(gcp_zone)" 2>&1 | gcp_redact >"$logdir/gcp-create.log" || return 1
       for i in $(seq 1 "$GCP_SSH_TRIES"); do
-        vm_shell "$name" true >/dev/null 2>&1 && return 0
+        if vm_shell "$name" true >/dev/null 2>&1; then
+          vm_platform "$name" >"$logdir/platform.txt" 2>>"$logdir/gcp-create.log" && return 0
+          echo "$name is up but its image or kernel could not be read" >>"$logdir/gcp-create.log"
+          return 2
+        fi
         sleep "$GCP_SSH_SLEEP"
       done
       echo "$name never became reachable over IAP ssh" >>"$logdir/gcp-create.log"
       return 1 ;;
   esac
+}
+
+# gcp: echoes "image=<resolved image name> kernel=<uname -r>" for NAME; non-zero (and nothing
+# echoed) unless both are non-empty. The family resolves at create time, so the boot disk's
+# sourceImage is the image the VM actually runs.
+vm_platform() {
+  local disk image kernel
+  disk="$(gcloud compute instances describe "$1" --zone="$(gcp_zone)" --format='value(disks[0].source)' 2>/dev/null)" || return 1
+  disk="${disk##*/}"
+  [ -n "$disk" ] || { echo "no boot disk found for $1" >&2; return 1; }
+  image="$(gcloud compute disks describe "$disk" --zone="$(gcp_zone)" --format='value(sourceImage)' 2>/dev/null)" || return 1
+  image="${image##*/}"
+  kernel="$(vm_shell "$1" uname -r 2>/dev/null | tr -d '\r\n')"
+  [ -n "$image" ] && [ -n "$kernel" ] || { echo "image='$image' kernel='$kernel'" >&2; return 1; }
+  echo "image=$image kernel=$kernel"
 }
 
 # Lima only: brings the guest to GCP-image parity before install. Ubuntu's cloud image and Lima

@@ -291,6 +291,12 @@ rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --
 assert "--confirm is a single 3/3 gate at 20 pods with no smaller fall-back size, and a failing gate ends FAIL" \
   "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
+mkdir -p "$TMP/tb-none" "$TMP/out-leak/burst-20"
+echo "LEAKED GCP VPS u7s-gate-leak: delete failed" > "$TMP/out-leak/burst-20/leaked-vps.txt"
+rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb-none" --out "$TMP/out-leak" 2>/dev/null)" || rc=$?
+assert "--confirm aborting on a sub-run setup error still reports leaked VPSes (else a billing instance from an earlier sub-run goes unnoticed)" \
+  "$([ "$rc" = 2 ] && echo "$out" | grep -q 'LEAKED GCP VPS u7s-gate-leak' && grep -q 'u7s-gate-leak' "$TMP/out-leak/leaked-vps.txt" && echo 1 || echo 0)"
+
 # --- marker (item: criterion (d) false pass) ---
 assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
 assert "empty read (recreated DB, table missing) -> not ok: the false-PASS path through the installer 302" \
@@ -679,8 +685,11 @@ printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
   '  "config get-value compute/zone") echo z-1 ;;' \
   '  "compute instances create"*) echo "created p-secret" ;;' \
   '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && { echo "ERROR: operations denied for p-secret" >&2; exit 1; }; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
+  '  "compute instances describe"*"disks[0].source"*) echo "https://www.googleapis.com/compute/v1/projects/p-secret/zones/z-1/disks/attached-boot-disk" ;;' \
   '  "compute instances describe"*) [ "${GCLOUD_DESCRIBE_ERR:-0}" = 1 ] && exit 1; echo 1 ;;' \
   '  "compute ssh"*vm-gate.sh*) [ "${GCLOUD_SSH_HANG:-0}" = 1 ] || exit 0; sleep 300 & echo $! > "$GCLOUD_HANG_PID"; wait ;;' \
+  '  "compute disks describe attached-boot-disk"*) [ "${GCLOUD_NO_IMAGE:-0}" = 1 ] || echo "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2604-resolute-amd64-v20261021"; exit 0 ;;' \
+  '  "compute ssh"*"uname -r"*) [ "${GCLOUD_NO_KERNEL:-0}" = 1 ] || echo 7.0.0-1017-gcp; exit 0 ;;' \
   '  "compute ssh"*) echo "ERROR: ssh to x.c.p-secret.internal failed" >&2; [ "${GCLOUD_SSH_OK:-0}" = 1 ] && exit 0; exit 1 ;;' \
   '  "compute scp"*) for a; do d="$a"; done; case "$*" in *:/var/tmp/rg/out*) mkdir -p "$d"; echo "host x.c.p-secret.internal" > "$d/install.log"; [ -z "${GCLOUD_RESULTS:-}" ] || cp "$GCLOUD_RESULTS" "$d/results.env" ;; esac; exit 0 ;;' \
   'esac' 'exit 0' > "$TMP/bin/gcloud"
@@ -690,7 +699,7 @@ gcp_gate() { # out-dir, extra args...; sets rc
   : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/$1"
   rc=0; "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/$1" "${@:2}" >"$TMP/$1.out" 2>&1 || rc=$?
 }
-for bad in "--backend gcp" "--backend lima --release v1.0.0" "--backend gcp --release v1.0.0 --memory 2" "--backend gcp --release v1.0.0 --tarball-dir $TMP/tb" "--backend gcp --release not-a-tag" "--backend vmware"; do
+for bad in "--backend gcp" "--backend lima --release v1.0.0" "--backend gcp --release v1.0.0 --memory 2" "--backend gcp --release v1.0.0 --tarball-dir $TMP/tb" "--backend gcp --release not-a-tag" "--backend vmware" "--backend lima --boot-disk-type pd-balanced"; do
   : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rc=0
   # shellcheck disable=SC2086
   "$HERE/burst-gate.sh" $bad --out "$TMP/out-gbad" >/dev/null 2>&1 || rc=$?
@@ -706,14 +715,26 @@ assert "gcp VPS is deleted at the end of the run (a gate VM left up keeps billin
   "$(grep -q 'instances delete u7s-rg-' "$GCLOUD_CALLS" && echo 1 || echo 0)"
 assert "gcp VM names are valid GCE names (lowercase) and run-unique" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
+n1="$(rg_vm_name gcp 20261117T120000Z 1 "$(rg_nonce)")"; n2="$(rg_vm_name gcp 20261117T120000Z 1 "$(rg_nonce)")"
+assert "two gcp VPS names generated in the same second differ (identical names made concurrent gate runs collide on create)" \
+  "$([ "$n1" != "$n2" ] && echo 1 || echo 0)"
+l1="$(rg_vm_name lima 20261117T120000Z 12 "$(rg_nonce)")"
+assert "gcp names keep the u7s-rg- prefix stray detection relies on and stay <= 52 chars (cert CN limit); lima likewise" \
+  "$([[ "$n1" == u7s-rg-* && "$l1" == u7s-rg-* ]] && [ "${#n1}" -le 52 ] && [ "${#l1}" -le 52 ] && echo 1 || echo 0)"
 assert "gate VMs are the custom n1 1 vCPU 1 GiB (e2-micro has 0.25 sustained vCPU; e2 custom shared-core caps one thread at half a core)" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-micro' && echo 1 || echo 0)"
 U7S_GCP_MACHINE_TYPE=e2-standard-2 gcp_gate out-gshape --runs 1
 assert "an ambient U7S_GCP_MACHINE_TYPE cannot change the release-authoritative shape" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
+U7S_GCP_BOOT_DISK_TYPE=pd-extreme gcp_gate out-gdisk --runs 1
+assert "gate VMs default to pd-balanced even with an ambient U7S_GCP_BOOT_DISK_TYPE (HDD-class disks wedge the 1 GiB node, so the default must be SSD-class and attributable)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-balanced ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'pd-extreme' && echo 1 || echo 0)"
+gcp_gate out-gdisk2 --runs 1 --boot-disk-type pd-standard
+assert "--boot-disk-type reaches gcp_vps_create and the verdict/backend.txt name it (a pd-standard run must not be mistaken for the SSD gate)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-standard ' && grep -q ' disk=pd-standard ' "$TMP/out-gdisk2/backend.txt" && grep -q 'GCP n1-custom-1-1024 pd-standard Spot' "$TMP/out-gdisk2.out" && echo 1 || echo 0)"
 gcp_gate out-gfail --runs 1
 assert "gcp verdict line says release-authoritative and names the mirror release" \
-  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 Spot, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
+  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 pd-balanced Spot, platforms none-recorded, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && grep -q ' disk=pd-balanced ' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
 assert "the gcloud project id never reaches the run logs (redacted)" \
   "$(grep -rq 'p-secret' "$TMP/out-gfail" "$TMP/out-gfail.out" && echo 0 || echo 1)"
 export GCLOUD_PREEMPTED=1
@@ -753,6 +774,25 @@ GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gpass --runs 1
 assert "a PASS verdict with no leak still exits 0" "$([ "$rc" = 0 ] && echo 1 || echo 0)"
 GCLOUD_RESULTS="$TMP/good.env" gcp_gate out-gcpass --confirm --runs 1
 assert "--confirm PASS with no leak still exits 0" "$([ "$rc" = 0 ] && [ ! -s "$TMP/out-gcpass/leaked-vps.txt" ] && echo 1 || echo 0)"
+P='image=ubuntu-2604-resolute-amd64-v20261021 kernel=7.0.0-1017-gcp'
+assert "the resolved image and uname -r land in host.txt and the sub-run verdict (a FAIL must be attributable to a kernel move at a glance)" \
+  "$(grep -qx "$P" "$TMP/out-gpass/run-1/host.txt" && grep -qx "PLATFORM: $P" "$TMP/out-gpass/run-1/verdict.txt" && echo 1 || echo 0)"
+assert "the boot disk is found via instances describe disks[0].source, not assumed to be named after the VM (a differently-named boot disk would make every gate run INVALID)" \
+  "$(grep -q "^compute disks describe attached-boot-disk " "$GCLOUD_CALLS" && ! grep -q "^compute disks describe u7s-gate" "$GCLOUD_CALLS" && echo 1 || echo 0)"
+assert "image and kernel land in backend.txt and the GATE line (the gate verdict names the platform it speaks for)" \
+  "$(grep -q 'platforms=image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp ' "$TMP/out-gpass/backend.txt" && grep -q 'GATE:.*platforms image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp' "$TMP/out-gpass.out" && echo 1 || echo 0)"
+assert "the gate still boots the floating family (pinning would stop the gate catching new kernels)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--image-family=ubuntu-2604-lts-amd64' && echo 1 || echo 0)"
+SS="$TMP/sum"; mkdir -p "$SS"; printf '0\tidle\tMEM\t500000\n' > "$SS/samples.tsv"
+assert "summarize.sh prints the platform first when given one (a pasted summary must name the kernel it ran on)" \
+  "$([ "$("$HERE/summarize.sh" "$SS" "$P" | head -1)" = "platform: $P" ] && ! "$HERE/summarize.sh" "$SS" | grep -q '^platform:' && echo 1 || echo 0)"
+for miss in GCLOUD_NO_IMAGE GCLOUD_NO_KERNEL; do
+  env "$miss=1" GCLOUD_RESULTS="$TMP/good.env" "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/out-gmiss-$miss" --runs 1 >"$TMP/out-gmiss-$miss.out" 2>&1 && rc=0 || rc=$?
+  assert "$miss: an unreadable image or kernel makes the run INVALID (exit 3) with the reason, never a PASS/FAIL or an empty platform field a FAIL could not be attributed from" \
+    "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gmiss-$miss/valid")" = 0 ] && grep -q 'INVALID, not a u7s FAIL): could not record the image name and uname -r' "$TMP/out-gmiss-$miss/run-1/verdict.txt" && ! grep -q 'GATE:.*PASS' "$TMP/out-gmiss-$miss.out" && echo 1 || echo 0)"
+  assert "$miss: all-INVALID final verdict names the real reason, not host contention (an operator would chase a quiet host for a platform-capture failure)" \
+    "$(grep -q "^==== GATE:.*INVALID (only 0/1 valid runs; run 1: .*could not record the image name" "$TMP/out-gmiss-$miss.out" && ! grep -q "^==== GATE:.*host contention" "$TMP/out-gmiss-$miss.out" && echo 1 || echo 0)"
+done
 assert "gcp vm-gate.log is fully written (redactor waited for) before the run proceeds" \
   "$([ ! -e "$TMP/out-gpass/run-1/vm-gate.fifo" ] && [ -f "$TMP/out-gpass/run-1/vm-gate.log" ] && echo 1 || echo 0)"
 export GCLOUD_HANG_PID="$TMP/hang.pid"

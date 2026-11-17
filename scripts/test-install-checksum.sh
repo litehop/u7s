@@ -40,6 +40,8 @@ write_fetch_tarball_runner() {
     echo 'set -euo pipefail'
     awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$install_script"
     awk '/^verify_release_signature\(\) \{/,/^\}/' "$install_script"
+    awk '/^DOWNLOAD_ATTEMPTS=/,/^DOWNLOAD_MAX_SECONDS=/' "$install_script"
+    awk '/^download_mirror\(\) \{/,/^\}/' "$install_script"
     awk '/^fetch_tarball\(\) \{/,/^\}/' "$install_script"
     echo 'RELEASE_PUBKEY_PEM="$TEST_PUBKEY_PEM"'
     echo 'DOWNLOAD_DIR=""; trap '"'"'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}'"'"' EXIT'
@@ -110,7 +112,7 @@ assert "fetch_tarball's checksum-mismatch error names the mismatch, so an operat
 # silently accepted, the corruption assertions above are doing real work.
 # ---------------------------------------------------------------------------
 MUTATED="$WORK/install-mutated.sh"
-sed 's/if \[ "\$expected" != "\$actual" \]; then/if false; then/' "$INSTALL" > "$MUTATED"
+sed 's/if \[ "\$expected" = "\$actual" \] && /if true \&\& /' "$INSTALL" > "$MUTATED"
 if diff -q "$INSTALL" "$MUTATED" > /dev/null 2>&1; then
   assert "mutation self-check: the checksum-comparison line exists in install.sh to mutate (if this fails, the line was renamed/reshaped and this suite no longer exercises it)" 0
 else

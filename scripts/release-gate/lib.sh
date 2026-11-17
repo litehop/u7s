@@ -418,6 +418,15 @@ rg_run_status() {
   fi
 }
 
+# One-line reason a run is INVALID. $1 run dir (verdict.txt, contention.txt), $2 harness error.
+rg_invalid_reason() {
+  local r
+  r="$(grep -m1 '^INFRASTRUCTURE' "$1/verdict.txt" 2>/dev/null | sed 's/^[^:]*: //')"
+  [ -n "$r" ] || { [ -z "$2" ] || r="harness error: $2"; }
+  [ -n "$r" ] || r="$(head -1 "$1/contention.txt" 2>/dev/null)"
+  echo "${r:-reason not recorded}"
+}
+
 # Classifies a kubectl probe: $1 exit code, $2 combined output. Echoes
 #   ok          the probe ran and succeeded
 #   answered    the API answered with an error (non-2xx, NotFound): a u7s answer
@@ -721,6 +730,14 @@ rg_experiment_args_error() {
   elif [ -z "$3" ] && [ "$5" = 1 ]; then echo "--install-only is only for an experiment (--tarball)"
   fi
 }
+
+# VPS name for attempt $3 of the run stamped $2 (backend $1). The nonce $4 keeps two runs started
+# in the same second apart. The gcp name stays short: the guest hostname is the name plus
+# ".c.<project>.internal", and the node cert CN "system:node:<hostname>" must stay under 64 chars.
+rg_vm_name() {
+  if [ "$1" = gcp ]; then echo "u7s-rg-${2:4:2}${2:6:2}${2:9:6}-$4-$3"; else echo "u7s-rg-$2-$4-$3"; fi
+}
+rg_nonce() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
 
 # Echoes why the overload flags are refused, or nothing. $1 --overload-pods, $2 --overload-mib,
 # $3 --no-workload (0|1), $4 --ramp, $5 --confirm (0|1), $6 --overload-window-secs.

@@ -426,7 +426,7 @@ assert_true "--tarball short-circuits the download entirely, rather than fetchin
 # non-prerelease release exists) left the host half-configured. Fetching
 # first means a bad URL leaves it untouched.
 fetch_line="$(grep -n 'fetch_tarball "$TARBALL_URL"' "$INSTALL" | cut -d: -f1)"
-apt_line="$(grep -n '^apt-get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
+apt_line="$(grep -n '^apt_get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
 assert "the tarball is downloaded before apt installs anything, so an unreachable or wrong URL aborts with the host untouched instead of half-configured with CRI-O running" \
   "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
 
@@ -2085,7 +2085,7 @@ assert "the file wait sits between the apiserver restart and the KCM/kubelet res
 
 # A curl without --proto '=https...' follows an https->http redirect, handing a
 # network attacker the bytes that become root-run binaries or apt keys.
-curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install' || true)"
+curl_lines="$(grep -nE '(^|[ (])curl ' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#|apt-get install|apt_install' || true)"
 bad_curls="$(printf '%s\n' "$curl_lines" | grep -vE "curl --proto '=https(,file)?'( --proto-redir '=https')? --tlsv1\.2 " || true)"
 assert "every curl in install.sh is https-only with TLS >= 1.2, so a MITM cannot downgrade a fetch that feeds root-run code (offenders: ${bad_curls:-none})" \
   "$([ -n "$curl_lines" ] && [ -z "$bad_curls" ] && echo 1 || echo 0)"
@@ -2885,6 +2885,194 @@ assert "the control-plane install waits after labelling the node, as its last st
   "$(awk '/^label_control_plane_node \|\| exit 1$/ {l=NR} /^wait_for_cluster_ready \|\| exit 1$/ {w=NR} /^echo "u7s bootstrap complete/ {b=NR} END {print (l && w>l && b>w) ? 1 : 0}' "$INSTALL")"
 assert "the worker path (which exits before the control-plane steps) never calls wait_for_cluster_ready" \
   "$(awk '/^if \[ "\$WORKER_MODE" -eq 1 \]; then$/ {w=1} w && /^  exit 0$/ {exit} w && /wait_for_cluster_ready/ {bad=1} END {print bad ? 0 : 1}' "$INSTALL")"
+
+# u7s-default AppArmor profile: without the stacked-peer rules MariaDB and
+# other self-signalling workloads hang on AppArmor 5 kernels.
+AA_BODY="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$INSTALL")"
+for rule in \
+  'signal (send,receive) peer=u7s-default//&*,' \
+  'ptrace (trace,read) peer=u7s-default//&*,'; do
+  assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
+    "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
+done
+assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
+  "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
+assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
+  "$(grep -qF 'command -v apparmor_parser' "$INSTALL" && grep -qF '/sys/module/apparmor/parameters/enabled' "$INSTALL" && echo 1 || echo 0)"
+
+assert "install.sh removes a stale 10-apparmor.conf when AppArmor is unavailable -- otherwise CRI-O stays pointed at an unloaded profile and sandbox creation fails" \
+  "$(awk '/^else$/ {e=1; next} /^fi$/ {e=0} e && /^  rm -f \/etc\/crio\/crio.conf.d\/10-apparmor.conf$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
+
+# apt resilience: apt-get calls outside the apt_get wrapper bypass the shared
+# timeout/retry/lock-wait options.
+find_bare_apt() { # stdin: numbered lines; prints those running apt-get outside the wrapper
+  local line code
+  while IFS= read -r line; do
+    case "$line" in *'apt-get "${APT_OPTS[@]}"'*) continue ;; esac
+    code="$(printf '%s\n' "$line" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")"
+    printf '%s\n' "$code" | grep -qE '^[^#]*\bapt-get ' && printf '%s\n' "$line"
+  done
+  return 0
+}
+bare_apt="$(grep -nE '^[^#]*\bapt-get ' "$INSTALL" | find_bare_apt)"
+assert "the bare-apt-get scan flags 'echo x; apt-get ...' -- an echo earlier on the line must not exempt a real unwrapped call" \
+  "$([ -n "$(printf '1:echo x; apt-get update\n' | find_bare_apt)" ] && echo 1 || echo 0)"
+assert "the bare-apt-get scan ignores apt-get named inside an echoed message -- error text must not be flagged" \
+  "$([ -z "$(printf '1:echo "run apt-get update"\n' | find_bare_apt)" ] && echo 1 || echo 0)"
+assert "every apt-get in install.sh goes through the shared APT_OPTS wrapper -- a bare call hangs or fails on the dpkg lock held by unattended-upgrades on a fresh cloud VM" \
+  "$([ -z "$bare_apt" ] && echo 1 || { echo "$bare_apt" >&2; echo 0; })"
+assert "APT_OPTS carries the HTTP timeout, Acquire::Retries and dpkg lock wait -- without them install hangs on a silent mirror or aborts on the lock" \
+  "$(grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::http::Timeout=30' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::Retries=3' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'DPkg::Lock::Timeout=300' && echo 1 || echo 0)"
+assert "the pinned cri-o install passes --allow-downgrades -- otherwise re-running install.sh on a host with a newer cri-o aborts instead of converging to the pin" \
+  "$(grep -E '^apt_install .*cri-o=' "$INSTALL" | grep -qF -- '--allow-downgrades' && echo 1 || echo 0)"
+
+# apt_install behaviour against a stubbed apt-get on PATH (the stub counts
+# install attempts in $STUB_DIR/installs and fails the first $FAIL_FIRST).
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK" "$RDY_WORK" "$STUB_DIR"' EXIT
+cat > "$STUB_DIR/apt-get" <<'STUB'
+#!/usr/bin/env bash
+case " $* " in
+  *" update "*) echo update >> "$STUB_DIR/updates"; exit 0 ;;
+esac
+echo install >> "$STUB_DIR/installs"
+n="$(wc -l < "$STUB_DIR/installs")"
+if [ "$n" -le "$FAIL_FIRST" ]; then
+  case "$STUB_MODE" in
+    other) echo "E: Unable to locate package crun" >&2; exit 100 ;;
+    lookalike)
+      echo "Fetched 404 kB in 1s (404 kB/s)" >&2
+      echo "E: Failed to fetch http://10.404.0.1/crun.deb  Connection failed [IP: 10.404.0.1 80]" >&2
+      exit 100 ;;
+  esac
+  echo "E: Failed to fetch http://mirror.example/ubuntu/pool/crun.deb  404  Not Found [IP: 192.0.2.1 80]" >&2
+  exit 100
+fi
+exit 0
+STUB
+chmod +x "$STUB_DIR/apt-get"
+APT_FUNCS="$(awk '/^APT_OPTS=/ {p=1} p {print} p && /^apt_install\(\) \{$/ {f=1} f && /^}$/ {exit}' "$INSTALL")"
+run_apt_install() { # $1 = FAIL_FIRST; prints combined output, returns apt_install's status
+  rm -f "$STUB_DIR/installs" "$STUB_DIR/updates"
+  PATH="$STUB_DIR:$PATH" STUB_DIR="$STUB_DIR" FAIL_FIRST="$1" STUB_MODE="${2:-404}" bash -c "$APT_FUNCS"'
+    APT_INSTALL_RETRY_DELAY=0
+    apt_install crun' 2>&1
+}
+rc=0; out="$(run_apt_install 2)" || rc=$?
+assert "a 404 that clears on the third attempt still installs -- a lagging mirror must not abort a first install" \
+  "$([ "$rc" -eq 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
+assert "apt-get update re-runs before each retry -- retrying against stale indexes repeats the same 404" \
+  "$([ "$(wc -l < "$STUB_DIR/updates")" -eq 2 ] && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99)" || rc=$?
+assert "a persistent 404 fails non-zero after exactly 3 attempts -- the installer must not loop forever or report success" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
+assert "the final error names the failing URL and the attempt count -- the user needs both to tell a mirror problem from a typo" \
+  "$(printf '%s\n' "$out" | grep -q 'failed after 3 attempt.*http://mirror.example/ubuntu/pool/crun.deb' && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99 other)" || rc=$?
+assert "a non-404 apt failure is not retried and fails non-zero -- retrying a broken package name or dpkg error only delays the real error" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 1 ] && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99 lookalike)" || rc=$?
+assert "'Fetched 404 kB' and an IP containing 404 do not count as a 404 fetch error -- only apt's fetch-error line may trigger a retry" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+# Resilient mirror downloads: the relay drops large streams under concurrent
+# load (curl 92 / 56). A stubbed curl on PATH replays those failures against
+# the real fetch_tarball/download_mirror extracted from install.sh.
+# ---------------------------------------------------------------------------
+DL_DIR="$(mktemp -d)"
+mkdir -p "$DL_DIR/bin"
+for i in $(seq 1 40); do printf 'release payload line %s\n' "$i"; done > "$DL_DIR/bin/good.tar.gz"
+for i in $(seq 1 40); do printf 'corrupt payload line %s\n' "$i"; done > "$DL_DIR/bin/bad.tar.gz"
+DL_GOOD_SUM="$(sha256sum "$DL_DIR/bin/good.tar.gz" | cut -d' ' -f1)"
+printf '%s  u7s-test.tar.gz\n' "$DL_GOOD_SUM" > "$DL_DIR/bin/good.sha256"
+cat > "$DL_DIR/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+# STUB_MODE: fail92x2 | partial56 | always56 | badresume | allbad
+all="$*"; dest=""; resume=0; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) dest="$2"; shift ;;
+    -C) resume=1; shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+echo "$url" >> "$STUB_DIR/urls"
+printf '%s\n' "$all" >> "$STUB_DIR/args"
+case "$url" in
+  *.tar.gz)
+    n="$(grep -c 'tar.gz$' "$STUB_DIR/urls")"
+    half=$(( $(wc -c < "$STUB_DIR/good.tar.gz") / 2 ))
+    case "$STUB_MODE" in
+      always56) echo "curl: (56) Recv failure: Connection reset by peer" >&2; exit 56 ;;
+      fail92x2)
+        if [ "$n" -le 2 ]; then echo "curl: (92) HTTP/2 stream 1 was not closed cleanly: INTERNAL_ERROR" >&2; exit 92; fi
+        cp "$STUB_DIR/good.tar.gz" "$dest" ;;
+      partial56)
+        if [ "$n" -eq 1 ]; then head -c "$half" "$STUB_DIR/good.tar.gz" > "$dest"; echo "curl: (56) OpenSSL SSL_read: unexpected eof" >&2; exit 56; fi
+        if [ "$resume" -eq 1 ]; then tail -c +"$((half + 1))" "$STUB_DIR/good.tar.gz" >> "$dest"; else cp "$STUB_DIR/good.tar.gz" "$dest"; fi ;;
+      badresume)
+        if [ "$n" -eq 1 ]; then head -c "$half" "$STUB_DIR/good.tar.gz" > "$dest"; exit 56; fi
+        if [ "$resume" -eq 1 ]; then tail -c +"$((half + 1))" "$STUB_DIR/bad.tar.gz" >> "$dest"; else cp "$STUB_DIR/good.tar.gz" "$dest"; fi ;;
+      allbad) cp "$STUB_DIR/bad.tar.gz" "$dest" ;;
+    esac ;;
+  *.sha256) cp "$STUB_DIR/good.sha256" "$dest" ;;
+  *.sig) echo sig > "$dest" ;;
+esac
+printf 200
+STUB
+chmod +x "$DL_DIR/bin/curl"
+DL_FUNCS="$(awk '/^DOWNLOAD_ATTEMPTS=/,/^DOWNLOAD_MAX_SECONDS=/' "$INSTALL"; awk '/^download_mirror\(\) \{/,/^\}/' "$INSTALL"; awk '/^fetch_tarball\(\) \{/,/^\}/' "$INSTALL")"
+run_fetch() { # $1 = STUB_MODE, $2 = url; prints combined output + TARBALL_SHA; returns fetch_tarball's status
+  rm -f "$DL_DIR/bin/urls" "$DL_DIR/bin/args"
+  PATH="$DL_DIR/bin:$PATH" STUB_DIR="$DL_DIR/bin" STUB_MODE="$1" bash -c "$DL_FUNCS"'
+    mktemp_disk_dir() { mktemp -d; }
+    verify_release_signature() { :; }
+    DOWNLOAD_RETRY_DELAY=0
+    fetch_tarball "$1" || exit $?
+    echo "TARBALL_SHA=$(sha256sum "$TARBALL" | cut -d" " -f1)"
+    ls "$TARBALL.part" >/dev/null 2>&1 && echo "PART_LEFT"
+    rm -rf "$DOWNLOAD_DIR"' _ "$2" 2>&1
+}
+DL_URL=https://mirror.example/u7s-test.tar.gz
+tar_calls() { grep -c 'tar.gz$' "$DL_DIR/bin/urls" || true; }
+tar_args() { grep 'tar.gz$' "$DL_DIR/bin/args" || true; }
+
+rc=0; out="$(run_fetch fail92x2 "$DL_URL")" || rc=$?
+assert "two HTTP/2 INTERNAL_ERROR (92) drops then success still installs with exactly 3 attempts -- otherwise the first install dies on a mirror hiccup" \
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+assert "only the third attempt falls back to --http1.1 -- HTTP/2 stream resets must not repeat forever, but HTTP/2 stays the first choice" \
+  "$(a=$(tar_args); f=$(printf '%s\n' "$a" | grep -c -- '--http1.1'); e=$(printf '%s\n' "$a" | sed -n '1,2p' | grep -c -- '--http1.1'); [ "$f" -eq 1 ] && [ "$e" -eq 0 ] && echo 1 || echo 0)"
+
+rc=0; out="$(run_fetch partial56 "$DL_URL")" || rc=$?
+assert "a connection reset (56) mid-download is resumed with -C - and the final file hashes to the sidecar -- without resume a 124 MB retry restarts from zero under the same load" \
+  "$([ "$rc" -eq 0 ] && tar_args | grep -q -- '-C -' && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+assert "the verified tarball is renamed out of the .part path -- a leftover .part would mean the verified bytes never reached \$TARBALL" \
+  "$(printf '%s\n' "$out" | grep -q PART_LEFT && echo 0 || echo 1)"
+
+rc=0; out="$(run_fetch badresume "$DL_URL")" || rc=$?
+assert "a resumed download that fails sha256 is deleted and re-fetched clean (last request without -C -), and the installed bytes are the good ones -- a bad splice must never be accepted" \
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && [ "$(tar_args | tail -n1 | grep -c -- '-C -')" -eq 0 ] && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+rc=0; out="$(run_fetch allbad "$DL_URL")" || rc=$?
+assert "a tarball that never matches its sha256 aborts non-zero after exactly one clean re-download -- a tampered or truncated tarball must not be accepted or looped on" \
+  "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 2 ] && ! printf '%s\n' "$out" | grep -q TARBALL_SHA && echo 1 || echo 0)"
+
+rc=0; out="$(run_fetch always56 "$DL_URL")" || rc=$?
+assert "a dead mirror fails non-zero after exactly 6 attempts -- the installer must neither hang nor report success" \
+  "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 6 ] && echo 1 || echo 0)"
+assert "the final error names the URL, the attempt count and the last curl error -- the user needs them to tell a mirror outage from a local network fault" \
+  "$(printf '%s\n' "$out" | grep -q "$DL_URL failed after 6 attempt.*curl exit 56: curl: (56) Recv failure" && echo 1 || echo 0)"
+assert "every attempt keeps --proto =https,file, --proto-redir =https, --tlsv1.2 and -fsSL -- retries must not downgrade transport security" \
+  "$([ "$(tar_args | wc -l)" -eq 6 ] && [ "$(tar_args | grep -c -- "--proto =https,file --proto-redir =https --tlsv1.2 -fsSL")" -eq 6 ] && echo 1 || echo 0)"
+assert "every attempt carries a stall guard (--speed-limit/--speed-time) -- a hung stream must be abandoned and retried, not waited out" \
+  "$([ "$(tar_args | grep -c -- '--speed-limit .* --speed-time ')" -eq 6 ] && echo 1 || echo 0)"
+
+rc=0; out="$(run_fetch always56 "file:///nonexistent/u7s-test.tar.gz")" || rc=$?
+assert "a file:// URL gets exactly one curl call and no retries -- a local path has no network hiccup to wait out" \
+  "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 1 ] && echo 1 || echo 0)"
+rm -rf "$DL_DIR"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

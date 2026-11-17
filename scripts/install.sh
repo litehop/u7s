@@ -356,12 +356,41 @@ wait_for_authentication_configmap() {
   fi
 }
 
+# Every apt-get goes through apt_get: bounded connect/read time, retry of
+# transient network errors, and a wait for the dpkg lock that fresh cloud VMs
+# hold at first boot (unattended-upgrades).
+APT_OPTS=(-o Acquire::http::Timeout=30 -o Acquire::Retries=3 -o DPkg::Lock::Timeout=300)
+apt_get() {
+  apt-get "${APT_OPTS[@]}" "$@"
+}
+
+# Mirrors behind one name can disagree about a file for a while, and apt's
+# Acquire::Retries does not retry a 404. Re-run `apt-get update` and try
+# again, for 404s only; any other failure aborts at once.
+APT_INSTALL_ATTEMPTS=3
+APT_INSTALL_RETRY_DELAY=20
+apt_install() {
+  local attempt out rc
+  for attempt in $(seq 1 "$APT_INSTALL_ATTEMPTS"); do
+    out="$( ( set -o pipefail; LC_ALL=C apt_get install -y "$@" 2>&1 | tee /dev/stderr ) )" && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    grep -qE '^(Err:|E: Failed to fetch).* 404 +Not Found' <<<"$out" || break
+    if [ "$attempt" -lt "$APT_INSTALL_ATTEMPTS" ]; then
+      echo "apt-get install hit a 404 (attempt $attempt/$APT_INSTALL_ATTEMPTS); re-running apt-get update and retrying in ${APT_INSTALL_RETRY_DELAY}s" >&2
+      sleep "$APT_INSTALL_RETRY_DELAY"
+      apt_get update -qq || true
+    fi
+  done
+  echo "error: apt-get install $* failed after $attempt attempt(s); failing URL(s): $(grep -oE '(Failed to fetch|Err:[0-9]+) [^ ]+' <<<"$out" | sort -u | tr '\n' ' ')" >&2
+  exit 1
+}
+
 # Only --mint-join-token/--join need jq; not installed unconditionally so the
 # default path's apt footprint stays unchanged.
 ensure_jq() {
   if ! command -v jq >/dev/null 2>&1; then
-    apt-get update -qq
-    apt-get install -y jq
+    apt_get update -qq
+    apt_install jq
   fi
 }
 
@@ -415,42 +444,101 @@ verify_release_signature() {
   rm -rf "$keydir"
 }
 
+# Mirror fetches die mid-stream under concurrent load (curl 92 HTTP/2
+# INTERNAL_ERROR, 56 reset), which curl's own --retry never retries. This loop
+# retries every transient failure with backoff, resumes a partial <dest> when
+# <resume> is non-empty, drops to HTTP/1.1 from the third attempt, and aborts a
+# stalled transfer (--speed-limit/--speed-time) instead of waiting out a long
+# fixed timeout. Protocol/TLS restrictions are identical on every attempt.
+# Permanent client errors (4xx other than 408/429) fail at once. file:// URLs
+# are one local read: no retries. Verification is the caller's job.
+DOWNLOAD_ATTEMPTS=6
+DOWNLOAD_RETRY_DELAY=2
+DOWNLOAD_MAX_SECONDS=1800
+download_mirror() {
+  local url="$1" dest="$2" resume="${3:-}"
+  case "$url" in
+    file://*) curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$dest" "$url"; return ;;
+  esac
+  local attempt=1 start="$SECONDS" rc code err left lasterr="" flags
+  err="$(mktemp)"
+  while :; do
+    left=$(( DOWNLOAD_MAX_SECONDS - (SECONDS - start) ))
+    [ "$left" -ge 1 ] || { lasterr="${lasterr:-overall ${DOWNLOAD_MAX_SECONDS}s time cap reached}"; break; }
+    flags=(--speed-limit 10240 --speed-time 30 --connect-timeout 20 --max-time "$left")
+    [ "$attempt" -lt 3 ] || flags+=(--http1.1)
+    [ -z "$resume" ] || flags+=(-C -)
+    rc=0
+    code="$(curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL "${flags[@]}" -w '%{http_code}' -o "$dest" "$url" 2>"$err")" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$err"
+      return 0
+    fi
+    lasterr="curl exit $rc: $(tail -n1 "$err")"
+    case "$code" in
+      416) rm -f "$dest" ;;
+      4[0-9][0-9]) [ "$code" = 408 ] || [ "$code" = 429 ] || break ;;
+    esac
+    [ "$rc" -ne 33 ] || rm -f "$dest"
+    [ "$attempt" -lt "$DOWNLOAD_ATTEMPTS" ] || break
+    echo "download of $url failed ($lasterr); retrying (attempt $((attempt + 1))/$DOWNLOAD_ATTEMPTS) in $((attempt * DOWNLOAD_RETRY_DELAY))s" >&2
+    sleep "$((attempt * DOWNLOAD_RETRY_DELAY))"
+    attempt=$((attempt + 1))
+  done
+  rm -f "$err"
+  echo "error: download of $url failed after $attempt attempt(s): $lasterr" >&2
+  return 1
+}
+
 # Download the release tarball, its .sha256 sidecar and their Ed25519
 # signatures, verify both signatures, then the sidecar's
-# hash against the downloaded bytes, and point $TARBALL at it. The caller
-# sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch failure
-# (including a 404, e.g. a pre-checksum release) fails the same as any other
-# curl error here: unverified bytes reaching `tar -xzf` become binaries run
-# as root, so a URL-based fetch always requires a passing checksum.
+# hash against the downloaded bytes, and point $TARBALL at it. The tarball
+# lands in $TARBALL.part and is renamed only after it verifies. A download that
+# fails verification (e.g. a bad resume splice) is deleted and fetched once
+# more from byte 0; a second failure aborts, so a mismatch is never accepted.
+# The caller sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch
+# failure (including a 404, e.g. a pre-checksum release) fails the same as any
+# other curl error here: unverified bytes reaching `tar -xzf` become binaries
+# run as root, so a URL-based fetch always requires a passing checksum.
 # --proto allows file:// only for local tarballs (release-gate bakes one); redirects must stay https.
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp_disk_dir)"
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
+  local part="$TARBALL.part"
   local checksum_url="$url.sha256"
   local checksum_file="$TARBALL.sha256"
 
   echo "Downloading release tarball from $url..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+  download_mirror "$url" "$part" resume || exit 1
 
   echo "Downloading checksum sidecar from $checksum_url..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
+  download_mirror "$checksum_url" "$checksum_file" || exit 1
 
   echo "Downloading signatures..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL.sig" "$url.sig"
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file.sig" "$checksum_url.sig"
-  verify_release_signature "$TARBALL" "$TARBALL.sig"
+  download_mirror "$url.sig" "$TARBALL.sig" || exit 1
+  download_mirror "$checksum_url.sig" "$checksum_file.sig" || exit 1
   verify_release_signature "$checksum_file" "$checksum_file.sig"
 
-  local expected actual
+  local expected actual tries=0
   expected="$(cut -d' ' -f1 "$checksum_file")"
-  actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
-  if [ "$expected" != "$actual" ]; then
-    echo "error: checksum mismatch for $url" >&2
-    echo "       expected (from $checksum_url): $expected" >&2
-    echo "       actual:                        $actual" >&2
-    exit 1
-  fi
+  while :; do
+    actual="$(sha256sum "$part" | cut -d' ' -f1)"
+    if [ "$expected" = "$actual" ] && ( verify_release_signature "$part" "$TARBALL.sig" ); then
+      break
+    fi
+    if [ "$tries" -ge 1 ]; then
+      echo "error: checksum or signature mismatch for $url after a clean re-download" >&2
+      echo "       expected (from $checksum_url): $expected" >&2
+      echo "       actual:                        $actual" >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    echo "warning: downloaded tarball failed verification; deleting it and re-downloading from scratch" >&2
+    rm -f "$part"
+    download_mirror "$url" "$part" || exit 1
+  done
+  mv "$part" "$TARBALL"
 }
 
 # Fetch an apt repo signing key from <url>, require it to be exactly one
@@ -1975,8 +2063,8 @@ fi
 # real deployment) and its containerd-disabling step (a fresh Ubuntu box ships
 # no containerd package at all; the unit Lima VMs have is injected by Lima's
 # guest agent, so a real install has nothing to conflict with).
-apt-get update -qq
-apt-get install -y apt-transport-https ca-certificates curl gpg
+apt_get update -qq
+apt_install apt-transport-https ca-certificates curl gpg
 
 install -d -m 0755 /etc/apt/keyrings
 # Pinned fingerprint of the isv:cri-o OBS project key (fetched and read with
@@ -1986,14 +2074,82 @@ install_apt_key https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:
   85B67D5C50100B1AC8CEFE49CBA9C85640A2B579 /etc/apt/keyrings/cri-o-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
-apt-get update -qq
-apt-get install -y cri-o crun conmon
+apt_get update -qq
+# Pinned so user installs run the same runtime the Lima rig tests; bump with
+# lima/kubelet.yaml. --allow-downgrades lets a re-run on a host carrying a
+# newer cri-o converge to the pin instead of aborting.
+CRIO_VERSION="1.37.3-1.1"
+apt_install --allow-downgrades "cri-o=${CRIO_VERSION}" crun conmon
 # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun: CRI-O ships its
 # own crun at /usr/libexec/crio/crun matching the OCI spec version it generates
 # (1.2.x), while the system crun accepts only 1.0/1.1 and fails every sandbox
 # create with "unknown version specified". The package's own 10-crio.conf
 # already sets the correct path.
 mkdir -p /etc/crio/crio.conf.d
+
+# CRI-O's built-in crio-default profile (go.podman.io/common v0.68.1 template)
+# lacks the stacked-peer signal/ptrace rules, so on AppArmor 5 kernels a
+# container signalling its own threads (mariadbd first init) is DENIED and
+# hangs. u7s-default is that template plus exactly the two rules added by
+# containers/container-libs 6506a4c7f3. Remove it, the drop-in and the
+# apparmor_parser load once the CRI-O release in use vendors that commit.
+# Guarded like CRI-O's own check: kernel module enabled and parser present.
+if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] \
+  && command -v apparmor_parser >/dev/null 2>&1; then
+  cat > /etc/apparmor.d/u7s-default <<'U7S_AA_EOF'
+#include <tunables/global>
+
+profile u7s-default flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # Allow signals from privileged profiles and from within the same profile
+  signal (receive) peer=unconfined,
+  signal (send,receive) peer=u7s-default,
+  # With AppArmor 5.0+, child processes get a stacked profile.
+  signal (send,receive) peer=u7s-default//&*,
+  # Allow certain signals from OCI runtimes (podman, runc and crun)
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}runc,
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}crun*,
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}podman,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'ps' inside a container
+  ptrace (trace,read) peer=u7s-default,
+  # With AppArmor 5.0+, child processes get a stacked profile.
+  ptrace (trace,read) peer=u7s-default//&*,
+}
+U7S_AA_EOF
+  apparmor_parser -r -W /etc/apparmor.d/u7s-default
+  cat > /etc/crio/crio.conf.d/10-apparmor.conf <<'CRIO_AA_EOF'
+[crio.runtime]
+apparmor_profile = "u7s-default"
+CRIO_AA_EOF
+else
+  # A drop-in from an earlier run would point CRI-O at a profile nothing loads.
+  rm -f /etc/crio/crio.conf.d/10-apparmor.conf
+fi
 
 # Reap idle exec/attach/logs/port-forward streaming connections' goroutines and
 # buffers instead of holding them open for cri-o's 4h default; reopens on

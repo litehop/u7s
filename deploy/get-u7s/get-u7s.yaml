@@ -39,6 +39,12 @@ data:
         proxy_buffers 4 32k;
         proxy_busy_buffers_size 64k;
 
+        # Stream the ~124 MB tarball straight to the client. Buffered mode
+        # spools to /tmp whenever the client is slower than GitHub's storage,
+        # so N slow clients meant N disk-backed copies. Response headers
+        # still use proxy_buffer_size.
+        proxy_buffering off;
+
         location = /healthz {
             access_log off;
             return 200 "ok\n";
@@ -112,7 +118,7 @@ metadata:
   labels:
     app: get-u7s
 spec:
-  replicas: 1
+  replicas: 2
   revisionHistoryLimit: 3
   selector:
     matchLabels:
@@ -124,6 +130,15 @@ spec:
     spec:
       nodeSelector:
         topology.linode.com/region: ap-northeast
+      # Best-effort spread: a single-node region still schedules both pods
+      # rather than leaving one Pending.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: get-u7s
       containers:
         - name: nginx
           image: "nginxinc/nginx-unprivileged:1.31-alpine@sha256:c3fed6436b61d2bf2201ec032c35c000871f7ed062dea5d586bc6bf4d0fdd140"
@@ -166,6 +181,18 @@ spec:
         # of the root filesystem is read-only
         - name: tmp
           emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: get-u7s
+  labels:
+    app: get-u7s
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: get-u7s
 ---
 apiVersion: v1
 kind: Service
