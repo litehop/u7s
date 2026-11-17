@@ -2094,6 +2094,11 @@ mkdir -p /etc/crio/crio.conf.d
 # containers/container-libs 6506a4c7f3. Remove it, the drop-in and the
 # apparmor_parser load once the CRI-O release in use vendors that commit.
 # Guarded like CRI-O's own check: kernel module enabled and parser present.
+# Lima conformance rig mirror: scripts/conformance/lima-start.sh reuses this
+# profile verbatim plus one rig-only u7s-default rule (a signal rule for host
+# dig/nslookup profiles). Changing the profile structure, or the
+# "signal (send,receive) peer=u7s-default//&*," anchor line the rig inserts
+# after, must be mirrored there; scripts/test-install-logic.sh enforces it.
 if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] \
   && command -v apparmor_parser >/dev/null 2>&1; then
   cat > /etc/apparmor.d/u7s-default <<'U7S_AA_EOF'

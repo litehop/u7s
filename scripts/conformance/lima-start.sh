@@ -343,6 +343,10 @@ AA_PROFILE="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_A
 # Rig-only: a container process stacked under a host dig/nslookup profile has
 # the label "dig//&u7s-default", which u7s-default's own peer=u7s-default//&*
 # does not match, so u7s-default must allow that stacked peer as well.
+# This rig-only u7s-default rule is intentionally NOT in install.sh's profile
+# (operator decision: user hosts' profiles are untouched; detection is planned
+# instead). Removing it here, or adding it to install.sh, means updating the
+# other side and scripts/test-install-logic.sh.
 AA_PROFILE="$(printf '%s\n' "$AA_PROFILE" | awk '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print "  signal (send,receive) peer={dig,nslookup}//&u7s-default,"; n++} END {if (n != 1) exit 1}')" \
   || { echo "FATAL: u7s-default stacked-peer signal rule not found in install.sh" >&2; exit 1; }
 AA_CRIO_CONF="/etc/crio/crio.conf.d/10-apparmor.conf"

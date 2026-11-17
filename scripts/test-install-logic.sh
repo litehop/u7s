@@ -3106,6 +3106,24 @@ assert "a file:// URL gets exactly one curl call and no retries -- a local path 
   "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 1 ] && echo 1 || echo 0)"
 rm -rf "$DL_DIR"
 
+# ---------------------------------------------------------------------------
+# Lima rig vs install.sh: the rig's u7s-default profile must be install.sh's
+# plus exactly one rig-only rule.
+# ---------------------------------------------------------------------------
+LIMA_START="$DIR/conformance/lima-start.sh"
+RIG_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
+INSTALL_AA="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$INSTALL")"
+# Run the rig's own extract+insert statements (not a copy), with $0 inside
+# scripts/conformance/ so its "$(dirname "$0")/../install.sh" resolves.
+RIG_SNIPPET="$(awk '/^AA_PROFILE="\$\(awk/ {p=1} /^AA_CRIO_CONF=/ {p=0} p' "$LIMA_START")"
+RIG_AA="$(bash -c "$RIG_SNIPPET"$'\nprintf "%s\\n" "$AA_PROFILE"' "$DIR/conformance/x" 2>/dev/null || true)"
+assert "rig's effective u7s-default profile is install.sh's profile plus exactly the one rig-only signal rule -- otherwise the conformance rig silently drifts from the profile users actually run" \
+  "$([ -n "$INSTALL_AA" ] && ! printf '%s\n' "$INSTALL_AA" | grep -qxF "$RIG_RULE" && [ "$RIG_AA" = "$(printf '%s\n' "$INSTALL_AA" | awk -v r="$RIG_RULE" '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print r}')" ] && echo 1 || echo 0)"
+assert_true "install.sh carries the rig-mirror comment -- without it a profile edit would not prompt updating lima-start.sh, and the rig would drift from what users run" \
+  grep -q 'Lima conformance rig mirror: scripts/conformance/lima-start.sh' "$INSTALL"
+assert_true "lima-start.sh carries the rig-only-rule comment -- without it the rule's absence from install.sh looks like an omission and gets 'fixed' on one side only, drifting the rig from what users run" \
+  grep -q 'This rig-only u7s-default rule is intentionally NOT in install.sh' "$LIMA_START"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
