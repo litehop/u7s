@@ -229,6 +229,13 @@ U7S_GCP_MACHINE_TYPE=e2-standard-2 run "$VPS" up t1
 create="$(grep 'compute instances create' <<<"$LOG" || true)"
 assert "U7S_GCP_MACHINE_TYPE overrides the machine type (the dual-stack sonobuoy subset saturates e2-micro) and nothing else" \
   "$(has '--machine-type=e2-standard-2' "$create")$(hasnt 'e2-micro' "$create")$(has '--provisioning-model=SPOT' "$create")"
+run "$VPS" up t1
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "boot disk defaults to pd-standard (existing gate/e2e VMs must not change disk class silently)" "$(has '--boot-disk-type=pd-standard' "$create")"
+U7S_GCP_BOOT_DISK_TYPE=pd-balanced run "$VPS" up t1
+create="$(grep 'compute instances create' <<<"$LOG" || true)"
+assert "U7S_GCP_BOOT_DISK_TYPE selects the boot disk class (disk-IO wedge A/B needs SSD-class VMs) and nothing else" \
+  "$(has '--boot-disk-type=pd-balanced' "$create")$(hasnt 'pd-standard' "$create")$(has '--boot-disk-size=10GB' "$create")"
 run "$VPS" up --machine-type n1-custom-1-1024 t1
 create="$(grep 'compute instances create' <<<"$LOG" || true)"
 assert "up --machine-type reaches gcloud (a tool that cannot pick the shape forces raw gcloud, bypassing labels and the 16h cap)" \

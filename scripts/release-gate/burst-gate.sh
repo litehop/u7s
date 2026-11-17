@@ -133,6 +133,7 @@ while [ $# -gt 0 ]; do
     --wedge-stall-secs) WEDGE_STALL_SECS="$2"; shift 2 ;;
     --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --backend) BACKEND="$2"; shift 2 ;;
+    --boot-disk-type) export U7S_GCP_BOOT_DISK_TYPE="$2"; shift 2 ;;
     --release) RELEASE="$2"; shift 2 ;;
     --tarball) EXP_TARBALL="$2"; shift 2 ;;
     --install-only) INSTALL_ONLY=1; shift ;;
