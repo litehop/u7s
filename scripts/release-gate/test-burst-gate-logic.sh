@@ -291,6 +291,12 @@ rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --
 assert "--confirm is a single 3/3 gate at 20 pods with no smaller fall-back size, and a failing gate ends FAIL" \
   "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
+mkdir -p "$TMP/tb-none" "$TMP/out-leak/burst-20"
+echo "LEAKED GCP VPS u7s-gate-leak: delete failed" > "$TMP/out-leak/burst-20/leaked-vps.txt"
+rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb-none" --out "$TMP/out-leak" 2>/dev/null)" || rc=$?
+assert "--confirm aborting on a sub-run setup error still reports leaked VPSes (else a billing instance from an earlier sub-run goes unnoticed)" \
+  "$([ "$rc" = 2 ] && echo "$out" | grep -q 'LEAKED GCP VPS u7s-gate-leak' && grep -q 'u7s-gate-leak' "$TMP/out-leak/leaked-vps.txt" && echo 1 || echo 0)"
+
 # --- marker (item: criterion (d) false pass) ---
 assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
 assert "empty read (recreated DB, table missing) -> not ok: the false-PASS path through the installer 302" \

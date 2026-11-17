@@ -242,12 +242,17 @@ fi
 # --confirm: full gate (--runs, default 3) at each size in CONFIRM_SIZES, largest first, stopping
 # at the first size where every run passes. The passing size is the gated no-swap burst ceiling.
 if [ "$CONFIRM" = 1 ]; then
+  confirm_leak_report() {
+    cat "$OUT"/burst-*/leaked-vps.txt > "$OUT/leaked-vps.txt" 2>/dev/null
+    [ -s "$OUT/leaked-vps.txt" ] || return 1
+    echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+  }
   tried=()
   for size in $CONFIRM_SIZES; do
     rg_confirm_sub_args "$size"
     sub_rc=0
     "$0" "${SUB_ARGS[@]}" >&2 || sub_rc=$?
-    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; exit 2; }
+    [ "$sub_rc" != 2 ] || { echo "CONFIRM: sub-run at $size pods hit a setup error (exit 2), aborting: not a verdict" >&2; confirm_leak_report; exit 2; }
     n_passed="$(cat "$OUT/burst-$size/passed" 2>/dev/null || echo 0)"
     n_valid="$(cat "$OUT/burst-$size/valid" 2>/dev/null || echo 0)"
     tried+=("$size:$n_passed:$n_valid:$RUNS")
@@ -255,9 +260,7 @@ if [ "$CONFIRM" = 1 ]; then
     [ "$n_passed" = "$n_valid" ] && break
   done
   rg_confirm_verdict "${tried[@]}"; rc=$?
-  cat "$OUT"/burst-*/leaked-vps.txt > "$OUT/leaked-vps.txt" 2>/dev/null
-  if [ -s "$OUT/leaked-vps.txt" ]; then
-    echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"
+  if confirm_leak_report; then
     [ "$rc" != 0 ] || { rc=4; echo "CONFIRM: PASS but LEAKED VPS: exit 4"; }
   fi
   exit "$rc"
