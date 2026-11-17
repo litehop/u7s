@@ -305,18 +305,16 @@ host_state() {
   echo "$(date -u +%H:%M:%SZ) $1 loadavg=$(sysctl -n vm.loadavg 2>/dev/null || cut -d' ' -f1-3 /proc/loadavg) other-running-vms=$(vm_running "$VM")"
 }
 
+NONCE="$(rg_nonce)"; PLATFORMS=""
 knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
 while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ]; do
   attempt=$((attempt + 1))
-  # The guest's hostname is the VPS name plus GCE's ".c.<project>.internal"; the node's
-  # certificate CN is "system:node:<hostname>" and openssl rejects a CN over 64 characters, so
-  # the gcp name stays short.
-  if [ "$BACKEND" = gcp ]; then VM="u7s-rg-${STAMP:4:2}${STAMP:6:2}${STAMP:9:6}-$attempt"; else VM="u7s-rg-$STAMP-$attempt"; fi
+  VM="$(rg_vm_name "$BACKEND" "$STAMP" "$attempt" "$NONCE")"
   RUN_OUT="$OUT/$RUN_PREFIX-$attempt"; mkdir -p "$RUN_OUT"
   [ -z "$EXP_TAG" ] || echo "$EXP_TAG"
   echo "==== attempt $attempt (valid $valid/$RUNS, invalid $invalid, preempted $preempted, cap $MAX_INVALID_RUNS): VM $VM ===="
   host_state start | tee "$RUN_OUT/host.txt"
-  status=""
+  status=""; PLATFORM=""
   VM_ALLOW_PCT=0
   : > "$RUN_OUT/quiet.log"
   if [ "$BACKEND" = lima ]; then
@@ -329,6 +327,11 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   if [ -n "$status" ]; then
     :
   elif VMS="$VMS $VM"; vm_create "$VM" "$RUN_OUT"; then
+    if [ "$BACKEND" = gcp ]; then
+      PLATFORM="$(cat "$RUN_OUT/platform.txt")"
+      echo "$PLATFORM" | tee -a "$RUN_OUT/host.txt"
+      case " $PLATFORMS " in *" ${PLATFORM/ /,} "*) ;; *) PLATFORMS="$PLATFORMS ${PLATFORM/ /,}" ;; esac
+    fi
     quiet_pid=""
     if [ "$BACKEND" = lima ]; then
       VM_ALLOW_PCT="$(rg_vm_cpu_allow_pct "$VM_VCPUS" "$HOST_CORES")"
@@ -375,10 +378,15 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       || echo "warning: could not copy results out of $VM" >&2
     PENDING_VM=""
   else
+    create_rc=$?
     echo "VM $VM failed to create/start (see $RUN_OUT/*-create.log)" >&2
     if [ "$BACKEND" = gcp ]; then
       status=INVALID
-      echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+      if [ "$create_rc" = 2 ]; then
+        echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): could not record the image name and uname -r of $VM, so a result could not be attributed to a platform (see $RUN_OUT/gcp-create.log)" | tee "$RUN_OUT/verdict.txt"
+      else
+        echo "INFRASTRUCTURE (run is INVALID, not a u7s FAIL): $VM was never created or never reachable over IAP ssh (stockout, quota, IAP)" | tee "$RUN_OUT/verdict.txt"
+      fi
     fi
   fi
   host_state end | tee -a "$RUN_OUT/host.txt"
@@ -400,6 +408,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       rg_verdict "$RUN_OUT/out/results.env" > "$RUN_OUT/verdict.txt"; rc=$?
     fi
     [ -z "$EXP_TAG" ] || { { echo "$EXP_TAG"; cat "$RUN_OUT/verdict.txt"; } > "$RUN_OUT/verdict.tmp"; mv "$RUN_OUT/verdict.tmp" "$RUN_OUT/verdict.txt"; }
+    [ -z "$PLATFORM" ] || echo "PLATFORM: $PLATFORM" >> "$RUN_OUT/verdict.txt"
     cat "$RUN_OUT/verdict.txt"
     status="$(rg_run_status "$rc" "$RUN_OUT/quiet.log" "$RUN_OUT/out/results.env")"
   fi
@@ -427,7 +436,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
     INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
-  [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out"; } | tee "$RUN_OUT/summary.md"
+  [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out" "$PLATFORM"; } | tee "$RUN_OUT/summary.md"
   [ "$KEEP" = 1 ] || { vm_delete "$VM" && VMS="${VMS/ $VM/}"; }
 done
 
@@ -437,12 +446,13 @@ if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
 elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED (only $valid/$RUNS valid runs; $preempted preempted, $invalid invalid)"; rc=3
 elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
 else verdict=PASS; rc=0; fi
+PLATFORMS="${PLATFORMS# }"; PLATFORMS="${PLATFORMS:-none-recorded}"
 if [ -n "$EXP_TAG" ]; then
-  echo "backend=gcp experiment=yes machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
+  echo "backend=gcp experiment=yes machine=$GCP_GATE_MACHINE_TYPE platforms=$PLATFORMS arch=x86_64 release-authoritative=no preempted=$preempted invalid=$invalid $EXP_TAG" > "$OUT/backend.txt"
   verdict="EXPERIMENT $verdict [$EXP_TAG]"
 elif [ "$BACKEND" = gcp ]; then
-  echo "backend=gcp release=$RELEASE machine=$GCP_GATE_MACHINE_TYPE arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
-  verdict="$verdict [release-authoritative: x86_64 GCP $GCP_GATE_MACHINE_TYPE Spot, mirror release $RELEASE]"
+  echo "backend=gcp release=$RELEASE machine=$GCP_GATE_MACHINE_TYPE platforms=$PLATFORMS arch=x86_64 release-authoritative=yes preempted=$preempted invalid=$invalid" > "$OUT/backend.txt"
+  verdict="$verdict [release-authoritative: x86_64 GCP $GCP_GATE_MACHINE_TYPE Spot, platforms $PLATFORMS, mirror release $RELEASE]"
 fi
 if [ -s "$OUT/leaked-vps.txt" ]; then
   echo "WARNING: VPSes may still be running and billing:"; cat "$OUT/leaked-vps.txt"

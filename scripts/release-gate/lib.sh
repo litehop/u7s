@@ -722,6 +722,14 @@ rg_experiment_args_error() {
   fi
 }
 
+# VPS name for attempt $3 of the run stamped $2 (backend $1). The nonce $4 keeps two runs started
+# in the same second apart. The gcp name stays short: the guest hostname is the name plus
+# ".c.<project>.internal", and the node cert CN "system:node:<hostname>" must stay under 64 chars.
+rg_vm_name() {
+  if [ "$1" = gcp ]; then echo "u7s-rg-${2:4:2}${2:6:2}${2:9:6}-$4-$3"; else echo "u7s-rg-$2-$4-$3"; fi
+}
+rg_nonce() { od -An -N3 -tx1 /dev/urandom | tr -d ' \n'; }
+
 # Echoes why the overload flags are refused, or nothing. $1 --overload-pods, $2 --overload-mib,
 # $3 --no-workload (0|1), $4 --ramp, $5 --confirm (0|1), $6 --overload-window-secs.
 rg_overload_args_error() {
