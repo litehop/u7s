@@ -43,6 +43,7 @@ gcp_require_config() {
 # NETWORK is u7s-test (default) or the probe VPC; SUBNET defaults to the network's namesake, and
 # u7s-test also has u7s-test-b.
 # U7S_GCP_MACHINE_TYPE overrides the machine type (default e2-micro).
+# U7S_GCP_BOOT_DISK_TYPE overrides the boot disk type (default pd-balanced: u7s needs SSD-class storage; HDD-class pd-standard wedges a 1 GiB node under pod bursts).
 gcp_vps_create() {
   local stack="${3:-IPV4_ONLY}" net="${4:-$GCP_NETWORK}"
   local subnet="${5:-$net}"
@@ -57,7 +58,7 @@ gcp_vps_create() {
   gcloud compute instances create "$1" --zone="$2" \
     --machine-type="${U7S_GCP_MACHINE_TYPE:-e2-micro}" \
     --image-family=ubuntu-2604-lts-amd64 --image-project=ubuntu-os-cloud \
-    --boot-disk-size=10GB --boot-disk-type=pd-standard \
+    --boot-disk-size=10GB --boot-disk-type="${U7S_GCP_BOOT_DISK_TYPE:-pd-balanced}" \
     --network="$net" --subnet="$subnet" --stack-type="$stack" ${v6[@]+"${v6[@]}"} \
     --labels="$GCP_LABEL" --tags="$GCP_VPS_TAG" \
     --provisioning-model=SPOT --instance-termination-action=STOP --max-run-duration=16h
