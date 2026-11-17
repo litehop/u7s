@@ -309,7 +309,7 @@ host_state() {
 }
 
 NONCE="$(rg_nonce)"; PLATFORMS=""
-knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0
+knees=""; overall=0; passed=0; valid=0; invalid=0; preempted=0; attempt=0; invalid_reasons=""
 while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ]; do
   attempt=$((attempt + 1))
   VM="$(rg_vm_name "$BACKEND" "$STAMP" "$attempt" "$NONCE")"
@@ -436,7 +436,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   case "$status" in
     PASS) passed=$((passed + 1)); valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
     FAIL) overall=1; valid=$((valid + 1)); [ -z "$RAMP" ] || knees="$knees $(rg_ramp_knee "$RUN_OUT/verdict.txt")" ;;
-    INVALID) invalid=$((invalid + 1)); [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
+    INVALID) invalid=$((invalid + 1)); invalid_reasons="$invalid_reasons; run $attempt: $(rg_invalid_reason "$RUN_OUT" "$harness_error")"; [ $((invalid + preempted)) -lt "$MAX_INVALID_RUNS" ] && { sleep "$RG_RETRY_WAIT_SECS" & wait $!; } ;;
     PREEMPTED) preempted=$((preempted + 1)) ;;
   esac
   [ -s "$RUN_OUT/out/samples.tsv" ] && { [ -z "$EXP_TAG" ] || printf '%s\n\n' "$EXP_TAG"; "$HERE/summarize.sh" "$RUN_OUT/out" "$PLATFORM"; } | tee "$RUN_OUT/summary.md"
@@ -447,7 +447,7 @@ echo "$passed" > "$OUT/passed"
 echo "$valid" > "$OUT/valid"
 if [ "$overall" != 0 ]; then verdict=FAIL; rc=1
 elif [ "$valid" -lt "$RUNS" ] && [ "$preempted" -gt 0 ]; then verdict="PREEMPTED (only $valid/$RUNS valid runs; $preempted preempted, $invalid invalid)"; rc=3
-elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs; host contention)"; rc=3
+elif [ "$valid" -lt "$RUNS" ]; then verdict="INVALID (only $valid/$RUNS valid runs$invalid_reasons)"; rc=3
 else verdict=PASS; rc=0; fi
 PLATFORMS="${PLATFORMS# }"; PLATFORMS="${PLATFORMS:-none-recorded}"
 if [ -n "$EXP_TAG" ]; then

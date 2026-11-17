@@ -685,9 +685,10 @@ printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
   '  "config get-value compute/zone") echo z-1 ;;' \
   '  "compute instances create"*) echo "created p-secret" ;;' \
   '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && { echo "ERROR: operations denied for p-secret" >&2; exit 1; }; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
+  '  "compute instances describe"*"disks[0].source"*) echo "https://www.googleapis.com/compute/v1/projects/p-secret/zones/z-1/disks/attached-boot-disk" ;;' \
   '  "compute instances describe"*) [ "${GCLOUD_DESCRIBE_ERR:-0}" = 1 ] && exit 1; echo 1 ;;' \
   '  "compute ssh"*vm-gate.sh*) [ "${GCLOUD_SSH_HANG:-0}" = 1 ] || exit 0; sleep 300 & echo $! > "$GCLOUD_HANG_PID"; wait ;;' \
-  '  "compute disks describe"*) [ "${GCLOUD_NO_IMAGE:-0}" = 1 ] || echo "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2604-resolute-amd64-v20261021"; exit 0 ;;' \
+  '  "compute disks describe attached-boot-disk"*) [ "${GCLOUD_NO_IMAGE:-0}" = 1 ] || echo "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2604-resolute-amd64-v20261021"; exit 0 ;;' \
   '  "compute ssh"*"uname -r"*) [ "${GCLOUD_NO_KERNEL:-0}" = 1 ] || echo 7.0.0-1017-gcp; exit 0 ;;' \
   '  "compute ssh"*) echo "ERROR: ssh to x.c.p-secret.internal failed" >&2; [ "${GCLOUD_SSH_OK:-0}" = 1 ] && exit 0; exit 1 ;;' \
   '  "compute scp"*) for a; do d="$a"; done; case "$*" in *:/var/tmp/rg/out*) mkdir -p "$d"; echo "host x.c.p-secret.internal" > "$d/install.log"; [ -z "${GCLOUD_RESULTS:-}" ] || cp "$GCLOUD_RESULTS" "$d/results.env" ;; esac; exit 0 ;;' \
@@ -770,6 +771,8 @@ assert "--confirm PASS with no leak still exits 0" "$([ "$rc" = 0 ] && [ ! -s "$
 P='image=ubuntu-2604-resolute-amd64-v20261021 kernel=7.0.0-1017-gcp'
 assert "the resolved image and uname -r land in host.txt and the sub-run verdict (a FAIL must be attributable to a kernel move at a glance)" \
   "$(grep -qx "$P" "$TMP/out-gpass/run-1/host.txt" && grep -qx "PLATFORM: $P" "$TMP/out-gpass/run-1/verdict.txt" && echo 1 || echo 0)"
+assert "the boot disk is found via instances describe disks[0].source, not assumed to be named after the VM (a differently-named boot disk would make every gate run INVALID)" \
+  "$(grep -q "^compute disks describe attached-boot-disk " "$GCLOUD_CALLS" && ! grep -q "^compute disks describe u7s-gate" "$GCLOUD_CALLS" && echo 1 || echo 0)"
 assert "image and kernel land in backend.txt and the GATE line (the gate verdict names the platform it speaks for)" \
   "$(grep -q 'platforms=image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp ' "$TMP/out-gpass/backend.txt" && grep -q 'GATE:.*platforms image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp' "$TMP/out-gpass.out" && echo 1 || echo 0)"
 assert "the gate still boots the floating family (pinning would stop the gate catching new kernels)" \
@@ -781,6 +784,8 @@ for miss in GCLOUD_NO_IMAGE GCLOUD_NO_KERNEL; do
   env "$miss=1" GCLOUD_RESULTS="$TMP/good.env" "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/out-gmiss-$miss" --runs 1 >"$TMP/out-gmiss-$miss.out" 2>&1 && rc=0 || rc=$?
   assert "$miss: an unreadable image or kernel makes the run INVALID (exit 3) with the reason, never a PASS/FAIL or an empty platform field a FAIL could not be attributed from" \
     "$([ "$rc" = 3 ] && [ "$(cat "$TMP/out-gmiss-$miss/valid")" = 0 ] && grep -q 'INVALID, not a u7s FAIL): could not record the image name and uname -r' "$TMP/out-gmiss-$miss/run-1/verdict.txt" && ! grep -q 'GATE:.*PASS' "$TMP/out-gmiss-$miss.out" && echo 1 || echo 0)"
+  assert "$miss: all-INVALID final verdict names the real reason, not host contention (an operator would chase a quiet host for a platform-capture failure)" \
+    "$(grep -q "^==== GATE:.*INVALID (only 0/1 valid runs; run 1: .*could not record the image name" "$TMP/out-gmiss-$miss.out" && ! grep -q "^==== GATE:.*host contention" "$TMP/out-gmiss-$miss.out" && echo 1 || echo 0)"
 done
 assert "gcp vm-gate.log is fully written (redactor waited for) before the run proceeds" \
   "$([ ! -e "$TMP/out-gpass/run-1/vm-gate.fifo" ] && [ -f "$TMP/out-gpass/run-1/vm-gate.log" ] && echo 1 || echo 0)"

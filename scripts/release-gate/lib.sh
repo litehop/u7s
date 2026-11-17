@@ -418,6 +418,15 @@ rg_run_status() {
   fi
 }
 
+# One-line reason a run is INVALID. $1 run dir (verdict.txt, contention.txt), $2 harness error.
+rg_invalid_reason() {
+  local r
+  r="$(grep -m1 '^INFRASTRUCTURE' "$1/verdict.txt" 2>/dev/null | sed 's/^[^:]*: //')"
+  [ -n "$r" ] || { [ -z "$2" ] || r="harness error: $2"; }
+  [ -n "$r" ] || r="$(head -1 "$1/contention.txt" 2>/dev/null)"
+  echo "${r:-reason not recorded}"
+}
+
 # Classifies a kubectl probe: $1 exit code, $2 combined output. Echoes
 #   ok          the probe ran and succeeded
 #   answered    the API answered with an error (non-2xx, NotFound): a u7s answer

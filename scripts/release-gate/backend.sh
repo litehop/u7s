@@ -41,8 +41,11 @@ vm_create() {
 # echoed) unless both are non-empty. The family resolves at create time, so the boot disk's
 # sourceImage is the image the VM actually runs.
 vm_platform() {
-  local image kernel
-  image="$(gcloud compute disks describe "$1" --zone="$(gcp_zone)" --format='value(sourceImage)' 2>/dev/null)" || return 1
+  local disk image kernel
+  disk="$(gcloud compute instances describe "$1" --zone="$(gcp_zone)" --format='value(disks[0].source)' 2>/dev/null)" || return 1
+  disk="${disk##*/}"
+  [ -n "$disk" ] || { echo "no boot disk found for $1" >&2; return 1; }
+  image="$(gcloud compute disks describe "$disk" --zone="$(gcp_zone)" --format='value(sourceImage)' 2>/dev/null)" || return 1
   image="${image##*/}"
   kernel="$(vm_shell "$1" uname -r 2>/dev/null | tr -d '\r\n')"
   [ -n "$image" ] && [ -n "$kernel" ] || { echo "image='$image' kernel='$kernel'" >&2; return 1; }
