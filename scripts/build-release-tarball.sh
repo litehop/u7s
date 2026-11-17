@@ -2,7 +2,7 @@
 # Builds the u7s release tarball for linux/x86_64: cargo-builds
 # u7s-apiserver + u7s-scheduler for x86_64-unknown-linux-gnu, downloads the
 # matching kubelet + kube-controller-manager + kubectl from dl.k8s.io (checksum- and
-# cosign-verified; the .sig/.cert ship alongside) plus the CNI plugins CRI-O and
+# cosign-verified when cosign is installed; the .sig/.cert ship alongside) plus the CNI plugins CRI-O and
 # flannel call (SHA-256 pinned below), and packages them into the layout scripts/install.sh
 # expects (it finds each binary by name anywhere in the extracted tree, so
 # internal layout is not load-bearing --
@@ -16,7 +16,8 @@
 #   scripts/build-release-tarball.sh v0.1.0
 #
 # Requires: cargo/rustup (with the x86_64-unknown-linux-gnu target
-# installable), curl, sha256sum, tar, cosign.
+# installable), curl, sha256sum, tar. Optional: cosign (verifies the upstream
+# signatures when on PATH; otherwise only the sha256 check runs).
 set -euo pipefail
 
 # Same Kubernetes version pinned elsewhere in this project (e2e-focus.yaml's
@@ -60,9 +61,10 @@ cp "$ROOT_DIR/target/$TARGET/release/u7s-scheduler" "$STAGE_DIR/"
 # shellcheck source=lib/release-fetch.sh
 . "$ROOT_DIR/scripts/lib/release-fetch.sh"
 
-if ! command -v cosign >/dev/null 2>&1; then
-  echo "error: cosign not found on PATH -- it verifies the upstream kubelet/kube-controller-manager/kubectl signatures" >&2
-  exit 1
+if command -v cosign >/dev/null 2>&1; then
+  echo "==> cosign found: upstream binaries are sha256- and cosign-verified" >&2
+else
+  echo "==> cosign verification skipped because cosign isn't installed; upstream binaries are sha256-verified only" >&2
 fi
 
 echo "==> Fetching kubelet + kube-controller-manager + kubectl v$K8S_VERSION for linux/$K8S_ARCH" >&2

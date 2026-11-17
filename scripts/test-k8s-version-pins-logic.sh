@@ -40,4 +40,21 @@ check "lima/kubelet.yaml CRIO_VERSION minor" "$minor" "$crio_pkg"
 install_crio="$(grep -oE 'isv:/cri-o:/stable:/v[0-9]+\.[0-9]+/' "$REPO/scripts/install.sh" | sort -u | sed 's#.*:/v\(.*\)/#\1#')"
 check "install.sh CRI-O repo minor" "$minor" "$install_crio"
 
+lima_crio_full="$(sed -n 's/^ *CRIO_VERSION="\(.*\)"$/\1/p' "$REPO/lima/kubelet.yaml")"
+install_crio_full="$(sed -n 's/^CRIO_VERSION="\(.*\)"$/\1/p' "$REPO/scripts/install.sh")"
+
+if [ -z "$install_crio_full" ]; then
+  echo "FAIL: install.sh does not pin CRIO_VERSION -- user installs silently change runtime whenever the repo publishes a new patch"
+  FAIL=1
+else
+  echo "PASS: install.sh pins CRIO_VERSION = $install_crio_full"
+fi
+
+if [ -n "$install_crio_full" ] && [ "$install_crio_full" = "$lima_crio_full" ]; then
+  echo "PASS: install.sh and lima/kubelet.yaml CRIO_VERSION equal = $lima_crio_full"
+else
+  echo "FAIL: install.sh CRIO_VERSION '${install_crio_full:-<none>}' != lima/kubelet.yaml '${lima_crio_full:-<none>}' -- dev VMs test a different runtime from what users get; bump them together"
+  FAIL=1
+fi
+
 exit "$FAIL"
