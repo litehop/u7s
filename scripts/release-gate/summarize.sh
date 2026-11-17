@@ -3,10 +3,12 @@
 # MemAvailable min per phase (the overall min excludes the install phase), and
 # per-component PSS/RSS (MiB) at the end of the idle phase, at the end of the wordpress phase, and the peak over the whole run.
 #
-# Usage: summarize.sh <run-out-dir>
+# Usage: summarize.sh <run-out-dir> [platform]
+# platform (gcp: "image=<name> kernel=<uname -r>") is printed first so a summary names what it ran on.
 set -euo pipefail
 S="${1:?usage: $0 <run-out-dir>}/samples.tsv"
 [ -s "$S" ] || { echo "no samples in $S" >&2; exit 1; }
+[ -z "${2:-}" ] || printf 'platform: %s\n\n' "$2"
 
 awk -F'\t' '
   $3 == "MEM" {
