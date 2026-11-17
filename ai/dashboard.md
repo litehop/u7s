@@ -1,35 +1,38 @@
 ---
-updated: 2026-11-16T09:29Z
+updated: 2026-11-17T15:10Z
 ---
-# Dashboard — session 2026-11-16 WRAPPED (main `28c1cf7d`)
-**Stance:** pre-alpha, no users; correctness (conformance) > security > perf > features; match upstream 1.37.1 except secure crypto defaults; queue merge on green, never `--admin`.
-**Resume:** paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons. No workers, VMs or GCP instances running.
+# Dashboard — hand-off after 2026-11-17 (main `e074a92d`) — v0.4.5 out; next v0.4.6
+**Stance:** alpha (no compat promise); correctness > security > perf > features; upstream 1.37.1 except secure crypto; queue merge on green, never `--admin`; security PRs drafted for operator.
+**Resume:** paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons; `bd recall release-plan-v0-4-6`.
 
 ## 🎯 Waiting on you
-- `mayor-7hmeo`: the project `.claude/settings.json` `autoMode` block is ignored by Claude Code (user/managed scope only). Delete it, or keep it as a template?
-- Carried from 2026-11-05: the `lewl1.4` interview, plus the `u9qzh` gate (FAIL 1/3 at 20 pods on a stale snapshot). Cut a fresh snapshot and re-run?
+1. (Optional) post the cri-o issue drafted in `temp/cri-o-issue-apparmor-stacked-peer.md`.
 
-## ⏭ Next
-1. `mayor-2wf82` (P2): flaky `test-critical-reviewer-hook.sh` concurrent rotation. It dropped 1 of 15 decisions and knocked #2140 out of the queue once. A real race would silently skip reviews.
-2. `mayor-866mm` (P2): an unknown admission rule scope matches everything; no validation rejects it.
-3. Partial leftovers: `l2imr` (roadmap nits) · `ynfzk` (skipped-bead list, CONTRIBUTING note) · `mayor-5g4i9` (dhat test coverage lost in #2140).
-4. Carried: `u9qzh` root-cause · `pzhtd` experiment E · `lewl1.5`/`.6` · P4 `01wat`.
+## ⏭ Next session → v0.4.6 once all three are on main
+- `mayor-1diau` pod MTU = NIC − 74/94 (beep Geneve); then notify beep mayor (earlier notice undelivered)
+- `mayor-u015m` download_mirror status-branch tests, overall time cap, temp-file trap
+- `mayor-na818` flannel from docker.io/flannel, digest-pinned
+- then snapshot → `--confirm` 3/3 on pd-balanced → release
 
-## ✅ This session (12 merged)
-Renovate #2133 #2135 #2136 (jsonwebtoken 12, operator-reviewed) · #2141 RUSTSEC quinn-udp/rustix · #2139 RBAC YAML SHA256 pin · #2140 dhat path (security) · #2142 revert-run docs + impersonated discovery test · #2143 burst-gate `--confirm` passthrough · #2144 tick bead-close cursor · #2145 README prereqs + kernel preflight · #2146 webhook timeout clamp + VAP Namespaced scope (security).
-Learned: Claude Code autoMode is honoured only from user/managed settings. Security PRs are held as draft so the tick can't auto-merge them.
+## ⏭ Later
+`mayor-lwwze` AppArmor detector (design approved; doc on `worker/agent-a8ffaf53174ff3c38` @ `6c03cb34`) · `mayor-kyhhp` DNS on generic-kernel real installs · `mayor-6ftew` DRA delete · `mayor-06ha8` 2-node rig · epic `mayor-c12qi` watchdog · `mayor-ie064` Renovate pins · `mayor-g06uz` CRI-O 1.37.4 · `mayor-qnix7` · `mayor-xqog5` reviewer posting · #2068 mariadb.
+
+## ✅ Session 2026-11-17
+**v0.4.5 released** (`92562be8`, gate 3/3) · beep run 1 PASS · Conformance 452/462 · #2158 #2161 #2165 #2166 #2168 #2170 #2171 install/gate/rig fixes · #2169 relay hardening (deployed) · #2156 README alpha. Decisions in bead notes.
 
 <!-- BEGIN AUTO: open-prs -->
-- #2068 mariadb (draft, partial) · #2039 control-plane memory (draft)
+- #2068 examples(mariadb): drop CPU limit, small InnoDB args (partial: first init still ~50% on e2-micro) (`worker/agent-a60ed75eb02f26db1`, CLEAN)
 <!-- END AUTO: open-prs -->
 <!-- BEGIN AUTO: worktrees -->
-- drafts' `a60ed75`, `a7c2b61`; `beep-903-run1`
+- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a60ed75eb02f26db1` (`worker/agent-a60ed75eb02f26db1`)
+- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a8ffaf53174ff3c38` (`worker/agent-a8ffaf53174ff3c38`)
+- `/Users/balint.erdos/litehop/u7s/ai/worktrees/beep-903-run1` (`beep/903-run1`)
 <!-- END AUTO: worktrees -->
 <!-- BEGIN AUTO: cron-loops -->
-none (cancelled at hand-off 2026-11-16)
+15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
 <!-- END AUTO: cron-loops -->
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-11-16T09:29Z — `main` @ `28c1cf7d`.
+As of 2026-11-17T15:10Z — Branch `main` @ `e074a92d`.
 <!-- END AUTO: repo-state -->
 <!-- BEGIN AUTO: review-queue -->
 0 pending review-queue entries.
