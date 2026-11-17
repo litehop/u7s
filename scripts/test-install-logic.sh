@@ -3044,7 +3044,7 @@ rc=0; out="$(run_fetch fail92x2 "$DL_URL")" || rc=$?
 assert "two HTTP/2 INTERNAL_ERROR (92) drops then success still installs with exactly 3 attempts -- otherwise the first install dies on a mirror hiccup" \
   "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
 assert "only the third attempt falls back to --http1.1 -- HTTP/2 stream resets must not repeat forever, but HTTP/2 stays the first choice" \
-  "$([ "$(tar_args | grep -c -- '--http1.1')" -eq 1 ] && ! tar_args | sed -n '1,2p' | grep -q -- '--http1.1' && echo 1 || echo 0)"
+  "$(a=$(tar_args); f=$(printf '%s\n' "$a" | grep -c -- '--http1.1'); e=$(printf '%s\n' "$a" | sed -n '1,2p' | grep -c -- '--http1.1'); [ "$f" -eq 1 ] && [ "$e" -eq 0 ] && echo 1 || echo 0)"
 
 rc=0; out="$(run_fetch partial56 "$DL_URL")" || rc=$?
 assert "a connection reset (56) mid-download is resumed with -C - and the final file hashes to the sidecar -- without resume a 124 MB retry restarts from zero under the same load" \
