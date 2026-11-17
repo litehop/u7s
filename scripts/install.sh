@@ -444,42 +444,101 @@ verify_release_signature() {
   rm -rf "$keydir"
 }
 
+# Mirror fetches die mid-stream under concurrent load (curl 92 HTTP/2
+# INTERNAL_ERROR, 56 reset), which curl's own --retry never retries. This loop
+# retries every transient failure with backoff, resumes a partial <dest> when
+# <resume> is non-empty, drops to HTTP/1.1 from the third attempt, and aborts a
+# stalled transfer (--speed-limit/--speed-time) instead of waiting out a long
+# fixed timeout. Protocol/TLS restrictions are identical on every attempt.
+# Permanent client errors (4xx other than 408/429) fail at once. file:// URLs
+# are one local read: no retries. Verification is the caller's job.
+DOWNLOAD_ATTEMPTS=6
+DOWNLOAD_RETRY_DELAY=2
+DOWNLOAD_MAX_SECONDS=1800
+download_mirror() {
+  local url="$1" dest="$2" resume="${3:-}"
+  case "$url" in
+    file://*) curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$dest" "$url"; return ;;
+  esac
+  local attempt=1 start="$SECONDS" rc code err left lasterr="" flags
+  err="$(mktemp)"
+  while :; do
+    left=$(( DOWNLOAD_MAX_SECONDS - (SECONDS - start) ))
+    [ "$left" -ge 1 ] || { lasterr="${lasterr:-overall ${DOWNLOAD_MAX_SECONDS}s time cap reached}"; break; }
+    flags=(--speed-limit 10240 --speed-time 30 --connect-timeout 20 --max-time "$left")
+    [ "$attempt" -lt 3 ] || flags+=(--http1.1)
+    [ -z "$resume" ] || flags+=(-C -)
+    rc=0
+    code="$(curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL "${flags[@]}" -w '%{http_code}' -o "$dest" "$url" 2>"$err")" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$err"
+      return 0
+    fi
+    lasterr="curl exit $rc: $(tail -n1 "$err")"
+    case "$code" in
+      416) rm -f "$dest" ;;
+      4[0-9][0-9]) [ "$code" = 408 ] || [ "$code" = 429 ] || break ;;
+    esac
+    [ "$rc" -ne 33 ] || rm -f "$dest"
+    [ "$attempt" -lt "$DOWNLOAD_ATTEMPTS" ] || break
+    echo "download of $url failed ($lasterr); retrying (attempt $((attempt + 1))/$DOWNLOAD_ATTEMPTS) in $((attempt * DOWNLOAD_RETRY_DELAY))s" >&2
+    sleep "$((attempt * DOWNLOAD_RETRY_DELAY))"
+    attempt=$((attempt + 1))
+  done
+  rm -f "$err"
+  echo "error: download of $url failed after $attempt attempt(s): $lasterr" >&2
+  return 1
+}
+
 # Download the release tarball, its .sha256 sidecar and their Ed25519
 # signatures, verify both signatures, then the sidecar's
-# hash against the downloaded bytes, and point $TARBALL at it. The caller
-# sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch failure
-# (including a 404, e.g. a pre-checksum release) fails the same as any other
-# curl error here: unverified bytes reaching `tar -xzf` become binaries run
-# as root, so a URL-based fetch always requires a passing checksum.
+# hash against the downloaded bytes, and point $TARBALL at it. The tarball
+# lands in $TARBALL.part and is renamed only after it verifies. A download that
+# fails verification (e.g. a bad resume splice) is deleted and fetched once
+# more from byte 0; a second failure aborts, so a mismatch is never accepted.
+# The caller sets the EXIT trap that removes $DOWNLOAD_DIR. A sidecar fetch
+# failure (including a 404, e.g. a pre-checksum release) fails the same as any
+# other curl error here: unverified bytes reaching `tar -xzf` become binaries
+# run as root, so a URL-based fetch always requires a passing checksum.
 # --proto allows file:// only for local tarballs (release-gate bakes one); redirects must stay https.
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp_disk_dir)"
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
+  local part="$TARBALL.part"
   local checksum_url="$url.sha256"
   local checksum_file="$TARBALL.sha256"
 
   echo "Downloading release tarball from $url..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL" "$url"
+  download_mirror "$url" "$part" resume || exit 1
 
   echo "Downloading checksum sidecar from $checksum_url..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file" "$checksum_url"
+  download_mirror "$checksum_url" "$checksum_file" || exit 1
 
   echo "Downloading signatures..."
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$TARBALL.sig" "$url.sig"
-  curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$checksum_file.sig" "$checksum_url.sig"
-  verify_release_signature "$TARBALL" "$TARBALL.sig"
+  download_mirror "$url.sig" "$TARBALL.sig" || exit 1
+  download_mirror "$checksum_url.sig" "$checksum_file.sig" || exit 1
   verify_release_signature "$checksum_file" "$checksum_file.sig"
 
-  local expected actual
+  local expected actual tries=0
   expected="$(cut -d' ' -f1 "$checksum_file")"
-  actual="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
-  if [ "$expected" != "$actual" ]; then
-    echo "error: checksum mismatch for $url" >&2
-    echo "       expected (from $checksum_url): $expected" >&2
-    echo "       actual:                        $actual" >&2
-    exit 1
-  fi
+  while :; do
+    actual="$(sha256sum "$part" | cut -d' ' -f1)"
+    if [ "$expected" = "$actual" ] && ( verify_release_signature "$part" "$TARBALL.sig" ); then
+      break
+    fi
+    if [ "$tries" -ge 1 ]; then
+      echo "error: checksum or signature mismatch for $url after a clean re-download" >&2
+      echo "       expected (from $checksum_url): $expected" >&2
+      echo "       actual:                        $actual" >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    echo "warning: downloaded tarball failed verification; deleting it and re-downloading from scratch" >&2
+    rm -f "$part"
+    download_mirror "$url" "$part" || exit 1
+  done
+  mv "$part" "$TARBALL"
 }
 
 # Fetch an apt repo signing key from <url>, require it to be exactly one
