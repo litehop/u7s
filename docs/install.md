@@ -248,13 +248,13 @@ then the workers.
 
 ### Upgrading to dual-stack
 
-Releases before v0.4.5 refuse it and require a reinstall. Existing Nodes keep
-their single-stack `spec.podCIDRs`, because upstream does not allow a Node
-to gain a pod range in place. Each Node must be re-created before its pods
-get an IPv6 address. Existing Services keep their single ClusterIP; new
-Services can request `ipFamilyPolicy: PreferDualStack` or
-`RequireDualStack`. Any change to the ranges other than adding one range of
-the other family is refused.
+Releases before v0.4.4-snapshot.1 refuse it and require a reinstall. Existing
+Nodes keep their single-stack `spec.podCIDRs`, because upstream does not allow
+a Node to gain a pod range in place. Each Node must be re-created before its
+pods get an IPv6 address. Existing Services keep their single ClusterIP; new
+Services can request `ipFamilyPolicy: PreferDualStack` or `RequireDualStack`.
+Any change to the ranges other than adding one range of the other family is
+refused.
 
 1. Make sure each node has an address of each family (see "Dual-stack
    install").
