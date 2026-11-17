@@ -1987,7 +1987,10 @@ install_apt_key https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:
 echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
   > /etc/apt/sources.list.d/cri-o.list
 apt-get update -qq
-apt-get install -y cri-o crun conmon
+# Pinned so user installs run the same runtime the Lima rig tests; bump with
+# lima/kubelet.yaml.
+CRIO_VERSION="1.37.3-1.1"
+apt-get install -y "cri-o=${CRIO_VERSION}" crun conmon
 # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun: CRI-O ships its
 # own crun at /usr/libexec/crio/crun matching the OCI spec version it generates
 # (1.2.x), while the system crun accepts only 1.0/1.1 and fails every sandbox
