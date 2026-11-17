@@ -2895,6 +2895,51 @@ for rule in \
   assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
     "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
 done
+LS_CODE="$(grep -vE '^[[:space:]]*#' "$DIR/conformance/lima-start.sh")"
+ls_line() { printf '%s\n' "$LS_CODE" | grep -nF -- "$1" | head -1 | cut -d: -f1 || true; }
+L_EXTRACT="$(ls_line "U7S_AA_EOF")"
+L_LOAD="$(ls_line "apparmor_parser -r -W /etc/apparmor.d/u7s-default")"
+L_DROPIN="$(ls_line 'apparmor_profile = \"u7s-default\"\n')"
+L_RESTART="$(printf '%s\n' "$LS_CODE" | grep -nF "systemctl restart crio" | tail -1 | cut -d: -f1)"
+assert "lima-start.sh extracts the u7s-default profile from install.sh -- a second copy would drift and the rig would stop matching real installs" \
+  "$([ -n "$L_EXTRACT" ] && echo 1 || echo 0)"
+assert "lima-start.sh loads the profile before writing the CRI-O drop-in and before restarting crio -- otherwise CRI-O points at an unloaded profile and sandbox creation fails" \
+  "$([ -n "$L_LOAD" ] && [ -n "$L_DROPIN" ] && [ -n "$L_RESTART" ] && [ "$L_LOAD" -lt "$L_DROPIN" ] && [ "$L_DROPIN" -lt "$L_RESTART" ] && echo 1 || echo 0)"
+assert "lima-start.sh reloads when the installed profile differs from install.sh -- otherwise profile edits never reach already-provisioned VMs" \
+  "$(printf '%s\n' "$LS_CODE" | grep -qF '"$AA_INSTALLED" != "$AA_PROFILE"' && echo 1 || echo 0)"
+L_HOSTLOOP="$(ls_line 'for p in dig nslookup')"
+L_UNDO="$(ls_line 'rm -f /etc/apparmor.d/disable/$p')"
+L_WANT="$(ls_line 'want="signal (send,receive) peer=@{profile_name}//&u7s-default,"')"
+L_WRITE="$(ls_line '> /etc/apparmor.d/local/$p')"
+L_HOSTRELOAD="$(ls_line 'apparmor_parser -r /etc/apparmor.d/$p')"
+assert "lima-start.sh adds the stacked-peer signal rule to the host dig/nslookup profiles' local overrides -- without it BIND's self-signal is DENIED and the DNS conformance specs die rc 139 on the arm64 rig" \
+  "$([ -n "$L_HOSTLOOP" ] && [ -n "$L_WANT" ] && [ -n "$L_WRITE" ] && echo 1 || echo 0)"
+assert "the host-profile rule is the narrow form (only the u7s-default stacked peer) -- a wider peer would weaken the Ubuntu profiles that must keep enforcing everything else" \
+  "$(printf '%s\n' "$LS_CODE" | grep -F 'want=' | grep -qxF '  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"' && [ "$(printf '%s\n' "$LS_CODE" | grep -c 'want=')" -eq 1 ] && echo 1 || echo 0)"
+L_AAADD="$(ls_line 'peer={dig,nslookup}//&u7s-default,')"
+assert "lima-start.sh also lets u7s-default signal stacked dig/nslookup peers, before installing the profile -- the stacked label 'dig//&u7s-default' does not match peer=u7s-default//&*, so u7s-default itself still DENIES BIND's self-signal (rc 139) even once the host profiles allow it" \
+  "$([ -n "$L_AAADD" ] && [ -n "$L_LOAD" ] && [ "$L_AAADD" -lt "$L_LOAD" ] && printf '%s\n' "$LS_CODE" | grep -qF 'stacked-peer signal rule not found in install.sh' && echo 1 || echo 0)"
+assert "lima-start.sh never unloads or disables the host dig/nslookup profiles -- that would drop all their other confinement" \
+  "$(printf '%s\n' "$LS_CODE" | grep -qE 'apparmor_parser -R|ln -sf .*apparmor.d/disable' && echo 0 || echo 1)"
+assert "lima-start.sh removes the old apparmor.d/disable symlinks before reloading so already-converted rigs re-enable the profiles" \
+  "$([ -n "$L_UNDO" ] && [ -n "$L_HOSTRELOAD" ] && [ "$L_UNDO" -lt "$L_HOSTRELOAD" ] && echo 1 || echo 0)"
+assert "lima-start.sh writes the local override before reloading the profile -- otherwise the reload picks up the old rules" \
+  "$([ -n "$L_WRITE" ] && [ -n "$L_HOSTRELOAD" ] && [ "$L_WRITE" -lt "$L_HOSTRELOAD" ] && echo 1 || echo 0)"
+assert "the host-profile block fails loud (set -euo pipefail) -- a silent failed write/reload leaves the rig broken with no signal" \
+  "$(printf '%s\n' "$LS_CODE" | grep -A1 'bash -c .set -euo pipefail' | grep -qF 'for p in dig nslookup' && ! printf '%s\n' "$LS_CODE" | grep -F 'apparmor_parser -r /etc/apparmor.d/$p' | grep -qF '|| true' && echo 1 || echo 0)"
+HB_DIR="$(mktemp -d)"
+mkdir -p "$HB_DIR/aa/local" "$HB_DIR/bin"
+: > "$HB_DIR/aa/dig"; : > "$HB_DIR/aa/nslookup"; : > "$HB_DIR/profiles"
+{ echo 'set -euo pipefail'; awk '/^for p in dig nslookup/ {p=1} p {print} /^done/ {p=0}' <<<"$LS_CODE" | sed "s|/etc/apparmor.d|$HB_DIR/aa|g; s|/sys/kernel/security/apparmor/profiles|$HB_DIR/profiles|g; s|^done'|done|"; } > "$HB_DIR/block.sh"
+printf '#!/bin/sh\nexit 1\n' > "$HB_DIR/bin/apparmor_parser"; chmod +x "$HB_DIR/bin/apparmor_parser"
+PATH="$HB_DIR/bin:$PATH" bash "$HB_DIR/block.sh" >/dev/null 2>&1 && hb_rc=0 || hb_rc=$?
+assert "a failed host-profile reload exits non-zero and leaves no local override behind -- otherwise the next run sees the file correct, skips the reload and the rig silently keeps the old rules" \
+  "$([ "$hb_rc" -ne 0 ] && [ ! -e "$HB_DIR/aa/local/dig" ] && echo 1 || echo 0)"
+printf '#!/bin/sh\nexit 0\n' > "$HB_DIR/bin/apparmor_parser"
+PATH="$HB_DIR/bin:$PATH" bash "$HB_DIR/block.sh" >/dev/null 2>&1 && hb_rc=0 || hb_rc=$?
+assert "a successful host-profile reload keeps the narrow local override on disk -- the failure-path cleanup must not remove converged state" \
+  "$([ "$hb_rc" -eq 0 ] && grep -qxF 'signal (send,receive) peer=@{profile_name}//&u7s-default,' "$HB_DIR/aa/local/dig" && echo 1 || echo 0)"
+rm -rf "$HB_DIR"
 assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
   "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
 assert "u7s-default loading is guarded on the apparmor kernel module and apparmor_parser so AppArmor-less hosts still install" \
@@ -3073,6 +3118,24 @@ rc=0; out="$(run_fetch always56 "file:///nonexistent/u7s-test.tar.gz")" || rc=$?
 assert "a file:// URL gets exactly one curl call and no retries -- a local path has no network hiccup to wait out" \
   "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 1 ] && echo 1 || echo 0)"
 rm -rf "$DL_DIR"
+
+# ---------------------------------------------------------------------------
+# Lima rig vs install.sh: the rig's u7s-default profile must be install.sh's
+# plus exactly one rig-only rule.
+# ---------------------------------------------------------------------------
+LIMA_START="$DIR/conformance/lima-start.sh"
+RIG_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
+INSTALL_AA="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$INSTALL")"
+# Run the rig's own extract+insert statements (not a copy), with $0 inside
+# scripts/conformance/ so its "$(dirname "$0")/../install.sh" resolves.
+RIG_SNIPPET="$(awk '/^AA_PROFILE="\$\(awk/ {p=1} /^AA_CRIO_CONF=/ {p=0} p' "$LIMA_START")"
+RIG_AA="$(bash -c "$RIG_SNIPPET"$'\nprintf "%s\\n" "$AA_PROFILE"' "$DIR/conformance/x" 2>/dev/null || true)"
+assert "rig's effective u7s-default profile is install.sh's profile plus exactly the one rig-only signal rule -- otherwise the conformance rig silently drifts from the profile users actually run" \
+  "$([ -n "$INSTALL_AA" ] && ! printf '%s\n' "$INSTALL_AA" | grep -qxF "$RIG_RULE" && [ "$RIG_AA" = "$(printf '%s\n' "$INSTALL_AA" | awk -v r="$RIG_RULE" '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print r}')" ] && echo 1 || echo 0)"
+assert_true "install.sh carries the rig-mirror comment -- without it a profile edit would not prompt updating lima-start.sh, and the rig would drift from what users run" \
+  grep -q 'Lima conformance rig mirror: scripts/conformance/lima-start.sh' "$INSTALL"
+assert_true "lima-start.sh carries the rig-only-rule comment -- without it the rule's absence from install.sh looks like an omission and gets 'fixed' on one side only, drifting the rig from what users run" \
+  grep -q 'This rig-only u7s-default rule is intentionally NOT in install.sh' "$LIMA_START"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
