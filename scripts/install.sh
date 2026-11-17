@@ -1995,6 +1995,70 @@ apt-get install -y cri-o crun conmon
 # already sets the correct path.
 mkdir -p /etc/crio/crio.conf.d
 
+# CRI-O's built-in crio-default profile (go.podman.io/common v0.68.1 template)
+# lacks the stacked-peer signal/ptrace rules, so on AppArmor 5 kernels a
+# container signalling its own threads (mariadbd first init) is DENIED and
+# hangs. u7s-default is that template plus exactly the two rules added by
+# containers/container-libs 6506a4c7f3. Remove it, the drop-in and the
+# apparmor_parser load once the CRI-O release in use vendors that commit.
+# Guarded like CRI-O's own check: kernel module enabled and parser present.
+if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] \
+  && command -v apparmor_parser >/dev/null 2>&1; then
+  cat > /etc/apparmor.d/u7s-default <<'U7S_AA_EOF'
+#include <tunables/global>
+
+profile u7s-default flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  capability,
+  file,
+  umount,
+
+  # Allow signals from privileged profiles and from within the same profile
+  signal (receive) peer=unconfined,
+  signal (send,receive) peer=u7s-default,
+  # With AppArmor 5.0+, child processes get a stacked profile.
+  signal (send,receive) peer=u7s-default//&*,
+  # Allow certain signals from OCI runtimes (podman, runc and crun)
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}runc,
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}crun*,
+  signal (receive) peer={/usr/bin/,/usr/sbin/,}podman,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9][^0-9][^0-9][^0-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  deny mount,
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'ps' inside a container
+  ptrace (trace,read) peer=u7s-default,
+  # With AppArmor 5.0+, child processes get a stacked profile.
+  ptrace (trace,read) peer=u7s-default//&*,
+}
+U7S_AA_EOF
+  apparmor_parser -r -W /etc/apparmor.d/u7s-default
+  cat > /etc/crio/crio.conf.d/10-apparmor.conf <<'CRIO_AA_EOF'
+[crio.runtime]
+apparmor_profile = "u7s-default"
+CRIO_AA_EOF
+else
+  # A drop-in from an earlier run would point CRI-O at a profile nothing loads.
+  rm -f /etc/crio/crio.conf.d/10-apparmor.conf
+fi
+
 # Reap idle exec/attach/logs/port-forward streaming connections' goroutines and
 # buffers instead of holding them open for cri-o's 4h default; reopens on
 # demand, so this only affects memory held by connections nobody is using.
