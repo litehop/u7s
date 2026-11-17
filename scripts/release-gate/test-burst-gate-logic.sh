@@ -699,7 +699,7 @@ gcp_gate() { # out-dir, extra args...; sets rc
   : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/$1"
   rc=0; "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/$1" "${@:2}" >"$TMP/$1.out" 2>&1 || rc=$?
 }
-for bad in "--backend gcp" "--backend lima --release v1.0.0" "--backend gcp --release v1.0.0 --memory 2" "--backend gcp --release v1.0.0 --tarball-dir $TMP/tb" "--backend gcp --release not-a-tag" "--backend vmware"; do
+for bad in "--backend gcp" "--backend lima --release v1.0.0" "--backend gcp --release v1.0.0 --memory 2" "--backend gcp --release v1.0.0 --tarball-dir $TMP/tb" "--backend gcp --release not-a-tag" "--backend vmware" "--backend lima --boot-disk-type pd-balanced"; do
   : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rc=0
   # shellcheck disable=SC2086
   "$HERE/burst-gate.sh" $bad --out "$TMP/out-gbad" >/dev/null 2>&1 || rc=$?
@@ -726,9 +726,15 @@ assert "gate VMs are the custom n1 1 vCPU 1 GiB (e2-micro has 0.25 sustained vCP
 U7S_GCP_MACHINE_TYPE=e2-standard-2 gcp_gate out-gshape --runs 1
 assert "an ambient U7S_GCP_MACHINE_TYPE cannot change the release-authoritative shape" \
   "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
+U7S_GCP_BOOT_DISK_TYPE=pd-extreme gcp_gate out-gdisk --runs 1
+assert "gate VMs default to pd-balanced even with an ambient U7S_GCP_BOOT_DISK_TYPE (HDD-class disks wedge the 1 GiB node, so the default must be SSD-class and attributable)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-balanced ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'pd-extreme' && echo 1 || echo 0)"
+gcp_gate out-gdisk2 --runs 1 --boot-disk-type pd-standard
+assert "--boot-disk-type reaches gcp_vps_create and the verdict/backend.txt name it (a pd-standard run must not be mistaken for the SSD gate)" \
+  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-standard ' && grep -q ' disk=pd-standard ' "$TMP/out-gdisk2/backend.txt" && grep -q 'GCP n1-custom-1-1024 pd-standard Spot' "$TMP/out-gdisk2.out" && echo 1 || echo 0)"
 gcp_gate out-gfail --runs 1
 assert "gcp verdict line says release-authoritative and names the mirror release" \
-  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 Spot, platforms none-recorded, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
+  "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 pd-balanced Spot, platforms none-recorded, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && grep -q ' disk=pd-balanced ' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
 assert "the gcloud project id never reaches the run logs (redacted)" \
   "$(grep -rq 'p-secret' "$TMP/out-gfail" "$TMP/out-gfail.out" && echo 0 || echo 1)"
 export GCLOUD_PREEMPTED=1
