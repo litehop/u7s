@@ -100,10 +100,10 @@ FETCH_RUNNER="$WORK/fetch-runner.sh"
   echo 'echo FETCHED'
 } > "$FETCH_RUNNER"
 
-run_fetch() { # <name> <PATH> <cosign-rc>
+run_fetch() { # <name> <PATH> <cosign-rc> [github-actions-value]
   mkdir -p "$WORK/$1"
   local st=0
-  COSIGN_LOG="$WORK/$1.log" COSIGN_RC="$3" PATH="$2" bash "$FETCH_RUNNER" "$WORK/$1" > "$WORK/$1.out" 2>&1 || st=$?
+  COSIGN_LOG="$WORK/$1.log" COSIGN_RC="$3" GITHUB_ACTIONS="${4:-}" PATH="$2" bash "$FETCH_RUNNER" "$WORK/$1" > "$WORK/$1.out" 2>&1 || st=$?
   echo "$st" > "$WORK/$1.status"
 }
 
@@ -111,13 +111,24 @@ run_fetch pass "$STUBS:$PATH" 0
 assert "with cosign on PATH and a good signature the binary is fetched and the output says cosign verified" \
   "$([ "$(cat "$WORK/pass.status")" -eq 0 ] && grep -q FETCHED "$WORK/pass.out" && grep -q 'kubelet: sha256 + cosign signature verified' "$WORK/pass.out" && [ -s "$WORK/pass.log" ] && echo 1 || echo 0)"
 
+assert "the end-to-end cosign call pins the Kubernetes release signer identity and Google issuer, so a signature from any other Sigstore identity cannot pass" \
+  "$(grep -q -- '--certificate-identity krel-staging@k8s-releng-prod.iam.gserviceaccount.com' "$WORK/pass.log" && grep -q -- '--certificate-oidc-issuer https://accounts.google.com' "$WORK/pass.log" && echo 1 || echo 0)"
+
 run_fetch fail "$STUBS:$PATH" 1
 assert "with cosign on PATH a bad signature aborts the build, so a tampered kubelet with a matching sha256 is never packaged" \
   "$([ "$(cat "$WORK/fail.status")" -ne 0 ] && ! grep -q FETCHED "$WORK/fail.out" && grep -q 'cosign signature verification failed for kubelet' "$WORK/fail.out" && echo 1 || echo 0)"
 
 run_fetch absent "$NOCOSIGN" 1
-assert "without cosign the build still succeeds on sha256 and says cosign verification was skipped, so the operator knows the weaker check ran" \
+assert "locally (GITHUB_ACTIONS unset) a missing cosign falls back to sha256 with a skip line, and only the CI guard stops a release shipping without upstream signature verification" \
   "$([ "$(cat "$WORK/absent.status")" -eq 0 ] && grep -q FETCHED "$WORK/absent.out" && grep -q 'cosign verification SKIPPED (cosign is not installed)' "$WORK/absent.out" && [ ! -e "$WORK/absent/kubelet.sig" ] && echo 1 || echo 0)"
+
+run_fetch ci-absent "$NOCOSIGN" 1 true
+assert "in CI (GITHUB_ACTIONS set) a missing cosign aborts the build, otherwise a CI release would ship without upstream signature verification" \
+  "$([ "$(cat "$WORK/ci-absent.status")" -ne 0 ] && ! grep -q FETCHED "$WORK/ci-absent.out" && grep -q 'cosign is not installed in CI; refusing to ship kubelet without upstream signature verification' "$WORK/ci-absent.out" && echo 1 || echo 0)"
+
+run_fetch ci-present "$STUBS:$PATH" 0 true
+assert "in CI with cosign present the build still passes, so the guard only blocks unverified releases" \
+  "$([ "$(cat "$WORK/ci-present.status")" -eq 0 ] && grep -q FETCHED "$WORK/ci-present.out" && echo 1 || echo 0)"
 
 sha_runner="$WORK/sha-runner.sh"
 {

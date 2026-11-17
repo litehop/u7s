@@ -55,6 +55,9 @@ fetch_k8s_binary() {
   if command -v cosign >/dev/null 2>&1; then
     verify_k8s_signature "$dest/$bin" "$url"
     echo "==> $bin: sha256 + cosign signature verified" >&2
+  elif [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "error: cosign is not installed in CI; refusing to ship $bin without upstream signature verification (install cosign before the build)" >&2
+    exit 1
   else
     echo "==> $bin: sha256 verified; cosign verification SKIPPED (cosign is not installed)" >&2
   fi
