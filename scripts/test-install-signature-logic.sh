@@ -38,6 +38,8 @@ write_runner() {
     echo 'set -euo pipefail'
     awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$install_script"
     awk '/^verify_release_signature\(\) \{/,/^\}/' "$install_script"
+    awk '/^DOWNLOAD_ATTEMPTS=/,/^DOWNLOAD_MAX_SECONDS=/' "$install_script"
+    awk '/^download_mirror\(\) \{/,/^\}/' "$install_script"
     awk '/^fetch_tarball\(\) \{/,/^\}/' "$install_script"
     echo 'RELEASE_PUBKEY_PEM="$TEST_PUBKEY_PEM"'
     echo 'DOWNLOAD_DIR=""; trap '"'"'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}'"'"' EXIT'
@@ -157,7 +159,7 @@ assert "--help states --tarball is not signature-verified" \
 # Mutation self-check: with verification removed the tampered cases must be
 # accepted, proving the assertions above depend on it.
 MUTATED="$WORK/install-mutated.sh"
-sed '/-o "\$TARBALL\.sig"/d; /-o "\$checksum_file\.sig"/d; s/^  verify_release_signature "\$TARBALL" .*$/  :/; s/^  verify_release_signature "\$checksum_file" .*$/  :/' "$INSTALL" > "$MUTATED"
+sed '/download_mirror "\$url\.sig"/d; /download_mirror "\$checksum_url\.sig"/d; s/^  verify_release_signature "\$checksum_file" .*$/  :/; s/ && ( verify_release_signature "\$part" "\$TARBALL\.sig" ); then/ \&\& true; then/' "$INSTALL" > "$MUTATED"
 if diff -q "$INSTALL" "$MUTATED" > /dev/null 2>&1; then
   assert "mutation self-check: verify_release_signature call sites exist in fetch_tarball to mutate" 0
 else
