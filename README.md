@@ -6,9 +6,9 @@ is normal. It exposes a kubectl-compatible API surface: `kubectl` and other
 standard Kubernetes clients talk to u7s the same way they talk to upstream
 Kubernetes.
 
-u7s is pre-alpha. There is no stable release, the API surface is bounded to
-what the project's current milestones need, and behavior changes without
-notice. Do not run production workloads against it yet.
+u7s is alpha. There is no compatibility promise: the API surface is bounded
+to what the project's current milestones need, and behavior can change
+between releases. Do not run production workloads against it yet.
 
 ## Prerequisites
 
