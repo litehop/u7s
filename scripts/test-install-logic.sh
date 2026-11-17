@@ -2905,7 +2905,20 @@ assert "install.sh removes a stale 10-apparmor.conf when AppArmor is unavailable
 
 # apt resilience: apt-get calls outside the apt_get wrapper bypass the shared
 # timeout/retry/lock-wait options.
-bare_apt="$(grep -nE '^[^#]*\bapt-get ' "$INSTALL" | grep -vE 'echo |"\$\{APT_OPTS\[@\]\}"' || true)"
+find_bare_apt() { # stdin: numbered lines; prints those running apt-get outside the wrapper
+  local line code
+  while IFS= read -r line; do
+    case "$line" in *'apt-get "${APT_OPTS[@]}"'*) continue ;; esac
+    code="$(printf '%s\n' "$line" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")"
+    printf '%s\n' "$code" | grep -qE '^[^#]*\bapt-get ' && printf '%s\n' "$line"
+  done
+  return 0
+}
+bare_apt="$(grep -nE '^[^#]*\bapt-get ' "$INSTALL" | find_bare_apt)"
+assert "the bare-apt-get scan flags 'echo x; apt-get ...' -- an echo earlier on the line must not exempt a real unwrapped call" \
+  "$([ -n "$(printf '1:echo x; apt-get update\n' | find_bare_apt)" ] && echo 1 || echo 0)"
+assert "the bare-apt-get scan ignores apt-get named inside an echoed message -- error text must not be flagged" \
+  "$([ -z "$(printf '1:echo "run apt-get update"\n' | find_bare_apt)" ] && echo 1 || echo 0)"
 assert "every apt-get in install.sh goes through the shared APT_OPTS wrapper -- a bare call hangs or fails on the dpkg lock held by unattended-upgrades on a fresh cloud VM" \
   "$([ -z "$bare_apt" ] && echo 1 || { echo "$bare_apt" >&2; echo 0; })"
 assert "APT_OPTS carries the HTTP timeout, Acquire::Retries and dpkg lock wait -- without them install hangs on a silent mirror or aborts on the lock" \
@@ -2916,7 +2929,7 @@ assert "the pinned cri-o install passes --allow-downgrades -- otherwise re-runni
 # apt_install behaviour against a stubbed apt-get on PATH (the stub counts
 # install attempts in $STUB_DIR/installs and fails the first $FAIL_FIRST).
 STUB_DIR="$(mktemp -d)"
-trap 'rm -rf "$STUB_DIR"' EXIT
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK" "$RDY_WORK" "$STUB_DIR"' EXIT
 cat > "$STUB_DIR/apt-get" <<'STUB'
 #!/usr/bin/env bash
 case " $* " in
@@ -2925,6 +2938,13 @@ esac
 echo install >> "$STUB_DIR/installs"
 n="$(wc -l < "$STUB_DIR/installs")"
 if [ "$n" -le "$FAIL_FIRST" ]; then
+  case "$STUB_MODE" in
+    other) echo "E: Unable to locate package crun" >&2; exit 100 ;;
+    lookalike)
+      echo "Fetched 404 kB in 1s (404 kB/s)" >&2
+      echo "E: Failed to fetch http://10.404.0.1/crun.deb  Connection failed [IP: 10.404.0.1 80]" >&2
+      exit 100 ;;
+  esac
   echo "E: Failed to fetch http://mirror.example/ubuntu/pool/crun.deb  404  Not Found [IP: 192.0.2.1 80]" >&2
   exit 100
 fi
@@ -2934,7 +2954,7 @@ chmod +x "$STUB_DIR/apt-get"
 APT_FUNCS="$(awk '/^APT_OPTS=/ {p=1} p {print} p && /^apt_install\(\) \{$/ {f=1} f && /^}$/ {exit}' "$INSTALL")"
 run_apt_install() { # $1 = FAIL_FIRST; prints combined output, returns apt_install's status
   rm -f "$STUB_DIR/installs" "$STUB_DIR/updates"
-  PATH="$STUB_DIR:$PATH" STUB_DIR="$STUB_DIR" FAIL_FIRST="$1" bash -c "$APT_FUNCS"'
+  PATH="$STUB_DIR:$PATH" STUB_DIR="$STUB_DIR" FAIL_FIRST="$1" STUB_MODE="${2:-404}" bash -c "$APT_FUNCS"'
     APT_INSTALL_RETRY_DELAY=0
     apt_install crun' 2>&1
 }
@@ -2948,6 +2968,12 @@ assert "a persistent 404 fails non-zero after exactly 3 attempts -- the installe
   "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
 assert "the final error names the failing URL and the attempt count -- the user needs both to tell a mirror problem from a typo" \
   "$(printf '%s\n' "$out" | grep -q 'failed after 3 attempt.*http://mirror.example/ubuntu/pool/crun.deb' && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99 other)" || rc=$?
+assert "a non-404 apt failure is not retried and fails non-zero -- retrying a broken package name or dpkg error only delays the real error" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 1 ] && echo 1 || echo 0)"
+rc=0; out="$(run_apt_install 99 lookalike)" || rc=$?
+assert "'Fetched 404 kB' and an IP containing 404 do not count as a 404 fetch error -- only apt's fetch-error line may trigger a retry" \
+  "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 1 ] && echo 1 || echo 0)"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

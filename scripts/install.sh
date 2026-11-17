@@ -370,23 +370,18 @@ apt_get() {
 APT_INSTALL_ATTEMPTS=3
 APT_INSTALL_RETRY_DELAY=20
 apt_install() {
-  local attempt log rc
-  log="$(mktemp)"
+  local attempt out rc
   for attempt in $(seq 1 "$APT_INSTALL_ATTEMPTS"); do
-    ( set -o pipefail; apt_get install -y "$@" 2>&1 | tee "$log" >&2 ) && rc=0 || rc=$?
-    if [ "$rc" -eq 0 ]; then
-      rm -f "$log"
-      return 0
-    fi
-    grep -q '404' "$log" || break
+    out="$( ( set -o pipefail; LC_ALL=C apt_get install -y "$@" 2>&1 | tee /dev/stderr ) )" && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    grep -qE '^(Err:|E: Failed to fetch).* 404 +Not Found' <<<"$out" || break
     if [ "$attempt" -lt "$APT_INSTALL_ATTEMPTS" ]; then
       echo "apt-get install hit a 404 (attempt $attempt/$APT_INSTALL_ATTEMPTS); re-running apt-get update and retrying in ${APT_INSTALL_RETRY_DELAY}s" >&2
       sleep "$APT_INSTALL_RETRY_DELAY"
       apt_get update -qq || true
     fi
   done
-  echo "error: apt-get install $* failed after $attempt attempt(s); failing URL(s): $(grep -oE 'Failed to fetch [^ ]+' "$log" | sort -u | tr '\n' ' ')" >&2
-  rm -f "$log"
+  echo "error: apt-get install $* failed after $attempt attempt(s); failing URL(s): $(grep -oE '(Failed to fetch|Err:[0-9]+) [^ ]+' <<<"$out" | sort -u | tr '\n' ' ')" >&2
   exit 1
 }
 
