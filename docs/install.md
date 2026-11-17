@@ -307,10 +307,12 @@ small app (WordPress + MariaDB) running. Large pod bursts on top of that
 push the host into page-cache thrash. `install.sh` deliberately does not
 touch the host OS, so these node-level mitigations are yours to apply:
 
-- Recommended for bursty or dense workloads: enable zram swap. `install.sh`
-  does not configure swap, and the release gate runs without it: the gated
-  burst size is measured at release time (see `docs/dev-setup.md`). On
-  1 GiB / 1 vCPU with no swap, an 80-pod burst
+- Recommended for bursty or dense workloads: provide swap yourself (zram or
+  a swapfile). u7s never creates, enables or tunes swap, and leaves any
+  existing swap as found. The release gate runs without it: the gated
+  burst size is measured at release time (see `docs/dev-setup.md`).
+  Indicative only (2026-10-16 A/B, predates later memory-pressure fixes):
+  on 1 GiB / 1 vCPU with no swap, an 80-pod burst
   never reached all-Ready within 600 s and the node went NotReady; with
   512 MiB zram, 80 pods were Ready in 15-17 s and the node stayed Ready.
   With `systemd-zram-generator` installed:
