@@ -340,6 +340,11 @@ fi
 # content or the CRI-O drop-in differs.
 AA_PROFILE="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$(dirname "$0")/../install.sh")"
 [ -n "$AA_PROFILE" ] || { echo "FATAL: u7s-default profile not found in install.sh" >&2; exit 1; }
+# Rig-only: a container process stacked under a host dig/nslookup profile has
+# the label "dig//&u7s-default", which u7s-default's own peer=u7s-default//&*
+# does not match, so u7s-default must allow that stacked peer as well.
+AA_PROFILE="$(printf '%s\n' "$AA_PROFILE" | awk '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print "  signal (send,receive) peer={dig,nslookup}//&u7s-default,"; n++} END {if (n != 1) exit 1}')" \
+  || { echo "FATAL: u7s-default stacked-peer signal rule not found in install.sh" >&2; exit 1; }
 AA_CRIO_CONF="/etc/crio/crio.conf.d/10-apparmor.conf"
 if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null'; then
   AA_INSTALLED="$(limactl shell "$VM_NAME" sudo cat /etc/apparmor.d/u7s-default 2>/dev/null || true)"
@@ -353,15 +358,21 @@ if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enab
   fi
   # Rig-only, not part of install.sh: Ubuntu 26.04 ships host profiles for
   # dig/nslookup that attach by path to the same binaries inside containers;
-  # their signal rules likewise lack the stacked-peer form, so the tools are
-  # DENIED signalling themselves even under u7s-default on the arm64 rig. Real
-  # x86_64 installs were verified unaffected. Disabled persistently
-  # (apparmor.d/disable) and unloaded now.
+  # their signal rules lack the stacked-peer form, so BIND's self-signal is
+  # DENIED under AppArmor 5 stacking even with u7s-default (arm64 rig; real
+  # x86_64 installs were verified unaffected). Add only that rule via the
+  # profiles' local overrides (as canonical/k8s-snap#2750 does); everything
+  # else stays enforced. Also undoes an earlier disable of these profiles.
   limactl shell "$VM_NAME" sudo bash -c 'set -euo pipefail
 for p in dig nslookup; do
   [ -f /etc/apparmor.d/$p ] || continue
-  ln -sf /etc/apparmor.d/$p /etc/apparmor.d/disable/$p
-  if grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then apparmor_parser -R /etc/apparmor.d/$p; fi
+  rm -f /etc/apparmor.d/disable/$p
+  want="signal (send,receive) peer=@{profile_name}//&*,"
+  if [ "$(cat /etc/apparmor.d/local/$p 2>/dev/null || true)" != "$want" ] \
+    || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
+    printf "%s\n" "$want" > /etc/apparmor.d/local/$p
+    apparmor_parser -r /etc/apparmor.d/$p
+  fi
 done'
 fi
 
