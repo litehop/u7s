@@ -63,8 +63,11 @@ Verdicts (2026-11-04):
 - Publish needs operator approval on the Release environment; snapshot cuts are
   operator-only.
 - Operator rules (2026-10-30, recorded in ad0692f8): no pre-pull or sequencing
-  in the gate (users just `kubectl apply`); pd-standard stays (it models the
-  cheapest VPS); do not publish unmerged code.
+  in the gate (users just `kubectl apply`); do not publish unmerged code.
+  Disk (2026-11-17, supersedes the earlier "pd-standard stays" rule):
+  pd-balanced (SSD-class) is the default for all GCP test VMs, since
+  pd-standard wedged on disk IO in the A/B (pd-balanced 3/3 vs 0/3 at 20
+  pods); pd-standard is an explicit override only.
 - Gate VPSes are `u7s-rg-<MMDDHHMMSS>-<n>` (`mayor-ddhlo`); check for strays by
   that pattern; node name <= 52 chars. A preemption mid-run yields no verdict.
 - Burst gate: `scripts/release-gate/burst-gate.sh --confirm` (~1-2 h). On Lima,
