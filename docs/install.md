@@ -311,10 +311,11 @@ touch the host OS, so these node-level mitigations are yours to apply:
   a swapfile). u7s never creates, enables or tunes swap, and leaves any
   existing swap as found. The release gate runs without it: the gated
   burst size is measured at release time (see `docs/dev-setup.md`).
-  Indicative only (2026-10-16 A/B, predates later memory-pressure fixes):
+  Indicative only (2026-10-16 A/B, before PRs #2115 and #2116; source:
+  `git show c35ffb8c^:ai/findings/2026-10-16-mayor-i4bvb-phase2-memory-protection.md`):
   on 1 GiB / 1 vCPU with no swap, an 80-pod burst
   never reached all-Ready within 600 s and the node went NotReady; with
-  512 MiB zram, 80 pods were Ready in 15-17 s and the node stayed Ready.
+  512 MiB zram, 80 pods were Ready in 15-17 s.
   With `systemd-zram-generator` installed:
 
   ```bash
