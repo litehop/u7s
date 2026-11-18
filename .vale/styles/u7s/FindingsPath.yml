@@ -1,0 +1,7 @@
+extends: existence
+message: "'%s' cites a findings file; it is deleted when its bead closes. Extract the content into docs/ or file a bead."
+level: error
+scope: raw
+ignorecase: false
+tokens:
+  - 'ai/findings/[A-Za-z0-9_.-]+\.md'

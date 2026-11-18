@@ -32,3 +32,11 @@ temp/*
 !.claude/review-queue/.gitkeep
 
 .beads.gate.lock
+
+# Vale: synced style packages (vale sync); config/vocabularies and u7s* styles stay tracked
+.vale/styles/*
+!.vale/styles/u7s/
+!.vale/styles/u7s-code/
+!.vale/styles/config/
+.vale/styles/config/*
+!.vale/styles/config/vocabularies/
