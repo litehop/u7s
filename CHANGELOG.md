@@ -5,6 +5,11 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+### Changed
+
+- The apiserver records the store's on-disk format and refuses to start on a
+  store written by a newer u7s. Downgrades are not supported.
+
 ### Fixed
 
 - An unreadable or non-numeric NIC MTU now fails the pod-MTU derivation with a
