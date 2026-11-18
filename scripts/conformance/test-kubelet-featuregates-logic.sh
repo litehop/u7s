@@ -15,6 +15,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LIMA_YAML="$DIR/../../lima/kubelet.yaml"
@@ -24,7 +25,7 @@ FAIL=0
 
 assert_contains() {
   local label="$1" haystack="$2" needle="$3"
-  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+  if printf '%s' "$haystack" | drain_grep -qF -- "$needle"; then
     echo "PASS: $label"
     PASS=$(( PASS + 1 ))
   else

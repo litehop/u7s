@@ -4,6 +4,7 @@
 # working while kubectl exec/logs/attach silently fail, which looks like spec
 # failures. Fixture lima.yaml files under a fake LIMA_HOME; no VM is touched.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 HELPER="$DIR/lima-kubelet-port.sh"
@@ -61,10 +62,10 @@ out=$("$HELPER" vm-reversed 2>&1) && rc=0 || rc=$?
 assert "helper handles hostPort listed before guestPort and ignores other guest ports" "$([ "$rc" = 0 ] && [ "$out" = 10270 ] && echo 1 || echo 0)"
 
 out=$("$HELPER" vm-missing 2>&1) && rc=0 || rc=$?
-assert "helper fails loud for a VM that does not exist" "$([ "$rc" != 0 ] && echo "$out" | grep -q 'does not exist' && echo 1 || echo 0)"
+assert "helper fails loud for a VM that does not exist" "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'does not exist' && echo 1 || echo 0)"
 
 out=$("$HELPER" vm-nomap 2>&1) && rc=0 || rc=$?
-assert "helper fails loud (and ignores guestPort outside portForwards) when 10250 is unmapped" "$([ "$rc" != 0 ] && echo "$out" | grep -q 'no portForwards entry' && echo 1 || echo 0)"
+assert "helper fails loud (and ignores guestPort outside portForwards) when 10250 is unmapped" "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'no portForwards entry' && echo 1 || echo 0)"
 
 source "$DIR/_lib.sh"
 
@@ -82,10 +83,10 @@ assert "existing VM without a mapping fails rather than passing silently" "$([ "
 
 # run-all.sh rejects a stale port before building or starting anything.
 out=$("$RUN_ALL" --vm vm-ok --kubelet-port 10253 --stack-only 2>&1) && rc=0 || rc=$?
-assert "run-all.sh aborts on --kubelet-port mismatch" "$([ "$rc" != 0 ] && echo "$out" | grep -q 'forwards guest 10250 to host 10263' && echo 1 || echo 0)"
+assert "run-all.sh aborts on --kubelet-port mismatch" "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'forwards guest 10250 to host 10263' && echo 1 || echo 0)"
 
 out=$("$RUN_ALL" --vm vm-ok --kubelet-port 10263 --extra-node vm-reversed --extra-kubelet-port 10271 --stack-only 2>&1) && rc=0 || rc=$?
-assert "run-all.sh aborts on --extra-kubelet-port mismatch" "$([ "$rc" != 0 ] && echo "$out" | grep -q 'vm-reversed forwards guest 10250 to host 10270' && echo 1 || echo 0)"
+assert "run-all.sh aborts on --extra-kubelet-port mismatch" "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'vm-reversed forwards guest 10250 to host 10270' && echo 1 || echo 0)"
 
 mkvm vm-quoted <<'Y'
 portForwards:
@@ -102,7 +103,7 @@ assert "quoted values and trailing comments do not cause a false 'no portForward
 out=$("$HELPER" vm-flow 2>&1) && rc=0 || rc=$?
 assert "flow-style {..} entries are parsed per-entry, not merged with a neighbour" "$([ "$rc" = 0 ] && [ "$out" = 10282 ] && echo 1 || echo 0)"
 out=$("$HELPER" vm-nomap 2>&1) && rc=0 || rc=$?
-assert "unmapped-10250 error tells the operator to pass --reset" "$([ "$rc" != 0 ] && echo "$out" | grep -q -- '--reset' && echo 1 || echo 0)"
+assert "unmapped-10250 error tells the operator to pass --reset" "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q -- '--reset' && echo 1 || echo 0)"
 
 # Run lima-start.sh's real gate line (extracted, not re-typed) so removing or
 # mis-gating the call fails here.

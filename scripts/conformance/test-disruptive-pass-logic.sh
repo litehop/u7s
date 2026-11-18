@@ -13,6 +13,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$DIR/06-run-sonobuoy.sh"
@@ -273,7 +274,7 @@ assert "a --focus pass that legitimately selects 0 specs is not flagged" \
 # (apply=0) appends --mode=certified-conformance, so its filter args must never
 # carry either flag, in any pass.
 assert "bare path appends --mode=certified-conformance after build_filter_args 0" \
-  "$(grep -A3 'build_filter_args 0' "$SCRIPT" | grep -q -- '--mode=certified-conformance' && echo 1 || echo 0)"
+  "$(grep -A3 'build_filter_args 0' "$SCRIPT" | drain_grep -q -- '--mode=certified-conformance' && echo 1 || echo 0)"
 for pass in parallel disruptive; do
   A="$(filter_args "$pass" 0 4)"
   assert "bare path ($pass) filter args never carry --e2e-skip/--e2e-focus that sonobuoy rejects with --mode" \

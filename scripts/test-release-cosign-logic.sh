@@ -11,6 +11,7 @@
 # shellcheck disable=SC2016 # file-wide: single-quoted patterns hold the build
 # script's own literal, unexpanded source text.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$DIR/.." && pwd)"
@@ -152,7 +153,7 @@ assert "the build script announces which verification will run (cosign present o
 loop_body="$(awk '/^for bin in kubelet kube-controller-manager kubectl; do/,/^done/' "$SCRIPT")"
 fetch_body="$(awk '/^fetch_k8s_binary\(\) \{/,/^\}/' "$LIB")"
 assert "the kubelet/kube-controller-manager/kubectl fetch loop goes through fetch_k8s_binary, which calls verify_k8s_signature" \
-  "$(printf '%s' "$loop_body" | grep -qF 'fetch_k8s_binary "$STAGE_DIR" "$K8S_ARCH" "$bin"' && printf '%s' "$fetch_body" | grep -qF 'verify_k8s_signature "$dest/$bin" "$url"' && echo 1 || echo 0)"
+  "$(printf '%s' "$loop_body" | drain_grep -qF 'fetch_k8s_binary "$STAGE_DIR" "$K8S_ARCH" "$bin"' && printf '%s' "$fetch_body" | drain_grep -qF 'verify_k8s_signature "$dest/$bin" "$url"' && echo 1 || echo 0)"
 assert "the release workflow installs a pinned cosign before the tarball build" \
   "$(grep -qE 'uses: sigstore/cosign-installer@[0-9a-f]{40} ' "$WORKFLOW" && grep -qE 'cosign-release: v[0-9]+\.[0-9]+\.[0-9]+$' "$WORKFLOW" && echo 1 || echo 0)"
 
