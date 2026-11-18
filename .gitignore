@@ -32,3 +32,9 @@ temp/*
 !.claude/review-queue/.gitkeep
 
 .beads.gate.lock
+
+# Vale trial: synced style packages (vale sync); config/vocabularies stay tracked
+.vale/styles/*
+!.vale/styles/config/
+.vale/styles/config/*
+!.vale/styles/config/vocabularies/
