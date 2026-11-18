@@ -1233,11 +1233,12 @@ fn prepare_schema(
         version = 1;
     }
     while version < supported {
-        migrations[(version - 1) as usize](&tx)?;
+        let step = migrations
+            .get((version - 1) as usize)
+            .ok_or(StoreError::MissingMigration { from: version })?;
+        step(&tx)?;
         version += 1;
     }
-    // Re-run so indexes added since the store was created appear on every open.
-    tx.execute_batch(SCHEMA_V1)?;
     if version != found {
         tx.pragma_update(None, "user_version", version)?;
     }
@@ -3149,6 +3150,25 @@ mod tests {
     fn step_b(conn: &Connection) -> Result<()> {
         conn.execute_batch("INSERT INTO step_log VALUES (2);")?;
         Ok(())
+    }
+
+    /// Bumping STORE_FORMAT without adding a migration step would make every startup on an
+    /// older store fail.
+    #[test]
+    fn every_format_bump_has_a_migration_step() {
+        assert_eq!(
+            MIGRATIONS.len() + 1,
+            STORE_FORMAT as usize,
+            "STORE_FORMAT bumped without a MIGRATIONS step: every startup on an older store would fail"
+        );
+    }
+
+    /// A gap in the migration list must surface as an error, not crash the apiserver.
+    #[test]
+    fn missing_migration_step_is_an_error_not_a_panic() {
+        let mut conn = Connection::open(format_db_path("gap")).unwrap();
+        let err = prepare_schema(&mut conn, 2, &[]).unwrap_err();
+        assert!(matches!(err, StoreError::MissingMigration { from: 1 }));
     }
 
     /// Forward migrations must run once each, in order, and leave the new version stamped;

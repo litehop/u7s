@@ -196,6 +196,9 @@ pub enum StoreError {
          the data was written by a newer u7s and this binary cannot use it"
     )]
     NewerFormat { found: i64, supported: i64 },
+
+    #[error("no migration from store format {from} to {}", from + 1)]
+    MissingMigration { from: i64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
