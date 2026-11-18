@@ -5,6 +5,8 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-11-18
+
 ### Added
 
 - Pod MTU is now derived from the NIC MTU minus the Geneve overhead of the
@@ -15,7 +17,8 @@ individually; their changes land in the next release's section.
   NIC MTU; refused with `--join`). An explicit value is saved and reused on
   later `install.sh` re-runs. The MTU is cluster-wide: a worker with a smaller
   NIC than the control plane needs the control plane installed with a fitting
-  `--pod-mtu`. (#2177)
+  `--pod-mtu`. A changed MTU applies only to pods created afterwards;
+  existing pods keep their old MTU until recreated. (#2177)
 
 ### Changed
 
