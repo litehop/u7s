@@ -1039,6 +1039,9 @@ iface_mtu() {
 # primary address or dual-stack), which takes the larger encapsulation overhead.
 derive_pod_mtu() {
   local overhead=74
+  case "$1" in
+    ''|*[!0-9]*) echo "error: NIC MTU must be a whole number, got '$1'" >&2; return 1 ;;
+  esac
   [ "${2:-0}" = 1 ] && overhead=94
   echo $((10#$1 - overhead))
 }
@@ -1092,7 +1095,7 @@ resolve_pod_mtu() {
     esac
     case "$IFACE_IP" in *:*) v6=1 ;; esac
     if [ -n "$POD_CLUSTER_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ]; then v6=1; fi
-    POD_MTU="$(derive_pod_mtu "$nic" "$v6")"
+    POD_MTU="$(derive_pod_mtu "$nic" "$v6")" || return 1
   fi
   if [ "$POD_MTU" -lt 1280 ]; then
     echo "error: pod MTU $POD_MTU is below 1280, the IPv6 minimum; raise the $IFACE MTU or pass --pod-mtu" >&2
