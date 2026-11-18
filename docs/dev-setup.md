@@ -100,6 +100,43 @@ Exit status: 0 PASS, 1 FAIL, 3 INVALID. A run during which the host is not quiet
 
 Needs `limactl` (vz), `cargo-zigbuild` + `zig`, and a quiet host (no other VM workloads: timings are part of the verdict). A run takes about 25 minutes. PASS requires all of, in every run: (a) no OOM kill of a control-plane host process or kube-system pod, (b) node Ready throughout, (c) each burst finished within 5 minutes, (d) WordPress still answers after the burst, (e) webhook-smoke passes. Exit status is non-zero on any FAIL; per-run verdicts, samples (`MemAvailable`, per-process PSS/RSS) and kernel logs land in `temp/release-gate/<timestamp>/` (gitignored, so copy numbers you need into the PR). `scripts/release-gate/test-burst-gate-logic.sh` covers the verdict logic without a VM.
 
+### Upgrade check
+
+`scripts/release-gate/upgrade-gate.sh` checks that re-running the
+candidate's `install.sh` with no flags (docs/install.md, "Upgrading") over
+the previous release keeps the cluster intact. The supported path is the
+immediately previous release only. Per run it boots a fresh gate-shaped VM
+(1 vCPU, 1 GiB), installs the previous release, deploys a ConfigMap marker,
+a 2-replica Deployment and a DaemonSet, polls `/readyz` every 2 s, upgrades,
+and upgrades once more for idempotence. It prints a verdict table: install
+exit 0, server version changed to the candidate's, CA and `sa.pub`
+preserved, marker readable, Deployment and DaemonSet pods keep UIDs with no
+new restarts, API outage at most 60 s (the measured gap is always
+reported), and the re-run exit 0 with nothing recreated or restarted.
+Flannel's DaemonSet pod is recreated on upgrade and not asserted. It is not
+a performance measurement: the burst gate's quiet-host INVALID logic does
+not apply.
+
+```sh
+scripts/release-gate/upgrade-gate.sh                       # lima: v<latest release> built from its tag -> this checkout
+scripts/release-gate/upgrade-gate.sh --from v0.4.6         # lima, explicit previous release
+scripts/release-gate/upgrade-gate.sh --backend gcp --from v0.4.6 --release v0.4.7-snapshot.1
+```
+
+Lima VMs are arm64 and releases are x86_64, so the previous release is built
+from a scratch worktree of its tag at `./temp/prev-src` and the candidate
+from this checkout, both with `build-arm64-tarball.sh` (needs `cosign`; see
+the burst gate's requirements) and stamped so their versions differ; add
+`--prev-dir`/`--cand-dir` to reuse finished builds. The unsigned local
+tarballs are installed with `--tarball`, the one deviation from a flagless
+re-run. On GCP both releases are
+installed from the mirror on the `n1-custom-1-1024` / `pd-balanced` gate
+shape. VMs are named `u7s-upg-*`. Exit codes are the release-gate table
+above; INVALID also covers a previous release that fails to install on its
+own. Results land in `temp/upgrade-gate/<timestamp>/` (`verdict.txt`,
+`out/` with `readyz.log` and the pod snapshots). The check logic is tested
+by `scripts/release-gate/test-upgrade-gate-logic.sh`.
+
 ## GCP test VPSes
 
 Real-VPC, x86_64 test hosts on GCP: Spot hosts installed from the mirror (`https://u7s.dekiru.tech/<tag>/install.sh`), never from a local build. `vps.sh up` defaults to `e2-micro` (0.25 sustained vCPU) and `--machine-type` picks another. The release gate uses the custom `n1-custom-1-1024` (1 dedicated vCPU, 1 GiB; kubelet allocatable cpu=1; a dedicated core is more generous than a typical shared 1-vCPU VPS, so a gate PASS is slightly optimistic for shared hosts), set once as `GCP_GATE_MACHINE_TYPE` in `scripts/gcp/lib.sh` and forced over an ambient `U7S_GCP_MACHINE_TYPE`. Helpers live in `scripts/gcp/`; the account, project and zone live only in a local gcloud named configuration, never in git.
