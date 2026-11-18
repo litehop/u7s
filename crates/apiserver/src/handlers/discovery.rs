@@ -1078,6 +1078,13 @@ fn apps_v1_resources() -> serde_json::Value {
         "groupVersion": "apps/v1",
         "resources": [
             {
+                "name": "controllerrevisions",
+                "singularName": "controllerrevision",
+                "namespaced": true,
+                "kind": "ControllerRevision",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
                 "name": "daemonsets",
                 "singularName": "daemonset",
                 "namespaced": true,
@@ -3854,6 +3861,58 @@ mod tests {
             names.contains(&"daemonsets"),
             "daemonsets must be in apps/v1 — DaemonSet is required for system workloads like CNI and kube-proxy; got: {names:?}"
         );
+    }
+
+    // Every resource the router serves must be discoverable: a resource registered for REST but
+    // missing here is invisible to kubectl ("doesn't have a resource type") and to every
+    // discovery-driven client, which is how ControllerRevision went unlisted.
+    #[test]
+    fn every_registered_builtin_resource_is_listed_in_discovery() {
+        let mut lists = vec![("", api_v1_resource_list_value())];
+        let mut gvs: Vec<(&str, &str)> = STATIC_GROUPS.to_vec();
+        gvs.extend([("autoscaling", "v1"), ("coordination.k8s.io", "v1alpha2")]);
+        for (g, v) in gvs {
+            lists.push((g, static_group_resources(g, v).unwrap()));
+        }
+        let served: std::collections::HashSet<(String, String)> = lists
+            .iter()
+            .flat_map(|(g, l)| {
+                l["resources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| (g.to_string(), r["name"].as_str().unwrap().to_string()))
+            })
+            .collect();
+        let missing: Vec<_> = crate::state::build_registry()
+            .keys()
+            .filter(|k| !served.contains(&(k.group.clone(), k.plural.clone())))
+            .map(|k| format!("{}/{}", k.group, k.plural))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registered but not in discovery (kubectl cannot see them): {missing:?}"
+        );
+    }
+
+    // StatefulSet/DaemonSet controllers store rollout history as ControllerRevisions.
+    #[tokio::test]
+    async fn apps_v1_resources_includes_controllerrevisions_so_kubectl_can_see_rollout_history() {
+        let state = make_state();
+        let resp =
+            api_group_resources(State(state), Path(("apps".to_string(), "v1".to_string()))).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let cr = val["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "controllerrevisions")
+            .expect("controllerrevisions must be in apps/v1 discovery");
+        assert_eq!(cr["kind"], "ControllerRevision");
+        assert_eq!(cr["namespaced"], true);
     }
 
     // batch/v1 must appear in /apis so kubectl can discover Job and CronJob resources.
