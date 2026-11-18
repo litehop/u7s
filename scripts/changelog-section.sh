@@ -26,7 +26,7 @@ body="$(awk -v want="## [$version]" '
     if (index($0, want) == 1 && (length($0) == length(want) || substr($0, length(want) + 1, 1) == " ")) found = 1
     next
   }
-  found { print }
+  found && !/^\[[^]]+\]:[ \t]/ { print }
   END { if (!found) exit 3 }
 ' "$file")" || rc=$?
 
