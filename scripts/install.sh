@@ -197,6 +197,8 @@ TARBALL_URL="$DEFAULT_TARBALL_URL"
 TARBALL_URL_EXPLICIT=0
 # Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
 DOWNLOAD_DIR=""
+# Absolute $SECONDS value by which every fetch_tarball download must be done.
+DOWNLOAD_DEADLINE=0
 MINT_JOIN_TOKEN=0
 ALLOW_SERVICE_EXTERNAL_IPS=0
 JOIN_SERVER=""
@@ -449,7 +451,10 @@ verify_release_signature() {
 # retries every transient failure with backoff, resumes a partial <dest> when
 # <resume> is non-empty, drops to HTTP/1.1 from the third attempt, and aborts a
 # stalled transfer (--speed-limit/--speed-time) instead of waiting out a long
-# fixed timeout. Protocol/TLS restrictions are identical on every attempt.
+# fixed timeout. Protocol/TLS restrictions are identical on every attempt. All
+# attempts of all fetches share the single DOWNLOAD_DEADLINE set by
+# fetch_tarball. The stderr scratch file lives in $DOWNLOAD_DIR so the caller's
+# EXIT trap removes it even on SIGINT.
 # Permanent client errors (4xx other than 408/429) fail at once. file:// URLs
 # are one local read: no retries. Verification is the caller's job.
 DOWNLOAD_ATTEMPTS=6
@@ -460,12 +465,12 @@ download_mirror() {
   case "$url" in
     file://*) curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$dest" "$url"; return ;;
   esac
-  local attempt=1 start="$SECONDS" rc code err left lasterr="" flags
-  err="$(mktemp)"
+  local attempt=1 rc code err left lasterr="" flags
+  err="$(mktemp "$DOWNLOAD_DIR/err.XXXXXX")"
   while :; do
-    left=$(( DOWNLOAD_MAX_SECONDS - (SECONDS - start) ))
+    left=$(( DOWNLOAD_DEADLINE - SECONDS ))
     [ "$left" -ge 1 ] || { lasterr="${lasterr:-overall ${DOWNLOAD_MAX_SECONDS}s time cap reached}"; break; }
-    flags=(--speed-limit 10240 --speed-time 30 --connect-timeout 20 --max-time "$left")
+    flags=(--speed-limit 10240 --speed-time 10 --connect-timeout 10 --max-time "$left")
     [ "$attempt" -lt 3 ] || flags+=(--http1.1)
     [ -z "$resume" ] || flags+=(-C -)
     rc=0
@@ -504,6 +509,7 @@ download_mirror() {
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp_disk_dir)"
+  DOWNLOAD_DEADLINE=$((SECONDS + DOWNLOAD_MAX_SECONDS))
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
   local part="$TARBALL.part"
   local checksum_url="$url.sha256"

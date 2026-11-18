@@ -3046,6 +3046,18 @@ while [ $# -gt 0 ]; do
 done
 echo "$url" >> "$STUB_DIR/urls"
 printf '%s\n' "$all" >> "$STUB_DIR/args"
+[ -e "$dest" ] && echo 1 >> "$STUB_DIR/present" || echo 0 >> "$STUB_DIR/present"
+[ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
+if [ -n "${STUB_CODES:-}" ]; then
+  # Per-call outcome: "<http_code>[:<curl_exit>]"; the last entry repeats.
+  k="$(wc -l < "$STUB_DIR/urls")"
+  set -- $STUB_CODES
+  [ "$k" -le "$#" ] || k=$#
+  spec="${!k}"; code="${spec%%:*}"; crc=22; [ "$spec" = "$code" ] || crc="${spec#*:}"
+  if [ "$code" = 200 ]; then echo ok > "$dest"; printf 200; exit 0; fi
+  echo "curl: ($crc) The requested URL returned error: $code" >&2
+  printf '%s' "$code"; exit "$crc"
+fi
 case "$url" in
   *.tar.gz)
     n="$(grep -c 'tar.gz$' "$STUB_DIR/urls")"
@@ -3117,6 +3129,62 @@ assert "every attempt carries a stall guard (--speed-limit/--speed-time) -- a hu
 rc=0; out="$(run_fetch always56 "file:///nonexistent/u7s-test.tar.gz")" || rc=$?
 assert "a file:// URL gets exactly one curl call and no retries -- a local path has no network hiccup to wait out" \
   "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 1 ] && echo 1 || echo 0)"
+
+# HTTP-status branches of download_mirror, driven by STUB_CODES
+# ("<http_code>[:<curl_exit>]" per call, last repeats). $dest is pre-seeded with
+# stale bytes; the stub logs whether $dest existed at the start of each call.
+run_dm() { # $1 = STUB_CODES; prints output, returns download_mirror's status
+  rm -f "$DL_DIR/bin/urls" "$DL_DIR/bin/args" "$DL_DIR/bin/present"
+  local d; d="$(mktemp -d)"; echo stale > "$d/dest"
+  PATH="$DL_DIR/bin:$PATH" STUB_DIR="$DL_DIR/bin" STUB_CODES="$1" bash -c "$DL_FUNCS"'
+    DOWNLOAD_RETRY_DELAY=0; DOWNLOAD_DIR="$1"; DOWNLOAD_DEADLINE=$((SECONDS + 100))
+    download_mirror https://mirror.example/x.tar.gz "$1/dest" resume; rc=$?
+    ls "$1" | grep -c "^err" | sed "s/^/ERR_LEFT=/"
+    exit $rc' _ "$d" 2>&1
+  local r=$?; rm -rf "$d"; return $r
+}
+for c in 404 403 400; do
+  rc=0; out="$(run_dm "$c")" || rc=$?
+  assert "HTTP $c is permanent: exactly 1 attempt and non-zero -- retrying a missing/forbidden release 6x only delays the real error" \
+    "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 1 ] && echo 1 || echo 0)"
+done
+for c in 500 503 408 429; do
+  rc=0; out="$(run_dm "$c 200")" || rc=$?
+  assert "HTTP $c is transient: retried and then succeeds on attempt 2 -- giving up would fail installs on a mirror blip or rate limit" \
+    "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 2 ] && echo 1 || echo 0)"
+done
+rc=0; out="$(run_dm "416 200")" || rc=$?
+assert "HTTP 416 deletes the partial file before retrying -- resuming past EOF of a stale partial would 416 forever" \
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 2 ] && [ "$(tr -d '\n' < "$DL_DIR/bin/present")" = 10 ] && echo 1 || echo 0)"
+rc=0; out="$(run_dm "000:33 200")" || rc=$?
+assert "curl exit 33 (server cannot resume) deletes the partial file before retrying -- otherwise every retry asks for the same unsupported range" \
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 2 ] && [ "$(tr -d '\n' < "$DL_DIR/bin/present")" = 10 ] && echo 1 || echo 0)"
+rc=0; out="$(run_dm "500")" || rc=$?
+assert "the stderr scratch file is gone after a failed download -- no leak on the error path" \
+  "$(printf '%s\n' "$out" | grep -q 'ERR_LEFT=0' && echo 1 || echo 0)"
+
+# One deadline for the whole fetch: each download starts with less time than the
+# previous one (the first tarball call sleeps 2s), sidecars/signatures included,
+# so a failed verification cannot buy a second full budget.
+rc=0; out="$(STUB_SLEEP=2 run_fetch allbad "$DL_URL")" || rc=$?
+maxes="$(sed -n 's/.*--max-time \([0-9]*\).*/\1/p' "$DL_DIR/bin/args")"
+assert "every fetch_tarball download (tarball, sidecar, both .sig, re-download) carries the stall guard, https-only flags and --max-time -- a flag missing on one fetch is an unguarded hang or downgrade" \
+  "$([ "$(wc -l < "$DL_DIR/bin/args")" -eq 5 ] && [ "$(grep -c -- "--proto =https,file --proto-redir =https --tlsv1.2 -fsSL .*--speed-limit .* --speed-time .*--max-time " "$DL_DIR/bin/args")" -eq 5 ] && echo 1 || echo 0)"
+assert "--max-time shrinks across downloads (budget is one overall deadline, not 1800s per call) -- otherwise a failed verification doubles the tarball budget (got: $(echo $maxes))" \
+  "$(echo "$maxes" | awk 'NR==1 && $1>1800 {bad=1} NR>1 && $1>1798 {bad=1} NR==5 && $1>1798 {bad=1} END {print (NR==5 && !bad) ? 1 : 0}')"
+
+# An interrupt mid-download must not leave the stderr scratch file behind.
+DL_TMP="$DL_DIR/created"
+{ MKTEMP_LOG="$DL_TMP" bash -c "$DL_FUNCS"'
+  mktemp() { local p; p="$(command mktemp "$@")" || return; echo "$p" >> "$MKTEMP_LOG"; echo "$p"; }
+  mktemp_disk_dir() { mktemp -d; }
+  trap '"'"'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}'"'"' EXIT
+  curl() { kill -TERM $$; sleep 1; }
+  fetch_tarball https://mirror.example/u7s-test.tar.gz' >/dev/null 2>&1 || true; } 2>/dev/null
+DL_LEAKED=""
+while read -r p; do [ ! -e "$p" ] || DL_LEAKED="$DL_LEAKED $p"; done < "$DL_TMP"
+assert "SIGTERM/SIGINT mid-download leaves no temp file behind -- the stderr scratch file must be under the EXIT-trapped download dir (leaked:${DL_LEAKED:- none}; created $(wc -l < "$DL_TMP") paths)" \
+  "$([ -z "$DL_LEAKED" ] && [ "$(wc -l < "$DL_TMP")" -ge 2 ] && echo 1 || echo 0)"
 rm -rf "$DL_DIR"
 
 # ---------------------------------------------------------------------------
