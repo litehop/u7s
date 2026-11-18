@@ -197,6 +197,8 @@ TARBALL_URL="$DEFAULT_TARBALL_URL"
 TARBALL_URL_EXPLICIT=0
 # Set by fetch_tarball; removed by the same EXIT trap as STAGE_DIR.
 DOWNLOAD_DIR=""
+# Absolute $SECONDS value by which every fetch_tarball download must be done.
+DOWNLOAD_DEADLINE=0
 MINT_JOIN_TOKEN=0
 ALLOW_SERVICE_EXTERNAL_IPS=0
 JOIN_SERVER=""
@@ -449,7 +451,12 @@ verify_release_signature() {
 # retries every transient failure with backoff, resumes a partial <dest> when
 # <resume> is non-empty, drops to HTTP/1.1 from the third attempt, and aborts a
 # stalled transfer (--speed-limit/--speed-time) instead of waiting out a long
-# fixed timeout. Protocol/TLS restrictions are identical on every attempt.
+# fixed timeout. Protocol/TLS restrictions are identical on every attempt. All
+# attempts of all fetches share the single DOWNLOAD_DEADLINE set by
+# fetch_tarball. The stderr scratch file lives in $DOWNLOAD_DIR so the caller's
+# EXIT trap removes it even on SIGINT. An attempt that grew <dest> is progress
+# and does not count toward DOWNLOAD_ATTEMPTS; only the deadline bounds a slow
+# but advancing transfer.
 # Permanent client errors (4xx other than 408/429) fail at once. file:// URLs
 # are one local read: no retries. Verification is the caller's job.
 DOWNLOAD_ATTEMPTS=6
@@ -460,14 +467,15 @@ download_mirror() {
   case "$url" in
     file://*) curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL -o "$dest" "$url"; return ;;
   esac
-  local attempt=1 start="$SECONDS" rc code err left lasterr="" flags
-  err="$(mktemp)"
+  local attempt=1 rc code err left lasterr="" flags size0 size1 delay expired=0
+  err="$(mktemp "$DOWNLOAD_DIR/err.XXXXXX")"
   while :; do
-    left=$(( DOWNLOAD_MAX_SECONDS - (SECONDS - start) ))
-    [ "$left" -ge 1 ] || { lasterr="${lasterr:-overall ${DOWNLOAD_MAX_SECONDS}s time cap reached}"; break; }
-    flags=(--speed-limit 10240 --speed-time 30 --connect-timeout 20 --max-time "$left")
+    left=$(( DOWNLOAD_DEADLINE - SECONDS ))
+    [ "$left" -ge 1 ] || { expired=1; break; }
+    flags=(--speed-limit 1024 --speed-time 10 --connect-timeout 10 --max-time "$left")
     [ "$attempt" -lt 3 ] || flags+=(--http1.1)
     [ -z "$resume" ] || flags+=(-C -)
+    size0="$(wc -c < "$dest" 2>/dev/null || echo 0)"
     rc=0
     code="$(curl --proto '=https,file' --proto-redir '=https' --tlsv1.2 -fsSL "${flags[@]}" -w '%{http_code}' -o "$dest" "$url" 2>"$err")" || rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -480,13 +488,25 @@ download_mirror() {
       4[0-9][0-9]) [ "$code" = 408 ] || [ "$code" = 429 ] || break ;;
     esac
     [ "$rc" -ne 33 ] || rm -f "$dest"
-    [ "$attempt" -lt "$DOWNLOAD_ATTEMPTS" ] || break
-    echo "download of $url failed ($lasterr); retrying (attempt $((attempt + 1))/$DOWNLOAD_ATTEMPTS) in $((attempt * DOWNLOAD_RETRY_DELAY))s" >&2
-    sleep "$((attempt * DOWNLOAD_RETRY_DELAY))"
-    attempt=$((attempt + 1))
+    size1="$(wc -c < "$dest" 2>/dev/null || echo 0)"
+    delay=$((attempt * DOWNLOAD_RETRY_DELAY))
+    left=$(( DOWNLOAD_DEADLINE - SECONDS ))
+    [ "$delay" -le "$left" ] || delay=$(( left > 0 ? left : 0 ))
+    if [ -n "$resume" ] && [ "$size1" -gt "$size0" ]; then
+      echo "download of $url failed ($lasterr) after making progress; resuming in ${delay}s" >&2
+    else
+      [ "$attempt" -lt "$DOWNLOAD_ATTEMPTS" ] || break
+      echo "download of $url failed ($lasterr); retrying (attempt $((attempt + 1))/$DOWNLOAD_ATTEMPTS) in ${delay}s" >&2
+      attempt=$((attempt + 1))
+    fi
+    sleep "$delay"
   done
   rm -f "$err"
-  echo "error: download of $url failed after $attempt attempt(s): $lasterr" >&2
+  if [ "$expired" -eq 1 ]; then
+    echo "error: download of $url did not finish within the overall ${DOWNLOAD_MAX_SECONDS}s deadline${lasterr:+: $lasterr}" >&2
+  else
+    echo "error: download of $url failed after $attempt attempt(s): $lasterr" >&2
+  fi
   return 1
 }
 
@@ -504,6 +524,7 @@ download_mirror() {
 fetch_tarball() {
   local url="$1"
   DOWNLOAD_DIR="$(mktemp_disk_dir)"
+  DOWNLOAD_DEADLINE=$((SECONDS + DOWNLOAD_MAX_SECONDS))
   TARBALL="$DOWNLOAD_DIR/$(basename "$url")"
   local part="$TARBALL.part"
   local checksum_url="$url.sha256"
