@@ -5,6 +5,15 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+### Fixed
+
+- StatefulSet pods were deleted and recreated every ~30 s (`collisionCount`
+  climbing without bound) when the pod template contained `<`, `>` or `&`,
+  for example a shell command with a redirect. ControllerRevisions are now
+  served with the same JSON escaping the controllers compare against.
+  `kubectl api-resources` and `kubectl get controllerrevisions` now list
+  `controllerrevisions`, which were previously reported as not served.
+
 ## [0.4.6] - 2026-11-18
 
 ### Added
