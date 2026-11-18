@@ -123,10 +123,42 @@ runs:
         done
         sudo systemctl enable --now crio
 
-    - name: Install containernetworking-plugins
+    - name: Resolve pinned CNI plugins version
+      id: cni-version
       shell: bash
       run: |
-        sudo apt-get install -y -o Dpkg::Options::="--force-overwrite" containernetworking-plugins
+        . scripts/lib/release-fetch.sh
+        echo "version=$CNI_PLUGINS_VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Cache CNI plugins
+      id: cache-cni
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/cni-plugins
+        key: cni-plugins-${{ steps.cni-version.outputs.version }}-${{ runner.arch }}
+
+    - name: Fetch CNI plugins
+      # The tarball is sha256-pinned in scripts/lib/release-fetch.sh and comes
+      # from github.com, not packages.microsoft.com (which 429s CI runners).
+      if: steps.cache-cni.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        for attempt in 1 2 3; do
+          if (. scripts/lib/release-fetch.sh && fetch_cni_plugins_for_arch "$HOME/cni-plugins" amd64); then
+            exit 0
+          fi
+          echo "CNI plugins fetch attempt $attempt failed" >&2
+          sleep $((attempt * 10))
+        done
+        exit 1
+
+    - name: Install CNI plugins
+      shell: bash
+      run: |
+        sudo install -d -m 0755 /opt/cni/bin
+        for p in bridge host-local loopback portmap; do
+          sudo install -m 0755 "$HOME/cni-plugins/$p" /opt/cni/bin/
+        done
 
     - name: Cache sonobuoy CLI
       id: cache-sonobuoy
