@@ -354,7 +354,7 @@ runs:
       run: |
         FLANNEL_RENDERED="$(mktemp)"
         . scripts/lib/flannel-render.sh
-        NIC="$(ip -o route show default | awk '{print $5; exit}')"
+        NIC="$(ip -o route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
         [ -n "$NIC" ] || { echo "ERROR: no default-route interface on this runner" >&2; exit 1; }
         render_flannel_for_nic "$NIC" "$(cat "/sys/class/net/$NIC/mtu")" 10.244.0.0/16 "" \
           < manifests/flannel.yaml > "$FLANNEL_RENDERED"
