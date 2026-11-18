@@ -1,0 +1,6 @@
+extends: existence
+message: "Remove '%s': bead IDs rot once the bead closes; history belongs in git (worker rule 10)."
+level: error
+scope: comment
+tokens:
+  - 'mayor-[a-z0-9]{5}\b'

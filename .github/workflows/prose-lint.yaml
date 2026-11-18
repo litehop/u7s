@@ -1,0 +1,44 @@
+name: Prose lint
+
+# Advisory: reports Vale alerts as annotations and a step summary, never fails.
+# Do not add `vale` to the required checks until the u7s/ rules gate via
+# `scripts/vale-report.sh --strict`.
+on:
+  pull_request:
+    paths:
+      - '**.md'
+      - '.vale.ini'
+      - '.vale/**'
+      - 'scripts/vale-report.sh'
+      - '.github/workflows/prose-lint.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  vale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Vale 3.27.0
+        run: |
+          set -euo pipefail
+          url=https://github.com/errata-ai/vale/releases/download/v3.27.0/vale_3.27.0_Linux_64-bit.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/vale.tar.gz" "$url"
+          echo "c80d62f6bce87b81843ac5b512a26e63213927b957adba0a64fc594570da2000  $RUNNER_TEMP/vale.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/vale"
+          tar -xzf "$RUNNER_TEMP/vale.tar.gz" -C "$RUNNER_TEMP/vale" vale
+          echo "$RUNNER_TEMP/vale" >> "$GITHUB_PATH"
+      - name: Vale report
+        run: |
+          scripts/vale-report.sh --github | tee "$RUNNER_TEMP/vale-report.txt"
+          {
+            echo '### Vale advisory report'
+            echo '```'
+            grep -v '^::' "$RUNNER_TEMP/vale-report.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

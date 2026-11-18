@@ -29,6 +29,14 @@ conventions — read them even if you're a human contributor, so your changes
 match the surrounding code. For user-facing docs specifically, follow
 [`docs/style-guide.md`](docs/style-guide.md).
 
+## Prose lint
+
+Install [Vale](https://vale.sh) and run `scripts/vale-report.sh` to lint
+`README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `docs/`. It is advisory:
+CI posts the report on PRs touching Markdown and never blocks a merge. The
+rules, and which house rule each enforces, are in
+[`.vale/README.md`](.vale/README.md).
+
 ## Opening a pull request
 
 1. Reference the bead ID your PR closes in the PR description.

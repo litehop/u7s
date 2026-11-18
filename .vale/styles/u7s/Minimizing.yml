@@ -1,0 +1,11 @@
+extends: existence
+message: "Drop '%s': minimizing a step's difficulty is banned by the docs style guide (rule 10)."
+level: warning
+scope: text
+ignorecase: true
+tokens:
+  - simply
+  - easily
+  - obviously
+  - trivially
+  - effortlessly

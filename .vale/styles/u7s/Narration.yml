@@ -1,0 +1,15 @@
+extends: existence
+message: "Cut '%s': narration points at other text instead of stating the fact (CLAUDE.md Rule 16)."
+level: warning
+scope: text
+ignorecase: true
+tokens:
+  - this session
+  - as mentioned
+  - as discussed
+  - as noted
+  - it's worth noting
+  - it is worth noting
+  - worth noting that
+  - in this PR
+  - previous run
