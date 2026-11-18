@@ -5,6 +5,8 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-11-18
+
 ### Fixed
 
 - StatefulSet pods were deleted and recreated every ~30 s (`collisionCount`
