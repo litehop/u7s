@@ -7,6 +7,11 @@ individually; their changes land in the next release's section.
 
 ## [0.4.7] - 2026-11-18
 
+### Changed
+
+- The apiserver records the store's on-disk format and refuses to start on a
+  store written by a newer u7s. Downgrades are not supported. (#2182)
+
 ### Fixed
 
 - StatefulSet pods were deleted and recreated every ~30 s (`collisionCount`
@@ -15,11 +20,7 @@ individually; their changes land in the next release's section.
   served with the same JSON escaping the controllers compare against.
   `kubectl api-resources` and `kubectl get controllerrevisions` now list
   `controllerrevisions`, which were previously reported as not served.
-
-### Changed
-
-- The apiserver records the store's on-disk format and refuses to start on a
-  store written by a newer u7s. Downgrades are not supported.
+  (#2184)
 
 ## [0.4.6] - 2026-11-18
 
