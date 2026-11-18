@@ -2481,6 +2481,15 @@ net_bad "changing a single-stack range to another single range is refused and po
 net_bad "dropping a family from a dual-stack install is refused: existing dual ClusterIPs and podCIDRs would be stranded" \
   'EXISTING_INSTALL=1; PERSISTED_SVC=10.96.0.0/12,fd00:96::/108; SERVICE_CIDR=10.96.0.0/12; resolve' "conflicts with the value in effect"
 
+for bad_mtu in "" "abc" "14x0"; do
+  net_run "derive_pod_mtu '$bad_mtu' 0"
+  assert "a node whose NIC MTU is '$bad_mtu' (NIC not found) fails with a readable error, not a bash arithmetic trace" \
+    "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -q "NIC MTU must be a whole number, got '$bad_mtu'" && ! printf '%s' "$NET_OUT" | grep -qi 'invalid integer' && echo 1 || echo 0)"
+done
+net_run 'derive_pod_mtu 1500 0'
+assert "a numeric NIC MTU still derives the pod MTU (1500 - 74)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1426 ] && echo 1 || echo 0)"
+
 # KCM: upstream rejects --node-cidr-mask-size with two cluster CIDRs.
 net_run 'POD_CLUSTER_CIDR=10.244.0.0/16; kcm_node_cidr_mask_flags'
 assert "single-stack IPv4 keeps the legacy --node-cidr-mask-size=24 and nothing else" \

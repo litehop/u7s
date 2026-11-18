@@ -5,6 +5,11 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+### Fixed
+
+- An unreadable or non-numeric NIC MTU now fails the pod-MTU derivation with a
+  clear error instead of a bash arithmetic error.
+
 ## [0.4.6] - 2026-11-18
 
 ### Added
