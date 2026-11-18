@@ -1,0 +1,8 @@
+[advisories]
+# Both: unmaintained, not vulnerable; pulled in via cel 0.16 `chrono` feature
+# (gates Value::Timestamp/Duration, needed for K8s CEL). Renewed monthly until
+# a cel release drops chrono.
+ignore = [
+    "RUSTSEC-2026-0543", # chrono; expires 2026-12-18
+    "RUSTSEC-2026-0555", # chrono-tz; expires 2026-12-18
+]
