@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-08-23
+**Extended by:** [container-images-ipv6-reachable-registries.md](container-images-ipv6-reachable-registries.md)
 
 ## Context
 

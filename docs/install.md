@@ -78,6 +78,28 @@ embed them first:
 sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten
 ```
 
+## Pod MTU
+
+`install.sh` sets the pod MTU to the `--iface` MTU minus 74 bytes, or minus 94
+on an IPv6 underlay or a dual-stack install: 1386 or 1366 on GCP (NIC 1460),
+1426 or 1406 on a 1500 NIC. The bundled LoadBalancer provider (beep) delivers
+traffic to pods in Geneve, which adds 14 (inner Ethernet) + 20 or 40 (outer
+IP) + 8 (UDP) + 8 (Geneve) + 24 (pod-id option) bytes. beep sets no
+don't-fragment bit and no "packet too big" reaches the pod, so a full-size pod
+packet that does not fit is fragmented by the underlay, or stalls silently on
+one that drops fragments. flannel's own default (NIC minus 50) is 24 bytes too
+large.
+
+Override the value with `--pod-mtu <mtu>` or `U7S_POD_MTU` (at least 1280, the
+IPv6 minimum, and not above the interface's MTU). The MTU is written into the
+cluster-wide flannel manifest from the control plane's interface, so every node
+gets it. An explicit value is saved in the node's config and reused by a re-run
+without the flag; a derived value is recomputed from the NIC each run. It
+applies to pods created after the change. The cluster's pod MTU is not
+readable from a worker, so `--join` cannot warn: a worker whose NIC MTU minus
+the overhead is below the control plane's pod MTU needs the control plane's
+`--pod-mtu` set low enough for it. `--join` refuses the flag.
+
 ## Dual-stack install
 
 A dual-stack cluster gives Services and pods an IPv4 and an IPv6 address.

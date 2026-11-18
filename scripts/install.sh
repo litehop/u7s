@@ -87,6 +87,12 @@ fi
 #   kube-system/u7s-cluster-config, read with the join token after discovery;
 #   its --node-ip is checked against the families that implies, as a control
 #   plane's is against its own ranges. The join fails if the read fails.
+#   --pod-mtu / U7S_POD_MTU       Pod interface MTU (default: this node's
+#                                 --iface MTU minus 74, or minus 94 on an IPv6
+#                                 underlay or dual-stack: beep's Geneve
+#                                 encapsulation of LoadBalancer traffic to pods
+#                                 must fit the NIC without fragmenting).
+#                                 Control plane only; pass it on every re-run.
 #   --manifest-output-dir / U7S_MANIFEST_OUTPUT_DIR
 #                                 Where vendored manifest YAMLs from the
 #                                 tarball land (default: /etc/u7s/manifests,
@@ -109,7 +115,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--manifest-output-dir <path>] [--allow-service-external-ips]
+  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--pod-mtu <mtu>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]]
 
@@ -134,6 +140,11 @@ Usage:
                          its tenth host, e.g. 10.96.0.10; k3s: 10.43.0.10).
                          Control plane only; --join nodes read it from the
                          cluster.
+  --pod-mtu <mtu>       Pod interface MTU (default: the --iface MTU minus 74,
+                         or minus 94 on an IPv6 underlay or dual-stack, so
+                         beep's Geneve-encapsulated LoadBalancer traffic fits
+                         the NIC unfragmented). Control plane only; pass it on
+                         every re-run.
   --manifest-output-dir <path>
                          Where vendored manifest YAMLs from the tarball land
                          (default: /etc/u7s/manifests, the apiserver's
@@ -182,6 +193,7 @@ DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"
 SERVICE_CIDR="${U7S_SERVICE_CIDR:-}"
 POD_CLUSTER_CIDR="${U7S_CLUSTER_CIDR:-}"
 CLUSTER_DNS="${U7S_CLUSTER_DNS:-}"
+POD_MTU="${U7S_POD_MTU:-}"
 # The cluster's IP families, primary first ("4", "6,4"). A control plane derives
 # it from its ranges; a worker derives it from the cluster's published ranges
 # (fetch_cluster_config) before it picks its --node-ip.
@@ -222,6 +234,7 @@ while [ $# -gt 0 ]; do
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --cluster-cidr) POD_CLUSTER_CIDR="$2"; shift 2 ;;
     --cluster-dns) CLUSTER_DNS="$2"; shift 2 ;;
+    --pod-mtu) POD_MTU="$2"; shift 2 ;;
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
@@ -1018,6 +1031,75 @@ kcm_node_cidr_mask_flags() {
   esac
 }
 
+iface_mtu() {
+  cat "/sys/class/net/$1/mtu" 2>/dev/null
+}
+
+# Pod MTU for a NIC MTU ($1); $2 is 1 when the underlay may carry IPv6 (IPv6
+# primary address or dual-stack), which takes the larger encapsulation overhead.
+derive_pod_mtu() {
+  local overhead=74
+  [ "${2:-0}" = 1 ] && overhead=94
+  echo $((10#$1 - overhead))
+}
+
+# Renders manifests/flannel.yaml (stdin to stdout). Args: <iface> <pod cidr
+# v4> <pod cidr v6, empty for single-stack> <pod mtu> [extra sed args]. The
+# IPv6Network line survives only with both CIDRs. Every render path (install.sh,
+# the dev rig, CI) goes through here; a placeholder left in the output fails
+# the render rather than reaching the CNI config.
+render_flannel() {
+  local iface="$1" v4="$2" v6="$3" mtu="$4" out
+  shift 4
+  local -a drop_v6=()
+  { [ -n "$v4" ] && [ -n "$v6" ]; } || drop_v6=(-e '/"IPv6Network"/d')
+  out="$(sed -e "s/__IFACE__/$iface/g" ${drop_v6[@]+"${drop_v6[@]}"} \
+    -e "s#__POD_CLUSTER_CIDR_IPV4__#$v4#g" -e "s#__POD_CLUSTER_CIDR_IPV6__#$v6#g" \
+    -e "s#__POD_MTU__#$mtu#g" ${1+"$@"})" || return 1
+  if printf '%s\n' "$out" | grep -qE '__[A-Z_]+__'; then
+    echo "error: rendered flannel manifest still has placeholder(s): $(printf '%s\n' "$out" | grep -oE '__[A-Z_]+__' | sort -u | paste -sd' ' -)" >&2
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# Sets POD_MTU (the --pod-mtu value, or the derived one). beep delivers
+# LoadBalancer traffic to pods in Geneve: 14 inner Ethernet + outer IP (20 v4,
+# 40 v6) + 8 UDP + 8 Geneve + 24 pod-id option = 74 B over an IPv4 underlay,
+# 94 B over IPv6. beep sets no DF and no PTB reaches the pod, so a pod packet
+# that does not fit after encapsulation is fragmented by the underlay or, if it
+# drops fragments, stalls silently. Flannel's own NIC-50 default leaves 24 B too
+# little. Dual-stack takes the larger overhead since either family may carry it.
+resolve_pod_mtu() {
+  local nic v6=0
+  nic="$(iface_mtu "$IFACE")"
+  if [ -n "$POD_MTU" ]; then
+    case "$POD_MTU" in
+      *[!0-9]*) echo "error: --pod-mtu must be a whole number, got '$POD_MTU'" >&2; return 1 ;;
+    esac
+    POD_MTU=$((10#$POD_MTU))
+    case "$nic" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$POD_MTU" -gt "$((10#$nic))" ]; then
+          echo "error: --pod-mtu $POD_MTU exceeds the $IFACE MTU $nic; pods could not send full-size packets" >&2
+          return 1
+        fi ;;
+    esac
+  else
+    case "$nic" in
+      ''|*[!0-9]*) echo "error: cannot read the MTU of $IFACE; pass --pod-mtu" >&2; return 1 ;;
+    esac
+    case "$IFACE_IP" in *:*) v6=1 ;; esac
+    if [ -n "$POD_CLUSTER_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ]; then v6=1; fi
+    POD_MTU="$(derive_pod_mtu "$nic" "$v6")"
+  fi
+  if [ "$POD_MTU" -lt 1280 ]; then
+    echo "error: pod MTU $POD_MTU is below 1280, the IPv6 minimum; raise the $IFACE MTU or pass --pod-mtu" >&2
+    return 1
+  fi
+}
+
 # Writes the install-time placeholders into the vendored manifests in $1.
 # __POD_CLUSTER_CIDR__ is the primary (first) pod CIDR, so a manifest that
 # predates dual-stack keeps a valid single-family value; the full list and
@@ -1032,13 +1114,11 @@ kcm_node_cidr_mask_flags() {
 # so its clusterIP line is rewritten and then verified.
 render_vendored_manifests() {
   local dir="$1" nl=$'\\\n' iface_host="${IFACE_IP:-}" other_dns=""
-  local -a flannel_sed=() beep_sed=() coredns_sed=()
+  local -a beep_sed=() coredns_sed=()
   case "$iface_host" in *:*) iface_host="[$iface_host]" ;; esac
   if [ -n "$POD_CLUSTER_CIDR_IPV4" ] && [ -n "$POD_CLUSTER_CIDR_IPV6" ]; then
     # beep admits a pod IP only against the --pod-cidr of its own family.
     beep_sed=(-e "s#--pod-cidr=__POD_CLUSTER_CIDR__#--pod-cidr=${POD_CLUSTER_CIDR%%,*}${nl}            - --pod-cidr=${POD_CLUSTER_CIDR#*,}#")
-  else
-    flannel_sed=(-e '/"IPv6Network": "__POD_CLUSTER_CIDR_IPV6__"/d')
   fi
   if [ -n "$SERVICE_CIDR_IPV4" ] && [ -n "$SERVICE_CIDR_IPV6" ]; then
     case "$CLUSTER_DNS" in
@@ -1055,12 +1135,13 @@ render_vendored_manifests() {
     -e "s#__SERVICE_CIDRS__#$SERVICE_CIDR#g"
     -e "s#__SERVICE_CIDR_IPV4__#$SERVICE_CIDR_IPV4#g"
     -e "s#__SERVICE_CIDR_IPV6__#$SERVICE_CIDR_IPV6#g"
+    -e "s#__POD_MTU__#$POD_MTU#g"
   )
   if [ -f "$dir/flannel.yaml" ]; then
     # sed -e ... > tmp && mv, not -i: -i's flag shape differs between GNU and
     # BSD sed, and this redirect-and-replace form works identically on both.
-    sed -e "s/__IFACE__/$IFACE/g" ${flannel_sed[@]+"${flannel_sed[@]}"} "${cidr_sed[@]}" \
-      "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp"
+    render_flannel "$IFACE" "$POD_CLUSTER_CIDR_IPV4" "$POD_CLUSTER_CIDR_IPV6" "$POD_MTU" "${cidr_sed[@]}" \
+      < "$dir/flannel.yaml" > "$dir/flannel.yaml.tmp" || return 1
     mv "$dir/flannel.yaml.tmp" "$dir/flannel.yaml"
   fi
   if [ -f "$dir/kube-proxy.yaml" ]; then
@@ -1919,6 +2000,7 @@ PERSISTED_SERVICE_CIDR=""
 PERSISTED_POD_CLUSTER_CIDR=""
 PERSISTED_CLUSTER_DNS=""
 PERSISTED_CLUSTER_FAMILIES=""
+PERSISTED_POD_MTU=""
 normalize_node_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
 NODE_NAME="$(normalize_node_name "$NODE_NAME")"
 if [ -f "$CONFIG_FILE" ]; then
@@ -1938,6 +2020,8 @@ if [ -f "$CONFIG_FILE" ]; then
   PERSISTED_CLUSTER_DNS="$(. "$CONFIG_FILE"; printf '%s' "${CLUSTER_DNS:-}")"
   # shellcheck disable=SC1090
   PERSISTED_CLUSTER_FAMILIES="$(. "$CONFIG_FILE"; printf '%s' "${CLUSTER_FAMILIES:-}")"
+  # shellcheck disable=SC1090
+  PERSISTED_POD_MTU="$(. "$CONFIG_FILE"; printf '%s' "${POD_MTU:-}")"
 fi
 
 # On an upgrade, an unset --iface/--node-name defaults to what was persisted
@@ -1980,8 +2064,8 @@ fi
 # are control-plane settings, so passing them with --join is refused rather
 # than silently ignored.
 if [ "$WORKER_MODE" -eq 1 ]; then
-  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]; then
-    echo "error: --service-cidr/--cluster-cidr/--cluster-dns are control-plane settings; a joining or already-joined worker reads them from the cluster (kube-system/u7s-cluster-config)" >&2
+  if [ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ] || [ -n "$POD_MTU" ]; then
+    echo "error: --service-cidr/--cluster-cidr/--cluster-dns/--pod-mtu are control-plane settings; a joining or already-joined worker reads them from the cluster (kube-system/u7s-cluster-config) or has none" >&2
     exit 1
   fi
   if [ "$JOIN_MODE" -eq 1 ]; then
@@ -1999,6 +2083,9 @@ else
   reconcile_network_flag --cluster-cidr POD_CLUSTER_CIDR "$PERSISTED_POD_CLUSTER_CIDR" "$DEFAULT_POD_CLUSTER_CIDR" || exit 1
   dns_default="$(default_cluster_dns "$SERVICE_CIDR")" || exit 1
   reconcile_network_flag --cluster-dns CLUSTER_DNS "$PERSISTED_CLUSTER_DNS" "$dns_default" || exit 1
+  # An explicit pod MTU outlives a bare re-run (which would otherwise reset the
+  # cluster-wide flannel ConfigMap to the derived value); a new flag overwrites.
+  [ -n "$POD_MTU" ] || POD_MTU="$PERSISTED_POD_MTU"
 fi
 validate_network_config "$WORKER_MODE" || exit 1
 [ "$WORKER_MODE" -eq 1 ] || CLUSTER_FAMILIES="$(cluster_families_from_cidrs "$SERVICE_CIDR" "$POD_CLUSTER_CIDR")"
@@ -2046,6 +2133,9 @@ for node_ip in ${NODE_IPS//,/ }; do
   [ "$WORKER_MODE" -eq 1 ] || check_node_ip_outside_ranges "$node_ip" || exit 1
 done
 IFACE_IP="${NODE_IPS%%,*}"
+POD_MTU_EXPLICIT=0
+[ -z "$POD_MTU" ] || POD_MTU_EXPLICIT=1
+[ "$WORKER_MODE" -eq 1 ] || { resolve_pod_mtu || exit 1; echo "Pod MTU: $POD_MTU"; }
 # Brackets for an IPv6 primary wherever the address becomes part of a
 # host:port or URL.
 IFACE_IP_HOST="$IFACE_IP"
@@ -2293,6 +2383,7 @@ install -d -m 0755 /etc/u7s/static-pods
   fi
   if [ "$WORKER_MODE" -eq 0 ]; then
     printf 'SERVICE_CIDR="%s"\nPOD_CLUSTER_CIDR="%s"\n' "$SERVICE_CIDR" "$POD_CLUSTER_CIDR"
+    if [ "$POD_MTU_EXPLICIT" -eq 1 ]; then printf 'POD_MTU="%s"\n' "$POD_MTU"; fi
   else
     printf 'CLUSTER_FAMILIES="%s"\n' "$CLUSTER_FAMILIES"
   fi

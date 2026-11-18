@@ -90,16 +90,29 @@ check "dual-stack kube-proxy clusterCIDR lists both families" \
   "10.244.0.0/16,fd00:244::/56" "$(rig_kube_proxy_cluster_cidr 1)"
 check "single-stack kube-proxy clusterCIDR stays v4" \
   "10.244.0.0/16" "$(rig_kube_proxy_cluster_cidr 0)"
-flannel_dual=$(rig_render_flannel eth0 1 < "$ROOT/manifests/flannel.yaml")
+flannel_dual=$(rig_render_flannel eth0 1 1500 < "$ROOT/manifests/flannel.yaml")
 check "dual-stack flannel keeps IPv6Network (lima-start used to delete it)" \
   "1" "$(printf '%s\n' "$flannel_dual" | grep -cF '"EnableIPv6": true, "IPv6Network": "fd00:244::/56"')"
-flannel_single=$(rig_render_flannel eth0 0 < "$ROOT/manifests/flannel.yaml")
+flannel_single=$(rig_render_flannel eth0 0 1500 < "$ROOT/manifests/flannel.yaml")
 check "single-stack flannel has no IPv6Network" \
   "0" "$(printf '%s\n' "$flannel_single" | grep -c 'IPv6Network"')"
-check "single-stack flannel render is byte-identical to the pre-dual-stack sed" \
-  "$(sed -e 's/__IFACE__/eth0/g' -e 's#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g' -e '/"IPv6Network"/d' "$ROOT/manifests/flannel.yaml")" "$flannel_single"
-check "no unresolved placeholder in either flannel render" \
-  "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z0-9_]+__[",]' || true)"
+check "rig single-stack flannel gets NIC MTU - 74 (a stale constant would diverge from install.sh)" \
+  "1" "$(printf '%s\n' "$flannel_single" | grep -cE '^ +"mtu": 1426,$')"
+check "rig dual-stack flannel gets NIC MTU - 94 (the larger IPv6 Geneve overhead)" \
+  "1" "$(printf '%s\n' "$flannel_dual" | grep -cE '^ +"mtu": 1406,$')"
+check "a rig NIC MTU of 1460 renders 1386, not a hard-coded value" \
+  "1" "$(rig_render_flannel eth0 0 1460 < "$ROOT/manifests/flannel.yaml" | grep -cE '^ +"mtu": 1386,$')"
+check "no unresolved placeholder in either rig flannel render (an unrendered \"mtu\" breaks every pod's CNI setup)" \
+  "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z_]+__' || true)"
+check "the CI action renders flannel through the shared render, not its own sed" \
+  "1" "$(grep -cF 'render_flannel_for_nic eth0' "$ROOT/.github/actions/e2e-focus-run/action.yml")"
+ci_render=$(cd "$ROOT" && bash -c '. scripts/lib/flannel-render.sh; render_flannel_for_nic eth0 1500 10.244.0.0/16 "" < manifests/flannel.yaml')
+check "the CI action's render call leaves no placeholder and carries a numeric mtu" \
+  "1" "$(printf '%s\n' "$ci_render" | grep -cE '^ +"mtu": 1426,$')"
+check "no placeholder survives the CI action's render" \
+  "0" "$(printf '%s\n' "$ci_render" | grep -cE '__[A-Z_]+__' || true)"
+check "render_flannel refuses to emit a manifest with an unknown placeholder left in it" \
+  "1" "$(printf 'a: __NEW_THING__\n' | render_flannel eth0 10.244.0.0/16 "" 1426 >/dev/null 2>&1 && echo 0 || echo 1)"
 check "dual-stack CoreDNS Service has a VIP per family, PreferDualStack" \
   "  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack" \
   "$(rig_render_coredns "$RIG_SERVICE_CIDR_DUAL" < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -)"

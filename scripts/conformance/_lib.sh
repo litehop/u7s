@@ -555,12 +555,15 @@ rig_kube_proxy_cluster_cidr() {
   if [ "$1" -eq 1 ]; then echo "${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6}"; else echo "${RIG_POD_CIDR_V4}"; fi
 }
 
-# Renders manifests/flannel.yaml (stdin to stdout) like install.sh: the
-# IPv6Network line survives only on dual-stack. Args: <iface> <1 if dual-stack>.
+# Renders manifests/flannel.yaml (stdin to stdout) with install.sh's own
+# render, deriving the pod MTU from the node's NIC. Args: <iface> <1 if
+# dual-stack> <the iface's MTU>.
 rig_render_flannel() {
-  local v6=(-e '/"IPv6Network"/d')
-  [ "$2" -eq 1 ] && v6=(-e "s#__POD_CLUSTER_CIDR_IPV6__#${RIG_POD_CIDR_V6}#g")
-  sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" "${v6[@]}"
+  local v6=""
+  # shellcheck source=scripts/lib/flannel-render.sh
+  . "$(dirname "${BASH_SOURCE[0]}")/../lib/flannel-render.sh"
+  [ "$2" -eq 1 ] && v6="$RIG_POD_CIDR_V6"
+  render_flannel_for_nic "$1" "$3" "$RIG_POD_CIDR_V4" "$v6"
 }
 
 # Renders manifests/coredns.yaml (stdin to stdout): the Service's clusterIP is
