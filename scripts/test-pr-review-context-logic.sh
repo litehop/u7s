@@ -21,6 +21,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/pr-review-context.sh"
@@ -48,7 +49,7 @@ trap 'rm -rf "$WORK"' EXIT
 # ever need git plumbing of its own. Strip comment lines first -- the
 # rationale comment above legitimately names "git show" in prose.
 assert "the script never invokes \`git show\` (the whole-file-dump anti-pattern this wrapper replaces)" \
-  "$(! grep -vE '^\s*#' "$SCRIPT" | grep -q 'git show' && echo 1 || echo 0)"
+  "$(! grep -vE '^\s*#' "$SCRIPT" | drain_grep -q 'git show' && echo 1 || echo 0)"
 
 # --- gh stub on PATH ----------------------------------------------------------
 STUBDIR="$WORK/stubbin"
@@ -94,20 +95,20 @@ assert "happy path exits 0" \
 
 # --- 1. metadata bundled in one call ------------------------------------------
 assert "PR title, state, base/head, and body reach stdout" \
-  "$(printf '%s' "$RUN_OUT" | grep -qF 'PR #482: fix: guard the merge path' \
-     && printf '%s' "$RUN_OUT" | grep -qF 'State: OPEN' \
-     && printf '%s' "$RUN_OUT" | grep -qF 'Base: main  Head: worker/agent-x' \
-     && printf '%s' "$RUN_OUT" | grep -qF 'Fixes a thing.' \
+  "$(printf '%s' "$RUN_OUT" | drain_grep -qF 'PR #482: fix: guard the merge path' \
+     && printf '%s' "$RUN_OUT" | drain_grep -qF 'State: OPEN' \
+     && printf '%s' "$RUN_OUT" | drain_grep -qF 'Base: main  Head: worker/agent-x' \
+     && printf '%s' "$RUN_OUT" | drain_grep -qF 'Fixes a thing.' \
      && echo 1 || echo 0)"
 assert "changed files list includes both files with their +/- counts" \
-  "$(printf '%s' "$RUN_OUT" | grep -qF 'src/foo.rs  +10 -2' \
-     && printf '%s' "$RUN_OUT" | grep -qF 'src/bar.rs  +3 -0' \
+  "$(printf '%s' "$RUN_OUT" | drain_grep -qF 'src/foo.rs  +10 -2' \
+     && printf '%s' "$RUN_OUT" | drain_grep -qF 'src/bar.rs  +3 -0' \
      && echo 1 || echo 0)"
 
 # --- 2. diff comes from \`gh pr diff\`, not re-implemented git plumbing -------
 assert "the diff section is exactly gh pr diff's (pre-filtered hunks) output" \
-  "$(printf '%s' "$RUN_OUT" | grep -qF -- '--- Diff ---' \
-     && printf '%s' "$RUN_OUT" | grep -qF '+added line' \
+  "$(printf '%s' "$RUN_OUT" | drain_grep -qF -- '--- Diff ---' \
+     && printf '%s' "$RUN_OUT" | drain_grep -qF '+added line' \
      && echo 1 || echo 0)"
 assert "...fetched via \`gh pr diff\`, confirmed by the stub's own call log" \
   "$(grep -qE '^pr diff 482$' "$GH_CALLED_LOG" && echo 1 || echo 0)"

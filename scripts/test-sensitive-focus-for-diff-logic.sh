@@ -15,6 +15,7 @@
 # Runs the REAL script as a subprocess against fixture changed-file lists and
 # registries -- not a reimplementation of its awk/matching logic.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/sensitive-focus-for-diff.sh"
@@ -45,12 +46,12 @@ printf '%s\n' \
   'crates/apiserver/src/handlers/services.rs' > "$WORK/changed-sensitive.txt"
 OUT=$("$SCRIPT" "$WORK/changed-sensitive.txt" "$REAL_REGISTRY")
 assert "sensitive pods.rs diff -> sensitive=true" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'sensitive=true' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$OUT" | drain_grep -Fqx 'sensitive=true' && echo 1 || echo 0)"
 FOCUS_LINE=$(printf '%s\n' "$OUT" | grep '^focus=' || true)
 assert "sensitive pods.rs diff -> focus carries both registered specs" \
   "$([[ "$FOCUS_LINE" == *"$SPEC_A"* && "$FOCUS_LINE" == *"$SPEC_B"* ]] && echo 1 || echo 0)"
 assert "sensitive pods.rs diff -> expected_specs=2 (real registry)" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'expected_specs=2' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$OUT" | drain_grep -Fqx 'expected_specs=2' && echo 1 || echo 0)"
 
 # --- Scenario B: a diff touching NOTHING registered stays quiet so the guard
 #     job quick-succeeds; a false positive would run a needless sonobuoy on
@@ -60,9 +61,9 @@ printf '%s\n' \
   'README.md' > "$WORK/changed-clean.txt"
 OUT=$("$SCRIPT" "$WORK/changed-clean.txt" "$REAL_REGISTRY")
 assert "non-sensitive diff -> sensitive=false" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'sensitive=false' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$OUT" | drain_grep -Fqx 'sensitive=false' && echo 1 || echo 0)"
 assert "non-sensitive diff -> emits no focus line" \
-  "$(printf '%s\n' "$OUT" | grep -q '^focus=' && echo 0 || echo 1)"
+  "$(printf '%s\n' "$OUT" | drain_grep -q '^focus=' && echo 0 || echo 1)"
 
 # --- Scenario C: multiple matched entries join focuses with | and SUM specs --
 #     the reason specs is an explicit per-entry field, not inferred from the
@@ -82,9 +83,9 @@ printf '%s\n' \
   'crates/apiserver/src/handlers/jobs.rs' > "$WORK/changed-multi.txt"
 OUT=$("$SCRIPT" "$WORK/changed-multi.txt" "$WORK/registry-multi.yaml")
 assert "two matched entries -> expected_specs summed (2+1=3)" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'expected_specs=3' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$OUT" | drain_grep -Fqx 'expected_specs=3' && echo 1 || echo 0)"
 assert "two matched entries -> focuses joined with |" \
-  "$(printf '%s\n' "$OUT" | grep -Fqx 'focus=Spec A|Spec B|Spec C' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$OUT" | drain_grep -Fqx 'focus=Spec A|Spec B|Spec C' && echo 1 || echo 0)"
 
 # --- Scenario D: a matched entry MISSING specs fails loud (fail-closed) --
 #     never silently guard a sensitive file with an unknown expected count.

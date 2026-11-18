@@ -17,6 +17,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
@@ -72,7 +73,7 @@ DEFAULT_ALL_E2E_TIMEOUT_SECONDS="${SONOBUOY_ALL_E2E_TIMEOUT_SECONDS:-43200}" # t
 # ---------------------------------------------------------------------------
 ARGS=$(build_sonobuoy_args "" 1 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
 assert "--all-e2e argv carries --timeout with the fixed default" \
-  "$(printf '%s' "$ARGS" | grep -q -- "--timeout ${DEFAULT_ALL_E2E_TIMEOUT_SECONDS}" && echo 1 || echo 0)"
+  "$(printf '%s' "$ARGS" | drain_grep -q -- "--timeout ${DEFAULT_ALL_E2E_TIMEOUT_SECONDS}" && echo 1 || echo 0)"
 assert "the fixed default clears sonobuoy's own 6h default (the actual overnight-run failure)" \
   "$([ "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS" -gt "$SONOBUOY_DEFAULT_TIMEOUT_SECONDS" ] && echo 1 || echo 0)"
 
@@ -80,7 +81,7 @@ assert "the fixed default clears sonobuoy's own 6h default (the actual overnight
 # scenario, so this test would catch a regression back to the unbounded default.
 OLD_ARGS=$(build_sonobuoy_args_old_buggy "" 1)
 assert "(regression guard) pre-fix --all-e2e argv genuinely lacks --timeout" \
-  "$(printf '%s' "$OLD_ARGS" | grep -q -- "--timeout" && echo 0 || echo 1)"
+  "$(printf '%s' "$OLD_ARGS" | drain_grep -q -- "--timeout" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 2. --focus and certified-conformance (default) argvs carry the 1h suite cap
@@ -88,11 +89,11 @@ assert "(regression guard) pre-fix --all-e2e argv genuinely lacks --timeout" \
 # ---------------------------------------------------------------------------
 FOCUS_ARGS=$(build_sonobuoy_args "AdmissionWebhook" 0 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
 assert "--focus argv carries the suite cap, not the --all-e2e 12h budget" \
-  "$(printf '%s' "$FOCUS_ARGS" | grep -q -- "--timeout 4200" && echo 1 || echo 0)"
+  "$(printf '%s' "$FOCUS_ARGS" | drain_grep -q -- "--timeout 4200" && echo 1 || echo 0)"
 
 DEFAULT_ARGS=$(build_sonobuoy_args "" 0 "$DEFAULT_ALL_E2E_TIMEOUT_SECONDS")
 assert "certified-conformance (bare) argv carries the suite cap, not the --all-e2e 12h budget" \
-  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- "--timeout 4200" && echo 1 || echo 0)"
+  "$(printf '%s' "$DEFAULT_ARGS" | drain_grep -q -- "--timeout 4200" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 3. SONOBUOY_ALL_E2E_TIMEOUT_SECONDS overrides the default -- mirrors
@@ -102,7 +103,7 @@ assert "certified-conformance (bare) argv carries the suite cap, not the --all-e
 # ---------------------------------------------------------------------------
 CUSTOM_ARGS=$(build_sonobuoy_args "" 1 "99999")
 assert "SONOBUOY_ALL_E2E_TIMEOUT_SECONDS override reaches the argv" \
-  "$(printf '%s' "$CUSTOM_ARGS" | grep -q -- "--timeout 99999" && echo 1 || echo 0)"
+  "$(printf '%s' "$CUSTOM_ARGS" | drain_grep -q -- "--timeout 99999" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

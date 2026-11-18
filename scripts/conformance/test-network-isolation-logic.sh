@@ -19,6 +19,7 @@
 # intentionally matches the literal, unexpanded source text of lima-start.sh,
 # not something meant to expand in this script's own shell.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
@@ -115,15 +116,15 @@ assert_true "the joining VM's own Node entry is not compared against itself" \
 NODES="vm-a2 vm-b"
 out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
 assert "VMs on different networks fail loud, naming both networks, so no unreachable overlay is programmed" \
-  "$([ "$rc" != 0 ] && echo "$out" | grep -q "user-v2-workers-a.*user-v2-workers-b" && echo 1 || echo 0)"
+  "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q "user-v2-workers-a.*user-v2-workers-b" && echo 1 || echo 0)"
 NODES="vm-a2 vm-gone"
 out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
 assert "a registered peer with no local lima.yaml fails loud, naming it and the remedies, instead of silently skipping the check" \
-  "$([ "$rc" != 0 ] && echo "$out" | grep -q "vm-gone" && echo "$out" | grep -q 'kubectl delete node vm-gone' && echo "$out" | grep -q -- '--reset' && echo 1 || echo 0)"
+  "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q "vm-gone" && echo "$out" | drain_grep -q 'kubectl delete node vm-gone' && echo "$out" | drain_grep -q -- '--reset' && echo 1 || echo 0)"
 kubectl() { return 1; }
 out=$(assert_same_lima_network vm-a kc 2>&1) && rc=0 || rc=$?
 assert "a kubectl failure fails loud rather than iterating zero peers and passing a mispaired VM" \
-  "$([ "$rc" != 0 ] && echo "$out" | grep -q 'cannot list cluster nodes' && echo 1 || echo 0)"
+  "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'cannot list cluster nodes' && echo 1 || echo 0)"
 unset -f kubectl
 
 APPLY_LINE=$(grep -n 'Applying flannel CNI DaemonSet' "$LIMA_START" | head -1 | cut -d: -f1 || true)

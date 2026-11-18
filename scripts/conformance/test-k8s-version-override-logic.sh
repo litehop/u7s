@@ -22,6 +22,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 RUN_ALL="$REPO/scripts/conformance/run-all.sh"
@@ -59,7 +60,7 @@ assert "run-all.sh accepts a --k8s-version CLI flag" \
 # site below, because the assignment above it kept the substring alive.
 DISPATCH_LINE="$(grep -F -- '"$DIR/06-run-sonobuoy.sh"' "$RUN_ALL")"
 assert "run-all.sh forwards --k8s-version to 06-run-sonobuoy.sh" \
-  "$(printf '%s' "$DISPATCH_LINE" | grep -qF -- '${_K8S_VERSION_ARG}' && echo 1 || echo 0)"
+  "$(printf '%s' "$DISPATCH_LINE" | drain_grep -qF -- '${_K8S_VERSION_ARG}' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. build_base_args() -- mirrors 06-run-sonobuoy.sh's own
@@ -79,7 +80,7 @@ build_base_args() {
 # update both together if that default ever moves again.
 DEFAULT_ARGS=$(build_base_args "1.37.1")
 assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.1" \
-  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.1' && echo 1 || echo 0)"
+  "$(printf '%s' "$DEFAULT_ARGS" | drain_grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.1' && echo 1 || echo 0)"
 
 # Explicit override to a DIFFERENT version than the default above -- the
 # actual motivating case (scouting new specs needs a conformance image the
@@ -88,9 +89,9 @@ assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.1" \
 # assertion coincidentally matching a hardcoded default either way.
 OVERRIDE_ARGS=$(build_base_args "1.35.9")
 assert "--k8s-version 1.35.9 emits --kube-conformance-image=...v1.35.9" \
-  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.35.9' && echo 1 || echo 0)"
+  "$(printf '%s' "$OVERRIDE_ARGS" | drain_grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.35.9' && echo 1 || echo 0)"
 assert "--k8s-version 1.35.9 does NOT emit the default's v1.37.1 tag" \
-  "$(printf '%s' "$OVERRIDE_ARGS" | grep -q -- 'v1.37.1' && echo 0 || echo 1)"
+  "$(printf '%s' "$OVERRIDE_ARGS" | drain_grep -q -- 'v1.37.1' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 3. Real end-to-end invocation: run-all.sh's arg parser must actually accept
@@ -102,7 +103,7 @@ set +e
 K8S_VERSION_OUT="$(bash "$RUN_ALL" --k8s-version 1.35.9 --stack-only --binary /nonexistent 2>&1)"
 set -e
 assert "run-all.sh does not reject --k8s-version as an unknown argument" \
-  "$(printf '%s' "$K8S_VERSION_OUT" | grep -qF -- 'Unknown argument: --k8s-version' && echo 0 || echo 1)"
+  "$(printf '%s' "$K8S_VERSION_OUT" | drain_grep -qF -- 'Unknown argument: --k8s-version' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # Summary

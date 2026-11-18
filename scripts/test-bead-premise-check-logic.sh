@@ -26,6 +26,7 @@
 #   5. End-to-end classification, including synthetic beads that mirror
 #      the exact shape of the two real false positives.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/bead-premise-check.sh"
@@ -144,9 +145,9 @@ FIX_TEXT='The bug is that `WidgetSpec.enabled` is never defaulted.
 
 Fix: add `default_widget_spec(obj)` to handle it.'
 assert "extract_fix_section_text captures everything from the Fix: marker onward" \
-  "$(call extract_fix_section_text "$FIX_TEXT" | grep -qF 'default_widget_spec' && echo 1 || echo 0)"
+  "$(call extract_fix_section_text "$FIX_TEXT" | drain_grep -qF 'default_widget_spec' && echo 1 || echo 0)"
 assert "...and excludes text BEFORE the Fix: marker" \
-  "$(! call extract_fix_section_text "$FIX_TEXT" | grep -qF 'WidgetSpec.enabled' && echo 1 || echo 0)"
+  "$(! call extract_fix_section_text "$FIX_TEXT" | drain_grep -qF 'WidgetSpec.enabled' && echo 1 || echo 0)"
 
 assert "a 'prefix:' line does not false-trigger the Fix: marker (must start a line, not just contain the substring)" \
   "$([ -z "$(call extract_fix_section_text 'set the prefix: value here, no real fix section')" ] && echo 1 || echo 0)"

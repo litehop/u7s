@@ -14,6 +14,7 @@
 # `limactl` on PATH (no real VM/lima install needed) and a temp $HOME so the
 # script's `~/.lima/lima-golden` existence check is fully test-controlled.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/conformance/lima-golden-bake.sh"
@@ -104,7 +105,7 @@ OUT=$(bash "$SCRIPT" 2>&1)
 assert "stopped golden: bake script is a no-op (no limactl start)" \
   "$(grep -q '^start ' "$LIMACTL_LOG" && echo 0 || echo 1)"
 assert "stopped golden: bake script reports nothing to do" \
-  "$(echo "$OUT" | grep -qF "nothing to do" && echo 1 || echo 0)"
+  "$(echo "$OUT" | drain_grep -qF "nothing to do" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 3. Golden left Running (e.g. an interrupted prior bake) -> must stop it,

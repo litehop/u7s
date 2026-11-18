@@ -29,6 +29,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
@@ -72,13 +73,13 @@ assert_true "podSpec tolerates the node.kubernetes.io/not-ready taint key -- wit
   grep -qF "key: node.kubernetes.io/not-ready" "$POD_SPEC_BLOCK"
 
 not_ready_toleration_is_noexecute() {
-  grep -A2 -B1 "key: node.kubernetes.io/not-ready" "$POD_SPEC_BLOCK" | grep -qF "effect: NoExecute"
+  grep -A2 -B1 "key: node.kubernetes.io/not-ready" "$POD_SPEC_BLOCK" | drain_grep -qF "effect: NoExecute"
 }
 assert_true "the not-ready toleration is scoped to NoExecute -- that is the actual effect node-controller applies for NotReady; a toleration under the wrong effect would silently fail to prevent the eviction this fix targets" \
   not_ready_toleration_is_noexecute
 
 not_ready_toleration_has_bounded_seconds() {
-  grep -A3 "key: node.kubernetes.io/not-ready" "$POD_SPEC_BLOCK" | grep -qE "tolerationSeconds: [0-9]+"
+  grep -A3 "key: node.kubernetes.io/not-ready" "$POD_SPEC_BLOCK" | drain_grep -qE "tolerationSeconds: [0-9]+"
 }
 assert_true "the not-ready toleration carries a BOUNDED tolerationSeconds -- omitting it tolerates the taint FOREVER, which would mask a genuinely dead node indefinitely instead of still eventually rescheduling off it" \
   not_ready_toleration_has_bounded_seconds

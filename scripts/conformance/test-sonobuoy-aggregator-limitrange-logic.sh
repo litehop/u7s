@@ -26,6 +26,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
@@ -56,7 +57,7 @@ assert_true "LimitRange item type is Container -- u7s's apply_limit_ranges only 
   grep -qF "type: Container" "$LIMITRANGE_YAML"
 
 has_memory_default_request() {
-  grep -A5 "type: Container" "$LIMITRANGE_YAML" | grep -qE "memory: [0-9]+[A-Za-z]*"
+  grep -A5 "type: Container" "$LIMITRANGE_YAML" | drain_grep -qE "memory: [0-9]+[A-Za-z]*"
 }
 assert_true "LimitRange sets a defaultRequest for memory -- without this, a container that omits resources.requests.memory gets nothing injected and stays BestEffort, the exact bug this fix targets" \
   has_memory_default_request
@@ -67,7 +68,7 @@ no_default_limit_set() {
   # aggregator's legitimate memory growth into a deterministic memcg OOM,
   # trading one fatal failure mode for another (the same reasoning already
   # documented for the e2e container in sonobuoy-plugin-e2e.yaml).
-  ! grep -A5 "type: Container" "$LIMITRANGE_YAML" | grep -qE "^\s*default:\s*$"
+  ! grep -A5 "type: Container" "$LIMITRANGE_YAML" | drain_grep -qE "^\s*default:\s*$"
 }
 assert_true "LimitRange is request-only (no default limit) -- a limit here would convert the aggregator's OOM class rather than fix it" \
   no_default_limit_set

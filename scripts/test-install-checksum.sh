@@ -12,6 +12,7 @@
 # shellcheck disable=SC2016 # file-wide: single-quoted `echo`/`sed` patterns
 # below intentionally hold install.sh's own literal, unexpanded source text.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL="$DIR/install.sh"
@@ -83,7 +84,7 @@ happy_out="$(bash "$RUNNER" "file://$TARBALL_SRC" 2>&1)" || happy_status=$?
 assert "fetch_tarball succeeds when the downloaded tarball's sha256 matches its .sha256 sidecar" \
   "$([ "$happy_status" -eq 0 ] && echo 1 || echo 0)"
 assert "fetch_tarball still reports the downloaded tarball's local path once checksum verification passes" \
-  "$(printf '%s' "$happy_out" | grep -q '^TARBALL_PATH=' && echo 1 || echo 0)"
+  "$(printf '%s' "$happy_out" | drain_grep -q '^TARBALL_PATH=' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Corrupted tarball: the acceptance criterion this bead exists for. Bytes
@@ -102,7 +103,7 @@ corrupt_out="$(bash "$RUNNER" "file://$CORRUPT_SRC" 2>&1)" || corrupt_status=$?
 assert "fetch_tarball hard-fails (non-zero exit) when the downloaded tarball's sha256 does not match its sidecar" \
   "$([ "$corrupt_status" -ne 0 ] && echo 1 || echo 0)"
 assert "fetch_tarball's checksum-mismatch error names the mismatch, so an operator isn't left debugging a bare non-zero exit" \
-  "$(printf '%s' "$corrupt_out" | grep -qi 'mismatch' && echo 1 || echo 0)"
+  "$(printf '%s' "$corrupt_out" | drain_grep -qi 'mismatch' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove this suite would actually

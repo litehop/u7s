@@ -18,13 +18,14 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
 
 assert_deleted() {
   local label="$1" ns="$2" output="$3"
-  if printf '%s' "$output" | grep -q "force-deleting namespace '${ns}'"; then
+  if printf '%s' "$output" | drain_grep -q "force-deleting namespace '${ns}'"; then
     echo "PASS: $label"
     PASS=$(( PASS + 1 ))
   else
@@ -36,7 +37,7 @@ assert_deleted() {
 
 assert_not_deleted() {
   local label="$1" ns="$2" output="$3"
-  if printf '%s' "$output" | grep -q "force-deleting namespace '${ns}'"; then
+  if printf '%s' "$output" | drain_grep -q "force-deleting namespace '${ns}'"; then
     echo "FAIL: $label — '${ns}' was force-deleted but should have been left alone"
     echo "  output was: $output"
     FAIL=$(( FAIL + 1 ))
