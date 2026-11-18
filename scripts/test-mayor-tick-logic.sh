@@ -29,6 +29,7 @@
 # either duplicate a dashboard heading or clobber mayor-owned prose outside
 # the sentinel block.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/mayor-tick.sh"
@@ -402,7 +403,7 @@ assert "state file with every field empty has exit_code 0" \
 MARKER="$WORKDIR/marker"
 OUT=$(MAYOR_TICK_DRY_RUN=1 call run_cmd touch "$MARKER")
 assert "MAYOR_TICK_DRY_RUN=1 logs the command instead of running it" \
-  "$(printf '%s' "$OUT" | grep -q 'would run: touch' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT" | drain_grep -q 'would run: touch' && echo 1 || echo 0)"
 assert "...and the gated command genuinely did not execute" \
   "$([ ! -e "$MARKER" ] && echo 1 || echo 0)"
 
@@ -636,7 +637,7 @@ run_full_tick "$STUB_EMPTY_BIN"
 assert "empty queue + empty PR list + empty bd ready: main() completes (exit 0), not an 'unbound variable' bash-3.2 crash" \
   "$([ "$TICK_RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...and never prints bash 3.2's 'unbound variable' error (the exact symptom of a reverted array guard)" \
-  "$(! printf '%s' "$TICK_OUT" | grep -qi 'unbound variable' && echo 1 || echo 0)"
+  "$(! printf '%s' "$TICK_OUT" | drain_grep -qi 'unbound variable' && echo 1 || echo 0)"
 assert "...and the state file is actually written and valid (execution reached write_state, not an early abort)" \
   "$(jq empty "$TICK_STATE" >/dev/null 2>&1 && echo 1 || echo 0)"
 assert "...with every one of the 8 guarded array fields empty, matching the genuinely-empty input state" \
@@ -656,9 +657,9 @@ assert "...with every one of the 8 guarded array fields empty, matching the genu
 ISO_RE='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
 DASH_REPO_STATE=$(call dashboard_repo_state)
 assert "dashboard_repo_state's output embeds an ISO-8601 UTC timestamp" \
-  "$(printf '%s' "$DASH_REPO_STATE" | grep -qE "$ISO_RE" && echo 1 || echo 0)"
+  "$(printf '%s' "$DASH_REPO_STATE" | drain_grep -qE "$ISO_RE" && echo 1 || echo 0)"
 assert "...stamped as 'As of <ts> (last tick) — Branch ...', not replacing the branch/sha/dirty/sync fields" \
-  "$(printf '%s' "$DASH_REPO_STATE" | grep -qE "^As of $ISO_RE \(last tick\) — Branch \`" && echo 1 || echo 0)"
+  "$(printf '%s' "$DASH_REPO_STATE" | drain_grep -qE "^As of $ISO_RE \(last tick\) — Branch \`" && echo 1 || echo 0)"
 
 build_scratch_repo
 DASH_E2E="$(dirname "$SCRATCH_REPO")/dashboard.md"
@@ -785,7 +786,7 @@ assert "an open worker PR with no review-queue entry and no review is synthesize
 assert "...and the resulting exit_code is 20 (not silently 0) -- pending_reviews alone doesn't wake the mayor if exit_code stays 0" \
   "$([ "$TICK_RC" -eq 20 ] && echo 1 || echo 0)"
 assert "...reconciliation logs with the distinct 'mayor-tick reconcile:' label so audits can tell script-detected from hook-queued" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick reconcile:' && echo 1 || echo 0)"
 
 QSEED_ALREADY_QUEUED="$WORKDIR/qseed-already-queued-pr"
 mkdir -p "$QSEED_ALREADY_QUEUED"
@@ -795,7 +796,7 @@ run_full_tick "$STUB_PR_BIN" "$QSEED_ALREADY_QUEUED"
 assert "a PR already covered by an active queue file is NOT double-queued by reconciliation (appears exactly once)" \
   "$([ "$(jq -c '.pending_reviews' "$TICK_STATE")" = "[4242]" ] && echo 1 || echo 0)"
 assert "...and reconciliation does not even log a synthesis message for a PR that's already queued" \
-  "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:' && echo 1 || echo 0)"
+  "$(! printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick reconcile:' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 12. Self-heal reconciliation's OTHER skip branch: a PR with
@@ -843,7 +844,7 @@ run_full_tick "$STUB_PR_REVIEWED_BIN"
 assert "a PR with no queue file but an already-submitted critical-reviewer review is NOT synthesized into pending_reviews" \
   "$([ "$(jq -r '.pending_reviews | index(4343) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconciliation does not log a synthesis message for it either -- the skip is silent by design" \
-  "$(! printf '%s' "$TICK_OUT" | grep -q 'mayor-tick reconcile:.*4343' && echo 1 || echo 0)"
+  "$(! printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick reconcile:.*4343' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 13. In-flight awareness -- pure building blocks. Worktree anomalies and
@@ -1129,7 +1130,7 @@ run_full_tick "$STUB_STALE_BLOCKING_FIXED"
 assert "a PR with a stale blocking verdict AND a commit landed after it is queued for re-review -- the fix earned another look, but nothing would ever trigger it otherwise" \
   "$([ "$(jq -r '.pending_reviews | index(6001) != null' "$TICK_STATE")" = "true" ] && echo 1 || echo 0)"
 assert "...and reconciliation logs the distinct stale-verdict reason, not the generic no-review-at-all message" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'stale needs-changes verdict' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'stale needs-changes verdict' && echo 1 || echo 0)"
 
 # Case B: same blocking verdict, but NO commit landed after it -- nothing
 # has changed for a reviewer to look at. Must NOT be queued.
@@ -1239,7 +1240,7 @@ COUNT_AFTER_SECOND=$(find "$QDIR_LOOP_GUARD" -maxdepth 1 -name '*.md' -type f | 
 assert "a second reconcile pass against the SAME unchanged PR does not write a second queue file -- pr_already_queued now sees the file from pass one" \
   "$([ "$COUNT_AFTER_SECOND" = "1" ] && echo 1 || echo 0)"
 assert "...and the second pass does not even log a new queuing message -- pr_already_queued short-circuits before reconcile re-evaluates the verdict" \
-  "$(! printf '%s' "$OUT2" | grep -q 'queuing re-review' && echo 1 || echo 0)"
+  "$(! printf '%s' "$OUT2" | drain_grep -q 'queuing re-review' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 19. True-concurrency collision guard. Section 18 above only proves the
@@ -1326,7 +1327,7 @@ chmod +x "$STUB_PR_DRAFT_BIN/gh" "$STUB_PR_DRAFT_BIN/bd"
 
 run_full_tick "$STUB_PR_DRAFT_BIN"
 assert "a draft PR is never enqueued via gh pr merge, even with a CLEAN mergeStateStatus and an LGTM verdict" \
-  "$(! printf '%s' "$TICK_OUT" | grep -q 'would run: gh pr merge 4444' && echo 1 || echo 0)"
+  "$(! printf '%s' "$TICK_OUT" | drain_grep -q 'would run: gh pr merge 4444' && echo 1 || echo 0)"
 assert "...and the tick exits with a normal in-contract code (not an unhandled error from a rejected draft-merge attempt)" \
   "$([ "$TICK_RC" -eq 0 ] || [ "$TICK_RC" -eq 10 ] || [ "$TICK_RC" -eq 20 ] || [ "$TICK_RC" -eq 30 ] && echo 1 || echo 0)"
 
@@ -1405,7 +1406,7 @@ run_full_tick "$STUB_RECONCILE_DRAFT_BIN"
 assert "a draft PR with no queue entry and no review is NOT synthesized into pending_reviews by reconcile -- a deliberately-held draft must not get nagged every tick" \
   "$([ "$(jq -r '.pending_reviews | index(5555) != null' "$TICK_STATE")" = "false" ] && echo 1 || echo 0)"
 assert "...and reconcile never even logs the synthesizing message for it" \
-  "$(! printf '%s' "$TICK_OUT" | grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
+  "$(! printf '%s' "$TICK_OUT" | drain_grep -q 'synthesizing pending_reviews entry' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 22. Post-merge checkout refresh in cleanup_merged_worktrees against a REAL
@@ -1785,7 +1786,7 @@ bead_tick
 assert "a result that fills --limit exits 20 with a bead-close-scan-truncated gate exception" \
   "$([ "$TICK_RC" -eq 20 ] && [ "$(jq -r '.gate_exceptions[0].reason' "$TICK_STATE")" = "bead-close-scan-truncated" ] && echo 1 || echo 0)"
 assert "...logs the truncation loudly" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'WARNING bead-close scan hit --limit' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'WARNING bead-close scan hit --limit' && echo 1 || echo 0)"
 assert "...and does not advance the cursor past unscanned PRs" \
   "$([ "$(jq -r '.bead_close_cursor' "$TICK_STATE")" = "" ] && echo 1 || echo 0)"
 
@@ -1861,9 +1862,9 @@ bead_tick
 assert "beads with no ID in the PR title close via their 'PR #N opened' note, even after an earlier PR's bead was skipped for open children" \
   "$([ "$(sort "$BEAD_CLOSE_LOG")" = "$(printf 'close %snote62 --reason merged in #62 (8888888888)\nclose %snote63 --reason merged in #63 (9999999999)' "$B" "$B")" ] && echo 1 || echo 0)"
 assert "a skipped bead logs 'bead <id> not closed: <reason>'" \
-  "$(printf '%s' "$TICK_OUT" | grep -q "mayor-tick: bead ${B}par61 not closed: has open children" && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q "mayor-tick: bead ${B}par61 not closed: has open children" && echo 1 || echo 0)"
 assert "a merged PR with no discoverable bead logs a reason line instead of staying silent" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #64 has no bead to close' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick: PR #64 has no bead to close' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 25. The review gate enqueues (bare `gh pr merge N`) a CLEAN PR whose latest
@@ -1912,15 +1913,15 @@ chmod +x "$STUB_GATE_BIN/gh" "$STUB_GATE_BIN/bd"
 
 run_full_tick "$STUB_GATE_BIN"
 assert "a CLEAN PR whose latest reviewer review is LGTM gets a bare 'gh pr merge 71' (no flags)" \
-  "$(printf '%s\n' "$TICK_OUT" | grep -qx '\[dry-run\] would run: gh pr merge 71' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$TICK_OUT" | drain_grep -qx '\[dry-run\] would run: gh pr merge 71' && echo 1 || echo 0)"
 assert "a PR UNKNOWN in the list but CLEAN on re-query (lazy mergeability) is enqueued too" \
-  "$(printf '%s\n' "$TICK_OUT" | grep -qx '\[dry-run\] would run: gh pr merge 74' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$TICK_OUT" | drain_grep -qx '\[dry-run\] would run: gh pr merge 74' && echo 1 || echo 0)"
 assert "a PR whose latest review is CHANGES_REQUESTED/needs-changes is not merged and logs why" \
-  "$(! printf '%s\n' "$TICK_OUT" | grep -q 'gh pr merge 72' && printf '%s' "$TICK_OUT" | grep -q "mayor-tick: PR #72 not enqueued: latest critical-reviewer verdict is 'needs-changes'" && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$TICK_OUT" | drain_grep -q 'gh pr merge 72' && printf '%s' "$TICK_OUT" | drain_grep -q "mayor-tick: PR #72 not enqueued: latest critical-reviewer verdict is 'needs-changes'" && echo 1 || echo 0)"
 assert "a non-CLEAN PR logs its merge state instead of vanishing from the log" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #73 not enqueued: mergeStateStatus is BLOCKED' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick: PR #73 not enqueued: mergeStateStatus is BLOCKED' && echo 1 || echo 0)"
 assert "a PR with pending checks logs the pending count" \
-  "$(printf '%s' "$TICK_OUT" | grep -q 'mayor-tick: PR #75 not enqueued: 1 check(s) still pending' && echo 1 || echo 0)"
+  "$(printf '%s' "$TICK_OUT" | drain_grep -q 'mayor-tick: PR #75 not enqueued: 1 check(s) still pending' && echo 1 || echo 0)"
 
 CLUSTER_TITLE="tooling(mayor): full bead IDs in cluster titles (${B}aa001, ${B}bb002, ${B}cc003)"
 assert "a Shape 2 cluster title lists every full bead ID, so extract_bead_ids returns all three and the tick can close them on merge" \

@@ -16,6 +16,7 @@
 # full 300KB body again or truncate the command-reference footer -- both
 # regressions this test catches without needing a live bd install.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/bd-prime-slim.sh"
@@ -82,19 +83,19 @@ EOF
 OUT_1=$(render_slim_prime "$EXPORT_1" "$MEM_1")
 
 assert "header prose before the memories section is preserved verbatim" \
-  "$(printf '%s' "$OUT_1" | grep -qF '> some header prose' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qF '> some header prose' && echo 1 || echo 0)"
 assert "footer (session close protocol onward) is preserved verbatim" \
-  "$(printf '%s' "$OUT_1" | grep -qF 'some footer prose that must survive untouched' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qF 'some footer prose that must survive untouched' && echo 1 || echo 0)"
 assert "memory count excludes the schema_version metadata key (2, not 3)" \
-  "$(printf '%s' "$OUT_1" | grep -qE '^## Persistent Memories \(2\)' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qE '^## Persistent Memories \(2\)' && echo 1 || echo 0)"
 assert "index lists memory-one as a one-line entry" \
-  "$(printf '%s' "$OUT_1" | grep -qE '^- memory-one: ' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qE '^- memory-one: ' && echo 1 || echo 0)"
 assert "index lists memory-two as a one-line entry" \
-  "$(printf '%s' "$OUT_1" | grep -qE '^- memory-two: ' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qE '^- memory-two: ' && echo 1 || echo 0)"
 assert "the FULL body text is NOT present -- this is the whole point of the index" \
-  "$(printf '%s' "$OUT_1" | grep -qF "$LONG_BODY_1" && echo 0 || echo 1)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qF "$LONG_BODY_1" && echo 0 || echo 1)"
 assert "schema_version itself never appears as an index entry" \
-  "$(printf '%s' "$OUT_1" | grep -qE '^- schema_version: ' && echo 0 || echo 1)"
+  "$(printf '%s' "$OUT_1" | drain_grep -qE '^- schema_version: ' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 2. DESC_LEN controls snippet length: a short cap must actually shorten the
@@ -118,7 +119,7 @@ printf '{"foo": "bar"}' > "$MEM_2"
 
 OUT_2=$(render_slim_prime "$EXPORT_2" "$MEM_2" 2>"$SANDBOX/stderr-2")
 assert "marker-drift fallback passes the original content through unmodified" \
-  "$(printf '%s' "$OUT_2" | grep -qF 'some content with no recognizable bd prime markers at all' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_2" | drain_grep -qF 'some content with no recognizable bd prime markers at all' && echo 1 || echo 0)"
 assert "marker-drift fallback warns on stderr instead of failing silently" \
   "$(grep -qF 'marker not found' "$SANDBOX/stderr-2" && echo 1 || echo 0)"
 
@@ -162,7 +163,7 @@ ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
 assert "render_slim_prime() on a ~300KB fixture completes well under bd's own per-call latency (<2000ms; regressed to ~40000ms before the awk fix)" \
   "$([ "$ELAPSED_MS" -lt 2000 ] && echo 1 || echo 0)"
 assert "the scale fixture's footer still survives the split, not just the timing" \
-  "$(printf '%s' "$OUT_BIG" | grep -qF 'footer content that must survive' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_BIG" | drain_grep -qF 'footer content that must survive' && echo 1 || echo 0)"
 echo "  (render_slim_prime on ${FIXTURE_BYTES}-byte fixture: ${ELAPSED_MS}ms)"
 
 # ---------------------------------------------------------------------------
@@ -212,11 +213,11 @@ OUT_COLLISION=$(render_slim_prime "$EXPORT_COLLISION" "$MEM_COLLISION")
 OUT_COLLISION_BYTES=$(printf '%s' "$OUT_COLLISION" | wc -c | tr -d ' ')
 
 assert "a memory body quoting the footer marker does NOT trigger an early split (real footer prose still present)" \
-  "$(printf '%s' "$OUT_COLLISION" | grep -qF 'real footer prose that must survive' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_COLLISION" | drain_grep -qF 'real footer prose that must survive' && echo 1 || echo 0)"
 assert "zzz-last-memory's full body is NOT leaked -- proves the split didn't fire at the body's fake marker" \
-  "$(printf '%s' "$OUT_COLLISION" | grep -qF "$LONG_BODY_2" && echo 0 || echo 1)"
+  "$(printf '%s' "$OUT_COLLISION" | drain_grep -qF "$LONG_BODY_2" && echo 0 || echo 1)"
 assert "zzz-last-memory still appears as a truncated index entry, same as any other memory" \
-  "$(printf '%s' "$OUT_COLLISION" | grep -qE '^- zzz-last-memory: ' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT_COLLISION" | drain_grep -qE '^- zzz-last-memory: ' && echo 1 || echo 0)"
 assert "marker-collision fixture stays well under the 50KB slim-output ceiling (proves no leak-driven bloat)" \
   "$([ "$OUT_COLLISION_BYTES" -lt 51200 ] && echo 1 || echo 0)"
 

@@ -18,6 +18,7 @@
 # kubectl reachability check, so a fake VM name/port and an empty --workdir
 # are enough to exercise the gating.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/conformance/add-node.sh"
@@ -52,7 +53,7 @@ set +e
 STDERR_BARE=$(env -u U7S_ADD_NODE_FROM_RUN_ALL bash "$SCRIPT" fake-vm 12345 --workdir "$WORKDIR/bare" 2>&1 >/dev/null)
 set -e
 assert "standalone add-node.sh invocation (no sentinel) prints the restart warning" \
-  "$(echo "$STDERR_BARE" | grep -qF "$WARNING_TEXT" && echo 1 || echo 0)"
+  "$(echo "$STDERR_BARE" | drain_grep -qF "$WARNING_TEXT" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. run-all.sh --extra-node's internal invocation (sentinel set) -- the
@@ -65,7 +66,7 @@ set +e
 STDERR_SENTINEL=$(U7S_ADD_NODE_FROM_RUN_ALL=1 bash "$SCRIPT" fake-vm 12345 --workdir "$WORKDIR/sentinel" 2>&1 >/dev/null)
 set -e
 assert "run-all.sh's internal invocation (U7S_ADD_NODE_FROM_RUN_ALL=1) suppresses the warning" \
-  "$(echo "$STDERR_SENTINEL" | grep -qF "$WARNING_TEXT" && echo 0 || echo 1)"
+  "$(echo "$STDERR_SENTINEL" | drain_grep -qF "$WARNING_TEXT" && echo 0 || echo 1)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

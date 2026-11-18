@@ -25,6 +25,7 @@
 #      match branches whose upstream is actually `[gone]`, not ones with no
 #      upstream configured at all (e.g. `investigation/*`).
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/worktree-hygiene.sh"
@@ -90,13 +91,13 @@ LIVE_WORKTREES='/Users/alice/worktrees/live-worktree
 ORPHANS=$(call find_orphans "$PS_OUTPUT" "$LIVE_WORKTREES")
 
 assert "an apiserver process whose worktree is gone is flagged as an orphan" \
-  "$(printf '%s\n' "$ORPHANS" | grep -qF '1111|apiserver|/Users/alice/worktrees/dead-worktree' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$ORPHANS" | drain_grep -qF '1111|apiserver|/Users/alice/worktrees/dead-worktree' && echo 1 || echo 0)"
 assert "a konnectivity-server process whose worktree is gone is flagged as an orphan (its --flag=path style must not leak the '--server-cert=' prefix into the matched path)" \
-  "$(printf '%s\n' "$ORPHANS" | grep -qF '1113|konnectivity-server|/Users/alice/worktrees/dead-worktree-2' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$ORPHANS" | drain_grep -qF '1113|konnectivity-server|/Users/alice/worktrees/dead-worktree-2' && echo 1 || echo 0)"
 assert "a sample-run-metrics.sh process whose worktree is gone is flagged as an orphan (regression: this type was dropped from STEP A's grep, letting it squat undetected)" \
-  "$(printf '%s\n' "$ORPHANS" | grep -qF '1114|sample-run-metrics|/Users/alice/worktrees/dead-worktree-3' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$ORPHANS" | drain_grep -qF '1114|sample-run-metrics|/Users/alice/worktrees/dead-worktree-3' && echo 1 || echo 0)"
 assert "a scheduler process whose worktree is still live is NOT flagged (must not kill a live worker's process)" \
-  "$(! printf '%s\n' "$ORPHANS" | grep -q '^1112|' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$ORPHANS" | drain_grep -q '^1112|' && echo 1 || echo 0)"
 assert "exactly three orphans are found, not more (no false positives from the live-worktree line)" \
   "$([ "$(printf '%s\n' "$ORPHANS" | grep -c '|')" = "3" ] && echo 1 || echo 0)"
 
@@ -122,7 +123,7 @@ assert "agent_id_from_worktree_path returns empty for a path with no ai/worktree
 PS_OUTPUT_LIVE_AGENT='alice  2222   0.0  0.1  123456  1234 s001  S+   10:00AM   0:00.05 target/release/u7s-apiserver --kubeconfig /repo/ai/worktrees/agent-liveid123/temp/u7s/kubeconfig --port 6444'
 RAW_ORPHAN_LIVE_AGENT=$(call find_orphans "$PS_OUTPUT_LIVE_AGENT" '')
 assert "sanity: without the live-agents filter, this process is classified an orphan by path alone (its worktree isn't in the live-worktree-path list)" \
-  "$(printf '%s\n' "$RAW_ORPHAN_LIVE_AGENT" | grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$RAW_ORPHAN_LIVE_AGENT" | drain_grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
 
 FILTERED_PROTECTED=$(call filter_orphans_by_live_agents "$RAW_ORPHAN_LIVE_AGENT" "liveid123")
 assert "an orphan process whose embedded worktree belongs to an agent-id IN --live-agents is filtered out -- its host process must never be killed just because path-existence alone looks orphaned (the original bug: a ListAgents-confirmed-live worker's worktree/branch was reaped anyway)" \
@@ -130,7 +131,7 @@ assert "an orphan process whose embedded worktree belongs to an agent-id IN --li
 
 FILTERED_STALE=$(call filter_orphans_by_live_agents "$RAW_ORPHAN_LIVE_AGENT" "some-other-agent")
 assert "the SAME orphan record, with a --live-agents set that does NOT include its agent-id, survives filtering and remains a genuine kill target" \
-  "$(printf '%s\n' "$FILTERED_STALE" | grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$FILTERED_STALE" | drain_grep -qF '2222|apiserver|/repo/ai/worktrees/agent-liveid123' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 1c. STEP A -- apiserver-less konnectivity-server in a LIVE worktree (e.g.
@@ -326,16 +327,16 @@ assert "a relative-workdir sampler whose cwd is a deleted worktree is still reap
   "$([ "$(step_a_stub "$RW_S" "STUB_CWD_6001=$RW_DEAD" | grep 'would run')" = '[dry-run] would run: kill 6001' ] && echo 1 || echo 0)"
 RW_OUT=$(step_a_stub "$RW_S")
 assert "a sampler whose cwd cannot be read is never killed (no provable owner)" \
-  "$(! printf '%s\n' "$RW_OUT" | grep -q 'would run' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$RW_OUT" | drain_grep -q 'would run' && echo 1 || echo 0)"
 assert "an unresolvable workdir is logged loudly as orphan-skip with type, pid and args" \
-  "$(printf '%s\n' "$RW_OUT" | grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001 args=' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$RW_OUT" | drain_grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001 args=' && echo 1 || echo 0)"
 assert "a '..' relative workdir whose cwd is gone cannot be resolved, so it is skipped, not killed" \
   "$([ -z "$(step_a_stub "$(mk_sampler 6001 ../x/temp/u7s)" "STUB_CWD_6001=$RW_DEAD" | grep 'would run')" ] && echo 1 || echo 0)"
 RW_SUB_OUT=$(step_a_stub "$RW_S" "STUB_CWD_6001=$RW_LIVE/scripts")
 assert "a live cwd (subdir of a live worktree) with a missing relative target is never killed (regression: lexical fallback resolved it to the subdir and reaped a live process)" \
-  "$(! printf '%s\n' "$RW_SUB_OUT" | grep -q 'would run' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$RW_SUB_OUT" | drain_grep -q 'would run' && echo 1 || echo 0)"
 assert "a live cwd with a missing relative target is logged as orphan-skip (unresolvable workdir)" \
-  "$(printf '%s\n' "$RW_SUB_OUT" | grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$RW_SUB_OUT" | drain_grep -qF '[hygiene] orphan-skip (unresolvable workdir): sample-run-metrics pid=6001' && echo 1 || echo 0)"
 RW_TWO="$(mk_sampler 6001 ./temp/u7s)
 $(mk_sampler 6002 ./temp/u7s)"
 assert "two samplers with the same relative workdir in different cwds: only the stale one dies" \
@@ -360,7 +361,7 @@ branch refs/heads/worker/agent-live'
 
 CHECKED_OUT=$(call checked_out_branches "$PORCELAIN")
 assert "checked_out_branches extracts every worktree's checked-out branch" \
-  "$(printf '%s\n' "$CHECKED_OUT" | grep -qxF 'worker/agent-live' && printf '%s\n' "$CHECKED_OUT" | grep -qxF 'main' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$CHECKED_OUT" | drain_grep -qxF 'worker/agent-live' && printf '%s\n' "$CHECKED_OUT" | drain_grep -qxF 'main' && echo 1 || echo 0)"
 
 RC=0
 call is_checked_out 'worker/agent-live' "$CHECKED_OUT" || RC=$?
@@ -606,10 +607,10 @@ LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$NLW" PATH="$STUB_GH_ONE_OPEN_PR:$PAT
   call step_c_stale_worker_branches >/dev/null 2>&1
 
 assert "reap-all mode (LIVE_AGENTS=\"\", what --no-live-workers sets) reaps a branch that is merged by patch-id AND has no open PR -- the idle-state win this flag exists for" \
-  "$(! git -C "$NLW" branch --list worker/agent-mergednopr | grep -q worker/agent-mergednopr && echo 1 || echo 0)"
+  "$(! git -C "$NLW" branch --list worker/agent-mergednopr | drain_grep -q worker/agent-mergednopr && echo 1 || echo 0)"
 
 assert "...but PRESERVES a branch in that SAME empty live-set run when an OPEN PR still references it, even though patch-id alone says it's already merged -- proves reap-all mode does not lower STEP C's staleness bar, it only waives the live-agent dimension (the safety constraint --no-live-workers must uphold, checked on revert: deleting has_open_pr's guard would flip this to reaped)" \
-  "$(git -C "$NLW" branch --list worker/agent-openpr | grep -q worker/agent-openpr && echo 1 || echo 0)"
+  "$(git -C "$NLW" branch --list worker/agent-openpr | drain_grep -q worker/agent-openpr && echo 1 || echo 0)"
 
 # End-to-end: a worker branch that is ALREADY MERGED (ff-mergeable, so
 # is_unmerged_by_patch_id says false), has no open PR, and no live worktree
@@ -646,12 +647,12 @@ chmod +x "$STUB_GH_NO_OPEN_PRS/gh"
 LIVE_AGENTS="liveagent456" WORKTREE_HYGIENE_REPO_ROOT="$L" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
   call step_c_stale_worker_branches >/dev/null 2>&1
 assert "STEP C protects a worker/agent-<id> branch whose id IS in --live-agents even though it's already merged, has no open PR, and no live worktree directory -- every other guard alone would have called it safe to delete" \
-  "$(git -C "$L" branch --list worker/agent-liveagent456 | grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
+  "$(git -C "$L" branch --list worker/agent-liveagent456 | drain_grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
 
 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$L" PATH="$STUB_GH_NO_OPEN_PRS:$PATH" \
   call step_c_stale_worker_branches >/dev/null 2>&1
 assert "...the SAME branch, with no matching --live-agents entry, is force-deleted -- proving the guard (not some accident of the other checks) is what protected it above" \
-  "$(! git -C "$L" branch --list worker/agent-liveagent456 | grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
+  "$(! git -C "$L" branch --list worker/agent-liveagent456 | drain_grep -q worker/agent-liveagent456 && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 4. STEP D -- gone-upstream match.
@@ -664,13 +665,13 @@ worker/agent-active [behind 2]'
 
 GONE=$(call gone_upstream_branches "$FOR_EACH_REF")
 assert "a branch with a [gone] upstream is matched for deletion" \
-  "$(printf '%s\n' "$GONE" | grep -qxF 'worker/agent-done' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$GONE" | drain_grep -qxF 'worker/agent-done' && echo 1 || echo 0)"
 assert "a branch with no upstream configured at all (no track field) is NOT matched (only [gone] counts, not merely absent)" \
-  "$(! printf '%s\n' "$GONE" | grep -qxF 'investigation/scratch' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$GONE" | drain_grep -qxF 'investigation/scratch' && echo 1 || echo 0)"
 assert "a branch that is merely behind (not gone) is NOT matched" \
-  "$(! printf '%s\n' "$GONE" | grep -qxF 'worker/agent-active' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$GONE" | drain_grep -qxF 'worker/agent-active' && echo 1 || echo 0)"
 assert "a branch that is ahead (not gone) is NOT matched" \
-  "$(! printf '%s\n' "$GONE" | grep -qxF 'main' && echo 1 || echo 0)"
+  "$(! printf '%s\n' "$GONE" | drain_grep -qxF 'main' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 4b. STEP D -- checked-out guard, exercised end-to-end (not via a
@@ -711,7 +712,7 @@ WORKTREE_HYGIENE_REPO_ROOT="$D" call step_d_gone_upstream_branches >/dev/null 2>
 assert "STEP D does not abort the whole hygiene tick (skipping STEP E) when a gone-upstream branch is still checked out in a live worktree" \
   "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...and the branch itself survives -- skipped for the tick's reap, not force-deleted out from under the live worktree" \
-  "$(git -C "$D" branch --list worker/agent-gone | grep -q worker/agent-gone && echo 1 || echo 0)"
+  "$(git -C "$D" branch --list worker/agent-gone | drain_grep -q worker/agent-gone && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 4c. STEP D -- --live-agents guard, exercised end-to-end against a
@@ -739,11 +740,11 @@ git -C "$D2" fetch -q --prune origin
 
 LIVE_AGENTS="liveagent789" WORKTREE_HYGIENE_REPO_ROOT="$D2" call step_d_gone_upstream_branches >/dev/null 2>&1
 assert "STEP D protects a gone-upstream worker/agent-<id> branch whose id IS in --live-agents, even though it's not checked out anywhere (STEP D's only other guard)" \
-  "$(git -C "$D2" branch --list worker/agent-liveagent789 | grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
+  "$(git -C "$D2" branch --list worker/agent-liveagent789 | drain_grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
 
 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$D2" call step_d_gone_upstream_branches >/dev/null 2>&1
 assert "...the SAME branch, with no matching --live-agents entry, is deleted -- proving the guard is what saved it above" \
-  "$(! git -C "$D2" branch --list worker/agent-liveagent789 | grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
+  "$(! git -C "$D2" branch --list worker/agent-liveagent789 | drain_grep -q worker/agent-liveagent789 && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 5. run_cmd dry-run gate -- the mechanism that keeps THIS test suite (and
@@ -754,7 +755,7 @@ assert "...the SAME branch, with no matching --live-agents entry, is deleted -- 
 MARKER="$SANDBOX_ROOT/marker"
 OUT=$(DRY_RUN=1 call run_cmd touch "$MARKER")
 assert "DRY_RUN=1 logs the command instead of running it" \
-  "$(printf '%s' "$OUT" | grep -q 'would run: touch' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT" | drain_grep -q 'would run: touch' && echo 1 || echo 0)"
 assert "...and the gated command genuinely did not execute" \
   "$([ ! -e "$MARKER" ] && echo 1 || echo 0)"
 
@@ -850,9 +851,9 @@ FAILSAFE_OUT=$(bash "$SCRIPT" 2>&1) || FAILSAFE_RC=$?
 assert "worktree-hygiene refuses to run at all when --live-agents is omitted, exiting non-zero instead of silently defaulting" \
   "$([ "$FAILSAFE_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and the refusal is explained on stderr naming the missing flag, not a silent no-op" \
-  "$(printf '%s' "$FAILSAFE_OUT" | grep -q -- '--live-agents' && echo 1 || echo 0)"
+  "$(printf '%s' "$FAILSAFE_OUT" | drain_grep -q -- '--live-agents' && echo 1 || echo 0)"
 assert "...and no destructive-step log output appears at all -- STEP A/B/C/D/E never even started" \
-  "$(! printf '%s' "$FAILSAFE_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+  "$(! printf '%s' "$FAILSAFE_OUT" | drain_grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 # Same fail-safe, but for a PRESENT --live-agents flag whose VALUE is empty
 # or whitespace-only -- the flag TOKEN appearing in argv is not enough on
@@ -866,14 +867,14 @@ FAILSAFE_EMPTY_OUT=$(bash "$SCRIPT" --live-agents "" 2>&1) || FAILSAFE_EMPTY_RC=
 assert "worktree-hygiene refuses to run when --live-agents is present but its value is the empty string, exiting non-zero rather than treating it as a valid (if empty) live set" \
   "$([ "$FAILSAFE_EMPTY_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and no destructive-step log output appears at all for the empty-value case either" \
-  "$(! printf '%s' "$FAILSAFE_EMPTY_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+  "$(! printf '%s' "$FAILSAFE_EMPTY_OUT" | drain_grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 FAILSAFE_WS_RC=0
 FAILSAFE_WS_OUT=$(bash "$SCRIPT" --live-agents "   " 2>&1) || FAILSAFE_WS_RC=$?
 assert "worktree-hygiene also refuses to run when --live-agents is whitespace-only -- a value that is non-empty as a raw string but carries no actual agent id must not bypass the fail-safe" \
   "$([ "$FAILSAFE_WS_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and no destructive-step log output appears at all for the whitespace-only case either" \
-  "$(! printf '%s' "$FAILSAFE_WS_OUT" | grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
+  "$(! printf '%s' "$FAILSAFE_WS_OUT" | drain_grep -qE '\[hygiene\]|worktree prune' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 7b. main() -- --no-live-workers: an explicit, affirmative "zero live
@@ -891,7 +892,7 @@ BOTH_OUT=$(bash "$SCRIPT" --live-agents abc123 --no-live-workers 2>&1) || BOTH_R
 assert "worktree-hygiene refuses to run when BOTH --live-agents and --no-live-workers are given -- ambiguous which one the caller meant" \
   "$([ "$BOTH_RC" -eq 2 ] && echo 1 || echo 0)"
 assert "...and the refusal names both flags as mutually exclusive, not a silent pick-one" \
-  "$(printf '%s' "$BOTH_OUT" | grep -q -- '--no-live-workers' && printf '%s' "$BOTH_OUT" | grep -q -- '--live-agents' && echo 1 || echo 0)"
+  "$(printf '%s' "$BOTH_OUT" | drain_grep -q -- '--no-live-workers' && printf '%s' "$BOTH_OUT" | drain_grep -q -- '--live-agents' && echo 1 || echo 0)"
 
 # --no-live-workers alone must NOT trip the fail-safe -- exercised through
 # the REAL main() (not __call, which bypasses argv parsing) against a
@@ -923,7 +924,7 @@ NLW_MAIN_OUT=$(DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$NLW_MAIN" PATH="$STUB_GH_E
 assert "worktree-hygiene runs (does not refuse) with --no-live-workers alone, unlike an omitted or empty --live-agents -- this is the idle-state reap path the flag exists to unlock" \
   "$([ "$NLW_MAIN_RC" -eq 0 ] && echo 1 || echo 0)"
 assert "...and the fail-safe refusal message never appears for --no-live-workers" \
-  "$(! printf '%s' "$NLW_MAIN_OUT" | grep -q 'refusing to run' && echo 1 || echo 0)"
+  "$(! printf '%s' "$NLW_MAIN_OUT" | drain_grep -q 'refusing to run' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 8. STEP F -- orphaned origin/worker/agent-* branches. Mirrors STEP C/D's
@@ -965,7 +966,7 @@ git -C "$F" push -q origin worker/agent-liveagent
 git -C "$F" branch -D worker/agent-liveagent
 
 assert "origin_worker_branches finds a branch via ls-remote even with zero local trace -- the crashed-worker shape STEP C's local refs/heads/* iteration cannot see" \
-  "$(printf '%s\n' "$(call origin_worker_branches "$F")" | grep -qxF 'worker/agent-openpr' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$(call origin_worker_branches "$F")" | drain_grep -qxF 'worker/agent-openpr' && echo 1 || echo 0)"
 
 STUB_GH_STEP_F="$SANDBOX_ROOT/stub-gh-step-f"
 mkdir -p "$STUB_GH_STEP_F"
@@ -994,7 +995,7 @@ LIVE_AGENTS="liveagent" WORKTREE_HYGIENE_REPO_ROOT="$F" PATH="$STUB_GH_STEP_F:$P
 assert "STEP F tags an orphan branch whose commits touch ai/findings/ as archive/<bead>-findings at its tip, on origin -- otherwise deleting it destroys the only copy of an audit doc" \
   "$([ "$(git -C "$BARE_F" rev-parse "refs/tags/archive/${BEAD_PFX}audit1-findings^{commit}" 2>/dev/null)" = "$AUDIT_TIP" ] && echo 1 || echo 0)"
 assert "...and only then deletes that branch from origin" \
-  "$(! git -C "$F" ls-remote --heads origin 'worker/agent-audit' | grep -q . && echo 1 || echo 0)"
+  "$(! git -C "$F" ls-remote --heads origin 'worker/agent-audit' | drain_grep -q . && echo 1 || echo 0)"
 assert "a findings-free orphan branch gets no archive tag -- tags are for branches with unique findings only" \
   "$([ "$(git -C "$BARE_F" tag -l 'archive/*' | wc -l | tr -d ' ')" = "1" ] && echo 1 || echo 0)"
 
@@ -1003,11 +1004,11 @@ origin_f_heads() {
 }
 
 assert "STEP F deletes a crashed-worker branch that exists ONLY on origin, has no open PR, and whose id is not in --live-agents -- the class of branch nothing else in this script or the merge queue ever revisits" \
-  "$(! origin_f_heads | grep -qxF 'refs/heads/worker/agent-crashed' && echo 1 || echo 0)"
+  "$(! origin_f_heads | drain_grep -qxF 'refs/heads/worker/agent-crashed' && echo 1 || echo 0)"
 assert "...but PRESERVES a same-shaped orphan-looking branch when an OPEN PR still references it -- has_open_pr, not liveness, is what saves it here" \
-  "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-openpr' && echo 1 || echo 0)"
+  "$(origin_f_heads | drain_grep -qxF 'refs/heads/worker/agent-openpr' && echo 1 || echo 0)"
 assert "...and PRESERVES a branch whose id IS in --live-agents even with no PR at all -- an in-flight worker that hasn't opened a PR yet must never be reaped" \
-  "$(origin_f_heads | grep -qxF 'refs/heads/worker/agent-liveagent' && echo 1 || echo 0)"
+  "$(origin_f_heads | drain_grep -qxF 'refs/heads/worker/agent-liveagent' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 9. STEP G -- fix-round worktrees on fix-<PR> branches. STEP C only knows
@@ -1153,11 +1154,11 @@ H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON="$FAIL_JSON" bash "$SCRIPT" 
 assert "STEP H returns 4 when main's audit failed, so the mayor tick sees a distinct code" \
   "$([ "$H_RC" -eq 4 ] && echo 1 || echo 0)"
 assert "...and the alert carries the run URL and the deduplicated advisory ids" \
-  "$(echo "$H_OUT" | grep -q 'https://example.test/runs/42' && echo "$H_OUT" | grep -q 'GHSA-abcd-1234-wxyz' && [ "$(echo "$H_OUT" | grep -o 'RUSTSEC-2026-0001' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
+  "$(echo "$H_OUT" | drain_grep -q 'https://example.test/runs/42' && echo "$H_OUT" | drain_grep -q 'GHSA-abcd-1234-wxyz' && [ "$(echo "$H_OUT" | grep -o 'RUSTSEC-2026-0001' | wc -l)" -eq 1 ] && echo 1 || echo 0)"
 
 H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"databaseId":50,"conclusion":"cancelled","url":"https://example.test/runs/50"},{"databaseId":42,"conclusion":"timed_out","createdAt":"2026-01-02T03:04:05Z","url":"https://example.test/runs/42"}]' bash "$SCRIPT" __call step_h_main_audit 2>&1) && H_RC=0 || H_RC=$?
 assert "STEP H alert names the decisive run (id, conclusion, created time, URL), not the cancelled newest one" \
-  "$([ "$H_RC" -eq 4 ] && echo "$H_OUT" | grep -q 'run 42 timed_out at 2026-01-02T03:04:05Z: https://example.test/runs/42' && echo 1 || echo 0)"
+  "$([ "$H_RC" -eq 4 ] && echo "$H_OUT" | drain_grep -q 'run 42 timed_out at 2026-01-02T03:04:05Z: https://example.test/runs/42' && echo 1 || echo 0)"
 
 H_RC=0
 PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[{"conclusion":"success"}]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
@@ -1167,7 +1168,7 @@ assert "STEP H returns 0 when main's audit is green" \
 H_RC=0
 H_OUT=$(PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_LIST_FAIL=1 bash "$SCRIPT" __call step_h_main_audit 2>&1) || H_RC=$?
 assert "STEP H returns 0 with a warning when gh errors -- an offline tick must not be reported as a failing audit" \
-  "$([ "$H_RC" -eq 0 ] && echo "$H_OUT" | grep -q 'WARNING' && echo 1 || echo 0)"
+  "$([ "$H_RC" -eq 0 ] && echo "$H_OUT" | drain_grep -q 'WARNING' && echo 1 || echo 0)"
 
 H_RC=0
 PATH="$STUB_GH_AUDIT:$PATH" STUB_AUDIT_JSON='[]' bash "$SCRIPT" __call step_h_main_audit >/dev/null 2>&1 || H_RC=$?
@@ -1310,7 +1311,7 @@ git -C "$P" push -q origin fix-lbl
 git -C "$P" worktree add -q "$P/ai/worktrees/agent-a3" fix-lbl
 P_OUT=$(DRY_RUN=1 LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$P" call step_g_fix_round_worktrees 2>&1 || true)
 assert "destructive steps label their output with the step so the log names what was deleted" \
-  "$(printf '%s\n' "$P_OUT" | grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$P_OUT" | drain_grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

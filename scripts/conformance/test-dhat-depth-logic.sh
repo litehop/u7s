@@ -14,6 +14,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 RUN_ALL="$REPO/scripts/conformance/run-all.sh"
@@ -106,7 +107,7 @@ set -e
 assert "(c) run-all.sh actually exits non-zero on an invalid --dhat-depth" \
   "$([ "$DEPTH_INVALID_EXIT" -ne 0 ] && echo 1 || echo 0)"
 assert "(c) run-all.sh's rejection message names the flag, not a generic parse error" \
-  "$(printf '%s' "$DEPTH_INVALID_OUT" | grep -qF -- '--dhat-depth' && echo 1 || echo 0)"
+  "$(printf '%s' "$DEPTH_INVALID_OUT" | drain_grep -qF -- '--dhat-depth' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # (d) should_warn_bare_profile() -- mirrors run-all.sh's exact warning

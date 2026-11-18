@@ -8,6 +8,7 @@
 # Calls the real u7s_owned_pids() / check_port_free() against throwaway
 # sleepers and an nc listener started here on a port from 20000-29999.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/../.." && pwd)"
@@ -95,7 +96,7 @@ assert_true "u7s-start.sh selects the apiserver via u7s_owned_pids" \
 assert_true "sample-run-metrics.sh selects the apiserver via u7s_owned_pids, not the port holder" \
   grep -q 'u7s_owned_pids apiserver' "$DIR/sample-run-metrics.sh"
 assert_true "sample-run-metrics.sh does not resolve the apiserver by lsof on the port" \
-  bash -c '! grep -A2 "^resolve_apiserver_pid" "$1" | grep -q lsof' _ "$DIR/sample-run-metrics.sh"
+  bash -c '! grep -A2 "^resolve_apiserver_pid" "$1" | drain_grep -q lsof' _ "$DIR/sample-run-metrics.sh"
 
 set +e
 OUT=$(check_port_free "$PORT" "apiserver" 2>&1)

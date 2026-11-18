@@ -8,6 +8,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 SCRIPT="$REPO/scripts/conformance/batch-focus.sh"
@@ -48,7 +49,7 @@ assert "escape_spec backslash-escapes every [ ] ( ) . * + character" \
 #    header point 2: ginkgo's --focus matches "Kubernetes e2e suite " + the
 #    joined spec text, so the round-trip must hold with that prefix too).
 assert "escaped spec round-trips: anchored regex matches its own literal source text" \
-  "$(printf '%s' "Kubernetes e2e suite $SPEC" | grep -qE "^Kubernetes e2e suite ${ESCAPED}\$" && echo 1 || echo 0)"
+  "$(printf '%s' "Kubernetes e2e suite $SPEC" | drain_grep -qE "^Kubernetes e2e suite ${ESCAPED}\$" && echo 1 || echo 0)"
 
 # 3. A second, unrelated spec must NOT match the first spec's anchored
 #    regex -- proves the escaping+anchoring actually scopes a batch member
@@ -57,7 +58,7 @@ assert "escaped spec round-trips: anchored regex matches its own literal source 
 #    "(filesystem volmode)" could cross-match).
 OTHER_SPEC='[sig-storage] CSI Volumes [Driver: csi-hostpath] [Testpattern: Dynamic PV (filesystem volmode)] multiVolume [Slow] should test.*with a dot+plus'
 assert "escaped+anchored regex does NOT match a sibling spec differing only in one word" \
-  "$(printf '%s' "Kubernetes e2e suite $OTHER_SPEC" | grep -qE "^Kubernetes e2e suite ${ESCAPED}\$" && echo 0 || echo 1)"
+  "$(printf '%s' "Kubernetes e2e suite $OTHER_SPEC" | drain_grep -qE "^Kubernetes e2e suite ${ESCAPED}\$" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # -list-tests line-prefix strip -- mirrors the real sed invocation.
@@ -214,7 +215,7 @@ set -e
 assert "batch-focus.sh exits non-zero with no --focus" \
   "$([ "$NO_FOCUS_EXIT" -ne 0 ] && echo 1 || echo 0)"
 assert "batch-focus.sh's rejection message names --focus" \
-  "$(printf '%s' "$NO_FOCUS_OUT" | grep -qF -- '--focus' && echo 1 || echo 0)"
+  "$(printf '%s' "$NO_FOCUS_OUT" | drain_grep -qF -- '--focus' && echo 1 || echo 0)"
 
 set +e
 BAD_BATCH_OUT="$(bash "$SCRIPT" --focus 'anything' --batch-size 0 2>&1)"
@@ -223,7 +224,7 @@ set -e
 assert "batch-focus.sh exits non-zero on --batch-size 0" \
   "$([ "$BAD_BATCH_EXIT" -ne 0 ] && echo 1 || echo 0)"
 assert "batch-focus.sh's rejection message names --batch-size" \
-  "$(printf '%s' "$BAD_BATCH_OUT" | grep -qF -- '--batch-size' && echo 1 || echo 0)"
+  "$(printf '%s' "$BAD_BATCH_OUT" | drain_grep -qF -- '--batch-size' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

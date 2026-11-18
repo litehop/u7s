@@ -38,6 +38,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 PASS=0
 FAIL=0
@@ -108,7 +109,7 @@ build_sonobuoy_args_old_buggy() {
 # ---------------------------------------------------------------------------
 ARGS=$(build_sonobuoy_args "" 1)
 assert "--all-e2e argv skips [Flaky]" \
-  "$(printf '%s' "$ARGS" | grep -q -- '--e2e-skip=\\\[Flaky\\\]' && echo 1 || echo 0)"
+  "$(printf '%s' "$ARGS" | drain_grep -q -- '--e2e-skip=\\\[Flaky\\\]' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. --all-e2e's argv must NOT skip [Disruptive] or [Slow] -- some specs
@@ -118,17 +119,17 @@ assert "--all-e2e argv skips [Flaky]" \
 #    guarantee --all-e2e is supposed to provide.
 # ---------------------------------------------------------------------------
 assert "--all-e2e argv does NOT skip [Disruptive] (2 of those specs are also [Conformance])" \
-  "$(printf '%s' "$ARGS" | grep -q -- 'Disruptive' && echo 0 || echo 1)"
+  "$(printf '%s' "$ARGS" | drain_grep -q -- 'Disruptive' && echo 0 || echo 1)"
 assert "--all-e2e argv does NOT skip [Slow] (6 of those specs are also [Conformance])" \
-  "$(printf '%s' "$ARGS" | grep -q -- 'Slow' && echo 0 || echo 1)"
+  "$(printf '%s' "$ARGS" | drain_grep -q -- 'Slow' && echo 0 || echo 1)"
 
 # Regression guard: prove the OLD argv genuinely skipped Disruptive/Slow in
 # this same scenario, so this test would catch a revert to the old pattern.
 OLD_ARGS=$(build_sonobuoy_args_old_buggy "" 1)
 assert "(regression guard) pre-fix --all-e2e argv genuinely skipped [Disruptive]" \
-  "$(printf '%s' "$OLD_ARGS" | grep -q -- 'Disruptive' && echo 1 || echo 0)"
+  "$(printf '%s' "$OLD_ARGS" | drain_grep -q -- 'Disruptive' && echo 1 || echo 0)"
 assert "(regression guard) pre-fix --all-e2e argv genuinely skipped [Slow]" \
-  "$(printf '%s' "$OLD_ARGS" | grep -q -- 'Slow' && echo 1 || echo 0)"
+  "$(printf '%s' "$OLD_ARGS" | drain_grep -q -- 'Slow' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 3. certified-conformance (default) argv is untouched -- this fix only
@@ -136,7 +137,7 @@ assert "(regression guard) pre-fix --all-e2e argv genuinely skipped [Slow]" \
 # ---------------------------------------------------------------------------
 DEFAULT_ARGS=$(build_sonobuoy_args "" 0)
 assert "certified-conformance (bare) argv carries no --e2e-skip at all" \
-  "$(printf '%s' "$DEFAULT_ARGS" | grep -q -- '--e2e-skip' && echo 0 || echo 1)"
+  "$(printf '%s' "$DEFAULT_ARGS" | drain_grep -q -- '--e2e-skip' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 4. all_e2e_applies_label_filter -- --all-e2e's own ".*" focus is exactly
@@ -146,7 +147,7 @@ assert "certified-conformance (bare) argv carries no --e2e-skip at all" \
 # ---------------------------------------------------------------------------
 ALL_E2E_ARGS=$(build_sonobuoy_args "" 1)
 assert "--all-e2e argv carries the FeatureGate label-filter with VolumeAttributesClass in the allow-set" \
-  "$(printf '%s' "$ALL_E2E_ARGS" | grep -q -- '--label-filter=FeatureGate: isSubsetOf {VolumeAttributesClass}' && echo 1 || echo 0)"
+  "$(printf '%s' "$ALL_E2E_ARGS" | drain_grep -q -- '--label-filter=FeatureGate: isSubsetOf {VolumeAttributesClass}' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 5. focus_default_applies_label_filter -- a named --focus test must NOT be
@@ -156,9 +157,9 @@ assert "--all-e2e argv carries the FeatureGate label-filter with VolumeAttribute
 # ---------------------------------------------------------------------------
 FOCUS_ARGS=$(build_sonobuoy_args "AdmissionWebhook" 0)
 assert "default --focus argv carries the FeatureGate label-filter, same as --all-e2e" \
-  "$(printf '%s' "$FOCUS_ARGS" | grep -q -- '--label-filter=FeatureGate: isSubsetOf {VolumeAttributesClass}' && echo 1 || echo 0)"
+  "$(printf '%s' "$FOCUS_ARGS" | drain_grep -q -- '--label-filter=FeatureGate: isSubsetOf {VolumeAttributesClass}' && echo 1 || echo 0)"
 assert "default --focus argv also carries the [Flaky] skip, same as --all-e2e" \
-  "$(printf '%s' "$FOCUS_ARGS" | grep -q -- '--e2e-skip=\\\[Flaky\\\]' && echo 1 || echo 0)"
+  "$(printf '%s' "$FOCUS_ARGS" | drain_grep -q -- '--e2e-skip=\\\[Flaky\\\]' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 6. unsafe_focus_wipes_label_filter -- the explicit, deliberate escape hatch
@@ -167,9 +168,9 @@ assert "default --focus argv also carries the [Flaky] skip, same as --all-e2e" \
 # ---------------------------------------------------------------------------
 UNSAFE_FOCUS_ARGS=$(build_sonobuoy_args "AdmissionWebhook" 0 1)
 assert "--focus --unsafe-focus argv carries NO FeatureGate label-filter" \
-  "$(printf '%s' "$UNSAFE_FOCUS_ARGS" | grep -q -- '--label-filter' && echo 0 || echo 1)"
+  "$(printf '%s' "$UNSAFE_FOCUS_ARGS" | drain_grep -q -- '--label-filter' && echo 0 || echo 1)"
 assert "--focus --unsafe-focus argv carries NO [Flaky] skip" \
-  "$(printf '%s' "$UNSAFE_FOCUS_ARGS" | grep -q -- '--e2e-skip' && echo 0 || echo 1)"
+  "$(printf '%s' "$UNSAFE_FOCUS_ARGS" | drain_grep -q -- '--e2e-skip' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 7. unsafe_focus_without_focus_is_a_noop -- --unsafe-focus only has meaning

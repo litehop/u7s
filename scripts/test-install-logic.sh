@@ -29,6 +29,7 @@
 # shellcheck disable=SC2016 # file-wide: single-quoted grep patterns below
 # intentionally match install.sh's literal, unexpanded source text.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 # A command dying under set -e must say so: a silent exit before the Results
 # line reads as "no output" in CI instead of a failure.
 trap 'echo "FAIL: test script aborted at line $LINENO before reaching Results" >&2' ERR
@@ -137,9 +138,9 @@ join_kc="$(STATE_DIR=/var/lib/u7s JOIN_SERVER=https://cp.example:6443 NODE_NAME=
 $join_kc_body
 EOF")"
 assert "a joined worker's kubeconfig carries no embedded -data: the kubelet could not see a re-issued client cert or CA" \
-  "$(printf '%s' "$join_kc" | grep -q -- '-data:' && echo 0 || echo 1)"
+  "$(printf '%s' "$join_kc" | drain_grep -q -- '-data:' && echo 0 || echo 1)"
 assert "a joined worker's kubeconfig names the CA, client cert and key files the join wrote" \
-  "$(printf '%s' "$join_kc" | grep -qF 'certificate-authority: /var/lib/u7s/ca.pem' && printf '%s' "$join_kc" | grep -qF 'client-certificate: /var/lib/u7s/kubelet-client.crt' && printf '%s' "$join_kc" | grep -qF 'client-key: /var/lib/u7s/kubelet-client.key' && echo 1 || echo 0)"
+  "$(printf '%s' "$join_kc" | drain_grep -qF 'certificate-authority: /var/lib/u7s/ca.pem' && printf '%s' "$join_kc" | drain_grep -qF 'client-certificate: /var/lib/u7s/kubelet-client.crt' && printf '%s' "$join_kc" | drain_grep -qF 'client-key: /var/lib/u7s/kubelet-client.key' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Without ExecReload=, systemd has no reload mechanism for a plain unit and
@@ -411,7 +412,7 @@ assert_true "DEFAULT_TARBALL_URL is empty in the repo copy, so a checkout fails 
 # pass either way and so could not fail when that ordering regresses.
 conflict_out="$(bash "$INSTALL" --tarball /x --tarball-url http://y 2>&1 || true)"
 conflict_ok=0
-printf '%s' "$conflict_out" | grep -q 'mutually exclusive' && conflict_ok=1
+printf '%s' "$conflict_out" | drain_grep -q 'mutually exclusive' && conflict_ok=1
 assert "passing both --tarball and --tarball-url is rejected by name before the root check, so the operator learns their flags conflict on the first run rather than after re-running under sudo" \
   "$conflict_ok"
 
@@ -677,7 +678,7 @@ assert "an upgrade with a pre-existing u7s-scheduler.service disables it via sys
 assert "an upgrade with a pre-existing u7s-scheduler.service reloads the systemd unit cache after removing the unit file" \
   "$(grep -qF 'daemon-reload' "$SCHED_SYSTEMCTL_LOG" && echo 1 || echo 0)"
 assert "the retirement step tells the operator why -- scheduling moved into the embedded apiserver task" \
-  "$(printf '%s' "$sched_out" | grep -qi 'retiring' && echo 1 || echo 0)"
+  "$(printf '%s' "$sched_out" | drain_grep -qi 'retiring' && echo 1 || echo 0)"
 
 # Case 2: a genuinely fresh install (no prior u7s-scheduler.service on disk)
 # must be a silent no-op -- no systemctl calls, no "retiring" message. A
@@ -689,7 +690,7 @@ fresh_sched_out="$(PATH="$SCHED_FAKE_BIN:$PATH" bash "$SCHED_RUNNER" "$sched_fre
 assert "a fresh install (no pre-existing u7s-scheduler.service) makes no systemctl calls at all -- this step must be a true no-op, not merely idempotent" \
   "$([ ! -s "$SCHED_SYSTEMCTL_LOG" ] && echo 1 || echo 0)"
 assert "a fresh install prints no 'retiring' message, since there is nothing to retire" \
-  "$(printf '%s' "$fresh_sched_out" | grep -qi 'retiring' && echo 0 || echo 1)"
+  "$(printf '%s' "$fresh_sched_out" | drain_grep -qi 'retiring' && echo 0 || echo 1)"
 
 # Mutation self-check (CLAUDE.md rule 14): prove Case 1 above would actually
 # catch a reverted/skipped cleanup, not just document today's behavior.
@@ -749,14 +750,14 @@ assert "the bash-required guard appears before the 'set -euo pipefail' line dash
 if command -v dash >/dev/null 2>&1; then
   dash_out="$(dash "$INSTALL" --help 2>&1)" && dash_status=0 || dash_status=$?
   assert "running install.sh under dash (Ubuntu's /bin/sh) exits non-zero with a clear bash-required message, instead of dash's bare 'Illegal option -o pipefail' parse crash" \
-    "$([ "$dash_status" -ne 0 ] && printf '%s' "$dash_out" | grep -qi 'requires bash' && echo 1 || echo 0)"
+    "$([ "$dash_status" -ne 0 ] && printf '%s' "$dash_out" | drain_grep -qi 'requires bash' && echo 1 || echo 0)"
 else
   echo "SKIP: dash not installed on this runner -- cannot exercise the dash-rejection path directly"
 fi
 
 bash_out="$(bash "$INSTALL" --help 2>&1)" && bash_status=0 || bash_status=$?
 assert "running install.sh under bash (a real invocation) is unaffected by the guard and proceeds past it" \
-  "$([ "$bash_status" -eq 0 ] && printf '%s' "$bash_out" | grep -q '^Usage:' && echo 1 || echo 0)"
+  "$([ "$bash_status" -eq 0 ] && printf '%s' "$bash_out" | drain_grep -q '^Usage:' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Regression guard: A re-run of install.sh against an existing
@@ -787,21 +788,21 @@ fresh_dir="$DETECT_WORK/fresh"
 mkdir -p "$fresh_dir"
 fresh_out="$(bash "$DETECT_RUNNER" "$fresh_dir" 2>&1)"
 assert "a genuinely fresh node (no ca.key, no kubeconfig on disk yet) is NOT flagged as an existing install -- a false positive here would print a confusing 'upgrading' message on someone's very first run" \
-  "$(printf '%s' "$fresh_out" | grep -q '^EXISTING_INSTALL=0$' && ! printf '%s' "$fresh_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+  "$(printf '%s' "$fresh_out" | drain_grep -q '^EXISTING_INSTALL=0$' && ! printf '%s' "$fresh_out" | drain_grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
 
 cp_dir="$DETECT_WORK/control-plane"
 mkdir -p "$cp_dir"
 touch "$cp_dir/ca.key"
 cp_out="$(bash "$DETECT_RUNNER" "$cp_dir" 2>&1)"
 assert "a control-plane node with an existing ca.key IS detected as an existing install -- ca.key only exists once apiserver's own load_or_generate_ca has actually run and succeeded, unlike the systemd unit file which install.sh writes even on a failed first attempt" \
-  "$(printf '%s' "$cp_out" | grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$cp_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+  "$(printf '%s' "$cp_out" | drain_grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$cp_out" | drain_grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
 
 worker_dir="$DETECT_WORK/worker"
 mkdir -p "$worker_dir"
 touch "$worker_dir/kubeconfig"
 worker_out="$(bash "$DETECT_RUNNER" "$worker_dir" 2>&1)"
 assert "an already-joined worker node (kubeconfig present, ca.key absent -- join_cluster never writes a CA key on a worker) IS detected as an existing install" \
-  "$(printf '%s' "$worker_out" | grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$worker_out" | grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
+  "$(printf '%s' "$worker_out" | drain_grep -q '^EXISTING_INSTALL=1$' && printf '%s' "$worker_out" | drain_grep -qi 'existing u7s install detected' && echo 1 || echo 0)"
 
 assert_false "(regression guard) the detection message does not reference a --force-reinstall flag, which does not exist in this bead's shipped scope -- mentioning it would send operators looking for a flag install.sh would reject as unknown" \
   grep -qF -- '--force-reinstall' "$INSTALL"
@@ -848,7 +849,7 @@ touch "$already_joined_dir/kubeconfig"
 rejoin_status=0
 rejoin_out="$(bash "$WORKER_MODE_RUNNER" "$already_joined_dir" "https://1.2.3.4:6443" 2>&1)" || rejoin_status=$?
 assert "--join against an already-joined worker (kubeconfig present, no ca.key) is refused loudly with a non-zero exit, instead of silently re-running the one-shot CSR flow and rotating the node's client identity" \
-  "$([ "$rejoin_status" -ne 0 ] && printf '%s' "$rejoin_out" | grep -qi 'refusing' && echo 1 || echo 0)"
+  "$([ "$rejoin_status" -ne 0 ] && printf '%s' "$rejoin_out" | drain_grep -qi 'refusing' && echo 1 || echo 0)"
 
 # Case B: --join against a genuinely fresh node (no kubeconfig, no ca.key at
 # all) must proceed normally -- the guard must not misfire on the one case
@@ -857,7 +858,7 @@ fresh_join_dir="$WORKER_MODE_WORK/fresh-join"
 mkdir -p "$fresh_join_dir"
 fresh_join_out="$(bash "$WORKER_MODE_RUNNER" "$fresh_join_dir" "https://1.2.3.4:6443" 2>&1)"
 assert "--join against a genuinely fresh node proceeds normally (JOIN_MODE=1, WORKER_MODE=1) -- the refuse-loud guard must not misfire on a real first-time join" \
-  "$(printf '%s' "$fresh_join_out" | grep -q '^JOIN_MODE=1$' && printf '%s' "$fresh_join_out" | grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
+  "$(printf '%s' "$fresh_join_out" | drain_grep -q '^JOIN_MODE=1$' && printf '%s' "$fresh_join_out" | drain_grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
 
 # Case C: a bare re-run (no --join/--token, the "curl | sudo bash" upgrade
 # UX) against an already-joined worker must resolve to WORKER_MODE=1 with
@@ -869,7 +870,7 @@ mkdir -p "$worker_upgrade_dir"
 touch "$worker_upgrade_dir/kubeconfig"
 worker_upgrade_out="$(bash "$WORKER_MODE_RUNNER" "$worker_upgrade_dir" "" 2>&1)"
 assert "a bare re-run (no --join/--token) against an already-joined worker resolves to WORKER_MODE=1 with JOIN_MODE=0 -- upgrades kubelet in place without ever re-entering join_cluster() or touching kubeconfig/kubelet-client.*" \
-  "$(printf '%s' "$worker_upgrade_out" | grep -q '^JOIN_MODE=0$' && printf '%s' "$worker_upgrade_out" | grep -q '^EXISTING_WORKER=1$' && printf '%s' "$worker_upgrade_out" | grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
+  "$(printf '%s' "$worker_upgrade_out" | drain_grep -q '^JOIN_MODE=0$' && printf '%s' "$worker_upgrade_out" | drain_grep -q '^EXISTING_WORKER=1$' && printf '%s' "$worker_upgrade_out" | drain_grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
 
 # Case D: a bare re-run against a control-plane node (ca.key present) must
 # stay on the full control-plane path (WORKER_MODE=0) -- this guard is
@@ -879,7 +880,7 @@ mkdir -p "$cp_upgrade_dir"
 touch "$cp_upgrade_dir/ca.key"
 cp_upgrade_out="$(bash "$WORKER_MODE_RUNNER" "$cp_upgrade_dir" "" 2>&1)"
 assert "a bare re-run against a control-plane node (ca.key present) stays on the full control-plane path (WORKER_MODE=0) -- a control-plane upgrade must not be misclassified as a worker one" \
-  "$(printf '%s' "$cp_upgrade_out" | grep -q '^WORKER_MODE=0$' && echo 1 || echo 0)"
+  "$(printf '%s' "$cp_upgrade_out" | drain_grep -q '^WORKER_MODE=0$' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove the refuse-loud guard
@@ -898,7 +899,7 @@ else
   mutated_status=0
   mutated_out="$(bash "$MUTATED_RUNNER" "$already_joined_dir" "https://1.2.3.4:6443" 2>&1)" || mutated_status=$?
   assert "mutation self-check: with the refuse-loud guard bypassed, a --join re-run against an already-joined worker is wrongly allowed to proceed -- proving the refusal test above would fail if this fix were ever reverted" \
-    "$([ "$mutated_status" -eq 0 ] && printf '%s' "$mutated_out" | grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
+    "$([ "$mutated_status" -eq 0 ] && printf '%s' "$mutated_out" | drain_grep -q '^WORKER_MODE=1$' && echo 1 || echo 0)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1215,11 +1216,11 @@ assert_true "an explicit --pod-mtu is persisted to \$STATE_DIR/config" \
 assert_false "a derived pod MTU is not persisted, so it keeps following the NIC" \
   grep -q 'POD_MTU' "$PERSIST_WORK/mtu-derived/config"
 assert "a re-run without --pod-mtu reuses the persisted explicit value (else the cluster-wide flannel MTU silently resets)" \
-  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" "" 2>&1)" | grep -qx 'POD_MTU=1300' && echo 1 || echo 0)"
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" "" 2>&1)" | drain_grep -qx 'POD_MTU=1300' && echo 1 || echo 0)"
 assert "a new --pod-mtu overrides the persisted one" \
-  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" 1400 2>&1)" | grep -qx 'POD_MTU=1400' && echo 1 || echo 0)"
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" 1400 2>&1)" | drain_grep -qx 'POD_MTU=1400' && echo 1 || echo 0)"
 assert "with nothing persisted, a re-run without --pod-mtu stays unset (derived)" \
-  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$PERSIST_WORK/mtu-derived" 1 "" "" "" "" 2>&1)" | grep -qx 'POD_MTU=' && echo 1 || echo 0)"
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$PERSIST_WORK/mtu-derived" 1 "" "" "" "" 2>&1)" | drain_grep -qx 'POD_MTU=' && echo 1 || echo 0)"
 
 # Case 2: an upgrade re-run with no --iface/--node-name flags (NODE_NAME/IFACE
 # arrive empty, exactly as install.sh's own flag-parsing leaves them unset)
@@ -1233,7 +1234,7 @@ mkdir -p "$upgrade_no_flags_dir"
 } > "$upgrade_no_flags_dir/config"
 no_flags_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_no_flags_dir" 1 "" "" 2>&1)"
 assert "an upgrade re-run with no --iface/--node-name defaults both to the values persisted at install time, instead of recomputing a fresh hostname/auto-detected interface" \
-  "$(printf '%s' "$no_flags_out" | grep -q '^NODE_NAME=old-node$' && printf '%s' "$no_flags_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+  "$(printf '%s' "$no_flags_out" | drain_grep -q '^NODE_NAME=old-node$' && printf '%s' "$no_flags_out" | drain_grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
 
 # Case 3: an upgrade re-run with an explicit --iface that DISAGREES with the
 # persisted value must refuse loudly and exit non-zero, naming $CONFIG_FILE
@@ -1250,9 +1251,9 @@ mkdir -p "$upgrade_mismatch_dir"
 mismatch_status=0
 mismatch_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_mismatch_dir" 1 "node-a" "eth1" 2>&1)" || mismatch_status=$?
 assert "an upgrade with a --iface that disagrees with the persisted value is refused loudly (non-zero exit, mentions the persisted 'eth0'), instead of silently rebaking a new --advertise-address into a live cluster" \
-  "$([ "$mismatch_status" -ne 0 ] && printf '%s' "$mismatch_out" | grep -qi 'conflicts' && printf '%s' "$mismatch_out" | grep -q 'eth0' && echo 1 || echo 0)"
+  "$([ "$mismatch_status" -ne 0 ] && printf '%s' "$mismatch_out" | drain_grep -qi 'conflicts' && printf '%s' "$mismatch_out" | drain_grep -q 'eth0' && echo 1 || echo 0)"
 assert "the --iface mismatch refusal names the exact file to delete (\$STATE_DIR/config), per the operator's decision that this is the only escape hatch (no override flag)" \
-  "$(printf '%s' "$mismatch_out" | grep -qF "$upgrade_mismatch_dir/config" && echo 1 || echo 0)"
+  "$(printf '%s' "$mismatch_out" | drain_grep -qF "$upgrade_mismatch_dir/config" && echo 1 || echo 0)"
 
 # Case 3b: the same guard on --node-name -- a distinct if-block in
 # install.sh, not exercised by the --iface case above.
@@ -1265,7 +1266,7 @@ mkdir -p "$upgrade_name_mismatch_dir"
 name_mismatch_status=0
 name_mismatch_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_name_mismatch_dir" 1 "node-b" "eth0" 2>&1)" || name_mismatch_status=$?
 assert "an upgrade with a --node-name that disagrees with the persisted value is refused loudly (non-zero exit, mentions the persisted 'node-a'), instead of silently rebaking a new kubelet --hostname-override into a live cluster" \
-  "$([ "$name_mismatch_status" -ne 0 ] && printf '%s' "$name_mismatch_out" | grep -qi 'conflicts' && printf '%s' "$name_mismatch_out" | grep -q 'node-a' && echo 1 || echo 0)"
+  "$([ "$name_mismatch_status" -ne 0 ] && printf '%s' "$name_mismatch_out" | drain_grep -qi 'conflicts' && printf '%s' "$name_mismatch_out" | drain_grep -q 'node-a' && echo 1 || echo 0)"
 
 # Case 4: an upgrade re-run with an explicit --iface that MATCHES the
 # persisted value is not a real mismatch -- it must proceed normally, or
@@ -1279,7 +1280,7 @@ mkdir -p "$upgrade_match_dir"
 } > "$upgrade_match_dir/config"
 match_out="$(bash "$PERSIST_CHECK_RUNNER" "$upgrade_match_dir" 1 "node-a" "eth0" 2>&1)"
 assert "an upgrade with an explicit --iface/--node-name that MATCHES the persisted value proceeds normally -- the guard only fires on a genuine mismatch, not on any explicit flag" \
-  "$(printf '%s' "$match_out" | grep -q '^NODE_NAME=node-a$' && printf '%s' "$match_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+  "$(printf '%s' "$match_out" | drain_grep -q '^NODE_NAME=node-a$' && printf '%s' "$match_out" | drain_grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
 
 # Case 5: a genuinely fresh install (EXISTING_INSTALL=0, no persisted config
 # file at all) must never trigger the mismatch guard, even with explicit
@@ -1288,7 +1289,7 @@ fresh_install_dir="$PERSIST_WORK/fresh-install"
 mkdir -p "$fresh_install_dir"
 fresh_install_out="$(bash "$PERSIST_CHECK_RUNNER" "$fresh_install_dir" 0 "node-a" "eth0" 2>&1)"
 assert "a genuinely fresh install (no persisted config, EXISTING_INSTALL=0) never trips the mismatch guard, even with explicit --iface/--node-name flags -- the guard is upgrade-only" \
-  "$(printf '%s' "$fresh_install_out" | grep -q '^NODE_NAME=node-a$' && printf '%s' "$fresh_install_out" | grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
+  "$(printf '%s' "$fresh_install_out" | drain_grep -q '^NODE_NAME=node-a$' && printf '%s' "$fresh_install_out" | drain_grep -q '^IFACE=eth0$' && echo 1 || echo 0)"
 
 # Case 6: a host named with capitals (the release-gate VMs are
 # u7s-rg-<stamp with T/Z>) must still install. The kubelet CSR name and the
@@ -1311,10 +1312,10 @@ upper_runner="$PERSIST_WORK/upper-name.sh"
 mkdir -p "$PERSIST_WORK/upper"
 upper_default_out="$(bash "$upper_runner" "$PERSIST_WORK/upper" "" 2>&1)"
 assert "a host named with capitals still gets a lowercase, trimmed node name from hostname (otherwise the kubelet CSR name is invalid and install fails)" \
-  "$(printf '%s' "$upper_default_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+  "$(printf '%s' "$upper_default_out" | drain_grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
 upper_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper" "$UPPER_HOST" 2>&1)"
 assert "an uppercase --node-name is lowercased too, so an explicit override cannot produce an invalid CSR name" \
-  "$(printf '%s' "$upper_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+  "$(printf '%s' "$upper_flag_out" | drain_grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
 # A host that already hit the uppercase bug persisted the uppercase name (config
 # is written before the kubelet identity CSR fails). It must recover by simply
 # re-running install, with or without a lowercase --node-name.
@@ -1322,10 +1323,10 @@ mkdir -p "$PERSIST_WORK/upper-persisted"
 printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$UPPER_HOST" > "$PERSIST_WORK/upper-persisted/config"
 recover_noflag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "" 1 2>&1 || true)"
 assert "a persisted UPPERCASE node name is lowercased on re-run with no flag (otherwise a host broken by the uppercase bug fails the same way forever)" \
-  "$(printf '%s' "$recover_noflag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
+  "$(printf '%s' "$recover_noflag_out" | drain_grep -qx "NODE_NAME=$LOWER_HOST" && echo 1 || echo 0)"
 recover_flag_out="$(bash "$upper_runner" "$PERSIST_WORK/upper-persisted" "$LOWER_HOST" 1 2>&1 || true)"
 assert "a lowercase --node-name does not conflict with the persisted uppercase spelling of the same name (operator can recover by passing the fix explicitly)" \
-  "$(printf '%s' "$recover_flag_out" | grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
+  "$(printf '%s' "$recover_flag_out" | drain_grep -qx "NODE_NAME=$LOWER_HOST" && ! printf '%s' "$recover_flag_out" | drain_grep -q 'conflicts with the node name persisted' && echo 1 || echo 0)"
 assert_false "the join/kubelet CSR names no longer embed NODE_NAME: a 253-char node name would push 'join-<name>-<ts>' past the 253-char object-name limit and the CSR create would be rejected" \
   grep -qE 'csr_name="(join|kubelet)-\$\{NODE_NAME\}' "$INSTALL"
 assert_true "the join CSR name is a short unique DNS-1123 name" \
@@ -1358,11 +1359,11 @@ for len in 52 53 63 64 253; do
   rc=0
   out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long" "$long_name" 2>&1)" || rc=$?
   assert "a $len-char --node-name is accepted (upstream joins nodes up to 253 chars)" \
-    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
   rc=0
   out="$(LONG_HOST="$(printf '%s' "$long_name" | tr a A)" bash "$long_runner" "$PERSIST_WORK/long" "" 2>&1)" || rc=$?
   assert "a $len-char hostname becomes the (lowercased) node name via the real derivation path" \
-    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
 done
 persisted_long="$(printf 'b%.0s' $(seq 1 100))"
 mkdir -p "$PERSIST_WORK/long-persisted"
@@ -1370,11 +1371,11 @@ printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$persisted_long" > "$PERSIST_WORK/long-
 rc=0
 out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "" 1 2>&1)" || rc=$?
 assert "a persisted long node name is reused on re-run with no flag (a host from a failed earlier install must not dead-end)" \
-  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
 rc=0
 out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "$persisted_long" 1 2>&1)" || rc=$?
 assert "re-running with the persisted long name as --node-name is not refused" \
-  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
+  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
 
 # Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
 # (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
@@ -1397,7 +1398,7 @@ assert "install labels the lowercase Node with node-role.kubernetes.io/control-p
 assert "labelling uses --overwrite so an install.sh re-run on a labelled Node is a no-op instead of an error" \
   "$(grep -qF -- '--overwrite' "$LABEL_WORK/kubectl.log" && echo 1 || echo 0)"
 assert "labelling reports success on the happy path" \
-  "$(printf '%s' "$label_ok_out" | grep -q 'labelled node-role.kubernetes.io/control-plane' && echo 1 || echo 0)"
+  "$(printf '%s' "$label_ok_out" | drain_grep -q 'labelled node-role.kubernetes.io/control-plane' && echo 1 || echo 0)"
 assert_false "install does not add a control-plane NoSchedule taint (u7s is single-node-first; workloads must schedule on the only node)" \
   grep -qE 'kubectl.*taint|NoSchedule' <(awk '/^label_control_plane_node\(\) \{/{f=1} f&&!/^#/{print} f&&/^}$/{exit}' "$INSTALL")
 touch "$LABEL_WORK/kubectl-fail"
@@ -1408,7 +1409,7 @@ else
     "$(grep -q 'could not label node' "$LABEL_WORK/fail.out" && echo 1 || echo 0)"
 fi
 assert "the control-plane install path calls label_control_plane_node exactly once, and join_cluster does not (joined workers must not carry the control-plane role)" \
-  "$([ "$(grep -c '^label_control_plane_node || exit 1$' "$INSTALL")" = 1 ] && ! awk '/^join_cluster\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL" | grep -q label_control_plane_node && echo 1 || echo 0)"
+  "$([ "$(grep -c '^label_control_plane_node || exit 1$' "$INSTALL")" = 1 ] && ! awk '/^join_cluster\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$INSTALL" | drain_grep -q label_control_plane_node && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Mutation self-check (CLAUDE.md rule 14): prove the --iface refusal assertion
@@ -1428,7 +1429,7 @@ else
   mutated_persist_status=0
   mutated_persist_out="$(bash "$MUTATED_PERSIST_RUNNER" "$upgrade_mismatch_dir" 1 "node-a" "eth1" 2>&1)" || mutated_persist_status=$?
   assert "mutation self-check: with the --iface mismatch guard bypassed, a disagreeing --iface is wrongly allowed to silently win -- proving the refusal test above would fail if this fix were ever reverted" \
-    "$([ "$mutated_persist_status" -eq 0 ] && printf '%s' "$mutated_persist_out" | grep -q '^IFACE=eth1$' && echo 1 || echo 0)"
+    "$([ "$mutated_persist_status" -eq 0 ] && printf '%s' "$mutated_persist_out" | drain_grep -q '^IFACE=eth1$' && echo 1 || echo 0)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1488,7 +1489,7 @@ MKDISK_RUNNER="$(mktemp)"
 } > "$MKDISK_RUNNER"
 if command -v findmnt >/dev/null 2>&1 && [ -d /var/tmp ]; then
   assert_false "mktemp_disk_dir must not return a tmpfs/ramfs path (RAM-backed extraction OOMs 1 GiB hosts)" \
-    bash -c 'bash "$1" | grep -qE "^(tmpfs|ramfs)$"' _ "$MKDISK_RUNNER"
+    bash -c 'bash "$1" | drain_grep -qE "^(tmpfs|ramfs)$"' _ "$MKDISK_RUNNER"
 fi
 rm -f "$MKDISK_RUNNER"
 
@@ -1551,11 +1552,11 @@ cp -R "$JOIN_CA_DIR" "$JOIN_CA_DIR_CUSTOM"
 printf 'CLUSTER_DNS="fd00:96::a"\nSERVICE_CIDR="fd00:96::/108,10.96.0.0/12"\n' > "$JOIN_CA_DIR_CUSTOM/config"
 mint_custom_out="$(bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
 assert "the join command carries no network flags even for a non-default dual-stack cluster: the worker reads DNS and families from the cluster, so a forgotten or stale flag cannot make it single-stack" \
-  "$(printf '%s%s' "$mint_out" "$mint_custom_out" | grep -qE -- '--cluster-dns|--cluster-ip-families' && echo 0 || echo 1)"
+  "$(printf '%s%s' "$mint_out" "$mint_custom_out" | drain_grep -qE -- '--cluster-dns|--cluster-ip-families' && echo 0 || echo 1)"
 
 mint_release_out="$(DEFAULT_TARBALL_URL=https://example.invalid/u7s.tar.gz bash "$MINT_RUNNER" "$JOIN_CA_DIR_CUSTOM" 2>&1)"
 assert "the join hint asks for --tarball only when the script has no baked release URL (a release copy fetches its own tarball, so a worker told to supply one follows the wrong recipe)" \
-  "$(printf '%s' "$mint_out" | grep -qF -- '--tarball <path>' && ! printf '%s' "$mint_release_out" | grep -qF -- '--tarball' && echo 1 || echo 0)"
+  "$(printf '%s' "$mint_out" | drain_grep -qF -- '--tarball <path>' && ! printf '%s' "$mint_release_out" | drain_grep -qF -- '--tarball' && echo 1 || echo 0)"
 
 assert "mint creates a bootstrap.kubernetes.io/token Secret named bootstrap-token-<id> in kube-system -- the type and name are what the apiserver authenticator, tokencleaner and bootstrapsigner key on, so a wrong shape means a minted token no node can use" \
   "$([ "$(jq -r .type "$SECRET_JSON")" = bootstrap.kubernetes.io/token ] && [ "$(jq -r .metadata.namespace "$SECRET_JSON")" = kube-system ] && [ "$(jq -r .metadata.name "$SECRET_JSON")" = "bootstrap-token-$(mint_field token-id)" ] && echo 1 || echo 0)"
@@ -1573,9 +1574,9 @@ assert "mint passes the Secret to kubectl on stdin, never argv (token secret vis
   "$(grep -qF "$(mint_field token-secret)" "$JOIN_CA_DIR/kubectl-argv" && echo 0 || echo 1)"
 mint_token="$(mint_field token-id).$(mint_field token-secret)"
 assert "mint prints the CA pin matching the cluster CA's SPKI hash in the join command, so the operator never has to compute it" \
-  "$(printf '%s' "$mint_out" | grep -qF -- "--ca-cert-hash $EXPECTED_CA_HASH" && echo 1 || echo 0)"
+  "$(printf '%s' "$mint_out" | drain_grep -qF -- "--ca-cert-hash $EXPECTED_CA_HASH" && echo 1 || echo 0)"
 assert "the printed join command carries no token (a token in the command line lands in shell history and ps); the token is printed once, separately" \
-  "$(printf '%s\n' "$mint_out" | grep -F 'install.sh --join' | grep -qF "$mint_token" && echo 0 || { printf '%s' "$mint_out" | grep -qF "$mint_token" && echo 1 || echo 0; })"
+  "$(printf '%s\n' "$mint_out" | grep -F 'install.sh --join' | drain_grep -qF "$mint_token" && echo 0 || { printf '%s' "$mint_out" | drain_grep -qF "$mint_token" && echo 1 || echo 0; })"
 assert_false "install.sh no longer passes --token-auth-file to the apiserver unit (static tokens survive restarts forever and cannot be revoked without editing a file)" \
   grep -q -- '--token-auth-file \$STATE_DIR' "$INSTALL"
 assert_false "no join artifact exists any more: nothing in install.sh packs a serving private key into a base64(JSON) blob passed on a command line" \
@@ -1649,7 +1650,7 @@ cpid_out="$(CPID_CA_KEY="$JOIN_WORK/ca.key" bash "$CPID_RUNNER" "$CPID_DIR" 2>&1
 }
 cpid_csr_subject="$(openssl req -in "$CPID_DIR/stub.csr" -noout -subject 2>/dev/null)"
 assert "the control-plane kubelet CSR asks for CN=system:node:<name> in O=system:nodes (the identity the Node authorizer recognises)" \
-  "$(printf '%s' "$cpid_csr_subject" | grep -q 'system:node:cp1' && printf '%s' "$cpid_csr_subject" | grep -q 'system:nodes' && echo 1 || echo 0)"
+  "$(printf '%s' "$cpid_csr_subject" | drain_grep -q 'system:node:cp1' && printf '%s' "$cpid_csr_subject" | drain_grep -q 'system:nodes' && echo 1 || echo 0)"
 assert "the control-plane kubelet CSR uses the kubelet-client signer, the only one csrapproving auto-approves for nodes" \
   "$([ "$(jq -r .spec.signerName "$CPID_DIR/created-csr.json")" = kubernetes.io/kube-apiserver-client-kubelet ] && echo 1 || echo 0)"
 assert "the node kubeconfig points at the issued kubelet client cert/key, not the admin cert" \
@@ -1670,7 +1671,7 @@ FLAGS_RUNNER="$JOIN_WORK/flags.sh"
   echo 'kubelet_round2_flags "$@"'
 } > "$FLAGS_RUNNER"
 assert_false "no kubelet may disable RotateKubeletServerCertificate, which serverTLSBootstrap needs to rotate its serving cert" \
-  bash -c 'bash "$1" 1.37 | grep -q RotateKubeletServerCertificate' _ "$FLAGS_RUNNER"
+  bash -c 'bash "$1" 1.37 | drain_grep -q RotateKubeletServerCertificate' _ "$FLAGS_RUNNER"
 
 # The join succeeds only when the Node is Ready AND the kubelet-filed serving
 # CSR is approved and issued.
@@ -1706,10 +1707,10 @@ assert "join does not report success while the Node has no podCIDRs, even if Rea
   "$([ "$nocidr_status" -ne 0 ] && echo 1 || echo 0)"
 late_status=0; run_wait "$READY_NO_CIDR_NODE" "$ISSUED_CSR" "$READY_DUAL_NODE" >/dev/null || late_status=$?
 assert "the join poll keeps reading the Node after Ready until podCIDRs appear, and forwards on the later v6 podCIDR (stopping at Ready would skip IPv6 forwarding permanently)" \
-  "$([ "$late_status" -eq 0 ] && tail -n1 "$JOIN_WORK/fwd.log" | grep -qF 'fd00:244:0:1::/64' && echo 1 || echo 0)"
+  "$([ "$late_status" -eq 0 ] && tail -n1 "$JOIN_WORK/fwd.log" | drain_grep -qF 'fd00:244:0:1::/64' && echo 1 || echo 0)"
 pend_status=0; pend_out="$(run_wait "$READY_NODE" "$PENDING_CSR")" || pend_status=$?
 assert "join fails loud with recovery text when the serving CSR stays Pending (logs/exec would be broken on a node reported as joined)" \
-  "$([ "$pend_status" -ne 0 ] && printf '%s' "$pend_out" | grep -q 'mint a new token' && echo 1 || echo 0)"
+  "$([ "$pend_status" -ne 0 ] && printf '%s' "$pend_out" | drain_grep -q 'mint a new token' && echo 1 || echo 0)"
 nr_status=0; run_wait "$NOTREADY_NODE" "$ISSUED_CSR" >/dev/null || nr_status=$?
 assert "join fails when the Node never becomes Ready even though the serving cert was issued" \
   "$([ "$nr_status" -ne 0 ] && echo 1 || echo 0)"
@@ -1744,7 +1745,7 @@ assert "a malformed token is rejected before any network call" \
 empty_status=0
 empty_out="$(bash "$TOKEN_RUNNER" "$JOIN_WORK" </dev/null 2>&1)" || empty_status=$?
 assert "empty non-TTY stdin fails with a clear 'no join token' message instead of a silent set -e exit (an unattended join otherwise dies with no explanation)" \
-  "$([ "$empty_status" -ne 0 ] && printf '%s' "$empty_out" | grep -q 'no join token on stdin' && echo 1 || echo 0)"
+  "$([ "$empty_status" -ne 0 ] && printf '%s' "$empty_out" | drain_grep -q 'no join token on stdin' && echo 1 || echo 0)"
 
 # Discovery: the cluster-info JWS must verify under the token and the CA must
 # match the pinned hash -- either failing means trusting an impostor endpoint.
@@ -1892,15 +1893,15 @@ rm -f "$ok_dir/ca-bundle.pem"
 exp_dir="$(new_worker_state expired "$UPG_WORK/expired.crt")"
 exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$?
 assert "an expired client identity fails the upgrade with a re-join-with-a-fresh-token message naming the state to clear (a silently restarted kubelet would crash-loop on 401 with no hint)" \
-  "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | grep -q 'expired' && printf '%s' "$exp_out" | grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | grep -q 'fresh token' && echo 1 || echo 0)"
+  "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | drain_grep -q 'expired' && printf '%s' "$exp_out" | drain_grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | drain_grep -q 'fresh token' && echo 1 || echo 0)"
 
 bothexp_dir="$(new_worker_state both-expired "$UPG_WORK/expired.crt")"
 cp "$UPG_WORK/expired-rotated.crt" "$bothexp_dir/kubelet/pki/kubelet-client-current.pem"
 bothexp_out="$(bash "$VERIFY_RUNNER" "$bothexp_dir" 2>&1)" || true
 assert "the expired-identity message reports the notAfter of the rotated cert the kubelet actually uses, not the stale join-time cert (an operator comparing dates would otherwise misdiagnose when the node lost access)" \
-  "$(printf '%s' "$bothexp_out" | grep -qF "$bothexp_dir/kubelet/pki/kubelet-client-current.pem: notAfter Jan  2 00:00:00 2021" && ! printf '%s' "$bothexp_out" | grep -q '2020' && echo 1 || echo 0)"
+  "$(printf '%s' "$bothexp_out" | drain_grep -qF "$bothexp_dir/kubelet/pki/kubelet-client-current.pem: notAfter Jan  2 00:00:00 2021" && ! printf '%s' "$bothexp_out" | drain_grep -q '2020' && echo 1 || echo 0)"
 assert "the expired-identity message names the join-time cert's notAfter when no rotated cert exists" \
-  "$(printf '%s' "$exp_out" | grep -qF "$exp_dir/kubelet-client.crt: notAfter Jan  2 00:00:00 2020" && echo 1 || echo 0)"
+  "$(printf '%s' "$exp_out" | drain_grep -qF "$exp_dir/kubelet-client.crt: notAfter Jan  2 00:00:00 2020" && echo 1 || echo 0)"
 
 rot_dir="$(new_worker_state rotated "$UPG_WORK/expired.crt")"
 cp "$UPG_WORK/valid.crt" "$rot_dir/kubelet/pki/kubelet-client-current.pem"
@@ -1913,11 +1914,11 @@ mkdir -p "$miss_dir"
 echo 'server: https://cp.example:6443' > "$miss_dir/kubeconfig"
 miss_status=0; miss_out="$(bash "$VERIFY_RUNNER" "$miss_dir" 2>&1)" || miss_status=$?
 assert "a worker kubeconfig without its client cert/key/CA means a join is required, said plainly (upgrading it would start a kubelet that can never authenticate)" \
-  "$([ "$miss_status" -ne 0 ] && printf '%s' "$miss_out" | grep -q 'a join is required' && printf '%s' "$miss_out" | grep -qF "$miss_dir/kubelet-client.crt" && echo 1 || echo 0)"
+  "$([ "$miss_status" -ne 0 ] && printf '%s' "$miss_out" | drain_grep -q 'a join is required' && printf '%s' "$miss_out" | drain_grep -qF "$miss_dir/kubelet-client.crt" && echo 1 || echo 0)"
 nokc_dir="$UPG_WORK/missing-all"; mkdir -p "$nokc_dir"
 nokc_out="$(bash "$VERIFY_RUNNER" "$nokc_dir" 2>&1)" || true
 assert "kubeconfig is not listed as a missing join identity: without it the node is not detected as an existing worker, so the entry could never fire" \
-  "$(printf '%s' "$nokc_out" | grep -qF "$nokc_dir/kubelet-client.crt" && ! printf '%s' "$nokc_out" | grep -qF "$nokc_dir/kubeconfig" && echo 1 || echo 0)"
+  "$(printf '%s' "$nokc_out" | drain_grep -qF "$nokc_dir/kubelet-client.crt" && ! printf '%s' "$nokc_out" | drain_grep -qF "$nokc_dir/kubeconfig" && echo 1 || echo 0)"
 
 # The install.sh worker branch, extracted: with an existing identity it must
 # skip the join, never read a token, and restart kubelet.
@@ -1978,13 +1979,13 @@ worker_upgrade_ipv6_forwarding'
 run_fwd() { rm -f "$UPG_WORK/fwd.log"; GET_FAIL="$1" GET_BODY="$2" bash "$FWD_RUNNER" "$UPG_WORK" 2>&1; }
 fwd_ok_status=0; fwd_ok_out="$(run_fwd 0 '{"spec":{"podCIDRs":["fd00::/64"]}}')" || fwd_ok_status=$?
 assert "the upgrade path passes the Node it read to the forwarding check without warning" \
-  "$([ "$fwd_ok_status" -eq 0 ] && [ "$(cat "$UPG_WORK/fwd.log")" = '{"spec":{"podCIDRs":["fd00::/64"]}}' ] && ! printf '%s' "$fwd_ok_out" | grep -q warning && echo 1 || echo 0)"
+  "$([ "$fwd_ok_status" -eq 0 ] && [ "$(cat "$UPG_WORK/fwd.log")" = '{"spec":{"podCIDRs":["fd00::/64"]}}' ] && ! printf '%s' "$fwd_ok_out" | drain_grep -q warning && echo 1 || echo 0)"
 fwd_get_status=0; fwd_get_out="$(run_fwd 1 '')" || fwd_get_status=$?
 assert "a failed Node GET on upgrade warns naming the node and the curl error, and does not abort the kubelet upgrade (silently skipping leaves a dual-stack worker without IPv6 forwarding)" \
-  "$([ "$fwd_get_status" -eq 0 ] && printf '%s' "$fwd_get_out" | grep -q 'warning: could not read node n1' && printf '%s' "$fwd_get_out" | grep -q 'connection refused' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
+  "$([ "$fwd_get_status" -eq 0 ] && printf '%s' "$fwd_get_out" | drain_grep -q 'warning: could not read node n1' && printf '%s' "$fwd_get_out" | drain_grep -q 'connection refused' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
 fwd_jq_status=0; fwd_jq_out="$(run_fwd 0 'not json')" || fwd_jq_status=$?
 assert "a Node GET that returns unparseable JSON also warns instead of passing garbage to the forwarding check" \
-  "$([ "$fwd_jq_status" -eq 0 ] && printf '%s' "$fwd_jq_out" | grep -q 'warning: could not read node n1' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
+  "$([ "$fwd_jq_status" -eq 0 ] && printf '%s' "$fwd_jq_out" | drain_grep -q 'warning: could not read node n1' && [ ! -e "$UPG_WORK/fwd.log" ] && echo 1 || echo 0)"
 
 # Post-restart verification.
 HB_RUNNER="$UPG_WORK/hb.sh"
@@ -2000,10 +2001,10 @@ assert "a Ready heartbeat older than the restart time is not reported as upgrade
   "$([ "$older_status" -ne 0 ] && echo 1 || echo 0)"
 fresh_out="$(HEARTBEAT=200 BEFORE=100 FP_BEFORE="$valid_fp" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && fresh_status=0 || fresh_status=$?
 assert "a Node that reports Ready with a newer heartbeat and an unchanged client cert is a successful upgrade, reported as such" \
-  "$([ "$fresh_status" -eq 0 ] && printf '%s' "$fresh_out" | grep -q 'client certificate unchanged' && echo 1 || echo 0)"
+  "$([ "$fresh_status" -eq 0 ] && printf '%s' "$fresh_out" | drain_grep -q 'client certificate unchanged' && echo 1 || echo 0)"
 rotd_out="$(HEARTBEAT=200 BEFORE=100 FP_BEFORE="AA:BB" bash "$HB_RUNNER" "$ok_dir" 2>&1)" && rotd_status=0 || rotd_status=$?
 assert "a client cert that changed across the restart is reported as rotated by the kubelet, not as a re-bootstrap" \
-  "$([ "$rotd_status" -eq 0 ] && printf '%s' "$rotd_out" | grep -q 'rotated its client certificate' && echo 1 || echo 0)"
+  "$([ "$rotd_status" -eq 0 ] && printf '%s' "$rotd_out" | drain_grep -q 'rotated its client certificate' && echo 1 || echo 0)"
 exp_after_status=0; HEARTBEAT=200 BEFORE=100 FP_BEFORE=x bash "$HB_RUNNER" "$exp_dir" >/dev/null 2>&1 || exp_after_status=$?
 assert "an upgrade whose client cert is no longer valid afterwards fails loud even if the Node looks Ready" \
   "$([ "$exp_after_status" -ne 0 ] && echo 1 || echo 0)"
@@ -2039,7 +2040,7 @@ cp_state="$UPG_WORK/cp-state"; mkdir -p "$cp_state"
 for f in ca.key ca.crt sa.key sa.pub; do echo "original $f" > "$cp_state/$f"; done
 cp_ok_out="$(bash "$CP_RUNNER" "$cp_state" 2>&1)" && cp_ok_status=0 || cp_ok_status=$?
 assert "a control-plane re-run that leaves ca.* alone succeeds and says no CA was re-minted" \
-  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | grep -q 'no CA re-minted' && echo 1 || echo 0)"
+  "$([ "$cp_ok_status" -eq 0 ] && printf '%s' "$cp_ok_out" | drain_grep -q 'no CA re-minted' && echo 1 || echo 0)"
 cp_rot_status=0; MUTATE=sa.key bash "$CP_RUNNER" "$cp_state" >/dev/null 2>&1 || cp_rot_status=$?
 assert "a rotated sa.key does not fail a control-plane upgrade (the apiserver rotates it on its own)" \
   "$([ "$cp_rot_status" -eq 0 ] && echo 1 || echo 0)"
@@ -2070,19 +2071,19 @@ WAITFILES_RUNNER="$WAITFILES_WORK/run.sh"
 wf_dir="$WAITFILES_WORK/late"; mkdir -p "$wf_dir"
 wf_out="$(APPEAR_AFTER=5 bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
 assert "install waits for files the apiserver writes after its restart returns instead of racing them (a slow first boot otherwise fails the KCM restart)" \
-  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=5' && echo 1 || echo 0)"
+  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | drain_grep -q 'polls=5' && echo 1 || echo 0)"
 
 wf_dir="$WAITFILES_WORK/present"; mkdir -p "$wf_dir"
 for f in ca.crt ca.key intermediate-cert.pem intermediate.key sa.key kubeconfig kcm-kubeconfig; do echo x > "$wf_dir/$f"; done
 wf_out="$(bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
 assert "a re-run with the identity already on disk does not wait (upgrades must not pay the first-boot delay)" \
-  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | grep -q 'polls=0' && echo 1 || echo 0)"
+  "$([ "$wf_status" -eq 0 ] && printf '%s' "$wf_out" | drain_grep -q 'polls=0' && echo 1 || echo 0)"
 
 for missing in ca.crt kcm-kubeconfig intermediate.key; do
   wf_dir="$WAITFILES_WORK/never-$missing"; mkdir -p "$wf_dir"
   wf_out="$(APPEAR_AFTER=1 NEVER="$missing" bash "$WAITFILES_RUNNER" "$wf_dir" 2>&1)" && wf_status=0 || wf_status=$?
   assert "a $missing that never appears fails the install naming that file (an operator must see which artefact is missing, not a later unit failure)" \
-    "$([ "$wf_status" -ne 0 ] && printf '%s' "$wf_out" | grep -qF "error: u7s-apiserver did not write $wf_dir/$missing" && echo 1 || echo 0)"
+    "$([ "$wf_status" -ne 0 ] && printf '%s' "$wf_out" | drain_grep -qF "error: u7s-apiserver did not write $wf_dir/$missing" && echo 1 || echo 0)"
 done
 rm -rf "$WAITFILES_WORK"
 
@@ -2097,10 +2098,10 @@ CMWAIT_RUNNER="$(mktemp)"
 } > "$CMWAIT_RUNNER"
 cm_out="$(FAIL_FIRST=3 bash "$CMWAIT_RUNNER" 2>&1)" && cm_status=0 || cm_status=$?
 assert "install keeps polling until the authentication ConfigMap appears (KCM must not start before it exists)" \
-  "$([ "$cm_status" -eq 0 ] && printf '%s' "$cm_out" | grep -q 'polls=4' && echo 1 || echo 0)"
+  "$([ "$cm_status" -eq 0 ] && printf '%s' "$cm_out" | drain_grep -q 'polls=4' && echo 1 || echo 0)"
 cm_out="$(FAIL_FIRST=9999 bash "$CMWAIT_RUNNER" 2>&1)" && cm_status=0 || cm_status=$?
 assert "a ConfigMap that never appears fails the install with a clear timeout message instead of hanging" \
-  "$([ "$cm_status" -ne 0 ] && printf '%s' "$cm_out" | grep -qF 'extension-apiserver-authentication was not published within 120s' && echo 1 || echo 0)"
+  "$([ "$cm_status" -ne 0 ] && printf '%s' "$cm_out" | drain_grep -qF 'extension-apiserver-authentication was not published within 120s' && echo 1 || echo 0)"
 rm -f "$CMWAIT_RUNNER"
 
 wf_apiserver_line="$(grep -n '^if ! systemctl restart u7s-apiserver.service' "$INSTALL" | cut -d: -f1)"
@@ -2133,8 +2134,8 @@ for cut_at in $(( main_line + 1 )) $(( (main_line + total_lines) / 2 )) $(( tota
   trunc_status=0
   trunc_out="$(bash "$TRUNC_WORK/install.sh" --bogus-flag 2>&1)" || trunc_status=$?
   [ "$trunc_status" -ne 0 ] || trunc_ok=0
-  printf '%s' "$trunc_out" | grep -q 'unknown argument' && trunc_ok=0
-  printf '%s' "$trunc_out" | grep -qiE 'syntax error|unexpected end of file|unexpected EOF' || trunc_ok=0
+  printf '%s' "$trunc_out" | drain_grep -q 'unknown argument' && trunc_ok=0
+  printf '%s' "$trunc_out" | drain_grep -qiE 'syntax error|unexpected end of file|unexpected EOF' || trunc_ok=0
 done
 rm -rf "$TRUNC_WORK"
 assert "a truncated install.sh fails to parse and executes nothing, instead of running a script prefix as root" \
@@ -2182,7 +2183,7 @@ assert "a key matching the pinned fingerprint is installed into the apt keyring"
 rm -f "$KEY_WORK/out.gpg"
 run_key_install "$KEY_WORK/other.asc" "$good_fpr"
 assert "a key with a different fingerprint than the pin is refused, naming expected and actual, and no keyring is written -- a compromised mirror cannot swap in its own key" \
-  "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && printf '%s' "$KEY_OUT" | grep -qF "expected: $good_fpr" && printf '%s' "$KEY_OUT" | grep -qF "actual:   $other_fpr" && echo 1 || echo 0)"
+  "$([ "$KEY_STATUS" -ne 0 ] && [ ! -e "$KEY_WORK/out.gpg" ] && printf '%s' "$KEY_OUT" | drain_grep -qF "expected: $good_fpr" && printf '%s' "$KEY_OUT" | drain_grep -qF "actual:   $other_fpr" && echo 1 || echo 0)"
 
 rm -f "$KEY_WORK/out.gpg"
 run_key_install "$KEY_WORK/both.asc" "$good_fpr"
@@ -2253,7 +2254,7 @@ assert "k3s ranges without --cluster-dns derive 10.43.0.10, k3s's own DNS VIP, s
 net_bad() {
   local why="$1" scenario="$2" expect="$3"
   net_run "$RESOLVE$scenario"
-  assert "$why" "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- "$expect" && echo 1 || echo 0)"
+  assert "$why" "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF -- "$expect" && echo 1 || echo 0)"
 }
 net_bad "a non-CIDR --service-cidr is refused by name instead of reaching the apiserver as a crash loop" \
   'SERVICE_CIDR=10.43.0.0; resolve' "--service-cidr '10.43.0.0' is not a CIDR"
@@ -2291,7 +2292,7 @@ assert "a worker validates only --cluster-dns syntax (it has no service range to
 
 net_run 'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; check_node_ip_outside_ranges 10.43.4.4'
 assert "a node address inside the service range is refused: the host would be unreachable behind its own Service routing" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside 10.43.0.0/16' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'inside 10.43.0.0/16' && echo 1 || echo 0)"
 net_run 'SERVICE_CIDR=10.43.0.0/16; POD_CLUSTER_CIDR=10.42.0.0/16; check_node_ip_outside_ranges 192.168.1.5'
 assert "a node address outside both ranges passes" "$([ "$NET_STATUS" -eq 0 ] && echo 1 || echo 0)"
 
@@ -2325,7 +2326,7 @@ render_vendored_manifests "'"$NET_DEST"'" && echo rendered
 STATE_DIR="'"$NET_WORK"'"; systemctl() { return 1; }
 write_kubelet_config_yaml 0 && echo kubelet'
 assert "rendering the real vendored manifests and kubelet config with k3s ranges succeeds" \
-  "$([ "$NET_STATUS" -eq 0 ] && printf '%s' "$NET_OUT" | grep -qx rendered && printf '%s' "$NET_OUT" | grep -qx kubelet && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -eq 0 ] && printf '%s' "$NET_OUT" | drain_grep -qx rendered && printf '%s' "$NET_OUT" | drain_grep -qx kubelet && echo 1 || echo 0)"
 assert_true "flannel's net-conf Network is the --cluster-cidr" \
   grep -qF '"Network": "10.42.0.0/16"' "$NET_DEST/flannel.yaml"
 assert_true "kube-proxy's clusterCIDR is the --cluster-cidr (it masquerades non-pod traffic to Services)" \
@@ -2335,7 +2336,7 @@ assert_true "beep's --pod-cidr is the --cluster-cidr" \
 assert_true "the CoreDNS kube-dns Service clusterIP is the --cluster-dns" \
   grep -qx '  clusterIP: 10.43.0.10' "$NET_DEST/coredns.yaml"
 assert "no rendered manifest keeps the old default service/pod/DNS addresses outside comments" \
-  "$(grep -hv '^[[:space:]]*#' "$NET_DEST/flannel.yaml" "$NET_DEST/kube-proxy.yaml" "$NET_DEST/beep.yaml" "$NET_DEST/coredns.yaml" | grep -qE '10\.96\.0\.|10\.244\.0\.' && echo 0 || echo 1)"
+  "$(grep -hv '^[[:space:]]*#' "$NET_DEST/flannel.yaml" "$NET_DEST/kube-proxy.yaml" "$NET_DEST/beep.yaml" "$NET_DEST/coredns.yaml" | drain_grep -qE '10\.96\.0\.|10\.244\.0\.' && echo 0 || echo 1)"
 assert_false "no rendered manifest keeps an unresolved __PLACEHOLDER__" \
   grep -qE '__[A-Z_]+__' "$NET_DEST/flannel.yaml" "$NET_DEST/kube-proxy.yaml" "$NET_DEST/beep.yaml"
 assert_true "kubelet-config.yaml's clusterDNS is the --cluster-dns, so pods' resolv.conf points at the CoreDNS Service" \
@@ -2345,7 +2346,7 @@ printf 'kind: Service\nspec:\n  clusterIP: 10.1.2.3\n' > "$NET_WORK/bad-coredns.
 mkdir -p "$NET_WORK/bad" && cp "$NET_WORK/bad-coredns.yaml" "$NET_WORK/bad/coredns.yaml"
 net_run "$K3S"'; render_vendored_manifests "'"$NET_WORK/bad"'"'
 assert "a CoreDNS manifest whose clusterIP line changed shape fails the install instead of shipping the wrong DNS VIP" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF "no 'clusterIP' line" && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF "no 'clusterIP' line" && echo 1 || echo 0)"
 
 # Units and persistence: structural, like the KCM assertions above.
 assert_true "u7s-apiserver.service passes --service-cluster-ip-range and --kube-dns-cluster-ip from the resolved values (the apiserver derives the kubernetes Service VIP and ServiceCIDR from the range)" \
@@ -2418,10 +2419,10 @@ assert "a worker accepts an IPv6 --cluster-dns (the DNS VIP of an IPv6-primary c
 
 net_run "$DUAL"'; check_node_ip_outside_ranges fd00:244:0:5::1'
 assert "an IPv6 node address inside the IPv6 pod range is refused" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside fd00:244::/56' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'inside fd00:244::/56' && echo 1 || echo 0)"
 net_run "$DUAL"'; check_node_ip_outside_ranges 10.244.3.3'
 assert "an IPv4 node address inside the IPv4 pod range of a dual-stack install is refused" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'inside 10.244.0.0/16' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'inside 10.244.0.0/16' && echo 1 || echo 0)"
 net_run "$DUAL"'; check_node_ip_outside_ranges 192.168.1.5 && check_node_ip_outside_ranges 2001:db8::5 && echo ok'
 assert "node addresses outside every range of both families pass" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = ok ] && echo 1 || echo 0)"
@@ -2484,7 +2485,7 @@ net_bad "dropping a family from a dual-stack install is refused: existing dual C
 for bad_mtu in "" "abc" "14x0"; do
   net_run "derive_pod_mtu '$bad_mtu' 0"
   assert "a node whose NIC MTU is '$bad_mtu' (NIC not found) fails with a readable error, not a bash arithmetic trace" \
-    "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -q "NIC MTU must be a whole number, got '$bad_mtu'" && ! printf '%s' "$NET_OUT" | grep -qi 'invalid integer' && echo 1 || echo 0)"
+    "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -q "NIC MTU must be a whole number, got '$bad_mtu'" && ! printf '%s' "$NET_OUT" | drain_grep -qi 'invalid integer' && echo 1 || echo 0)"
 done
 net_run 'derive_pod_mtu 1500 0'
 assert "a numeric NIC MTU still derives the pod MTU (1500 - 74)" \
@@ -2541,14 +2542,14 @@ assert_true "beep gets an IPv6 --pod-cidr, or every IPv6 pod backend is rejected
 assert "beep has exactly two --pod-cidr flags on a dual-stack install" \
   "$([ "$(grep -c -- '--pod-cidr=' "$DUAL_DEST/beep.yaml")" -eq 2 ] && echo 1 || echo 0)"
 assert "CoreDNS Service is PreferDualStack with one kube-dns VIP per family, primary first" \
-  "$(grep -A4 '^  clusterIP: ' "$DUAL_DEST/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack' && echo 1 || echo 0)"
+  "$(grep -A4 '^  clusterIP: ' "$DUAL_DEST/coredns.yaml" | paste -sd'|' - | drain_grep -qxF '  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack' && echo 1 || echo 0)"
 assert_false "no dual-stack rendered manifest keeps an unresolved __PLACEHOLDER__" \
   grep -qE '__[A-Z_]+__' "$DUAL_DEST/flannel.yaml" "$DUAL_DEST/kube-proxy.yaml" "$DUAL_DEST/beep.yaml"
 net_run 'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
 mkdir -p "'"$NET_WORK/dual6"'" && cp "'"$ROOT_DIR"'"/manifests/coredns.yaml "'"$NET_WORK/dual6/"'"
 validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/dual6"'" && echo rendered'
 assert "an IPv6-primary dual-stack CoreDNS lists its IPv6 VIP first and the IPv4 VIP second" \
-  "$(grep -A2 '^  clusterIPs:' "$NET_WORK/dual6/coredns.yaml" | paste -sd'|' - | grep -qxF '  clusterIPs:|  - fd00:96::a|  - 10.96.0.10' && echo 1 || echo 0)"
+  "$(grep -A2 '^  clusterIPs:' "$NET_WORK/dual6/coredns.yaml" | paste -sd'|' - | drain_grep -qxF '  clusterIPs:|  - fd00:96::a|  - 10.96.0.10' && echo 1 || echo 0)"
 mkdir -p "$NET_WORK/v6url"
 cp "$ROOT_DIR"/manifests/kube-proxy.yaml "$NET_WORK/v6url/"
 net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; IFACE=eth0; IFACE_IP=fd00::5; KUBE_VERSION=1.37.1
@@ -2615,23 +2616,23 @@ assert "a dual-stack install on an IPv4 primary address still derives NIC - 94 (
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1406 ] && echo 1 || echo 0)"
 mtu_case 1460 10.0.0.5 10.244.0.0/16 "" 1200
 assert "--pod-mtu below 1280 is refused: pods under the IPv6 minimum MTU break IPv6" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'below 1280' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'below 1280' && echo 1 || echo 0)"
 mtu_case 9000 10.0.0.5 10.244.0.0/16 "" 08000
 assert "--pod-mtu overrides the derivation and is normalised to decimal (08000 must not reach the CNI JSON, where it is invalid)" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 8000 ] && echo 1 || echo 0)"
 mtu_case 9000 10.0.0.5 10.244.0.0/16 "" 14x0
 assert "a non-numeric --pod-mtu is refused rather than written into the CNI JSON" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'whole number' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'whole number' && echo 1 || echo 0)"
 mtu_case "" 10.0.0.5 10.244.0.0/16 "" ""
 assert "an unreadable NIC MTU fails loud and names --pod-mtu instead of installing a guessed value" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
 mtu_case 1300 10.0.0.5 10.244.0.0/16 "" ""
 assert "a derived MTU below 1280 (NIC 1300 - 74) is refused with a pointer to --pod-mtu" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'below 1280' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'below 1280' && echo 1 || echo 0)"
 
 mtu_case 1500 10.0.0.5 10.244.0.0/16 "" 9000
 assert "an explicit --pod-mtu above the NIC MTU is refused: pods could never send a full-size packet" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'exceeds the eth0 MTU 1500' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'exceeds the eth0 MTU 1500' && echo 1 || echo 0)"
 mtu_case 1500 10.0.0.5 10.244.0.0/16 "" 1500
 assert "an explicit --pod-mtu equal to the NIC MTU is accepted" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1500 ] && echo 1 || echo 0)"
@@ -2652,7 +2653,7 @@ net_run 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; POD_MTU=1300
 '"$worker_guard"'
 echo not-refused'
 assert "a worker is refused --pod-mtu (the CNI config is cluster-wide, applied from the control plane)" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
 net_run 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; POD_MTU=""
 '"$worker_guard"'
 echo not-refused'
@@ -2672,11 +2673,11 @@ assert "no file other than install.sh substitutes flannel placeholders itself (f
 for v6 in "" fd00:244::/56; do
   net_run 'render_flannel eth0 10.244.0.0/16 "'"$v6"'" 1426 < "'"$ROOT_DIR"'/manifests/flannel.yaml"'
   assert "render_flannel (v6='${v6:-none}') exits 0 and leaves no __PLACEHOLDER__ in the output" \
-    "$([ "$NET_STATUS" -eq 0 ] && ! printf '%s' "$NET_OUT" | grep -qE '__[A-Z_]+__' && echo 1 || echo 0)"
+    "$([ "$NET_STATUS" -eq 0 ] && ! printf '%s' "$NET_OUT" | drain_grep -qE '__[A-Z_]+__' && echo 1 || echo 0)"
 done
 net_run 'printf "a: __NEW_THING__\n" | render_flannel eth0 10.244.0.0/16 "" 1426'
 assert "render_flannel fails loud on an unknown placeholder instead of shipping it into the CNI config" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF '__NEW_THING__' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF '__NEW_THING__' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Node address list: --iface yields every global-scope family, --node-ip
@@ -2713,10 +2714,10 @@ assert "--node-ip keeps the operator's order, so an IPv6-primary cluster is expr
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = "fd00::5,10.0.0.5" ] && echo 1 || echo 0)"
 net_run 'parse_node_ip_list "10.0.0.5,10.0.0.6"'
 assert "--node-ip with two addresses of one family is rejected (kubelet takes at most one per family)" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'two IPv4' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | drain_grep -q 'two IPv4' && echo 1 || echo 0)"
 net_run 'parse_node_ip_list "eth0"'
 assert "--node-ip rejects a non-IP such as an interface name instead of baking it into unit files" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'not a literal' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | drain_grep -q 'not a literal' && echo 1 || echo 0)"
 net_run 'parse_node_ip_list "10.0.0.5,"'
 assert "--node-ip rejects an empty list entry" \
   "$([ "$NET_STATUS" -ne 0 ] && echo 1 || echo 0)"
@@ -2735,21 +2736,21 @@ net_run "$(node_scenario "$DUAL_RANGES" "" 10.96.0.10)"
 assert "a dual-stack interface puts both families in kubelet --node-ip (control plane and worker units)" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$(echo "$NET_OUT" | grep -c -- '--node-ip=10.0.0.5,2001:db8::5 ')" -eq 2 ] && echo 1 || echo 0)"
 assert "the apiserver advertises the primary IPv4 address and carries the IPv6 address in the serving-cert SANs (a client dialling the node's IPv6 address would otherwise fail TLS verification)" \
-  "$(echo "$NET_OUT" | grep -q -- '--advertise-address https://10.0.0.5:6443 --apiserver-cert-extra-sans 2001:db8::5 ' && echo 1 || echo 0)"
+  "$(echo "$NET_OUT" | drain_grep -q -- '--advertise-address https://10.0.0.5:6443 --apiserver-cert-extra-sans 2001:db8::5 ' && echo 1 || echo 0)"
 V6_PRIMARY='NODE_IP="fd00::5,10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16'
 net_run "$(node_scenario "$V6_PRIMARY" "" fd00:96::a)"
 assert "an IPv6 primary address is bracketed in --listen and --advertise-address (an unbracketed v6 host:port does not parse)" \
-  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--listen \[fd00::5\]:6443,10.0.0.5:6443 --advertise-address https://\[fd00::5\]:6443 --apiserver-cert-extra-sans 10.0.0.5 ' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | drain_grep -q -- '--listen \[fd00::5\]:6443,10.0.0.5:6443 --advertise-address https://\[fd00::5\]:6443 --apiserver-cert-extra-sans 10.0.0.5 ' && echo 1 || echo 0)"
 SINGLE='NODE_IP="10.0.0.5"; NODE_IPS_EXPLICIT=1; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
 net_run "$(node_scenario "$SINGLE" "" 10.96.0.10)"
 assert "a single-stack --node-ip yields a single --node-ip address, one --listen address and no extra-SANs flag (single-stack unit output is unchanged)" \
-  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | grep -q -- '--node-ip=10.0.0.5 ' && echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q 'extra-sans' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -eq 0 ] && echo "$NET_OUT" | drain_grep -q -- '--node-ip=10.0.0.5 ' && echo "$NET_OUT" | drain_grep -q -- '--listen 10.0.0.5:6443 --advertise-address' && ! echo "$NET_OUT" | drain_grep -q 'extra-sans' && echo 1 || echo 0)"
 net_run "$(node_scenario "$DUAL_RANGES" "" 10.96.0.10)"
 assert "a dual-stack node's apiserver listens on every node address, not only the primary (the cert and kubelet advertise both, so an unbound family is unreachable), and never on a wildcard" \
-  "$(echo "$NET_OUT" | grep -q -- '--listen 10.0.0.5:6443,\[2001:db8::5\]:6443 --advertise-address' && ! echo "$NET_OUT" | grep -q -- '--listen 0.0.0.0\|--listen \[::\]' && echo 1 || echo 0)"
+  "$(echo "$NET_OUT" | drain_grep -q -- '--listen 10.0.0.5:6443,\[2001:db8::5\]:6443 --advertise-address' && ! echo "$NET_OUT" | drain_grep -q -- '--listen 0.0.0.0\|--listen \[::\]' && echo 1 || echo 0)"
 net_run "$(node_scenario "$DUAL_RANGES"$'\nip() { echo "2: eth0    inet 10.0.0.5/24 scope global eth0\\\\       valid_lft forever preferred_lft forever"; }' "" 10.96.0.10)"
 assert "dual-stack ranges on a single-family interface abort the install flow itself (not just the helper)" \
-  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'no IPv6 address' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | drain_grep -q 'no IPv6 address' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Node-address x cluster-family matrix, through the real derivation block for
@@ -2834,7 +2835,7 @@ for role in cp worker; do
     net_run "$(cell_scenario "$role" "$m_iface" "$m_mode" "$m_fams")"
     m_ok=0
     case "$m_expect_rest" in
-      ERR:*) [ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- "${m_expect_rest#ERR:}" && m_ok=1 ;;
+      ERR:*) [ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF -- "${m_expect_rest#ERR:}" && m_ok=1 ;;
       *) [ "$NET_STATUS" -eq 0 ] && [ "$(printf '%s' "$NET_OUT" | grep '^RESULT:')" = "RESULT:$m_expect_rest" ] && m_ok=1 ;;
     esac
     [ "$m_ok" -eq 1 ] && MATRIX_OK=$(( MATRIX_OK + 1 ))
@@ -2847,27 +2848,27 @@ for fail_code in 403 404; do
   net_run 'curl() { echo "curl: (22) The requested URL returned error: '"$fail_code"'" >&2; return 22; }
 CLUSTER_FAMILIES=untouched; fetch_cluster_config abcdef.0123456789abcdef; echo "STATUS:$? FAMILIES:$CLUSTER_FAMILIES"'
   assert "a $fail_code reading u7s-cluster-config fails the join naming the ConfigMap (never a silent default to IPv4, which would leave a dual-stack node single-stack)" \
-    "$(printf '%s' "$NET_OUT" | grep -qF 'kube-system/u7s-cluster-config' && printf '%s' "$NET_OUT" | grep -qF "returned error: $fail_code" && printf '%s' "$NET_OUT" | grep -qF 'STATUS:1 FAMILIES:untouched' && echo 1 || echo 0)"
+    "$(printf '%s' "$NET_OUT" | drain_grep -qF 'kube-system/u7s-cluster-config' && printf '%s' "$NET_OUT" | drain_grep -qF "returned error: $fail_code" && printf '%s' "$NET_OUT" | drain_grep -qF 'STATUS:1 FAMILIES:untouched' && echo 1 || echo 0)"
 done
 net_run 'curl() { printf "%s" "{\"data\":{\"podCIDRs\":\"10.244.0.0/16\"}}"; }
 fetch_cluster_config abcdef.0123456789abcdef'
 assert "a ConfigMap without serviceCIDRs/clusterDNS fails the join instead of guessing families" \
-  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'refusing to guess' && echo 1 || echo 0)"
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'refusing to guess' && echo 1 || echo 0)"
 net_run 'curl() { printf "%s\n" "$@" > "$STATE_DIR_ARGV"; printf "%s" "{\"data\":{\"serviceCIDRs\":\"10.96.0.0/12\",\"clusterDNS\":\"10.96.0.10\"}}"; }
 STATE_DIR_ARGV='"$NET_WORK"'/argv; fetch_cluster_config abcdef.0123456789abcdef; cat "$STATE_DIR_ARGV"; echo "FAM:$CLUSTER_FAMILIES DNS:$CLUSTER_DNS"'
 assert "the ConfigMap is read over TLS pinned to the discovered CA and with the token off argv (an unverified or argv-visible read would leak the join token to a MITM or ps)" \
-  "$(printf '%s' "$NET_OUT" | grep -qxF -- '--cacert' && printf '%s' "$NET_OUT" | grep -qF "/var/lib/u7s/ca.pem" && ! printf '%s' "$NET_OUT" | grep -qE -- '^-[a-zA-Z]*k$|^--insecure$|abcdef\.0123456789abcdef' && printf '%s' "$NET_OUT" | grep -qF 'https://cp.example:6443/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config' && echo 1 || echo 0)"
+  "$(printf '%s' "$NET_OUT" | drain_grep -qxF -- '--cacert' && printf '%s' "$NET_OUT" | drain_grep -qF "/var/lib/u7s/ca.pem" && ! printf '%s' "$NET_OUT" | drain_grep -qE -- '^-[a-zA-Z]*k$|^--insecure$|abcdef\.0123456789abcdef' && printf '%s' "$NET_OUT" | drain_grep -qF 'https://cp.example:6443/api/v1/namespaces/kube-system/configmaps/u7s-cluster-config' && echo 1 || echo 0)"
 UNKNOWN_FLAG_OK=1
 for removed in --cluster-ip-families; do
   removed_out="$(bash "$INSTALL" "$removed" 4 2>&1)" || true
-  printf '%s' "$removed_out" | grep -qF "unknown argument: $removed" || UNKNOWN_FLAG_OK=0
+  printf '%s' "$removed_out" | drain_grep -qF "unknown argument: $removed" || UNKNOWN_FLAG_OK=0
 done
 assert "--cluster-ip-families is gone: a worker's families come from the cluster, and a flag that could contradict it would silently re-create the single-stack-on-dual-stack bug" \
   "$UNKNOWN_FLAG_OK"
 assert "a worker refuses --cluster-dns, --service-cidr and --cluster-cidr instead of letting them contradict the cluster's published values" \
   "$(grep -qF '[ -n "$SERVICE_CIDR" ] || [ -n "$POD_CLUSTER_CIDR" ] || [ -n "$CLUSTER_DNS" ]' "$INSTALL" && grep -qF 'a joining or already-joined worker reads them from the cluster' "$INSTALL" && echo 1 || echo 0)"
 assert "a worker validates the families it derived from the cluster, and rejects a malformed set instead of guessing" \
-  "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | grep -q 'must be one of' && echo 1 || echo 0)"
+  "$(net_run 'CLUSTER_DNS=10.96.0.10; CLUSTER_FAMILIES=7; validate_network_config 1'; [ "$NET_STATUS" -ne 0 ] && echo "$NET_OUT" | drain_grep -q 'must be one of' && echo 1 || echo 0)"
 net_run 'cluster_families_from_cidrs "fd00:96::/108,10.96.0.0/12" "10.244.0.0/16"'
 assert "families are the Service ranges' families in order (the primary Service range decides the node's primary family)" \
   "$([ "$NET_OUT" = "6,4" ] && echo 1 || echo 0)"
@@ -2944,28 +2945,28 @@ rdy_run() {
   RDY_OUT="$(PATH="$RDY_WORK/bin:$PATH" FAKE_STATE="$RDY_WORK/state" "$@" bash "$RDY_WORK/scenario.sh" 2>&1)" || RDY_STATUS=$?
 }
 rdy_not_ready() { # $1 = exactly the items that must be named unready
-  [ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF "not Ready after 10s: $1" && echo 1 || echo 0
+  [ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | drain_grep -qF "not Ready after 10s: $1" && echo 1 || echo 0
 }
 assert "the wait scenario was extracted with the real functions (if this fails the wait tests below test nothing)" \
   "$(grep -q 'workload_is_ready()' "$RDY_WORK/scenario.sh" && grep -q 'ready_kubectl()' "$RDY_WORK/scenario.sh" && grep -q '^READY_POLL_SECONDS=' "$RDY_WORK/scenario.sh" && echo 1 || echo 0)"
 
 rdy_run env FAKE_READY_AFTER=0 U7S_READY_TIMEOUT_SECONDS=600
 assert "everything Ready (counters, generation, selected pods) exits 0 so install may report done" \
-  "$([ "$RDY_STATUS" -eq 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'all vendored workloads are Ready' && echo 1 || echo 0)"
+  "$([ "$RDY_STATUS" -eq 0 ] && printf '%s' "$RDY_OUT" | drain_grep -qF 'all vendored workloads are Ready' && echo 1 || echo 0)"
 
 rdy_run env FAKE_READY_AFTER=3 U7S_READY_TIMEOUT_SECONDS=600
 assert "install keeps polling while a workload is not ready and returns 0 only once it is, so a user's first apply never races our image pulls" \
-  "$([ "$RDY_STATUS" -eq 0 ] && [ "$(cat "$RDY_WORK/state")" -eq 4 ] && printf '%s' "$RDY_OUT" | grep -qF 'still waiting' && printf '%s' "$RDY_OUT" | grep -qF 'kube-system/daemonset/kube-proxy' && echo 1 || echo 0)"
+  "$([ "$RDY_STATUS" -eq 0 ] && [ "$(cat "$RDY_WORK/state")" -eq 4 ] && printf '%s' "$RDY_OUT" | drain_grep -qF 'still waiting' && printf '%s' "$RDY_OUT" | drain_grep -qF 'kube-system/daemonset/kube-proxy' && echo 1 || echo 0)"
 
 rdy_run env FAKE_READY_AFTER=never U7S_READY_TIMEOUT_SECONDS=20
 assert "a workload that never becomes ready fails the install non-zero, naming only it with a describe hint -- no silent success" \
-  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'not Ready after 20s: kube-system/daemonset/kube-proxy' && printf '%s' "$RDY_OUT" | grep -qF 'describe daemonset/kube-proxy' && ! printf '%s' "$RDY_OUT" | grep -qF 'describe deployment/coredns' && echo 1 || echo 0)"
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | drain_grep -qF 'not Ready after 20s: kube-system/daemonset/kube-proxy' && printf '%s' "$RDY_OUT" | drain_grep -qF 'describe daemonset/kube-proxy' && ! printf '%s' "$RDY_OUT" | drain_grep -qF 'describe deployment/coredns' && echo 1 || echo 0)"
 assert "the timeout is bounded by the configured seconds (20s at 5s polls = 4 sleeps), not unbounded" \
   "$([ "$(wc -l < "$RDY_WORK/state.sleeps")" -eq 4 ] && echo 1 || echo 0)"
 
 rdy_run env FAKE_NODE_READY=False U7S_READY_TIMEOUT_SECONDS=10
 assert "a node that is not Ready fails the install even when every workload is ready" \
-  "$([ "$(rdy_not_ready node/n1)" = 1 ] && printf '%s' "$RDY_OUT" | grep -qF 'describe node n1' && echo 1 || echo 0)"
+  "$([ "$(rdy_not_ready node/n1)" = 1 ] && printf '%s' "$RDY_OUT" | drain_grep -qF 'describe node n1' && echo 1 || echo 0)"
 
 rdy_run env FAKE_COREDNS_OBS=1 U7S_READY_TIMEOUT_SECONDS=10
 assert "stale Deployment status (observedGeneration < generation, counters still 'ready') is not ready: that is the false done after a restart" \
@@ -2995,7 +2996,7 @@ assert "the deadline is wall time checked before every kubectl call: with 2s cal
 
 rdy_run env U7S_READY_TIMEOUT_SECONDS=abc
 assert "a malformed U7S_READY_TIMEOUT_SECONDS is rejected rather than silently treated as 0" \
-  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | grep -qF 'must be a whole number' && echo 1 || echo 0)"
+  "$([ "$RDY_STATUS" -ne 0 ] && printf '%s' "$RDY_OUT" | drain_grep -qF 'must be a whole number' && echo 1 || echo 0)"
 
 # Structural: the workload list is what the vendored manifests actually ship,
 # and only the control-plane path waits (a worker's node identity cannot read
@@ -3004,8 +3005,8 @@ wl_line="$(grep -F 'CLUSTER_WORKLOADS="kube-system' "$INSTALL")"
 wl_ok=1
 for spec in "coredns.yaml Deployment coredns" "kube-proxy.yaml DaemonSet kube-proxy" "beep.yaml DaemonSet servicelb-controller" "flannel.yaml DaemonSet kube-flannel-ds"; do
   read -r f k n <<< "$spec"
-  awk -v k="$k" '$0=="kind: " k {s=1} s && /^  name: / {print $2; exit}' "$ROOT_DIR/manifests/$f" | grep -qx "$n" || wl_ok=0
-  printf '%s' "$wl_line" | grep -qF "/$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]')/$n" || wl_ok=0
+  awk -v k="$k" '$0=="kind: " k {s=1} s && /^  name: / {print $2; exit}' "$ROOT_DIR/manifests/$f" | drain_grep -qx "$n" || wl_ok=0
+  printf '%s' "$wl_line" | drain_grep -qF "/$(printf '%s' "$k" | tr '[:upper:]' '[:lower:]')/$n" || wl_ok=0
 done
 assert "CLUSTER_WORKLOADS lists exactly the Deployment/DaemonSets the vendored manifests define (a new or renamed workload must be waited on)" "$wl_ok"
 assert "no vendored manifest defines a Deployment/DaemonSet/StatefulSet beyond the four waited on" \
@@ -3022,7 +3023,7 @@ for rule in \
   'signal (send,receive) peer=u7s-default//&*,' \
   'ptrace (trace,read) peer=u7s-default//&*,'; do
   assert "u7s-default profile carries '$rule' -- without it MariaDB and other self-signalling workloads hang (DENIED signal) on AppArmor 5 kernels such as GCP 7.0.0-1017" \
-    "$(printf '%s\n' "$AA_BODY" | grep -qxF "  $rule" && echo 1 || echo 0)"
+    "$(printf '%s\n' "$AA_BODY" | drain_grep -qxF "  $rule" && echo 1 || echo 0)"
 done
 LS_CODE="$(grep -vE '^[[:space:]]*#' "$DIR/conformance/lima-start.sh")"
 ls_line() { printf '%s\n' "$LS_CODE" | grep -nF -- "$1" | head -1 | cut -d: -f1 || true; }
@@ -3035,7 +3036,7 @@ assert "lima-start.sh extracts the u7s-default profile from install.sh -- a seco
 assert "lima-start.sh loads the profile before writing the CRI-O drop-in and before restarting crio -- otherwise CRI-O points at an unloaded profile and sandbox creation fails" \
   "$([ -n "$L_LOAD" ] && [ -n "$L_DROPIN" ] && [ -n "$L_RESTART" ] && [ "$L_LOAD" -lt "$L_DROPIN" ] && [ "$L_DROPIN" -lt "$L_RESTART" ] && echo 1 || echo 0)"
 assert "lima-start.sh reloads when the installed profile differs from install.sh -- otherwise profile edits never reach already-provisioned VMs" \
-  "$(printf '%s\n' "$LS_CODE" | grep -qF '"$AA_INSTALLED" != "$AA_PROFILE"' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$LS_CODE" | drain_grep -qF '"$AA_INSTALLED" != "$AA_PROFILE"' && echo 1 || echo 0)"
 L_HOSTLOOP="$(ls_line 'for p in dig nslookup')"
 L_UNDO="$(ls_line 'rm -f /etc/apparmor.d/disable/$p')"
 L_WANT="$(ls_line 'want="signal (send,receive) peer=@{profile_name}//&u7s-default,"')"
@@ -3044,18 +3045,18 @@ L_HOSTRELOAD="$(ls_line 'apparmor_parser -r /etc/apparmor.d/$p')"
 assert "lima-start.sh adds the stacked-peer signal rule to the host dig/nslookup profiles' local overrides -- without it BIND's self-signal is DENIED and the DNS conformance specs die rc 139 on the arm64 rig" \
   "$([ -n "$L_HOSTLOOP" ] && [ -n "$L_WANT" ] && [ -n "$L_WRITE" ] && echo 1 || echo 0)"
 assert "the host-profile rule is the narrow form (only the u7s-default stacked peer) -- a wider peer would weaken the Ubuntu profiles that must keep enforcing everything else" \
-  "$(printf '%s\n' "$LS_CODE" | grep -F 'want=' | grep -qxF '  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"' && [ "$(printf '%s\n' "$LS_CODE" | grep -c 'want=')" -eq 1 ] && echo 1 || echo 0)"
+  "$(printf '%s\n' "$LS_CODE" | grep -F 'want=' | drain_grep -qxF '  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"' && [ "$(printf '%s\n' "$LS_CODE" | grep -c 'want=')" -eq 1 ] && echo 1 || echo 0)"
 L_AAADD="$(ls_line 'peer={dig,nslookup}//&u7s-default,')"
 assert "lima-start.sh also lets u7s-default signal stacked dig/nslookup peers, before installing the profile -- the stacked label 'dig//&u7s-default' does not match peer=u7s-default//&*, so u7s-default itself still DENIES BIND's self-signal (rc 139) even once the host profiles allow it" \
-  "$([ -n "$L_AAADD" ] && [ -n "$L_LOAD" ] && [ "$L_AAADD" -lt "$L_LOAD" ] && printf '%s\n' "$LS_CODE" | grep -qF 'stacked-peer signal rule not found in install.sh' && echo 1 || echo 0)"
+  "$([ -n "$L_AAADD" ] && [ -n "$L_LOAD" ] && [ "$L_AAADD" -lt "$L_LOAD" ] && printf '%s\n' "$LS_CODE" | drain_grep -qF 'stacked-peer signal rule not found in install.sh' && echo 1 || echo 0)"
 assert "lima-start.sh never unloads or disables the host dig/nslookup profiles -- that would drop all their other confinement" \
-  "$(printf '%s\n' "$LS_CODE" | grep -qE 'apparmor_parser -R|ln -sf .*apparmor.d/disable' && echo 0 || echo 1)"
+  "$(printf '%s\n' "$LS_CODE" | drain_grep -qE 'apparmor_parser -R|ln -sf .*apparmor.d/disable' && echo 0 || echo 1)"
 assert "lima-start.sh removes the old apparmor.d/disable symlinks before reloading so already-converted rigs re-enable the profiles" \
   "$([ -n "$L_UNDO" ] && [ -n "$L_HOSTRELOAD" ] && [ "$L_UNDO" -lt "$L_HOSTRELOAD" ] && echo 1 || echo 0)"
 assert "lima-start.sh writes the local override before reloading the profile -- otherwise the reload picks up the old rules" \
   "$([ -n "$L_WRITE" ] && [ -n "$L_HOSTRELOAD" ] && [ "$L_WRITE" -lt "$L_HOSTRELOAD" ] && echo 1 || echo 0)"
 assert "the host-profile block fails loud (set -euo pipefail) -- a silent failed write/reload leaves the rig broken with no signal" \
-  "$(printf '%s\n' "$LS_CODE" | grep -A1 'bash -c .set -euo pipefail' | grep -qF 'for p in dig nslookup' && ! printf '%s\n' "$LS_CODE" | grep -F 'apparmor_parser -r /etc/apparmor.d/$p' | grep -qF '|| true' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$LS_CODE" | grep -A1 'bash -c .set -euo pipefail' | drain_grep -qF 'for p in dig nslookup' && ! printf '%s\n' "$LS_CODE" | grep -F 'apparmor_parser -r /etc/apparmor.d/$p' | drain_grep -qF '|| true' && echo 1 || echo 0)"
 HB_DIR="$(mktemp -d)"
 mkdir -p "$HB_DIR/aa/local" "$HB_DIR/bin"
 : > "$HB_DIR/aa/dig"; : > "$HB_DIR/aa/nslookup"; : > "$HB_DIR/profiles"
@@ -3084,7 +3085,7 @@ find_bare_apt() { # stdin: numbered lines; prints those running apt-get outside 
   while IFS= read -r line; do
     case "$line" in *'apt-get "${APT_OPTS[@]}"'*) continue ;; esac
     code="$(printf '%s\n' "$line" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g")"
-    printf '%s\n' "$code" | grep -qE '^[^#]*\bapt-get ' && printf '%s\n' "$line"
+    printf '%s\n' "$code" | drain_grep -qE '^[^#]*\bapt-get ' && printf '%s\n' "$line"
   done
   return 0
 }
@@ -3096,9 +3097,9 @@ assert "the bare-apt-get scan ignores apt-get named inside an echoed message -- 
 assert "every apt-get in install.sh goes through the shared APT_OPTS wrapper -- a bare call hangs or fails on the dpkg lock held by unattended-upgrades on a fresh cloud VM" \
   "$([ -z "$bare_apt" ] && echo 1 || { echo "$bare_apt" >&2; echo 0; })"
 assert "APT_OPTS carries the HTTP timeout, Acquire::Retries and dpkg lock wait -- without them install hangs on a silent mirror or aborts on the lock" \
-  "$(grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::http::Timeout=30' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'Acquire::Retries=3' && grep -E '^APT_OPTS=' "$INSTALL" | grep -qF 'DPkg::Lock::Timeout=300' && echo 1 || echo 0)"
+  "$(grep -E '^APT_OPTS=' "$INSTALL" | drain_grep -qF 'Acquire::http::Timeout=30' && grep -E '^APT_OPTS=' "$INSTALL" | drain_grep -qF 'Acquire::Retries=3' && grep -E '^APT_OPTS=' "$INSTALL" | drain_grep -qF 'DPkg::Lock::Timeout=300' && echo 1 || echo 0)"
 assert "the pinned cri-o install passes --allow-downgrades -- otherwise re-running install.sh on a host with a newer cri-o aborts instead of converging to the pin" \
-  "$(grep -E '^apt_install .*cri-o=' "$INSTALL" | grep -qF -- '--allow-downgrades' && echo 1 || echo 0)"
+  "$(grep -E '^apt_install .*cri-o=' "$INSTALL" | drain_grep -qF -- '--allow-downgrades' && echo 1 || echo 0)"
 
 # apt_install behaviour against a stubbed apt-get on PATH (the stub counts
 # install attempts in $STUB_DIR/installs and fails the first $FAIL_FIRST).
@@ -3141,7 +3142,7 @@ rc=0; out="$(run_apt_install 99)" || rc=$?
 assert "a persistent 404 fails non-zero after exactly 3 attempts -- the installer must not loop forever or report success" \
   "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 3 ] && echo 1 || echo 0)"
 assert "the final error names the failing URL and the attempt count -- the user needs both to tell a mirror problem from a typo" \
-  "$(printf '%s\n' "$out" | grep -q 'failed after 3 attempt.*http://mirror.example/ubuntu/pool/crun.deb' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$out" | drain_grep -q 'failed after 3 attempt.*http://mirror.example/ubuntu/pool/crun.deb' && echo 1 || echo 0)"
 rc=0; out="$(run_apt_install 99 other)" || rc=$?
 assert "a non-404 apt failure is not retried and fails non-zero -- retrying a broken package name or dpkg error only delays the real error" \
   "$([ "$rc" -ne 0 ] && [ "$(wc -l < "$STUB_DIR/installs")" -eq 1 ] && echo 1 || echo 0)"
@@ -3235,28 +3236,28 @@ tar_args() { grep 'tar.gz$' "$DL_DIR/bin/args" || true; }
 
 rc=0; out="$(run_fetch fail92x2 "$DL_URL")" || rc=$?
 assert "two HTTP/2 INTERNAL_ERROR (92) drops then success still installs with exactly 3 attempts -- otherwise the first install dies on a mirror hiccup" \
-  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && printf '%s\n' "$out" | drain_grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
 assert "only the third attempt falls back to --http1.1 -- HTTP/2 stream resets must not repeat forever, but HTTP/2 stays the first choice" \
   "$(a=$(tar_args); f=$(printf '%s\n' "$a" | grep -c -- '--http1.1'); e=$(printf '%s\n' "$a" | sed -n '1,2p' | grep -c -- '--http1.1'); [ "$f" -eq 1 ] && [ "$e" -eq 0 ] && echo 1 || echo 0)"
 
 rc=0; out="$(run_fetch partial56 "$DL_URL")" || rc=$?
 assert "a connection reset (56) mid-download is resumed with -C - and the final file hashes to the sidecar -- without resume a 124 MB retry restarts from zero under the same load" \
-  "$([ "$rc" -eq 0 ] && tar_args | grep -q -- '-C -' && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+  "$([ "$rc" -eq 0 ] && tar_args | drain_grep -q -- '-C -' && printf '%s\n' "$out" | drain_grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
 assert "the verified tarball is renamed out of the .part path -- a leftover .part would mean the verified bytes never reached \$TARBALL" \
-  "$(printf '%s\n' "$out" | grep -q PART_LEFT && echo 0 || echo 1)"
+  "$(printf '%s\n' "$out" | drain_grep -q PART_LEFT && echo 0 || echo 1)"
 
 rc=0; out="$(run_fetch badresume "$DL_URL")" || rc=$?
 assert "a resumed download that fails sha256 is deleted and re-fetched clean (last request without -C -), and the installed bytes are the good ones -- a bad splice must never be accepted" \
-  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && [ "$(tar_args | tail -n1 | grep -c -- '-C -')" -eq 0 ] && printf '%s\n' "$out" | grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 3 ] && [ "$(tar_args | tail -n1 | grep -c -- '-C -')" -eq 0 ] && printf '%s\n' "$out" | drain_grep -q "TARBALL_SHA=$DL_GOOD_SUM" && echo 1 || echo 0)"
 rc=0; out="$(run_fetch allbad "$DL_URL")" || rc=$?
 assert "a tarball that never matches its sha256 aborts non-zero after exactly one clean re-download -- a tampered or truncated tarball must not be accepted or looped on" \
-  "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 2 ] && ! printf '%s\n' "$out" | grep -q TARBALL_SHA && echo 1 || echo 0)"
+  "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 2 ] && ! printf '%s\n' "$out" | drain_grep -q TARBALL_SHA && echo 1 || echo 0)"
 
 rc=0; out="$(run_fetch always56 "$DL_URL")" || rc=$?
 assert "a dead mirror fails non-zero after exactly 6 attempts -- the installer must neither hang nor report success" \
   "$([ "$rc" -ne 0 ] && [ "$(tar_calls)" -eq 6 ] && echo 1 || echo 0)"
 assert "the final error names the URL, the attempt count and the last curl error -- the user needs them to tell a mirror outage from a local network fault" \
-  "$(printf '%s\n' "$out" | grep -q "$DL_URL failed after 6 attempt.*curl exit 56: curl: (56) Recv failure" && echo 1 || echo 0)"
+  "$(printf '%s\n' "$out" | drain_grep -q "$DL_URL failed after 6 attempt.*curl exit 56: curl: (56) Recv failure" && echo 1 || echo 0)"
 assert "every attempt keeps --proto =https,file, --proto-redir =https, --tlsv1.2 and -fsSL -- retries must not downgrade transport security" \
   "$([ "$(tar_args | wc -l)" -eq 6 ] && [ "$(tar_args | grep -c -- "--proto =https,file --proto-redir =https --tlsv1.2 -fsSL")" -eq 6 ] && echo 1 || echo 0)"
 assert "every attempt carries a stall guard (--speed-limit/--speed-time) -- a hung stream must be abandoned and retried, not waited out" \
@@ -3297,7 +3298,7 @@ assert "curl exit 33 (server cannot resume) deletes the partial file before retr
   "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 2 ] && [ "$(tr -d '\n' < "$DL_DIR/bin/present")" = 10 ] && echo 1 || echo 0)"
 rc=0; out="$(run_dm "500")" || rc=$?
 assert "the stderr scratch file is gone after a failed download -- no leak on the error path" \
-  "$(printf '%s\n' "$out" | grep -q 'ERR_LEFT=0' && echo 1 || echo 0)"
+  "$(printf '%s\n' "$out" | drain_grep -q 'ERR_LEFT=0' && echo 1 || echo 0)"
 
 # Progress vs stuck: a slow link that times out every attempt but keeps growing
 # the partial file must keep resuming past DOWNLOAD_ATTEMPTS.
@@ -3310,7 +3311,7 @@ assert "every attempt keeps the 1 KB/s stall floor -- 10 KB/s would abort a live
 # Deadline already exhausted: curl never runs and the error says so.
 rc=0; out="$(DM_WINDOW=0 run_dm "200")" || rc=$?
 assert "an exhausted deadline makes zero curl calls, fails non-zero and says the deadline was exhausted -- not 'after 1 attempt(s)', which would blame a mirror that was never contacted" \
-  "$([ "$rc" -ne 0 ] && [ ! -e "$DL_DIR/bin/urls" ] && printf '%s\n' "$out" | grep -q 'overall 1800s deadline' && ! printf '%s\n' "$out" | grep -q 'attempt(s)' && echo 1 || echo 0)"
+  "$([ "$rc" -ne 0 ] && [ ! -e "$DL_DIR/bin/urls" ] && printf '%s\n' "$out" | drain_grep -q 'overall 1800s deadline' && ! printf '%s\n' "$out" | drain_grep -q 'attempt(s)' && echo 1 || echo 0)"
 
 # Backoff sleep must not run past the deadline.
 t0=$SECONDS; rc=0; out="$(DM_DELAY=100 DM_WINDOW=3 run_dm "500")" || rc=$?
@@ -3353,7 +3354,7 @@ INSTALL_AA="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_A
 RIG_SNIPPET="$(awk '/^AA_PROFILE="\$\(awk/ {p=1} /^AA_CRIO_CONF=/ {p=0} p' "$LIMA_START")"
 RIG_AA="$(bash -c "$RIG_SNIPPET"$'\nprintf "%s\\n" "$AA_PROFILE"' "$DIR/conformance/x" 2>/dev/null || true)"
 assert "rig's effective u7s-default profile is install.sh's profile plus exactly the one rig-only signal rule -- otherwise the conformance rig silently drifts from the profile users actually run" \
-  "$([ -n "$INSTALL_AA" ] && ! printf '%s\n' "$INSTALL_AA" | grep -qxF "$RIG_RULE" && [ "$RIG_AA" = "$(printf '%s\n' "$INSTALL_AA" | awk -v r="$RIG_RULE" '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print r}')" ] && echo 1 || echo 0)"
+  "$([ -n "$INSTALL_AA" ] && ! printf '%s\n' "$INSTALL_AA" | drain_grep -qxF "$RIG_RULE" && [ "$RIG_AA" = "$(printf '%s\n' "$INSTALL_AA" | awk -v r="$RIG_RULE" '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print r}')" ] && echo 1 || echo 0)"
 assert_true "install.sh carries the rig-mirror comment -- without it a profile edit would not prompt updating lima-start.sh, and the rig would drift from what users run" \
   grep -q 'Lima conformance rig mirror: scripts/conformance/lima-start.sh' "$INSTALL"
 assert_true "lima-start.sh carries the rig-only-rule comment -- without it the rule's absence from install.sh looks like an omission and gets 'fixed' on one side only, drifting the rig from what users run" \

@@ -6,6 +6,7 @@
 # started and the node never got a podCIDR. curl is stubbed on PATH (no
 # network) to serve a fixture binary plus its .sha256 sidecar.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FETCH="$SCRIPT_DIR/fetch-cached-binary.sh"
@@ -74,7 +75,7 @@ rc=0; out="$("$FETCH" "$URL" "$DEST" 2>&1)" || rc=$?
 assert "a truncated non-executable cache is re-fetched, so KCM starts instead of 'Permission denied'" \
   "$([ "$rc" = 0 ] && [ -x "$DEST" ] && [ "$(shasum_of "$DEST")" = "$(cat "$WORK/srv/kcm.sha256")" ] && [ "$(downloads)" = 3 ] && echo 1 || echo 0)"
 assert "the truncated cache is reported loudly" \
-  "$(printf '%s' "$out" | grep -q 'WARNING.*corrupt' && echo 1 || echo 0)"
+  "$(printf '%s' "$out" | drain_grep -q 'WARNING.*corrupt' && echo 1 || echo 0)"
 
 # Executable but wrong content must also be rejected (mode alone proves nothing).
 head -c 20 "$WORK/srv/kcm" > "$DEST"; chmod +x "$DEST"
@@ -87,7 +88,7 @@ rm -f "$DEST" "$DEST.sha256"
 printf 'corrupted-in-transit' > "$WORK/srv/kcm"
 rc=0; out="$("$FETCH" "$URL" "$DEST" 2>&1)" || rc=$?
 assert "a checksum mismatch on download fails loudly" \
-  "$([ "$rc" != 0 ] && printf '%s' "$out" | grep -q 'sha256 mismatch' && echo 1 || echo 0)"
+  "$([ "$rc" != 0 ] && printf '%s' "$out" | drain_grep -q 'sha256 mismatch' && echo 1 || echo 0)"
 assert "a mismatched download never reaches the final path or leaves a temp file" \
   "$([ ! -e "$DEST" ] && [ "$(ls "$WORK/cache" | wc -l | tr -d ' ')" = 0 ] && echo 1 || echo 0)"
 
