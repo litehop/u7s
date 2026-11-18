@@ -3048,6 +3048,13 @@ echo "$url" >> "$STUB_DIR/urls"
 printf '%s\n' "$all" >> "$STUB_DIR/args"
 [ -e "$dest" ] && echo 1 >> "$STUB_DIR/present" || echo 0 >> "$STUB_DIR/present"
 [ -z "${STUB_SLEEP:-}" ] || sleep "$STUB_SLEEP"
+if [ -n "${STUB_GROW:-}" ]; then
+  # Slow link: the first STUB_GROW calls append a chunk then time out (28).
+  if [ "$(wc -l < "$STUB_DIR/urls")" -le "$STUB_GROW" ]; then
+    echo chunk >> "$dest"; echo "curl: (28) Operation too slow" >&2; exit 28
+  fi
+  echo done >> "$dest"; printf 200; exit 0
+fi
 if [ -n "${STUB_CODES:-}" ]; then
   # Per-call outcome: "<http_code>[:<curl_exit>]"; the last entry repeats.
   k="$(wc -l < "$STUB_DIR/urls")"
@@ -3137,7 +3144,7 @@ run_dm() { # $1 = STUB_CODES; prints output, returns download_mirror's status
   rm -f "$DL_DIR/bin/urls" "$DL_DIR/bin/args" "$DL_DIR/bin/present"
   local d; d="$(mktemp -d)"; echo stale > "$d/dest"
   PATH="$DL_DIR/bin:$PATH" STUB_DIR="$DL_DIR/bin" STUB_CODES="$1" bash -c "$DL_FUNCS"'
-    DOWNLOAD_RETRY_DELAY=0; DOWNLOAD_DIR="$1"; DOWNLOAD_DEADLINE=$((SECONDS + 100))
+    DOWNLOAD_RETRY_DELAY="${DM_DELAY:-0}"; DOWNLOAD_DIR="$1"; DOWNLOAD_DEADLINE=$((SECONDS + ${DM_WINDOW:-100}))
     download_mirror https://mirror.example/x.tar.gz "$1/dest" resume; rc=$?
     ls "$1" | grep -c "^err" | sed "s/^/ERR_LEFT=/"
     exit $rc' _ "$d" 2>&1
@@ -3162,6 +3169,24 @@ assert "curl exit 33 (server cannot resume) deletes the partial file before retr
 rc=0; out="$(run_dm "500")" || rc=$?
 assert "the stderr scratch file is gone after a failed download -- no leak on the error path" \
   "$(printf '%s\n' "$out" | grep -q 'ERR_LEFT=0' && echo 1 || echo 0)"
+
+# Progress vs stuck: a slow link that times out every attempt but keeps growing
+# the partial file must keep resuming past DOWNLOAD_ATTEMPTS.
+rc=0; out="$(STUB_GROW=10 run_dm "")" || rc=$?
+assert "10 timeouts that each advanced the partial file still end in success -- a slow but advancing link must not die after 6 attempts, only no-progress counts (calls: $(tar_calls))" \
+  "$([ "$rc" -eq 0 ] && [ "$(tar_calls)" -eq 11 ] && echo 1 || echo 0)"
+assert "every attempt keeps the 1 KB/s stall floor -- 10 KB/s would abort a live slow link" \
+  "$([ "$(grep -c -- '--speed-limit 1024 --speed-time 10' "$DL_DIR/bin/args")" -eq 11 ] && echo 1 || echo 0)"
+
+# Deadline already exhausted: curl never runs and the error says so.
+rc=0; out="$(DM_WINDOW=0 run_dm "200")" || rc=$?
+assert "an exhausted deadline makes zero curl calls, fails non-zero and says the deadline was exhausted -- not 'after 1 attempt(s)', which would blame a mirror that was never contacted" \
+  "$([ "$rc" -ne 0 ] && [ ! -e "$DL_DIR/bin/urls" ] && printf '%s\n' "$out" | grep -q 'overall 1800s deadline' && ! printf '%s\n' "$out" | grep -q 'attempt(s)' && echo 1 || echo 0)"
+
+# Backoff sleep must not run past the deadline.
+t0=$SECONDS; rc=0; out="$(DM_DELAY=100 DM_WINDOW=3 run_dm "500")" || rc=$?
+assert "retry sleep is clamped to the time left -- with a 100s backoff and 3s deadline the run must end in about 3s, not 100s (took $((SECONDS - t0))s)" \
+  "$([ "$rc" -ne 0 ] && [ "$((SECONDS - t0))" -lt 20 ] && echo 1 || echo 0)"
 
 # One deadline for the whole fetch: each download starts with less time than the
 # previous one (the first tarball call sleeps 2s), sidecars/signatures included,
