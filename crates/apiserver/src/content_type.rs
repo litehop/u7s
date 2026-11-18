@@ -2,7 +2,8 @@
 //
 // Kubelet 1.36+ sends `Accept: application/vnd.kubernetes.protobuf, application/json`
 // on every request.  The ContentTypeService middleware below validates incoming requests
-// and passes responses through unchanged — it does not touch response bodies.
+// and passes responses through unchanged — except ControllerRevision JSON, which gets Go-style
+// HTML escaping (see `escape_html_like_go`).
 //
 // A prior response-side re-encoder was reverted 2026-05-21 (commit 51d54dec) after a
 // client-go decoder crash: that encoder wrapped the *JSON* bytes inside a protobuf
@@ -153,6 +154,52 @@ pub fn negotiated_response(accept: &str, obj: serde_json::Value) -> Response<Bod
     axum::Json(obj).into_response()
 }
 
+/// Rewrites `<`, `>`, `&`, U+2028 and U+2029 in serialized JSON to the `\uXXXX` escapes Go's
+/// `encoding/json` emits. Those characters occur only inside JSON strings, so a byte-level pass
+/// is safe. ControllerRevision `data` is an opaque `RawExtension`: the StatefulSet/DaemonSet
+/// controllers byte-compare it with a fresh `json.Marshal`, and any difference reads as a hash
+/// collision that recreates the pods forever. A multi-byte separator split across two watch
+/// frames is left as is.
+pub(crate) fn escape_html_like_go(json: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(json.len());
+    let mut i = 0;
+    while i < json.len() {
+        match json[i] {
+            b'<' => out.extend_from_slice(b"\\u003c"),
+            b'>' => out.extend_from_slice(b"\\u003e"),
+            b'&' => out.extend_from_slice(b"\\u0026"),
+            0xE2 if json[i + 1..].starts_with(&[0x80, 0xA8]) => {
+                out.extend_from_slice(b"\\u2028");
+                i += 2;
+            }
+            0xE2 if json[i + 1..].starts_with(&[0x80, 0xA9]) => {
+                out.extend_from_slice(b"\\u2029");
+                i += 2;
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn escape_json_body_like_go(resp: Response<Body>) -> Response<Body> {
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if !is_json {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let stream = futures_util::StreamExt::map(body.into_data_stream(), |chunk| {
+        chunk.map(|b| bytes::Bytes::from(escape_html_like_go(&b)))
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 // ---------------------------------------------------------------------------
 // ContentTypeLayer
 // ---------------------------------------------------------------------------
@@ -207,6 +254,11 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        let go_escape = req
+            .uri()
+            .path()
+            .split('/')
+            .any(|s| s == "controllerrevisions");
         let request_id = uuid::Uuid::new_v4();
         // Entered around the whole handler call so that any `tracing::warn!`/`error!` fired
         // deep inside a handler (e.g. util::extract_body's undecodable-protobuf-body warning)
@@ -219,6 +271,9 @@ where
         Box::pin(
             async move {
                 let mut resp = inner.call(req).await?;
+                if go_escape {
+                    resp = escape_json_body_like_go(resp);
+                }
 
                 // Single access-log point for every request — keeps the field set/level
                 // consistent and ensures the status logged is the one actually returned
@@ -378,6 +433,50 @@ mod tests {
             SAMPLE_JSON.as_bytes(),
             "response body must be the original JSON unchanged"
         );
+    }
+
+    /// The StatefulSet controller byte-compares a ControllerRevision's `data` with a Go
+    /// `json.Marshal` (which writes `>` as `>`); serving `>` raw reads as a hash collision
+    /// on every sync and the StatefulSet's pods are deleted and recreated forever.
+    #[tokio::test]
+    async fn controllerrevision_json_is_served_with_go_html_escapes_but_other_kinds_are_not() {
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: r#"{"data":{"cmd":"a > b & c < d"}}"#,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+        let req = |path: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let cr = layer_svc
+            .call(req(
+                "/apis/apps/v1/namespaces/default/controllerrevisions/x",
+            ))
+            .await
+            .unwrap();
+        let cr = axum::body::to_bytes(cr.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let expected = ["a ", "u003e b ", "u0026 c ", "u003c d"].join("\\");
+        assert!(
+            String::from_utf8_lossy(&cr).contains(&expected),
+            "got {}",
+            String::from_utf8_lossy(&cr)
+        );
+
+        let other = layer_svc
+            .call(req("/apis/apps/v1/namespaces/default/configmaps/x"))
+            .await
+            .unwrap();
+        let other = axum::body::to_bytes(other.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&other).contains("a > b"));
     }
 
     /// A 4xx error response must NOT be re-encoded — client-go always reads errors as JSON.

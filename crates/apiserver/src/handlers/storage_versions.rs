@@ -74,6 +74,7 @@ pub(crate) const STORAGE_VERSIONS: &[(&str, &str, &str, &str)] = &[
         "apiregistration.k8s.io",
         "v1",
     ),
+    ("apps", "controllerrevisions", "apps", "v1"),
     ("apps", "daemonsets", "apps", "v1"),
     ("apps", "deployments", "apps", "v1"),
     ("apps", "replicasets", "apps", "v1"),
