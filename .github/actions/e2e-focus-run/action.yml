@@ -353,8 +353,9 @@ runs:
       shell: bash
       run: |
         FLANNEL_RENDERED="$(mktemp)"
-        sed -e "s/__IFACE__/eth0/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g" -e '/"IPv6Network"/d' \
-          manifests/flannel.yaml > "$FLANNEL_RENDERED"
+        . scripts/lib/flannel-render.sh
+        render_flannel_for_nic eth0 "$(cat /sys/class/net/eth0/mtu)" 10.244.0.0/16 "" \
+          < manifests/flannel.yaml > "$FLANNEL_RENDERED"
         kubectl apply --validate=false -f "$FLANNEL_RENDERED"
         rm -f "$FLANNEL_RENDERED"
 

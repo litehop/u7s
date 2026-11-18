@@ -91,10 +91,13 @@ one that drops fragments. flannel's own default (NIC minus 50) is 24 bytes too
 large.
 
 Override the value with `--pod-mtu <mtu>` or `U7S_POD_MTU` (at least 1280, the
-IPv6 minimum). The MTU is written into the cluster-wide flannel manifest from
-the control plane's interface, so every node gets it; pass the flag again on
-each re-run, since it is not persisted, and it applies to pods created after
-the change. A worker whose NIC MTU is smaller than the control plane's needs
+IPv6 minimum, and not above the interface's MTU). The MTU is written into the
+cluster-wide flannel manifest from the control plane's interface, so every node
+gets it. An explicit value is saved in the node's config and reused by a re-run
+without the flag; a derived value is recomputed from the NIC each run. It
+applies to pods created after the change. The cluster's pod MTU is not
+readable from a worker, so `--join` cannot warn: a worker whose NIC MTU minus
+the overhead is below the control plane's pod MTU needs the control plane's
 `--pod-mtu` set low enough for it. `--join` refuses the flag.
 
 ## Dual-stack install

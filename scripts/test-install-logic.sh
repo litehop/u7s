@@ -938,6 +938,7 @@ write_manifest_copy_runner() {
     echo 'POD_MTU=1426'
     echo 'SERVICE_CIDR=10.96.0.0/12; SERVICE_CIDR_IPV4=$SERVICE_CIDR; SERVICE_CIDR_IPV6=""'
     echo 'POD_CLUSTER_CIDR_IPV4=$POD_CLUSTER_CIDR; POD_CLUSTER_CIDR_IPV6=""'
+    awk '/^render_flannel\(\) \{$/,/^\}$/' "$install_script"
     awk '/^render_vendored_manifests\(\) \{$/,/^\}$/' "$install_script"
     awk '/^if \[ "\$WORKER_MODE" -eq 0 \]; then$/,/^fi$/' "$install_script"
   } > "$runner"
@@ -1155,6 +1156,7 @@ write_persist_config_write_runner() {
     echo 'NODE_NAME="$2"'
     echo 'IFACE="$3"'
     echo 'NODE_IP="${4:-}"; NODE_IPS_EXPLICIT=0; [ -z "$NODE_IP" ] || NODE_IPS_EXPLICIT=1'
+    echo 'POD_MTU="${5:-}"; POD_MTU_EXPLICIT=0; [ -z "$POD_MTU" ] || POD_MTU_EXPLICIT=1'
     echo 'WORKER_MODE=0; CLUSTER_DNS=10.96.0.10; SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16'
     awk 'prev == "{" && /NODE_NAME=/ {p=1; print prev} p {print} p && /^} > "\$CONFIG_FILE"$/ {exit} {prev=$0}' "$install_script"
   } > "$runner"
@@ -1171,7 +1173,10 @@ write_persist_config_check_runner() {
     echo 'NODE_NAME="$3"'
     echo 'IFACE="$4"'
     echo 'NODE_IP="${5:-}"'
+    echo 'POD_MTU="${6:-}"'
     awk '/^PERSISTED_NODE_NAME=""$/,/^# --- Network ranges: defaults/ { if ($0 !~ /^# --- Network ranges: defaults/) print }' "$install_script"
+    grep -F '|| POD_MTU="$PERSISTED_POD_MTU"' "$install_script" || true
+    echo 'echo "POD_MTU=$POD_MTU"'
     echo 'echo "NODE_NAME=$NODE_NAME"'
     echo 'echo "IFACE=$IFACE"'
     echo 'echo "NODE_IP=$NODE_IP"'
@@ -1197,6 +1202,24 @@ assert_true "a fresh install persists the resolved node-name to \$STATE_DIR/conf
   grep -qF 'NODE_NAME="node-a"' "$fresh_write_dir/config"
 assert_true "a fresh install persists the resolved iface to \$STATE_DIR/config" \
   grep -qF 'IFACE="eth0"' "$fresh_write_dir/config"
+
+# An explicit --pod-mtu is persisted and reused by a bare re-run; a derived one
+# is not (it must follow the NIC). Without it, a bare re-run re-renders flannel
+# with the derived value and silently resets the cluster-wide CNI MTU.
+mtu_persist_dir="$PERSIST_WORK/mtu-persist"
+mkdir -p "$mtu_persist_dir" "$PERSIST_WORK/mtu-derived"
+bash "$PERSIST_WRITE_RUNNER" "$mtu_persist_dir" "node-a" "eth0" "" 1300
+bash "$PERSIST_WRITE_RUNNER" "$PERSIST_WORK/mtu-derived" "node-a" "eth0"
+assert_true "an explicit --pod-mtu is persisted to \$STATE_DIR/config" \
+  grep -qF 'POD_MTU="1300"' "$mtu_persist_dir/config"
+assert_false "a derived pod MTU is not persisted, so it keeps following the NIC" \
+  grep -q 'POD_MTU' "$PERSIST_WORK/mtu-derived/config"
+assert "a re-run without --pod-mtu reuses the persisted explicit value (else the cluster-wide flannel MTU silently resets)" \
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" "" 2>&1)" | grep -qx 'POD_MTU=1300' && echo 1 || echo 0)"
+assert "a new --pod-mtu overrides the persisted one" \
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$mtu_persist_dir" 1 "" "" "" 1400 2>&1)" | grep -qx 'POD_MTU=1400' && echo 1 || echo 0)"
+assert "with nothing persisted, a re-run without --pod-mtu stays unset (derived)" \
+  "$(printf "%s\n" "$(bash "$PERSIST_CHECK_RUNNER" "$PERSIST_WORK/mtu-derived" 1 "" "" "" "" 2>&1)" | grep -qx 'POD_MTU=' && echo 1 || echo 0)"
 
 # Case 2: an upgrade re-run with no --iface/--node-name flags (NODE_NAME/IFACE
 # arrive empty, exactly as install.sh's own flag-parsing leaves them unset)
@@ -2182,12 +2205,12 @@ NET_WORK="$(mktemp -d)"
 trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
 {
   for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs fetch_cluster_config \
-    reconcile_network_flag check_node_ip_outside_ranges iface_mtu resolve_pod_mtu render_vendored_manifests write_kubelet_config_yaml; do
+    reconcile_network_flag check_node_ip_outside_ranges iface_mtu derive_pod_mtu render_flannel resolve_pod_mtu render_vendored_manifests write_kubelet_config_yaml; do
     awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
   done
 } > "$NET_WORK/fns.sh"
 assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
-  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 24 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 26 ] && echo 1 || echo 0)"
 
 # net_run <scenario>: runs <scenario> after the extracted functions with the
 # production defaults loaded; sets NET_STATUS/NET_OUT.
@@ -2597,6 +2620,13 @@ mtu_case 1300 10.0.0.5 10.244.0.0/16 "" ""
 assert "a derived MTU below 1280 (NIC 1300 - 74) is refused with a pointer to --pod-mtu" \
   "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'below 1280' && echo 1 || echo 0)"
 
+mtu_case 1500 10.0.0.5 10.244.0.0/16 "" 9000
+assert "an explicit --pod-mtu above the NIC MTU is refused: pods could never send a full-size packet" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'exceeds the eth0 MTU 1500' && echo 1 || echo 0)"
+mtu_case 1500 10.0.0.5 10.244.0.0/16 "" 1500
+assert "an explicit --pod-mtu equal to the NIC MTU is accepted" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1500 ] && echo 1 || echo 0)"
+
 MTU_DEST="$NET_WORK/rendered-mtu"
 mkdir -p "$MTU_DEST"
 cp "$ROOT_DIR"/manifests/flannel.yaml "$MTU_DEST/"
@@ -2606,8 +2636,38 @@ assert_true "flannel's CNI delegate carries the resolved pod MTU, so every pod i
   grep -qE '^ +"mtu": 1386,$' "$MTU_DEST/flannel.yaml"
 assert_true "the install flow resolves the pod MTU on a control plane only (a worker has no flannel manifest to render)" \
   grep -qF 'resolve_pod_mtu || exit 1' "$INSTALL"
-assert_true "a worker is refused --pod-mtu (the CNI config is cluster-wide, applied from the control plane)" \
-  grep -qF -- '--cluster-dns/--pod-mtu are control-plane settings' "$INSTALL"
+worker_guard="$(awk '/^  if \[ -n "\$SERVICE_CIDR" \] \|\| .*POD_MTU/ {p=1} p {print} p && /^  fi$/ {exit}' "$INSTALL")"
+assert "the worker guard was extracted from install.sh (if this fails the next checks test nothing)" \
+  "$([ -n "$worker_guard" ] && echo 1 || echo 0)"
+net_run 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; POD_MTU=1300
+'"$worker_guard"'
+echo not-refused'
+assert "a worker is refused --pod-mtu (the CNI config is cluster-wide, applied from the control plane)" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
+net_run 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; POD_MTU=""
+'"$worker_guard"'
+echo not-refused'
+assert "a worker with no control-plane flags passes the guard" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = not-refused ] && echo 1 || echo 0)"
+assert_true "docs/install.md tells operators a joining node's smaller NIC needs a lower --pod-mtu on the control plane (the cluster MTU is not readable from a worker, so install.sh cannot warn)" \
+  grep -qF 'readable from a worker' "$ROOT_DIR/docs/install.md"
+
+# Placeholder-survival guard: every flannel render path must leave no
+# __PLACEHOLDER__, since a surviving "mtu": __POD_MTU__ breaks every pod's CNI
+# setup. install.sh and the rig/CI helper are executed above and in
+# conformance/test-dual-stack-lan-logic.sh; here, no other file may carry its
+# own substitution of flannel's placeholders.
+rogue="$(grep -rlE 's[/#]__(IFACE|POD_CLUSTER_CIDR_IPV4|POD_MTU)__' "$ROOT_DIR/scripts" "$ROOT_DIR/.github" 2>/dev/null | grep -vE "/scripts/install.sh$|/scripts/test-install-logic.sh$|/scripts/conformance/test-dual-stack-lan-logic.sh$" || true)"
+assert "no file other than install.sh substitutes flannel placeholders itself (found: ${rogue:-none}); a private sed is how the CI render missed __POD_MTU__" \
+  "$([ -z "$rogue" ] && echo 1 || echo 0)"
+for v6 in "" fd00:244::/56; do
+  net_run 'render_flannel eth0 10.244.0.0/16 "'"$v6"'" 1426 < "'"$ROOT_DIR"'/manifests/flannel.yaml"'
+  assert "render_flannel (v6='${v6:-none}') exits 0 and leaves no __PLACEHOLDER__ in the output" \
+    "$([ "$NET_STATUS" -eq 0 ] && ! printf '%s' "$NET_OUT" | grep -qE '__[A-Z_]+__' && echo 1 || echo 0)"
+done
+net_run 'printf "a: __NEW_THING__\n" | render_flannel eth0 10.244.0.0/16 "" 1426'
+assert "render_flannel fails loud on an unknown placeholder instead of shipping it into the CNI config" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF '__NEW_THING__' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Node address list: --iface yields every global-scope family, --node-ip

@@ -1083,7 +1083,8 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 # whichever node's --iface value wins the last apply is not a correctness issue.
 echo "Applying flannel CNI DaemonSet..."
 FLANNEL_RENDERED="$(mktemp)"
-rig_render_flannel "$LIMA_VM_IFACE" "$DUAL_STACK" < "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
+LIMA_VM_IFACE_MTU=$(limactl shell "$VM_NAME" cat "/sys/class/net/$LIMA_VM_IFACE/mtu" | tr -d '[:space:]')
+rig_render_flannel "$LIMA_VM_IFACE" "$DUAL_STACK" "$LIMA_VM_IFACE_MTU" < "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
 kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$FLANNEL_RENDERED"
 rm -f "$FLANNEL_RENDERED"
 
