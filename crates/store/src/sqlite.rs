@@ -486,34 +486,8 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     pub fn new(db_path: &str) -> Result<Self> {
-        let write_conn = open_conn(db_path, WRITE_CACHE_SIZE_KIB)?;
-
-        // Run migrations on the write connection.
-        write_conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS objects (
-                key      TEXT    NOT NULL PRIMARY KEY,
-                value    BLOB    NOT NULL,
-                revision INTEGER NOT NULL,
-                ns       TEXT,
-                obj_name TEXT
-            ) WITHOUT ROWID;
-
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT NOT NULL PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
-
-            CREATE INDEX IF NOT EXISTS idx_pods_nodename
-            ON objects (json_extract(value, '$.spec.nodeName'))
-            WHERE key LIKE '/registry/pods/%';
-
-            CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);
-        ",
-        )?;
+        let mut write_conn = open_conn(db_path, WRITE_CACHE_SIZE_KIB)?;
+        prepare_schema(&mut write_conn, STORE_FORMAT, MIGRATIONS)?;
 
         let write_conn = Arc::new(Mutex::new(write_conn));
 
@@ -1205,6 +1179,69 @@ fn restrict_db_files(path: &str) -> std::io::Result<()> {
             _ => {}
         }
     }
+    Ok(())
+}
+
+/// On-disk format of the store, kept in SQLite's `PRAGMA user_version`. Bump it only for an
+/// incompatible schema or stored-encoding change, and add the matching step to `MIGRATIONS`.
+/// Independent of the u7s release version.
+pub const STORE_FORMAT: i64 = 1;
+
+/// `MIGRATIONS[n - 1]` upgrades a store from format `n` to `n + 1`.
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[];
+
+const SCHEMA_V1: &str = "
+    CREATE TABLE IF NOT EXISTS objects (
+        key      TEXT    NOT NULL PRIMARY KEY,
+        value    BLOB    NOT NULL,
+        revision INTEGER NOT NULL,
+        ns       TEXT,
+        obj_name TEXT
+    ) WITHOUT ROWID;
+
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT NOT NULL PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+
+    CREATE INDEX IF NOT EXISTS idx_pods_nodename
+    ON objects (json_extract(value, '$.spec.nodeName'))
+    WHERE key LIKE '/registry/pods/%';
+
+    CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);
+";
+
+/// Brings the database to `supported` in one transaction. `user_version` 0 is a fresh database
+/// or one from before versioning; both get the base schema (idempotent) and are stamped 1.
+/// A newer format is refused without any write.
+fn prepare_schema(
+    conn: &mut Connection,
+    supported: i64,
+    migrations: &[fn(&Connection) -> Result<()>],
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let found: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if found > supported {
+        return Err(StoreError::NewerFormat { found, supported });
+    }
+    let mut version = found;
+    if version == 0 {
+        tx.execute_batch(SCHEMA_V1)?;
+        version = 1;
+    }
+    while version < supported {
+        migrations[(version - 1) as usize](&tx)?;
+        version += 1;
+    }
+    // Re-run so indexes added since the store was created appear on every open.
+    tx.execute_batch(SCHEMA_V1)?;
+    if version != found {
+        tx.pragma_update(None, "user_version", version)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3000,6 +3037,142 @@ mod tests {
             .await
             .expect("put");
         (store, db_path_str)
+    }
+
+    fn format_db_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("u7s-format-{tag}-{nanos}.db"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn user_version(path: &str) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn table_names(path: &str) -> Vec<String> {
+        let conn = Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// A new install must be stamped, or the next release could not tell it apart from a
+    /// pre-versioning store and would have no base to migrate from.
+    #[test]
+    fn fresh_store_is_stamped_with_current_format() {
+        let path = format_db_path("fresh");
+        drop(SqliteStore::new(&path).unwrap());
+        assert_eq!(user_version(&path), STORE_FORMAT);
+    }
+
+    /// Upgrading an install that predates versioning must keep the cluster's data and just
+    /// stamp it; losing objects on upgrade would wipe the cluster.
+    #[test]
+    fn pre_versioning_store_is_stamped_and_keeps_its_data() {
+        let path = format_db_path("legacy");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO objects (key, value, revision) VALUES ('/registry/configmaps/a/x', X'7b7d', 1)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(user_version(&path), 0, "fixture must look pre-versioning");
+        }
+        drop(SqliteStore::new(&path).unwrap());
+        assert_eq!(user_version(&path), STORE_FORMAT);
+        let n: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM objects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "existing object must survive stamping");
+    }
+
+    /// Every restart reopens the store; reopening must not reset or lose anything.
+    #[tokio::test]
+    async fn reopening_at_current_format_keeps_data_and_version() {
+        let (store, path) = file_store_with_one_object("reopen").await;
+        drop(store);
+        let store = SqliteStore::new(&path).unwrap();
+        assert!(store
+            .get("/registry/configmaps/a/x")
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(user_version(&path), STORE_FORMAT);
+    }
+
+    /// An older binary pointed at newer data could misread or corrupt it, so startup must
+    /// fail naming both formats, and must not touch the file.
+    #[test]
+    fn newer_format_store_is_refused_and_left_untouched() {
+        let path = format_db_path("newer");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", STORE_FORMAT + 1)
+                .unwrap();
+        }
+        let err = match SqliteStore::new(&path) {
+            Ok(_) => panic!("newer format must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("{}", STORE_FORMAT + 1))
+                && err.contains(&format!("supported format {STORE_FORMAT}"))
+                && err.contains("newer u7s"),
+            "error must name both formats and the cause: {err}"
+        );
+        assert_eq!(user_version(&path), STORE_FORMAT + 1);
+        assert!(
+            table_names(&path).is_empty(),
+            "refused store must get no schema"
+        );
+    }
+
+    fn step_a(conn: &Connection) -> Result<()> {
+        conn.execute_batch("CREATE TABLE step_log (n INTEGER); INSERT INTO step_log VALUES (1);")?;
+        Ok(())
+    }
+
+    fn step_b(conn: &Connection) -> Result<()> {
+        conn.execute_batch("INSERT INTO step_log VALUES (2);")?;
+        Ok(())
+    }
+
+    /// Forward migrations must run once each, in order, and leave the new version stamped;
+    /// otherwise an upgrade would skip or repeat schema changes.
+    #[test]
+    fn migrations_apply_in_order_from_the_stored_format() {
+        let path = format_db_path("migrate");
+        let mut conn = Connection::open(&path).unwrap();
+        prepare_schema(&mut conn, 1, &[]).unwrap();
+        prepare_schema(&mut conn, 3, &[step_a, step_b]).unwrap();
+        let log: Vec<i64> = conn
+            .prepare("SELECT n FROM step_log ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(log, vec![1, 2]);
+        assert_eq!(user_version(&path), 3);
+        prepare_schema(&mut conn, 3, &[step_a, step_b]).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM step_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "reopening at the new format must not re-run steps");
     }
 
     /// A local user who can read state.db, -wal or -shm reads every Secret in the cluster.
