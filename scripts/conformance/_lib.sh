@@ -446,6 +446,8 @@ lan_v6_seed_mesh() {
 # Single-stack rigs keep the IPv4 values.
 RIG_POD_CIDR_V4="10.244.0.0/16"
 RIG_POD_CIDR_V6="fd00:244::/56"
+# Lima VM NICs are 1500; install.sh derives NIC - 74 for an IPv4 underlay.
+RIG_POD_MTU=1426
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
 RIG_SERVICE_CIDR_V4="10.96.0.0/12"
 
@@ -560,7 +562,7 @@ rig_kube_proxy_cluster_cidr() {
 rig_render_flannel() {
   local v6=(-e '/"IPv6Network"/d')
   [ "$2" -eq 1 ] && v6=(-e "s#__POD_CLUSTER_CIDR_IPV6__#${RIG_POD_CIDR_V6}#g")
-  sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" "${v6[@]}"
+  sed -e "s/__IFACE__/$1/g" -e "s#__POD_CLUSTER_CIDR_IPV4__#${RIG_POD_CIDR_V4}#g" -e "s#__POD_MTU__#${RIG_POD_MTU}#g" "${v6[@]}"
 }
 
 # Renders manifests/coredns.yaml (stdin to stdout): the Service's clusterIP is

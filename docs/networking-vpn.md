@@ -52,14 +52,15 @@ answer.
 
 ## MTU
 
-Nothing to set. flannel derives the pod MTU from the interface: `wg0` came up
-at 1380 (the NIC's 1460 minus WireGuard's 80), `flannel.1` and pod `eth0` at
-1330 (minus 50 for VXLAN). From the control plane, `ping -M do -s 1302 <worker pod IP>`
-passed and `-s 1303` failed locally; a 1 MB cross-node transfer and the LB
-transfers completed. Only this auto-derived path was tested, on a 1460
-underlay. Setting `MTU` in `wg0.conf` for a smaller underlay, or a wrong `wg0`
-MTU after install, was not tested; check the boundary with the `ping -M do`
-probe above (`-s` = pod MTU minus 28).
+`install.sh` sets the pod MTU to the `--iface` MTU minus 74 (minus 94 on an
+IPv6 underlay or dual-stack), the room beep's Geneve encapsulation needs; see
+[Pod MTU](install.md#pod-mtu). `--iface wg0` at 1380 (the NIC's 1460 minus
+WireGuard's 80) therefore gives pods 1306. flannel's `flannel.1` stays at the
+interface MTU minus 50. A cross-node transfer and the LB transfers completed
+on the earlier flannel-derived 1330 on a 1460 underlay; the 1306 value was
+not run over the mesh. Setting `MTU` in `wg0.conf` for a smaller underlay,
+or a wrong `wg0` MTU after install, was not tested; check the boundary with
+a `ping -M do` probe (`-s` = pod MTU minus 28) or pass `--pod-mtu`.
 
 ## Firewall
 

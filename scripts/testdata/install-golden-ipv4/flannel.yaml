@@ -3,7 +3,7 @@
 # of an install.sh heredoc -- kube-proxy's DaemonSet gets the same treatment
 # (manifests/kube-proxy.yaml).
 #
-# Two install-time placeholders scripts/install.sh substitutes before writing this file into
+# Install-time placeholders scripts/install.sh substitutes before writing this file into
 # --manifest-output-dir (kept as literal tokens here, not real values, since this is the
 # source-of-truth copy Renovate/Dependabot scans for the *fixed* image tags below -- a
 # per-node value has no business being a committed default):
@@ -17,6 +17,8 @@
 #                           never drift apart (they agree today: 10.244.0.0/16 is also
 #                           flannel's and this project's own default). Single-stack installs
 #                           drop the EnableIPv6/IPv6Network line.
+#   1426            install.sh's pod MTU: the NIC's MTU minus beep's Geneve overhead
+#                           (74 bytes, 94 on an IPv6 underlay or dual-stack), or --pod-mtu.
 #
 # Departures from upstream:
 #   - flanneld gets both --iface and --iface-regex, matching install.sh's own $IFACE
@@ -28,6 +30,8 @@
 #     falling through to the regex.
 #   - net-conf.json's Network (and, dual-stack, IPv6Network) is templated, not upstream's
 #     hardcoded literal.
+#   - cni-conf.json's delegate sets "mtu" explicitly: flannel would otherwise derive NIC MTU - 50,
+#     which leaves no room for beep's Geneve encapsulation of LoadBalancer traffic.
 #   - Images come from docker.io/flannel/* (has AAAA) pinned by digest, not upstream's ghcr.io
 #     (no AAAA, unreachable from IPv6-only nodes); docs/decisions/container-images-ipv6-reachable-registries.md.
 apiVersion: v1
@@ -99,6 +103,7 @@ data:
         {
           "type": "flannel",
           "delegate": {
+            "mtu": 1426,
             "hairpinMode": true,
             "isDefaultGateway": true
           }

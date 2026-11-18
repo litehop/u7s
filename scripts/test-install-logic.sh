@@ -935,6 +935,7 @@ write_manifest_copy_runner() {
     echo 'KUBE_VERSION="${6:-1.37.1}"'
     echo 'IFACE_IP="${7:-10.0.0.1}"'
     echo 'CLUSTER_DNS="${8:-10.96.0.10}"'
+    echo 'POD_MTU=1426'
     echo 'SERVICE_CIDR=10.96.0.0/12; SERVICE_CIDR_IPV4=$SERVICE_CIDR; SERVICE_CIDR_IPV6=""'
     echo 'POD_CLUSTER_CIDR_IPV4=$POD_CLUSTER_CIDR; POD_CLUSTER_CIDR_IPV6=""'
     awk '/^render_vendored_manifests\(\) \{$/,/^\}$/' "$install_script"
@@ -2181,12 +2182,12 @@ NET_WORK="$(mktemp -d)"
 trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK"' EXIT
 {
   for fn in ipv4_to_int int_to_ipv4 ip6_to_hex ip6_hex_to_str ip6_mask_hex ip6_prefix_equal ip6_add_hex parse_cidr parse_cidr_list cidrs_overlap kcm_node_cidr_mask_flags default_cluster_dns validate_network_config iface_global_addrs parse_node_ip_list reconcile_node_ips_with_families cluster_families_from_cidrs fetch_cluster_config \
-    reconcile_network_flag check_node_ip_outside_ranges render_vendored_manifests write_kubelet_config_yaml; do
+    reconcile_network_flag check_node_ip_outside_ranges iface_mtu resolve_pod_mtu render_vendored_manifests write_kubelet_config_yaml; do
     awk -v f="$fn" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
   done
 } > "$NET_WORK/fns.sh"
 assert "all network-range functions were extracted from install.sh (if this fails the behavioral tests below test nothing)" \
-  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 22 ] && echo 1 || echo 0)"
+  "$([ "$(grep -c '^[a-z0-9_]*() {$' "$NET_WORK/fns.sh")" -eq 24 ] && echo 1 || echo 0)"
 
 # net_run <scenario>: runs <scenario> after the extracted functions with the
 # production defaults loaded; sets NET_STATUS/NET_OUT.
@@ -2194,6 +2195,7 @@ net_run() {
   {
     echo 'set -uo pipefail'
     echo 'DEFAULT_SERVICE_CIDR="10.96.0.0/12"; DEFAULT_POD_CLUSTER_CIDR="10.244.0.0/16"'
+    echo 'POD_MTU=1386'
     echo 'SERVICE_CIDR=""; POD_CLUSTER_CIDR=""; CLUSTER_DNS=""; CLUSTER_FAMILIES=""; EXISTING_INSTALL=0; DUAL_STACK_UPGRADE=0; POD_CIDR_UPGRADE=0'
     echo 'SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""; POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""'
     echo 'CONFIG_FILE=/var/lib/u7s/config; STATE_DIR=/var/lib/u7s; JOIN_SERVER=https://cp.example:6443'
@@ -2529,7 +2531,7 @@ GOLDEN_DIR="$DIR/testdata/install-golden-ipv4"
 GOLDEN_OUT="$NET_WORK/golden"
 mkdir -p "$GOLDEN_OUT" "$NET_WORK/golden-man"
 cp "$ROOT_DIR"/manifests/*.yaml "$NET_WORK/golden-man/"
-golden_scenario='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10
+golden_scenario='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; POD_MTU=1426
 BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; APISERVER_LISTEN=192.168.1.5:6443; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.1
 validate_network_config 0 || exit 1
 KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
@@ -2554,6 +2556,58 @@ for gold in "$GOLDEN_DIR"/*; do
   assert "single-stack IPv4 $(basename "$gold") is byte-identical to the pre-dual-stack installer output, so upgrading an existing cluster rewrites nothing" \
     "$(cmp -s "$gold" "$GOLDEN_OUT/$(basename "$gold")" && echo 1 || echo 0)"
 done
+
+# ---------------------------------------------------------------------------
+# Pod MTU: beep delivers LoadBalancer traffic to pods in Geneve (74 B over an
+# IPv4 underlay, 94 B over IPv6). A pod MTU of NIC-50 (flannel's default) leaves
+# full-size packets 24 B over the NIC; an underlay that drops fragments then
+# stalls them silently, so the derived value must leave room for the overhead.
+# ---------------------------------------------------------------------------
+# mtu_case <nic mtu> <primary node ip> <pod cidr v4> <pod cidr v6> <--pod-mtu>
+mtu_case() {
+  net_run 'IFACE=eth0; IFACE_IP='"$2"'; POD_CLUSTER_CIDR_IPV4='"$3"'; POD_CLUSTER_CIDR_IPV6='"$4"'; POD_MTU='"$5"'
+iface_mtu() { echo '"$1"'; }
+resolve_pod_mtu && echo "$POD_MTU"'
+}
+mtu_case 1460 10.0.0.5 10.244.0.0/16 "" ""
+assert "GCP (NIC 1460) on an IPv4 underlay derives pod MTU 1386 (NIC - 74) so beep's Geneve packets fit without fragmenting" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1386 ] && echo 1 || echo 0)"
+mtu_case 1500 10.0.0.5 10.244.0.0/16 "" ""
+assert "a 1500 NIC on an IPv4 underlay derives pod MTU 1426 (NIC - 74)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1426 ] && echo 1 || echo 0)"
+mtu_case 1460 fd00::5 "" fd00:244::/56 ""
+assert "an IPv6 underlay derives NIC - 94 (1366 on GCP): the outer IPv6 header is 20 B larger, so NIC - 74 would overflow" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1366 ] && echo 1 || echo 0)"
+mtu_case 1500 10.0.0.5 10.244.0.0/16 fd00:244::/56 ""
+assert "a dual-stack install on an IPv4 primary address still derives NIC - 94 (1406 on 1500): either family may carry the Geneve underlay" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 1406 ] && echo 1 || echo 0)"
+mtu_case 1460 10.0.0.5 10.244.0.0/16 "" 1200
+assert "--pod-mtu below 1280 is refused: pods under the IPv6 minimum MTU break IPv6" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'below 1280' && echo 1 || echo 0)"
+mtu_case 9000 10.0.0.5 10.244.0.0/16 "" 08000
+assert "--pod-mtu overrides the derivation and is normalised to decimal (08000 must not reach the CNI JSON, where it is invalid)" \
+  "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = 8000 ] && echo 1 || echo 0)"
+mtu_case 9000 10.0.0.5 10.244.0.0/16 "" 14x0
+assert "a non-numeric --pod-mtu is refused rather than written into the CNI JSON" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'whole number' && echo 1 || echo 0)"
+mtu_case "" 10.0.0.5 10.244.0.0/16 "" ""
+assert "an unreadable NIC MTU fails loud and names --pod-mtu instead of installing a guessed value" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF -- '--pod-mtu' && echo 1 || echo 0)"
+mtu_case 1300 10.0.0.5 10.244.0.0/16 "" ""
+assert "a derived MTU below 1280 (NIC 1300 - 74) is refused with a pointer to --pod-mtu" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | grep -qF 'below 1280' && echo 1 || echo 0)"
+
+MTU_DEST="$NET_WORK/rendered-mtu"
+mkdir -p "$MTU_DEST"
+cp "$ROOT_DIR"/manifests/flannel.yaml "$MTU_DEST/"
+net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; IFACE=eth0; IFACE_IP=192.168.1.5; POD_MTU=1386
+validate_network_config 0 && render_vendored_manifests "'"$MTU_DEST"'" && echo rendered'
+assert_true "flannel's CNI delegate carries the resolved pod MTU, so every pod interface gets it instead of flannel's NIC-50" \
+  grep -qE '^ +"mtu": 1386,$' "$MTU_DEST/flannel.yaml"
+assert_true "the install flow resolves the pod MTU on a control plane only (a worker has no flannel manifest to render)" \
+  grep -qF 'resolve_pod_mtu || exit 1' "$INSTALL"
+assert_true "a worker is refused --pod-mtu (the CNI config is cluster-wide, applied from the control plane)" \
+  grep -qF -- '--cluster-dns/--pod-mtu are control-plane settings' "$INSTALL"
 
 # ---------------------------------------------------------------------------
 # Node address list: --iface yields every global-scope family, --node-ip

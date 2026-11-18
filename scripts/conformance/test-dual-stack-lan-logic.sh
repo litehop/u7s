@@ -97,7 +97,7 @@ flannel_single=$(rig_render_flannel eth0 0 < "$ROOT/manifests/flannel.yaml")
 check "single-stack flannel has no IPv6Network" \
   "0" "$(printf '%s\n' "$flannel_single" | grep -c 'IPv6Network"')"
 check "single-stack flannel render is byte-identical to the pre-dual-stack sed" \
-  "$(sed -e 's/__IFACE__/eth0/g' -e 's#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g' -e '/"IPv6Network"/d' "$ROOT/manifests/flannel.yaml")" "$flannel_single"
+  "$(sed -e 's/__IFACE__/eth0/g' -e 's#__POD_CLUSTER_CIDR_IPV4__#10.244.0.0/16#g' -e 's#__POD_MTU__#1426#g' -e '/"IPv6Network"/d' "$ROOT/manifests/flannel.yaml")" "$flannel_single"
 check "no unresolved placeholder in either flannel render" \
   "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z0-9_]+__[",]' || true)"
 check "dual-stack CoreDNS Service has a VIP per family, PreferDualStack" \
