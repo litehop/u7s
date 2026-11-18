@@ -17,7 +17,7 @@ between releases. Do not run production workloads against it yet.
 3. systemd as PID 1 and root access. OpenSSL 3+ is needed only to verify a
    downloaded tarball.
 4. Outbound HTTPS to `u7s.dekiru.tech` (installer and release), the container
-   registries `ghcr.io` (IPv4-only today, no AAAA record), `registry.k8s.io`
+   registries `registry.k8s.io`
    and Docker Hub, and the CDN and auth hosts they redirect to; the CRI-O apt
    mirror `slc-mirror.opensuse.org`; and your distribution's package mirrors.
 5. At least 1 dedicated vCPU, 1 GiB RAM and about 10 GB of disk. First boot to

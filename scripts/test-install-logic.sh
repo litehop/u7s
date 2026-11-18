@@ -473,6 +473,12 @@ assert_true "manifests/flannel.yaml's --iface is a __IFACE__ placeholder scripts
 assert_true "manifests/flannel.yaml's net-conf.json Network is a __POD_CLUSTER_CIDR_IPV4__ placeholder scripts/install.sh substitutes, so it can never drift from kube-controller-manager's own --cluster-cidr" \
   grep -qF '"Network": "__POD_CLUSTER_CIDR_IPV4__"' "$FLANNEL_MANIFEST"
 
+assert_false "manifests/flannel.yaml pulls no image from ghcr.io -- ghcr.io has no AAAA record, so an IPv6-only node could never pull flannel and would never get pod networking" \
+  grep -qE 'image: ghcr\.io/' "$FLANNEL_MANIFEST"
+
+assert_true "every manifests/flannel.yaml image is docker.io/flannel/* pinned by sha256 digest -- docker.io is IPv6-reachable and a digest pin keeps the pulled bytes the verified ones even if a tag is re-pushed" \
+  test "$(grep -cE '^[[:space:]]+image: docker\.io/flannel/[a-z-]+:[^@ ]+@sha256:[0-9a-f]{64}$' "$FLANNEL_MANIFEST")" = "$(grep -c '^[[:space:]]*image:' "$FLANNEL_MANIFEST")"
+
 assert_true "install.sh disables CRI-O's own default bridge CNI conflist(s) once Flannel supplies the real one -- CRI-O picks whichever CNI config file sorts first alphabetically, so leaving 10-crio-bridge.conflist active would silently keep winning over Flannel's 10-flannel.conflist" \
   grep -qF 'mv "$CNI_DIR/$f" "$CNI_DIR/$f.disabled"' "$INSTALL"
 
