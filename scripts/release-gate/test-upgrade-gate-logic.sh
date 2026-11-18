@@ -35,6 +35,13 @@ assert "default previous release skips a newer snapshot tag (upgrading from a pr
 empty="$TMP/empty"; git -C "$TMP" init -q empty
 git -C "$empty" -c user.name=t -c user.email=t@t commit -q --allow-empty -m a
 git -C "$empty" tag v0.1.0-snapshot.1
+git -C "$R" tag -d v0.4.7-snapshot.1 >/dev/null
+git -C "$R" checkout -q v0.4.6
+got="$(cd "$R" && ug_default_from)"
+assert "HEAD exactly on a release tag picks the previous release, not itself (upgrading a release to itself tests nothing)" "$(yes_if [ "$got" = v0.4.5 ])"
+git -C "$R" -c user.name=t -c user.email=t@t commit -q --allow-empty -m d
+got="$(cd "$R" && ug_default_from)"
+assert "HEAD past a release tag picks that release" "$(yes_if [ "$got" = v0.4.6 ])"
 assert "no release tag reachable fails instead of guessing a previous release" "$(yes_if bash -c "cd '$empty' && . '$HERE/upgrade-lib.sh' && ! ug_default_from >/dev/null")"
 assert "tag validation accepts releases and snapshots" "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; ug_tag_valid v0.4.6 && ug_tag_valid v0.4.7-snapshot.2")"
 assert "tag validation rejects a path-like value that would reach a mirror URL" "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; ! ug_tag_valid 'v0.4.6/../x' && ! ug_tag_valid latest")"
@@ -74,6 +81,27 @@ before="$TMP/before.log"
 assert "samples outside the window (an earlier blip) are not charged to this phase" \
   "$(yes_if [ "$(ug_downtime_summary "$before" 100 102)" = "max_gap=2 failed=0 samples=2" ])"
 
+trail="$TMP/trail.log"
+{ echo "100 200"; echo "102 200"; echo "104 FAIL"; echo "170 FAIL"; } > "$trail"
+s="$(ug_downtime_summary "$trail" 100 170)"
+assert "an API that answers then stays down to the window end fails the bound (trailing outage)" \
+  "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; [ '$s' = 'max_gap=68 failed=2 samples=4' ] && ! ug_downtime_ok '$s'")"
+lead="$TMP/lead.log"
+{ echo "100 FAIL"; echo "165 200"; echo "167 200"; echo "169 200"; } > "$lead"
+s="$(ug_downtime_summary "$lead" 100 170)"
+assert "an API that is down from the window start until late fails the bound (leading outage)" \
+  "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; [ '$s' = 'max_gap=65 failed=1 samples=4' ] && ! ug_downtime_ok '$s'")"
+
+# ---- state files preserved ----
+printf 'aaa  ca.key\nbbb  ca.crt\n' > "$TMP/h-pre.txt"
+cp "$TMP/h-pre.txt" "$TMP/h-same.txt"
+assert "an unchanged hash is preserved" "$(yes_if ug_hash_preserved "$TMP/h-pre.txt" "$TMP/h-same.txt" ca.key)"
+printf 'zzz  ca.key\nbbb  ca.crt\n' > "$TMP/h-changed.txt"
+assert "a changed hash is not preserved (regenerated CA)" "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; ! ug_hash_preserved '$TMP/h-pre.txt' '$TMP/h-changed.txt' ca.key")"
+assert "a file missing before and after is not preserved (empty == empty must not pass)" "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; ! ug_hash_preserved '$TMP/h-pre.txt' '$TMP/h-same.txt' sa.pub")"
+printf 'bbb  ca.crt\n' > "$TMP/h-lost.txt"
+assert "a file deleted by the upgrade is not preserved" "$(yes_if bash -c ". '$HERE/upgrade-lib.sh'; ! ug_hash_preserved '$TMP/h-pre.txt' '$TMP/h-lost.txt' ca.key")"
+
 # ---- pod continuity ----
 pre="$TMP/pre.txt"
 printf 'default/dep-a aaa 0,\ndefault/dep-b bbb 0,\ndefault/ds-x ccc 0,0,\n' > "$pre"
@@ -94,7 +122,7 @@ assert "an additional pod does not fail continuity" "$(yes_if [ -z "$(ug_continu
 # ---- verdict ----
 good="$TMP/good.env"
 {
-  for k in cand_install version ca sa_pub marker workload downtime rerun_install rerun_quiet; do echo "$k=1"; done
+  for k in cand_install node_ready version ca sa_pub marker workload downtime rerun_install rerun_quiet; do echo "$k=1"; done
   echo "done=1"
 } > "$good"
 assert "all checks passing is PASS (exit 0)" "$(yes_if ug_run_status "$good")"
@@ -114,6 +142,11 @@ assert "a failed previous-release install is INVALID (exit 3): the candidate was
 dtbad="$TMP/dt.env"; sed 's/^downtime=1/downtime=0/' "$good" > "$dtbad"
 rc=0; ug_run_status "$dtbad" || rc=$?
 assert "an out-of-bound outage fails the run" "$(yes_if [ "$rc" = 1 ])"
+
+nrbad="$TMP/nr.env"; sed 's/^node_ready=1/node_ready=0/' "$good" > "$nrbad"
+rc=0; ug_run_status "$nrbad" || rc=$?
+assert "a node that never returns Ready fails the run" "$(yes_if [ "$rc" = 1 ])"
+assert "the verdict table names the node check" "$(yes_if grep -q '^FAIL  node Ready' <(ug_verdict "$nrbad"))"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

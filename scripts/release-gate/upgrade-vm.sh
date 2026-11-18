@@ -118,9 +118,10 @@ sleep 6
 log "upgrade: candidate install.sh, no flags"
 T_UP0="$(date +%s)"
 install_cand upgrade; UP_RC=$?
-wait_node_ready 150 || log "node not Ready 5 min after the upgrade"
+NODE_UP=1; wait_node_ready 150 || { NODE_UP=0; log "node not Ready 5 min after the upgrade"; }
 sleep 20
 T_UP1="$(date +%s)"
+res node_ready "$NODE_UP"
 
 res cand_install "$([ "$UP_RC" = 0 ] && echo 1 || echo 0)"
 res cand_install_detail "exit $UP_RC"
@@ -134,7 +135,7 @@ state_hashes > "$OUT/hashes-post.txt"
 for pair in "ca|ca.key ca.crt" "sa_pub|sa.pub"; do
   key="${pair%%|*}"; files="${pair#*|}"; changed=""
   for f in $files; do
-    [ "$(grep " $f\$" "$OUT/hashes-pre.txt" | cut -d' ' -f1)" = "$(grep " $f\$" "$OUT/hashes-post.txt" | cut -d' ' -f1)" ] && [ -s "$OUT/hashes-post.txt" ] || changed="$changed $f"
+    ug_hash_preserved "$OUT/hashes-pre.txt" "$OUT/hashes-post.txt" "$f" || changed="$changed $f"
   done
   res "$key" "$([ -z "$changed" ] && echo 1 || echo 0)"
   res "${key}_detail" "${changed:+changed:$changed}"
@@ -158,7 +159,7 @@ log "upgrade API downtime: $dt"
 log "idempotence: candidate install.sh again"
 T_RE0="$(date +%s)"
 install_cand rerun; RE_RC=$?
-wait_node_ready 150 || log "node not Ready after the re-run"
+NODE_RE=1; wait_node_ready 150 || { NODE_RE=0; log "node not Ready after the re-run"; }
 sleep 20
 T_RE1="$(date +%s)"
 res rerun_install "$([ "$RE_RC" = 0 ] && echo 1 || echo 0)"
@@ -166,7 +167,7 @@ res rerun_install_detail "exit $RE_RC"
 pod_state > "$OUT/pods-rerun.txt"
 cont2="$(ug_continuity_problems "$OUT/pods-post.txt" "$OUT/pods-rerun.txt")"
 dt2="$(ug_downtime_summary "$OUT/readyz.log" "$T_RE0" "$T_RE1")"
-ok2=0; [ -z "$cont2" ] && ug_downtime_ok "$dt2" && ok2=1
+ok2=0; [ -z "$cont2" ] && ug_downtime_ok "$dt2" && [ "$NODE_RE" = 1 ] && ok2=1
 res rerun_quiet "$ok2"
 res rerun_quiet_detail "$(echo "${cont2:+$cont2; }$dt2" | tr '\n' ';')"
 log "re-run API downtime: $dt2"

@@ -15,6 +15,7 @@ UG_MAX_DOWNTIME_SECS="${UG_MAX_DOWNTIME_SECS:-60}"
 
 # check-key|verdict label, in report order.
 UG_CHECKS="cand_install|candidate install.sh exits 0
+node_ready|node Ready after the upgrade
 version|server version changed to the candidate's
 ca|CA (ca.key, ca.crt) preserved
 sa_pub|service-account public keyring (sa.pub) preserved
@@ -24,9 +25,21 @@ downtime|API /readyz outage within bound
 rerun_install|candidate install.sh re-run exits 0
 rerun_quiet|re-run recreates and restarts nothing, API stays up"
 
-# Newest non-snapshot release tag reachable from HEAD; non-zero if there is none.
+# Newest non-snapshot release tag before the candidate; non-zero if there is none. HEAD sitting
+# exactly on a release tag is the candidate itself, so the search starts from its parent.
 ug_default_from() {
-  git describe --tags --abbrev=0 --exclude '*-snapshot*' 2>/dev/null
+  local base=HEAD
+  git describe --tags --exact-match --exclude '*-snapshot*' HEAD >/dev/null 2>&1 && base=HEAD^
+  git describe --tags --abbrev=0 --exclude '*-snapshot*' "$base" 2>/dev/null
+}
+
+# $1 hashes-pre, $2 hashes-post ("<sha256>  <file>" lines), $3 file name. Exit 0 only if the file
+# was hashed before and the hash is identical after; a file missing from both is not preserved.
+ug_hash_preserved() {
+  local pre post
+  pre="$(grep " $3\$" "$1" | cut -d' ' -f1)"
+  post="$(grep " $3\$" "$2" | cut -d' ' -f1)"
+  [ -n "$pre" ] && [ "$pre" = "$post" ]
 }
 
 ug_tag_valid() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; }
@@ -47,16 +60,18 @@ ug_version_problem() {
 # $1 file of "<epoch> <http code>" /readyz samples, $2/$3 window start/end epochs.
 # Echoes "max_gap=<s> failed=<n> samples=<n>": the longest time between consecutive 200s inside
 # the window (upper bound of the outage; a healthy 2 s poll shows 2-4), the non-200 samples, and
-# the sample count. No 200 at all reports the whole window as the gap.
+# the sample count. The gap runs from the window start to the first 200 and from the last 200 to
+# the window end too; no 200 at all reports the whole window as the gap.
 ug_downtime_summary() {
   awk -v from="$2" -v to="$3" '
     $1 >= from && $1 <= to {
       n++
-      if ($2 == 200) { if (seen && $1 - prev > gap) gap = $1 - prev; prev = $1; seen = 1 }
+      if ($2 == 200) { if ($1 - (seen ? prev : from) > gap) gap = $1 - (seen ? prev : from); prev = $1; seen = 1 }
       else failed++
     }
     END {
       if (!seen) gap = to - from
+      else if (to - prev > gap) gap = to - prev
       printf "max_gap=%d failed=%d samples=%d\n", gap, failed, n
     }' "$1"
 }
