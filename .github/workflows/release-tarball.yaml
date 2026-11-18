@@ -71,6 +71,24 @@ jobs:
           echo "v=$V" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
+      - name: Extract release notes from CHANGELOG.md
+        # Fails the build, before the expensive steps, when a non-snapshot
+        # release has no curated section.
+        if: steps.version.outputs.prerelease == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
+        run: |
+          mkdir release-notes
+          scripts/changelog-section.sh "$VERSION" > release-notes/notes.md
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.version.outputs.prerelease == 'false'
+        with:
+          name: release-notes
+          path: release-notes/notes.md
+          if-no-files-found: error
+          retention-days: 1
+
       # No rust-cache: a cache restored from main-branch CI would feed
       # attacker-controlled build output into the release.
       - name: Install pinned Rust toolchain
@@ -162,6 +180,12 @@ jobs:
           name: release-dist
           path: dist/
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.build.outputs.prerelease == 'false'
+        with:
+          name: release-notes
+          path: release-notes/
+
       - name: Verify artifact against the build job's digests
         # Digests travel as job outputs, a different channel from the artifact,
         # so a tampered or truncated artifact fails here.
@@ -219,11 +243,14 @@ jobs:
           VERSION: ${{ needs.build.outputs.version }}
           PRERELEASE: ${{ needs.build.outputs.prerelease }}
         run: |
-          prerelease_flag=""
-          [ "$PRERELEASE" = "true" ] && prerelease_flag="--prerelease"
+          if [ "$PRERELEASE" = "true" ]; then
+            notes=(--prerelease --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh.")
+          else
+            [ -s release-notes/notes.md ] || { echo "error: release-notes/notes.md missing or empty for non-snapshot $VERSION" >&2; exit 1; }
+            notes=(--notes-file release-notes/notes.md)
+          fi
           # See docs/decisions/distribution-hosting-shape.md.
           gh release create "$VERSION" dist/* \
             --target "$GITHUB_SHA" \
             --title "$VERSION" \
-            --notes "u7s $VERSION for linux/amd64: u7s-apiserver, u7s-scheduler, kubelet, and kube-controller-manager, plus the matching install.sh." \
-            $prerelease_flag
+            "${notes[@]}"
