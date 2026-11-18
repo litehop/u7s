@@ -70,9 +70,9 @@ assert "vale crash exits 2 (a broken config must not look clean)" \
 printf '%s' "$U7S_WARN" > "$SANDBOX/out.json"
 OUT="$(PATH="$SANDBOX/bin:$PATH" STUB_JSON="$SANDBOX/out.json" "$SCRIPT" --github 2>&1)"
 assert "report lists the u7s rule that fired" \
-  "$(echo "$OUT" | grep -q 'u7s.Minimizing' && echo 1 || echo 0)"
+  "$(grep -q 'u7s.Minimizing' <<<"$OUT" && echo 1 || echo 0)"
 assert "--github emits an annotation" \
-  "$(echo "$OUT" | grep -q '^::warning file=a.md,line=1' && echo 1 || echo 0)"
+  "$(grep -q '^::warning file=a.md,line=1' <<<"$OUT" && echo 1 || echo 0)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
