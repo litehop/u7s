@@ -1,39 +1,35 @@
 ---
-updated: 2026-11-17T15:10Z
+updated: 2026-11-18T13:35Z
 ---
-# Dashboard — hand-off after 2026-11-17 (main `e074a92d`) — v0.4.5 out; next v0.4.6
-**Stance:** alpha (no compat promise); correctness > security > perf > features; upstream 1.37.1 except secure crypto; queue merge on green, never `--admin`; security PRs drafted for operator.
-**Resume:** paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons; `bd recall release-plan-v0-4-6`.
+# Dashboard — session 2026-11-18 closed (main `6f8b7d37`) — v0.4.7 released
+**Stance:** alpha (no compat promise); correctness > security > perf > features; upstream 1.37.1 except secure crypto; queue merge on green, never `--admin`; security PRs drafted for operator; every release gated (agent runs burst + upgrade gates, operator pushes tags + approves publish).
+**Resume:** paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons; `bd recall release-plan-v0-4-7`; `bd recall upgrade-policy-prev-release-only-until-prod`.
 
 ## 🎯 Waiting on you
-1. (Optional) post the cri-o issue drafted in `temp/cri-o-issue-apparmor-stacked-peer.md`.
+1. (Optional) post the cri-o issue in `temp/cri-o-issue-apparmor-stacked-peer.md`.
 
-## ⏭ Next session → v0.4.6 once all three are on main and audit is green
-- **`mayor-bekfa` (P1) cargo audit red on main**: chrono + chrono-tz newly "unmaintained" (RUSTSEC-2026-0543/0555), via u7s-apiserver and cel 0.16
-- `mayor-1diau` pod MTU = NIC − 74/94 (beep Geneve); then notify beep mayor (earlier notice undelivered)
-- `mayor-u015m` download_mirror status-branch tests, overall time cap, temp-file trap
-- `mayor-na818` flannel from docker.io/flannel, digest-pinned
-- then snapshot → `--confirm` 3/3 on pd-balanced → release
+## ⏭ Next — update story (migration `te4sn.5` after)
+- `docs/upgrading.md` against the decided policy (Vale's first real use)
+- `mayor-ur8p9` P2 SIGPIPE-prone pipes in ~30 non-test scripts (install.sh first) · `umkeu` P2 flannel restart on MTU change
+- Then top-10 triage of the ~100 ready beads
 
 ## ⏭ Later
-`mayor-lwwze` AppArmor detector (design approved; doc on `worker/agent-a8ffaf53174ff3c38` @ `6c03cb34`) · `mayor-kyhhp` DNS on generic-kernel real installs · `mayor-6ftew` DRA delete · `mayor-06ha8` 2-node rig · epic `mayor-c12qi` watchdog · `mayor-ie064` Renovate pins · `mayor-g06uz` CRI-O 1.37.4 · `mayor-qnix7` · `mayor-xqog5` reviewer posting · #2068 mariadb.
+`oisst` version truncation · `umkeu` flannel MTU restart · `oisst` version truncation · `3l1se` · `wvd1p` · `ccwwb` · `uv9ga` · `5mqdd` · hygiene `gpud5`/`qh7ko` · later: `te4sn.5`, `8leyz` (12-17), `lwwze`, `kyhhp`, `6ftew`, `06ha8`, `c12qi`, `ie064`, `g06uz`
 
-## ✅ Session 2026-11-17
-**v0.4.5 released** (`92562be8`, gate 3/3) · beep run 1 PASS · Conformance 452/462 · #2158 #2161 #2165 #2166 #2168 #2170 #2171 install/gate/rig fixes · #2169 relay hardening (deployed) · #2156 README alpha. Decisions in bead notes.
+## ✅ 2026-11-18
+**v0.4.7 released** 13:29Z (`d9e45502`; burst 3/3 + upgrade 10/10, `mayor-nhpl9`) · **v0.4.6 released** (`dec6f6e3`) · #2189 CI CNI plugins from pinned GitHub release, cached by digest (`6f8b7d37`) · #2181 advisory Vale lint (`d9e45502`) · #2186 SIGPIPE-safe test greps + guard · #2187/#2188 v0.4.7 changelog (`6d008d78` = snapshot commit) · #2183 upgrade check Lima+GCP (`6fab1015`) · #2185 CI eth0 → default-route NIC (`430a9d97`) · #2184 StatefulSet churn fix (`7aa44e32`) · #2182 store `user_version` (`b8789597`) · audits `4genk`, `fqktu` (archive tags) · #2180 #2176 #2177 #2175 #2174 #2173 · memories 380→326.
 
 <!-- BEGIN AUTO: open-prs -->
-- #2068 examples(mariadb): drop CPU limit, small InnoDB args (partial: first init still ~50% on e2-micro) (`worker/agent-a60ed75eb02f26db1`, CLEAN)
+None open.
 <!-- END AUTO: open-prs -->
 <!-- BEGIN AUTO: worktrees -->
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a60ed75eb02f26db1` (`worker/agent-a60ed75eb02f26db1`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/agent-a8ffaf53174ff3c38` (`worker/agent-a8ffaf53174ff3c38`)
-- `/Users/balint.erdos/litehop/u7s/ai/worktrees/beep-903-run1` (`beep/903-run1`)
+None (no active worker worktrees).
 <!-- END AUTO: worktrees -->
 <!-- BEGIN AUTO: cron-loops -->
 15m mayor tick (`scripts/mayor-tick.sh`) · 60m reread posture · 60m worktree hygiene
 <!-- END AUTO: cron-loops -->
 <!-- BEGIN AUTO: repo-state -->
-As of 2026-11-17T15:10Z — Branch `main` @ `e074a92d`.
+As of 2026-11-18T13:19:42Z (last tick) — Branch `main` @ `6f8b7d37`, dirty, up to date with origin/main.
 <!-- END AUTO: repo-state -->
 <!-- BEGIN AUTO: review-queue -->
 0 pending review-queue entries.
