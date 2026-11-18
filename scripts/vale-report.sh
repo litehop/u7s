@@ -22,7 +22,7 @@ for arg in "$@"; do
   esac
 done
 if [ "${#PATHS[@]}" -eq 0 ]; then
-  PATHS=(README.md CONTRIBUTING.md CHANGELOG.md docs crates)
+  PATHS=(README.md CONTRIBUTING.md CHANGELOG.md docs ai/extended-context ai/dashboard.md crates)
 fi
 
 if ! command -v vale >/dev/null 2>&1; then

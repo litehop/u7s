@@ -3,4 +3,4 @@ message: "Remove '%s': bead IDs rot once the bead closes; history belongs in git
 level: error
 scope: comment
 tokens:
-  - 'mayor-[a-z0-9]{5}\b'
+  - '\bmayor-(?!(?:based|tick|only|side|level)\b)[a-z0-9]{3,5}(?:\.[0-9]+)?\b'

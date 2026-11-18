@@ -35,6 +35,7 @@ jobs:
           echo "$RUNNER_TEMP/vale" >> "$GITHUB_PATH"
       - name: Vale report
         run: |
+          set -euo pipefail
           scripts/vale-report.sh --github | tee "$RUNNER_TEMP/vale-report.txt"
           {
             echo '### Vale advisory report'

@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
 # Unit test for scripts/vale-report.sh's exit-code contract.
 #
-# Runs the REAL script as a subprocess over fixture files. The contract matters
-# because CI runs the script advisory-only: if alerts ever made the default
-# mode exit non-zero, every prose nit would block merges; if --strict stopped
-# failing on deterministic u7s/ errors, the future gate would silently pass.
-#
-# Skips (exit 0, loudly) when vale is not installed.
+# Runs the REAL script as a subprocess with a stub `vale` on PATH that emits
+# canned JSON, so the test needs no Vale install and can fail in CI. The
+# contract matters because CI runs the script advisory-only: if alerts ever
+# made the default mode exit non-zero, every prose nit would block merges; if
+# --strict stopped failing on deterministic u7s/ errors, the future gate would
+# silently pass; if a Vale crash exited 0, a broken config would look clean.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO/scripts/vale-report.sh"
-
-if ! command -v vale >/dev/null 2>&1; then
-  echo "SKIP: vale not installed"
-  exit 0
-fi
 
 PASS=0
 FAIL=0
@@ -29,34 +24,55 @@ assert() {
   fi
 }
 
-# Exit code of the script, without tripping set -e.
+SANDBOX="$(mktemp -d)"
+trap 'rm -rf "$SANDBOX"' EXIT
+mkdir "$SANDBOX/bin"
+cat > "$SANDBOX/bin/vale" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "sync" ]; then exit 0; fi
+cat "$STUB_JSON"
+exit "${STUB_RC:-0}"
+EOF
+chmod +x "$SANDBOX/bin/vale"
+
+alert() { # check severity
+  printf '{"Check":"%s","Severity":"%s","Line":1,"Span":[1,2],"Message":"m","Match":"x"}' "$1" "$2"
+}
+
+# Exit code of the script against canned vale output $1 (JSON) and exit $2.
 code() {
+  printf '%s' "$1" > "$SANDBOX/out.json"
   set +e
-  "$SCRIPT" "$@" >/dev/null 2>&1
+  PATH="$SANDBOX/bin:$PATH" STUB_JSON="$SANDBOX/out.json" STUB_RC="$2" \
+    "$SCRIPT" "${@:3}" >/dev/null 2>&1
   local rc=$?
   set -e
   echo "$rc"
 }
 
-SANDBOX="$(mktemp -d)"
-trap 'rm -rf "$SANDBOX"' EXIT
+U7S_ERR="{\"a.md\":[$(alert u7s.FindingsPath error)]}"
+U7S_WARN="{\"a.md\":[$(alert u7s.Minimizing warning)]}"
+OTHER_ERR="{\"a.md\":[$(alert ai-tells.EmDashUsage error)]}"
 
-printf '# Clean\n\nRun the installer.\n' > "$SANDBOX/clean.md"
-printf '# Cites\n\nSee ai/findings/2026-01-01-thing.md for the numbers.\n' > "$SANDBOX/findings.md"
-printf '# Easy\n\nSimply run the installer.\n' > "$SANDBOX/minimizing.md"
+assert "clean output passes --strict" \
+  "$([ "$(code '{}' 0 --strict)" = 0 ] && echo 1 || echo 0)"
+assert "u7s error exits 0 without --strict (advisory must never block)" \
+  "$([ "$(code "$U7S_ERR" 0)" = 0 ] && echo 1 || echo 0)"
+assert "u7s error fails --strict (deleted-on-close findings file is a broken reference)" \
+  "$([ "$(code "$U7S_ERR" 0 --strict)" = 1 ] && echo 1 || echo 0)"
+assert "u7s warning does not fail --strict (only deterministic errors gate)" \
+  "$([ "$(code "$U7S_WARN" 0 --strict)" = 0 ] && echo 1 || echo 0)"
+assert "non-u7s error does not fail --strict (third-party rules are not deterministic)" \
+  "$([ "$(code "$OTHER_ERR" 0 --strict)" = 0 ] && echo 1 || echo 0)"
+assert "vale crash exits 2 (a broken config must not look clean)" \
+  "$([ "$(code '' 1)" = 2 ] && echo 1 || echo 0)"
 
-assert "clean doc passes --strict" \
-  "$([ "$(code --strict "$SANDBOX/clean.md")" = 0 ] && echo 1 || echo 0)"
-assert "bare ai/findings path exits 0 without --strict (advisory must never block)" \
-  "$([ "$(code "$SANDBOX/findings.md")" = 0 ] && echo 1 || echo 0)"
-assert "bare ai/findings path fails --strict (deleted-on-close file is a broken reference)" \
-  "$([ "$(code --strict "$SANDBOX/findings.md")" = 1 ] && echo 1 || echo 0)"
-assert "warning-level u7s rule does not fail --strict (only deterministic errors gate)" \
-  "$([ "$(code --strict "$SANDBOX/minimizing.md")" = 0 ] && echo 1 || echo 0)"
-
-OUT="$("$SCRIPT" "$SANDBOX/minimizing.md" 2>&1)"
-assert "report names the u7s rule that fired" \
+printf '%s' "$U7S_WARN" > "$SANDBOX/out.json"
+OUT="$(PATH="$SANDBOX/bin:$PATH" STUB_JSON="$SANDBOX/out.json" "$SCRIPT" --github 2>&1)"
+assert "report lists the u7s rule that fired" \
   "$(echo "$OUT" | grep -q 'u7s.Minimizing' && echo 1 || echo 0)"
+assert "--github emits an annotation" \
+  "$(echo "$OUT" | grep -q '^::warning file=a.md,line=1' && echo 1 || echo 0)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
