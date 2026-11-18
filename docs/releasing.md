@@ -20,8 +20,11 @@ operator first. Every release is gated, patch releases included. Whether
    `scripts/release-gate/burst-gate.sh --backend gcp --release <snapshot-tag> --confirm`.
    Flags and exit codes: the script header and
    [dev-setup.md](dev-setup.md#release-gate-1-gib-burst-survival).
-4. **Release only on 3/3 PASS.** On a failure, find the root cause; do not
-   retry until it passes. INVALID and PREEMPTED runs are not verdicts.
+   Also run the upgrade check, previous release to the same snapshot:
+   `scripts/release-gate/upgrade-gate.sh --backend gcp --from <previous-release-tag> --release <snapshot-tag>`
+   ([dev-setup.md](dev-setup.md#upgrade-check)).
+4. **Release only on 3/3 PASS and an upgrade-check PASS.** On a failure,
+   find the root cause; do not retry until it passes. INVALID and PREEMPTED runs are not verdicts.
 5. **Tag `vX.Y.Z`** on the exact commit whose snapshot passed the gate; the
    release is rebuilt from the tag, not promoted from the snapshot. The
    workflow publishes the changelog section as the release notes and fails the

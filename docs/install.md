@@ -268,6 +268,10 @@ then the workers.
   different `--node-name`. Other names, including an existing worker's, are
   accepted so a worker can re-join.
 
+Downgrades are not supported: the API server refuses to start on a store
+written by a newer u7s, and the error names the store's format and the
+format this release supports.
+
 ### Upgrading to dual-stack
 
 Releases before v0.4.4-snapshot.1 refuse it and require a reinstall. Existing
