@@ -10,6 +10,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/drain-grep.sh"
 
 # macOS ships LibreSSL, which lacks Ed25519 -rawin; Homebrew's OpenSSL does not.
 [ -d /opt/homebrew/bin ] && PATH="/opt/homebrew/bin:$PATH"
@@ -92,7 +93,7 @@ run_fetch "$RUNNER" "$WORK/tar"
 assert "a tampered tarball with a matching rewritten sidecar is rejected (checksum alone cannot catch a channel attacker)" \
   "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
 assert "tampered-tarball rejection names the signature failure" \
-  "$(printf '%s' "$OUT" | grep -q 'signature verification FAILED' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT" | drain_grep -q 'signature verification FAILED' && echo 1 || echo 0)"
 
 # Tampered sidecar.
 make_release "$WORK/sha"
@@ -101,7 +102,7 @@ run_fetch "$RUNNER" "$WORK/sha"
 assert "a tampered .sha256 is rejected on its own signature" \
   "$([ "$STATUS" -ne 0 ] && echo 1 || echo 0)"
 assert "tampered-sidecar rejection is a signature failure, not the later checksum mismatch" \
-  "$(printf '%s' "$OUT" | grep -q 'signature verification FAILED' && echo 1 || echo 0)"
+  "$(printf '%s' "$OUT" | drain_grep -q 'signature verification FAILED' && echo 1 || echo 0)"
 
 # Missing .sig: downgrade to an unsigned release must fail.
 make_release "$WORK/nosig"
@@ -154,7 +155,7 @@ assert "release workflow signs install.sh (otherwise no install.sh.sig is publis
 # --tarball is a trusted local file (no .sig exists beside a locally built
 # tarball): the help text must say so rather than imply verification.
 assert "--help states --tarball is not signature-verified" \
-  "$(bash "$INSTALL" --help 2>&1 | grep -q 'NOT$' && echo 1 || echo 0)"
+  "$(bash "$INSTALL" --help 2>&1 | drain_grep -q 'NOT$' && echo 1 || echo 0)"
 
 # Mutation self-check: with verification removed the tampered cases must be
 # accepted, proving the assertions above depend on it.

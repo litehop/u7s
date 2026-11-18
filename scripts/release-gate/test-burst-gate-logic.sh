@@ -4,6 +4,7 @@
 # matter are a false PASS (a bad build ships) and a missing-data PASS (a run that died
 # halfway looks green). No VM needed.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
@@ -49,14 +50,14 @@ mutate() {
 good > "$TMP/good.env"
 verdict_of "$TMP/good.env"
 assert "all criteria met -> exit 0 and RESULT: PASS (a clean run must not be reported as failing)" \
-  "$([ "$V_RC" = 0 ] && echo "$V_OUT" | grep -q '^RESULT: PASS' && echo 1 || echo 0)"
+  "$([ "$V_RC" = 0 ] && echo "$V_OUT" | drain_grep -q '^RESULT: PASS' && echo 1 || echo 0)"
 
 # Each criterion alone must flip the verdict, and only its own row.
 expect_fail() {
   local label="$1" key="$2" val="$3" row="$4"
   verdict_of "$(mutate "$key" "$val")"
   assert "$label" \
-    "$([ "$V_RC" != 0 ] && echo "$V_OUT" | grep -q "^FAIL $row " && echo "$V_OUT" | grep -q '^RESULT: FAIL' && echo 1 || echo 0)"
+    "$([ "$V_RC" != 0 ] && echo "$V_OUT" | drain_grep -q "^FAIL $row " && echo "$V_OUT" | drain_grep -q '^RESULT: FAIL' && echo 1 || echo 0)"
 }
 expect_fail "(a) host process OOM-killed -> FAIL: a dead apiserver/kubelet takes the whole node down" oom_host 1 '(a)'
 expect_fail "(a) kube-system pod OOM-killed -> FAIL: CoreDNS dying breaks cluster DNS (the 2026-10-01 failure)" oom_kubesystem 2 '(a)'
@@ -93,10 +94,10 @@ out="$( { klog php-fpm /kubepods.slice/kubepods-besteffort.slice/kubepods-bestef
           klog u7s-apiserver /system.slice/u7s-apiserver.service
           klog kubelet /system.slice/kubelet.service
           echo "kernel: Out of memory: Killed process 42 (php-fpm)"; } | rg_oom_victims "$UIDS")"
-assert "workload pod victim classed other (does not fail criterion (a))" "$(echo "$out" | grep -qx 'other php-fpm' && echo 1 || echo 0)"
-assert "kube-system pod victim matched by pod UID in its cgroup path" "$(echo "$out" | grep -qx 'kube-system coredns' && echo 1 || echo 0)"
-assert "apiserver victim classed host" "$(echo "$out" | grep -qx 'host u7s-apiserver' && echo 1 || echo 0)"
-assert "kubelet victim classed host" "$(echo "$out" | grep -qx 'host kubelet' && echo 1 || echo 0)"
+assert "workload pod victim classed other (does not fail criterion (a))" "$(echo "$out" | drain_grep -qx 'other php-fpm' && echo 1 || echo 0)"
+assert "kube-system pod victim matched by pod UID in its cgroup path" "$(echo "$out" | drain_grep -qx 'kube-system coredns' && echo 1 || echo 0)"
+assert "apiserver victim classed host" "$(echo "$out" | drain_grep -qx 'host u7s-apiserver' && echo 1 || echo 0)"
+assert "kubelet victim classed host" "$(echo "$out" | drain_grep -qx 'host kubelet' && echo 1 || echo 0)"
 assert "one victim per oom-kill line (the 'Killed process' companion line is not double counted)" "$([ "$(echo "$out" | wc -l | tr -d ' ')" = 4 ] && echo 1 || echo 0)"
 assert "host process classified by cgroup even if comm is unknown (e.g. renamed unit binary)" \
   "$([ "$(rg_classify_oom mystery /system.slice/crio.service "$UIDS")" = host ] && echo 1 || echo 0)"
@@ -110,15 +111,15 @@ printf '#!/bin/sh\necho 100\n' > "$TMP/bin/idle100"; chmod +x "$TMP/bin/idle100"
 export RG_IDLE_PROBE="$TMP/bin/idle100" QUIET_RECHECK_SECS=1 RG_RETRY_WAIT_SECS=0
 PATH="$TMP/bin:$PATH"
 gate_env() { "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-$1" "${@:2}" >/dev/null 2>&1; cat "$TMP/out-$1/stage/gate.env"; }
-assert "--zram-mib 512 reaches the VM env" "$(gate_env z512 --zram-mib 512 | grep -qx 'ZRAM_MIB=512' && echo 1 || echo 0)"
-assert "--zram-mib 0 is accepted and means no swap" "$(gate_env z0 --zram-mib 0 | grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
-assert "--zram-mib defaults to off" "$(gate_env zdef | grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
-assert "--coredns-requests reaches the VM env" "$(gate_env cd --coredns-requests | grep -qx 'COREDNS_REQ=1' && echo 1 || echo 0)"
-assert "--coredns-requests defaults to off" "$(gate_env cddef | grep -qx 'COREDNS_REQ=0' && echo 1 || echo 0)"
+assert "--zram-mib 512 reaches the VM env" "$(gate_env z512 --zram-mib 512 | drain_grep -qx 'ZRAM_MIB=512' && echo 1 || echo 0)"
+assert "--zram-mib 0 is accepted and means no swap" "$(gate_env z0 --zram-mib 0 | drain_grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
+assert "--zram-mib defaults to off" "$(gate_env zdef | drain_grep -qx 'ZRAM_MIB=0' && echo 1 || echo 0)"
+assert "--coredns-requests reaches the VM env" "$(gate_env cd --coredns-requests | drain_grep -qx 'COREDNS_REQ=1' && echo 1 || echo 0)"
+assert "--coredns-requests defaults to off" "$(gate_env cddef | drain_grep -qx 'COREDNS_REQ=0' && echo 1 || echo 0)"
 for bad in abc -5 1.5 ""; do
   rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-bad" --zram-mib "$bad" 2>&1 >/dev/null)" || rc=$?
   assert "--zram-mib '$bad' rejected on the host with exit 2 before any VM exists (a bad size must not look like 'zram did not help')" \
-    "$([ "$rc" = 2 ] && echo "$err" | grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
+    "$([ "$rc" = 2 ] && echo "$err" | drain_grep -q 'non-negative integer' && [ ! -e "$TMP/out-bad/stage" ] && echo 1 || echo 0)"
 done
 
 for n in 0 2; do
@@ -126,7 +127,7 @@ for n in 0 2; do
   i=0; while [ "$i" -lt "$n" ]; do i=$((i + 1)); : > "$TMP/tb$n/u7s-gate-$i.tar.gz"; done
   rc=0; err="$("$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb$n" --out "$TMP/out-tb$n" 2>&1 >/dev/null)" || rc=$?
   assert "$n staged gate tarballs -> exit 2 naming the stage dir and count (an ambiguous or missing gate tarball must stop the run, not install the wrong build)" \
-    "$([ "$rc" = 2 ] && echo "$err" | grep -q "exactly one u7s-gate-\*.tar.gz in $TMP/out-tb$n/stage, found $n" && echo 1 || echo 0)"
+    "$([ "$rc" = 2 ] && echo "$err" | drain_grep -q "exactly one u7s-gate-\*.tar.gz in $TMP/out-tb$n/stage, found $n" && echo 1 || echo 0)"
 done
 
 # --runs validation: BSD `seq 1 0` counts down, so --runs 0 once created a real VM.
@@ -136,7 +137,7 @@ for bad in 0 00 -1 abc 1.5 ""; do
   : > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
   rc=0; err="$("$HERE/burst-gate.sh" --runs "$bad" --tarball-dir "$TMP/tb" --out "$TMP/out-runs" 2>&1 >/dev/null)" || rc=$?
   assert "--runs '$bad' rejected with exit 2 and zero limactl calls (a bad count must not spawn a VM)" \
-    "$([ "$rc" = 2 ] && echo "$err" | grep -q 'positive integer' && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
+    "$([ "$rc" = 2 ] && echo "$err" | drain_grep -q 'positive integer' && [ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"
 done
 : > "$LIMA_CALLS"; rm -rf "$TMP/out-runs"
 "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-runs" >/dev/null 2>&1 || true
@@ -200,24 +201,24 @@ ramp_env() {
 ramp_env 30 40 50:bad > "$TMP/ramp.env"
 out="$(rg_ramp_verdict "$TMP/ramp.env" "30 40 50 60" "$TMP/s.tsv")" && rrc=0 || rrc=$?
 assert "ramp candidate is the largest size before the first failure, labelled approximate" \
-  "$(echo "$out" | grep -q '^RAMP: candidate N=40 -- approximate (single VM, state carryover)' && [ "$rrc" = 0 ] && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q '^RAMP: candidate N=40 -- approximate (single VM, state carryover)' && [ "$rrc" = 0 ] && echo 1 || echo 0)"
 assert "ramp table shows the failed size and the size never run" \
-  "$(echo "$out" | grep -E '^50 +PASS +FAIL +FAIL +FAIL' >/dev/null && echo "$out" | grep -q '^60 .*not run' && echo 1 || echo 0)"
+  "$(echo "$out" | grep -E '^50 +PASS +FAIL +FAIL +FAIL' >/dev/null && echo "$out" | drain_grep -q '^60 .*not run' && echo 1 || echo 0)"
 assert "ramp summary states webhook-smoke (e) is not evaluated per size" \
-  "$(echo "$out" | grep -q '^RAMP: criterion (e) webhook-smoke is NOT evaluated per size' && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q '^RAMP: criterion (e) webhook-smoke is NOT evaluated per size' && echo 1 || echo 0)"
 assert "ramp summary says stopped at the first criterion failure (50), not VM death" \
-  "$(echo "$out" | grep -q '^RAMP: stopped at the first criterion failure (50-pod burst)' && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q '^RAMP: stopped at the first criterion failure (50-pod burst)' && echo 1 || echo 0)"
 ramp_env 30 40 > "$TMP/rampd.env"
 out="$(rg_ramp_verdict "$TMP/rampd.env" "30 40 50 60" "$TMP/s.tsv")" || true
 assert "ramp that ends with sizes unrun and no failure is reported as VM death / cap, not as a criterion failure" \
-  "$(echo "$out" | grep -q '^RAMP: ended early with no criterion failure; sizes not run: 50 60' && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q '^RAMP: ended early with no criterion failure; sizes not run: 50 60' && echo 1 || echo 0)"
 ramp_env 30 40 | grep -v '^ramp_40_ready_final=' > "$TMP/rampu.env"
 out="$(rg_ramp_verdict "$TMP/rampu.env" "30 40" "$TMP/s.tsv")" || true
 assert "ramp step with no node status (API unreachable) is reported as unreachable" \
-  "$(echo "$out" | grep -q '^RAMP: API unreachable at the end of the 40-pod step' && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q '^RAMP: API unreachable at the end of the 40-pod step' && echo 1 || echo 0)"
 ramp_env 30:bad > "$TMP/ramp0.env"
 out="$(rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv")" && rrc=0 || rrc=$?
-assert "ramp with a failing first size has no candidate and exits non-zero" "$([ "$rrc" != 0 ] && echo "$out" | grep -q 'no size passed' && echo 1 || echo 0)"
+assert "ramp with a failing first size has no candidate and exits non-zero" "$([ "$rrc" != 0 ] && echo "$out" | drain_grep -q 'no size passed' && echo 1 || echo 0)"
 for key in secs oom_host oom_kubesystem notready ready_final wp_ok marker_ok; do
   ramp_env 30 | grep -v "^ramp_30_$key=" > "$TMP/rampm.env"
   assert "ramp step missing ramp_30_$key is not a pass (a step that died midway must not become the candidate)" \
@@ -228,7 +229,7 @@ assert "ramp knee is read from the verdict (40), so the summary can report where
   "$([ "$(rg_ramp_knee "$TMP/ramp.verdict")" = 40 ] && echo 1 || echo 0)"
 out="$(rg_ramp_summary "30 40 50 60" " $(rg_ramp_knee "$TMP/ramp.verdict")" PASS /o)"
 assert "ramp summary reports the knee and never 'passed at <max> pods' for a run that broke at 50 (operators read this line as the result)" \
-  "$(echo "$out" | grep -q 'knee.*: 40 ' && ! echo "$out" | grep -qE 'passed at [0-9]+ pods' && echo 1 || echo 0)"
+  "$(echo "$out" | drain_grep -q 'knee.*: 40 ' && ! echo "$out" | drain_grep -qE 'passed at [0-9]+ pods' && echo 1 || echo 0)"
 rg_ramp_verdict "$TMP/ramp0.env" "30 40" "$TMP/s.tsv" > "$TMP/ramp0.verdict" || true
 assert "ramp with no passing step has knee none" "$([ "$(rg_ramp_knee "$TMP/ramp0.verdict")" = none ] && echo 1 || echo 0)"
 ramp_env 30 | sed 's/^ramp_30_oom_kubesystem=0/ramp_30_oom_kubesystem=1/' > "$TMP/rampo.env"
@@ -239,28 +240,28 @@ printf 'install_ok=0\n' > "$TMP/rampi.env"
 assert "ramp with failed install fails" "$(rg_ramp_verdict "$TMP/rampi.env" "30" "$TMP/s.tsv" >/dev/null && echo 0 || echo 1)"
 
 assert "verdict names the gated pod count so release notes can cite it" \
-  "$(verdict_of "$TMP/good.env"; echo "$V_OUT" | grep -q '^RESULT: PASS (50-pod burst)' && echo 1 || echo 0)"
+  "$(verdict_of "$TMP/good.env"; echo "$V_OUT" | drain_grep -q '^RESULT: PASS (50-pod burst)' && echo 1 || echo 0)"
 verdict_of "$(mutate burst_pods -)"
 assert "missing burst_pods fails (c): a verdict that cannot name its pod count is not citable" "$([ "$V_RC" != 0 ] && echo 1 || echo 0)"
 
 # Confirm mode: ceiling is the first size (50, then 40) passing every run.
 out="$(rg_confirm_verdict 50:3:3:3)" && crc=0 || crc=$?
 assert "50 passes 3/3 -> gated ceiling 50 (the highest tried size wins)" \
-  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 50 pods' && echo 1 || echo 0)"
+  "$([ "$crc" = 0 ] && echo "$out" | drain_grep -q 'gated no-swap burst ceiling = 50 pods' && echo 1 || echo 0)"
 out="$(rg_confirm_verdict 50:2:3:3 40:3:3:3)" && crc=0 || crc=$?
 assert "50 fails once -> falls to 40 and gates at 40: one flaky run at 50 must not ship a 50-pod claim" \
-  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'gated no-swap burst ceiling = 40 pods' && ! echo "$out" | grep -q 'ceiling = 50' && echo 1 || echo 0)"
+  "$([ "$crc" = 0 ] && echo "$out" | drain_grep -q 'gated no-swap burst ceiling = 40 pods' && ! echo "$out" | drain_grep -q 'ceiling = 50' && echo 1 || echo 0)"
 out="$(rg_confirm_verdict 50:1:3:3 40:2:3:3)" && crc=0 || crc=$?
 assert "40 also fails -> FAIL with no ceiling: the release must not claim a burst size it did not confirm" \
-  "$([ "$crc" != 0 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && ! echo "$out" | grep -q 'ceiling =' && echo 1 || echo 0)"
+  "$([ "$crc" != 0 ] && echo "$out" | drain_grep -q '^CONFIRM: FAIL' && ! echo "$out" | drain_grep -q 'ceiling =' && echo 1 || echo 0)"
 rg_confirm_verdict 50:0:0:0 >/dev/null && crc=0 || crc=$?
 assert "0/0 runs is not a pass (a gate that ran nothing must not confirm a ceiling)" "$([ "$crc" != 0 ] && echo 1 || echo 0)"
 out="$(rg_confirm_verdict 50:2:2:3 40:3:3:3)" && crc=0 || crc=$?
 assert "50 ran out of valid runs (noise, no FAIL) -> INVALID exit 3, never falls to 40: noise must not lower the gated ceiling" \
-  "$([ "$crc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && ! echo "$out" | grep -q 'ceiling =' && echo 1 || echo 0)"
+  "$([ "$crc" = 3 ] && echo "$out" | drain_grep -q '^CONFIRM: INVALID' && ! echo "$out" | drain_grep -q 'ceiling =' && echo 1 || echo 0)"
 out="$(rg_confirm_verdict 50:1:2:3 40:3:3:3)" && crc=0 || crc=$?
 assert "a valid FAIL at 50 is final even when other runs were INVALID -> falls to 40" \
-  "$([ "$crc" = 0 ] && echo "$out" | grep -q 'ceiling = 40 pods' && echo 1 || echo 0)"
+  "$([ "$crc" = 0 ] && echo "$out" | drain_grep -q 'ceiling = 40 pods' && echo 1 || echo 0)"
 
 rc=0; "$HERE/burst-gate.sh" --burst-pods 0 --tarball-dir "$TMP/tb" --out "$TMP/out-bp" >/dev/null 2>&1 || rc=$?
 assert "--burst-pods 0 rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
@@ -289,13 +290,13 @@ assert "default burst is 20 pods, reaching the VM env: the operator-decided gate
 rm -rf "$TMP/out-conf"
 rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf" 2>/dev/null)" || rc=$?
 assert "--confirm is a single 3/3 gate at 20 pods with no smaller fall-back size, and a failing gate ends FAIL" \
-  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
+  "$([ "$rc" != 0 ] && grep -qx 'BURST_PODS=20' "$TMP/out-conf/burst-20/stage/gate.env" && [ "$(ls -d "$TMP"/out-conf/burst-* | wc -l)" -eq 1 ] && echo "$out" | drain_grep -q '^CONFIRM: FAIL' && echo 1 || echo 0)"
 
 mkdir -p "$TMP/tb-none" "$TMP/out-leak/burst-20"
 echo "LEAKED GCP VPS u7s-gate-leak: delete failed" > "$TMP/out-leak/burst-20/leaked-vps.txt"
 rc=0; out="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb-none" --out "$TMP/out-leak" 2>/dev/null)" || rc=$?
 assert "--confirm aborting on a sub-run setup error still reports leaked VPSes (else a billing instance from an earlier sub-run goes unnoticed)" \
-  "$([ "$rc" = 2 ] && echo "$out" | grep -q 'LEAKED GCP VPS u7s-gate-leak' && grep -q 'u7s-gate-leak' "$TMP/out-leak/leaked-vps.txt" && echo 1 || echo 0)"
+  "$([ "$rc" = 2 ] && echo "$out" | drain_grep -q 'LEAKED GCP VPS u7s-gate-leak' && grep -q 'u7s-gate-leak' "$TMP/out-leak/leaked-vps.txt" && echo 1 || echo 0)"
 
 # --- marker (item: criterion (d) false pass) ---
 assert "marker read back equal -> ok" "$([ "$(rg_marker_ok rg-1 rg-1)" = 1 ] && echo 1 || echo 0)"
@@ -338,11 +339,11 @@ q="$TMP/q.log"
 rg_quiet_line 1 95 0 > "$q"; rg_quiet_line 2 70 0 >> "$q"
 assert "quiet log at/above 70% idle with no other VMs -> no reasons (70 is inclusive)" "$([ -z "$(rg_quiet_log_reasons "$q")" ] && echo 1 || echo 0)"
 rg_quiet_line 3 69 0 >> "$q"
-assert "idle below 70% -> contended (load average is not a usable threshold; idle is)" "$(rg_quiet_log_reasons "$q" | grep -q '69% < 70%' && echo 1 || echo 0)"
+assert "idle below 70% -> contended (load average is not a usable threshold; idle is)" "$(rg_quiet_log_reasons "$q" | drain_grep -q '69% < 70%' && echo 1 || echo 0)"
 rg_quiet_line 1 95 1 > "$q"
-assert "another running VM -> contended" "$(rg_quiet_log_reasons "$q" | grep -q 'other Lima VMs' && echo 1 || echo 0)"
+assert "another running VM -> contended" "$(rg_quiet_log_reasons "$q" | drain_grep -q 'other Lima VMs' && echo 1 || echo 0)"
 rg_quiet_line 1 '' 0 > "$q"
-assert "unmeasurable idle -> contended (quiet cannot be proven)" "$(rg_quiet_log_reasons "$q" | grep -q 'not measurable' && echo 1 || echo 0)"
+assert "unmeasurable idle -> contended (quiet cannot be proven)" "$(rg_quiet_log_reasons "$q" | drain_grep -q 'not measurable' && echo 1 || echo 0)"
 rg_quiet_line 1 95 '' > "$q"
 assert "unmeasurable VM list -> contended" "$([ -n "$(rg_quiet_log_reasons "$q")" ] && echo 1 || echo 0)"
 assert "missing quiet log -> no reasons (nothing observed)" "$([ -z "$(rg_quiet_log_reasons "$TMP/nonexistent")" ] && echo 1 || echo 0)"
@@ -351,7 +352,7 @@ cal_env() { printf 'cal_ref_ms=%s\ncal_ref_n=%s\ncal_idle_ms=%s\ncal_idle_n=%s\n
 cal_env 100 3 150 3
 assert "idle calibration exactly 1.5x the baseline is not contention" "$([ -z "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
 cal_env 100 3 151 3
-assert "idle calibration over 1.5x the pre-install baseline -> contention reason" "$(rg_cal_reason "$TMP/cal.env" | grep -q '151ms > 1.5x pre-install baseline 100ms' && echo 1 || echo 0)"
+assert "idle calibration over 1.5x the pre-install baseline -> contention reason" "$(rg_cal_reason "$TMP/cal.env" | drain_grep -q '151ms > 1.5x pre-install baseline 100ms' && echo 1 || echo 0)"
 cal_env 100 3 400 3
 assert "uniform sustained contention (every idle sample slow vs the baseline) is detected; slowest-vs-fastest could not see it" \
   "$([ -n "$(rg_cal_reason "$TMP/cal.env")" ] && echo 1 || echo 0)"
@@ -492,11 +493,11 @@ assert "FAIL with a slow idle-boundary calibration on a quiet-looking host -> IN
 # --- watchdog kills the in-VM workload ---
 for cmd in 'bash /var/tmp/rg/vm-gate.sh' 'bash /var/tmp/rg/vm-sampler.sh /var/tmp/rg/out 5' 'bash /var/tmp/rg/webhook-smoke.sh --kubeconfig x' 'bash /var/tmp/rg/install.sh'; do
   assert "kill pattern matches '$cmd' (a surviving in-VM workload keeps loading the host after the cap)" \
-    "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 1 || echo 0)"
+    "$(echo "$cmd" | drain_grep -qE "$RG_VM_KILL_PATTERN" && echo 1 || echo 0)"
 done
 for cmd in 'bash -c sudo pkill -KILL -f ^bash /var/tmp/rg/vm-gate.sh' 'pkill -KILL -f x /var/tmp/rg/vm-gate.sh' 'kubectl get node'; do
   assert "kill pattern does not match '$cmd' (the killer must not kill itself or unrelated processes)" \
-    "$(echo "$cmd" | grep -qE "$RG_VM_KILL_PATTERN" && echo 0 || echo 1)"
+    "$(echo "$cmd" | drain_grep -qE "$RG_VM_KILL_PATTERN" && echo 0 || echo 1)"
 done
 
 # --- overload recovery metric ---
@@ -535,11 +536,11 @@ RO_BODY="$(sed -n '/^run_overload() {$/,/^}$/p' "$HERE/vm-gate.sh")"
 assert "run_overload probes through rg_probe_cycle: an inline probe loop would bypass the per-call timeouts the test above covers" \
   "$(grep -q 'rg_probe_cycle ' <<<"$RO_BODY" && echo 1 || echo 0)"
 assert "run_overload's post-window k calls are time-bounded: they run on a possibly-starved node and the 30 s default stalls the verdict" \
-  "$(grep -c 'K_TIMEOUT=10 k get' <<<"$RO_BODY" | grep -qx 2 && echo 1 || echo 0)"
+  "$(grep -c 'K_TIMEOUT=10 k get' <<<"$RO_BODY" | drain_grep -qx 2 && echo 1 || echo 0)"
 good > "$TMP/ov.env"
 printf 'overload_pods=40\noverload_mib=60\nrecovery_hold_secs=120\noverload_window_secs=420\noverload_final=node=True overload-pods: Running=30 restarts=12\nrecovery_secs=95\n' >> "$TMP/ov.env"
 assert "overload verdict is RECOVERED with exit 0 when the recovery metric is numeric" \
-  "$(rg_overload_verdict "$TMP/ov.env" | grep -q 'RECOVERED 95s after overload start (40 pods x 60 MiB)' && echo 1 || echo 0)"
+  "$(rg_overload_verdict "$TMP/ov.env" | drain_grep -q 'RECOVERED 95s after overload start (40 pods x 60 MiB)' && echo 1 || echo 0)"
 { grep -v '^recovery_secs=' "$TMP/ov.env"; echo recovery_secs=none; } > "$TMP/ov2.env"; mv "$TMP/ov2.env" "$TMP/ov.env"
 assert "overload verdict is NOT RECOVERED with non-zero exit, naming the final pod state" \
   "$(rg_overload_verdict "$TMP/ov.env" > "$TMP/ov.out"; rc=$?; [ "$rc" != 0 ] && grep -q 'NOT RECOVERED.*Running=30 restarts=12' "$TMP/ov.out" && echo 1 || echo 0)"
@@ -647,12 +648,12 @@ assert "quiet host + VM that cannot start -> FAIL exit 1 (not INVALID: no conten
 rm -rf "$TMP/out-conf2"
 rc=0; out="$(RG_IDLE_PROBE="$TMP/bin/idle30" "$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-conf2" 2>/dev/null)" || rc=$?
 assert "--confirm on a noisy host: INVALID exit 3, and it never falls through to 40 pods" \
-  "$([ "$rc" = 3 ] && echo "$out" | grep -q '^CONFIRM: INVALID' && [ ! -e "$TMP/out-conf2/burst-40" ] && echo 1 || echo 0)"
+  "$([ "$rc" = 3 ] && echo "$out" | drain_grep -q '^CONFIRM: INVALID' && [ ! -e "$TMP/out-conf2/burst-40" ] && echo 1 || echo 0)"
 mkdir -p "$TMP/tb2"; : > "$TMP/tb2/u7s-gate-a.tar.gz"; : > "$TMP/tb2/u7s-gate-b.tar.gz"
 rm -rf "$TMP/out-conf3"
 rc=0; err="$("$HERE/burst-gate.sh" --confirm --runs 1 --tarball-dir "$TMP/tb2" --out "$TMP/out-conf3" 2>&1 >/dev/null)" || rc=$?
 assert "--confirm whose sub-run hits a setup error (exit 2) aborts with exit 2, not 'INVALID only 0/N valid runs (host contention)'" \
-  "$([ "$rc" = 2 ] && echo "$err" | grep -q 'setup error' && echo 1 || echo 0)"
+  "$([ "$rc" = 2 ] && echo "$err" | drain_grep -q 'setup error' && echo 1 || echo 0)"
 
 # --- gcp backend: steal-based INVALID, PREEMPTED, backend selection ---
 CPU_A='cpu  1000 0 500 8000 100 0 0 0 0 0'
@@ -714,7 +715,7 @@ assert "gcp VPS never reachable (stockout/quota/IAP flake) -> INVALID exit 3, re
 assert "gcp VPS is deleted at the end of the run (a gate VM left up keeps billing)" \
   "$(grep -q 'instances delete u7s-rg-' "$GCLOUD_CALLS" && echo 1 || echo 0)"
 assert "gcp VM names are valid GCE names (lowercase) and run-unique" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -qE 'create u7s-rg-[0-9a-z-]+ ' && echo 1 || echo 0)"
 n1="$(rg_vm_name gcp 20261117T120000Z 1 "$(rg_nonce)")"; n2="$(rg_vm_name gcp 20261117T120000Z 1 "$(rg_nonce)")"
 assert "two gcp VPS names generated in the same second differ (identical names made concurrent gate runs collide on create)" \
   "$([ "$n1" != "$n2" ] && echo 1 || echo 0)"
@@ -722,16 +723,16 @@ l1="$(rg_vm_name lima 20261117T120000Z 12 "$(rg_nonce)")"
 assert "gcp names keep the u7s-rg- prefix stray detection relies on and stay <= 52 chars (cert CN limit); lima likewise" \
   "$([[ "$n1" == u7s-rg-* && "$l1" == u7s-rg-* ]] && [ "${#n1}" -le 52 ] && [ "${#l1}" -le 52 ] && echo 1 || echo 0)"
 assert "gate VMs are the custom n1 1 vCPU 1 GiB (e2-micro has 0.25 sustained vCPU; e2 custom shared-core caps one thread at half a core)" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-micro' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q 'e2-micro' && echo 1 || echo 0)"
 U7S_GCP_MACHINE_TYPE=e2-standard-2 gcp_gate out-gshape --runs 1
 assert "an ambient U7S_GCP_MACHINE_TYPE cannot change the release-authoritative shape" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'e2-standard' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q -- '--machine-type=n1-custom-1-1024 ' && ! grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q 'e2-standard' && echo 1 || echo 0)"
 U7S_GCP_BOOT_DISK_TYPE=pd-extreme gcp_gate out-gdisk --runs 1
 assert "gate VMs default to pd-balanced even with an ambient U7S_GCP_BOOT_DISK_TYPE (HDD-class disks wedge the 1 GiB node, so the default must be SSD-class and attributable)" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-balanced ' && ! grep 'instances create' "$GCLOUD_CALLS" | grep -q 'pd-extreme' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q -- '--boot-disk-type=pd-balanced ' && ! grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q 'pd-extreme' && echo 1 || echo 0)"
 gcp_gate out-gdisk2 --runs 1 --boot-disk-type pd-standard
 assert "--boot-disk-type reaches gcp_vps_create and the verdict/backend.txt name it (a pd-standard run must not be mistaken for the SSD gate)" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--boot-disk-type=pd-standard ' && grep -q ' disk=pd-standard ' "$TMP/out-gdisk2/backend.txt" && grep -q 'GCP n1-custom-1-1024 pd-standard Spot' "$TMP/out-gdisk2.out" && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q -- '--boot-disk-type=pd-standard ' && grep -q ' disk=pd-standard ' "$TMP/out-gdisk2/backend.txt" && grep -q 'GCP n1-custom-1-1024 pd-standard Spot' "$TMP/out-gdisk2.out" && echo 1 || echo 0)"
 gcp_gate out-gfail --runs 1
 assert "gcp verdict line says release-authoritative and names the mirror release" \
   "$(grep -q 'release-authoritative: x86_64 GCP n1-custom-1-1024 pd-balanced Spot, platforms none-recorded, mirror release v9.9.9-test' "$TMP/out-gfail.out" && grep -q 'release-authoritative=yes' "$TMP/out-gfail/backend.txt" && grep -q ' disk=pd-balanced ' "$TMP/out-gfail/backend.txt" && echo 1 || echo 0)"
@@ -782,10 +783,10 @@ assert "the boot disk is found via instances describe disks[0].source, not assum
 assert "image and kernel land in backend.txt and the GATE line (the gate verdict names the platform it speaks for)" \
   "$(grep -q 'platforms=image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp ' "$TMP/out-gpass/backend.txt" && grep -q 'GATE:.*platforms image=ubuntu-2604-resolute-amd64-v20261021,kernel=7.0.0-1017-gcp' "$TMP/out-gpass.out" && echo 1 || echo 0)"
 assert "the gate still boots the floating family (pinning would stop the gate catching new kernels)" \
-  "$(grep 'instances create' "$GCLOUD_CALLS" | grep -q -- '--image-family=ubuntu-2604-lts-amd64' && echo 1 || echo 0)"
+  "$(grep 'instances create' "$GCLOUD_CALLS" | drain_grep -q -- '--image-family=ubuntu-2604-lts-amd64' && echo 1 || echo 0)"
 SS="$TMP/sum"; mkdir -p "$SS"; printf '0\tidle\tMEM\t500000\n' > "$SS/samples.tsv"
 assert "summarize.sh prints the platform first when given one (a pasted summary must name the kernel it ran on)" \
-  "$([ "$("$HERE/summarize.sh" "$SS" "$P" | head -1)" = "platform: $P" ] && ! "$HERE/summarize.sh" "$SS" | grep -q '^platform:' && echo 1 || echo 0)"
+  "$([ "$("$HERE/summarize.sh" "$SS" "$P" | head -1)" = "platform: $P" ] && ! "$HERE/summarize.sh" "$SS" | drain_grep -q '^platform:' && echo 1 || echo 0)"
 for miss in GCLOUD_NO_IMAGE GCLOUD_NO_KERNEL; do
   env "$miss=1" GCLOUD_RESULTS="$TMP/good.env" "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/out-gmiss-$miss" --runs 1 >"$TMP/out-gmiss-$miss.out" 2>&1 && rc=0 || rc=$?
   assert "$miss: an unreadable image or kernel makes the run INVALID (exit 3) with the reason, never a PASS/FAIL or an empty platform field a FAIL could not be attributed from" \
@@ -837,7 +838,7 @@ xp_gate out-xpass --backend gcp --tarball "$XT" --runs 1
 assert "experiment run installs the uploaded tarball and install.sh, not the mirror (the point is to test unpublished code)" \
   "$(grep -q 'compute scp.*u7s-gate-experiment-0123456789ab-x86_64.tar.gz' "$GCLOUD_CALLS" && ! grep -q 'u7s.dekiru.tech' "$GCLOUD_CALLS" && grep -q '^INSTALL_TARBALL=/var/tmp/rg/u7s-gate-experiment-0123456789ab-x86_64.tar.gz$' "$TMP/out-xpass/stage/gate.env" && echo 1 || echo 0)"
 assert "every experiment artefact carries EXPERIMENT and the sha: out dir, run dir, verdict file, backend.txt, GATE line" \
-  "$([ -f "$TMP/out-xpass/EXPERIMENT.txt" ] && [ -d "$TMP/out-xpass/EXPERIMENT-run-1" ] && head -1 "$TMP/out-xpass/EXPERIMENT-run-1/verdict.txt" | grep -q '^EXPERIMENT .*sha=0123456789ab' && grep -q 'experiment=yes' "$TMP/out-xpass/backend.txt" && grep -q '^==== GATE: .*EXPERIMENT PASS' "$TMP/out-xpass.out" && echo 1 || echo 0)"
+  "$([ -f "$TMP/out-xpass/EXPERIMENT.txt" ] && [ -d "$TMP/out-xpass/EXPERIMENT-run-1" ] && head -1 "$TMP/out-xpass/EXPERIMENT-run-1/verdict.txt" | drain_grep -q '^EXPERIMENT .*sha=0123456789ab' && grep -q 'experiment=yes' "$TMP/out-xpass/backend.txt" && grep -q '^==== GATE: .*EXPERIMENT PASS' "$TMP/out-xpass.out" && echo 1 || echo 0)"
 assert "an experiment is never release-authoritative, even when it passes" \
   "$(grep -q 'release-authoritative=no' "$TMP/out-xpass/backend.txt" && ! grep -q 'release-authoritative=yes\|release-authoritative: ' "$TMP/out-xpass/backend.txt" "$TMP/out-xpass.out" && echo 1 || echo 0)"
 xp_gate out-xdefault --backend gcp --tarball "$XT" --runs 1 --install-only
@@ -888,12 +889,12 @@ verdict_of "$TMP/dead.env"
 assert "dead run: observed not-Ready evidence replaces 'missing' in criterion (b) (1 observation after watch start, final=unreachable)" \
   "$(grep -qE '^FAIL +\(b\).*observations=1, final=unreachable' <<< "$V_OUT" && echo 1 || echo 0)"
 assert "dead run: the verdict says the tally was rebuilt and OOM counts are unknown, not silently green" \
-  "$(echo "$V_OUT" | grep -q 'OOM counts unknown' && echo 1 || echo 0)"
+  "$(echo "$V_OUT" | drain_grep -q 'OOM counts unknown' && echo 1 || echo 0)"
 good | grep -vE '^(notready_events|node_ready_final)=' > "$TMP/dead2.env"
 printf '100 True\n' > "$TMP/dead2-nr.log"
 rg_fill_tally "$TMP/dead2.env" "$TMP/dead2-nr.log"
 assert "dead run whose log ends at a stale Ready=True is 'unconfirmed', never a (b) PASS: a vanished guest must not look green" \
-  "$(rg_get "$TMP/dead2.env" node_ready_final | grep -qx unconfirmed && echo 1 || echo 0)"
+  "$(rg_get "$TMP/dead2.env" node_ready_final | drain_grep -qx unconfirmed && echo 1 || echo 0)"
 good > "$TMP/full.env"; cp "$TMP/full.env" "$TMP/full2.env"
 rg_fill_tally "$TMP/full2.env" "$TMP/dead-nr.log"
 assert "a complete tally is never overwritten by the host-side rebuild" "$(cmp -s "$TMP/full.env" "$TMP/full2.env" && echo 1 || echo 0)"
@@ -902,7 +903,7 @@ out="$(printf 'kube-system coredns Running True\ndefault mariadb-0 Pending \ndef
 assert "not-Ready pods are listed incl. a Pending pod with no Ready condition (mariadb-0 never Ready must get diagnostics)" \
   "$([ "$out" = "$(printf 'default mariadb-0\nkube-system kcm')" ] && echo 1 || echo 0)"
 assert "finished pods and the burst workload are excluded (50 describes would flood a wedged guest)" \
-  "$(echo "$out" | grep -qE 'job-x|rg-burst' && echo 0 || echo 1)"
+  "$(echo "$out" | drain_grep -qE 'job-x|rg-burst' && echo 0 || echo 1)"
 
 eval "$(sed -n '/^res() {/,/^}/p' "$HERE/vm-gate.sh")"
 OUT="$TMP/resout"; mkdir -p "$OUT"; : > "$OUT/results.env"
@@ -915,12 +916,12 @@ NOW=10000
 wedge() { RG_WEDGE_IOWAIT_PCT="${IO-90}" RG_WEDGE_SECS="${W:-60}" rg_wedge_reason "$NOW" "$1" "${2:-/dev/null}" "${3:-/dev/null}"; }
 printf '%s True\n%s False\n' $((NOW - 500)) $((NOW - 60)) > "$TMP/wn1.log"
 assert "node not Ready for exactly 60 s is a wedge (abort within the ~60-90 s budget)" \
-  "$(wedge "$TMP/wn1.log" | grep -qx 'node Ready=False for 60s' && echo 1 || echo 0)"
+  "$(wedge "$TMP/wn1.log" | drain_grep -qx 'node Ready=False for 60s' && echo 1 || echo 0)"
 printf '%s True\n%s False\n' $((NOW - 500)) $((NOW - 59)) > "$TMP/wn2.log"
 assert "node not Ready for 59 s is not yet a wedge (a brief flap must not kill a passing run)" "$([ -z "$(wedge "$TMP/wn2.log")" ] && echo 1 || echo 0)"
 printf '%s True\n%s Unknown\n%s unreachable\n%s unreachable\n' $((NOW - 500)) $((NOW - 90)) $((NOW - 40)) $((NOW - 5)) > "$TMP/wn3.log"
 assert "the not-Ready run is timed from its first observation and an unreachable API is named as such" \
-  "$(wedge "$TMP/wn3.log" | grep -qx 'API unreachable for 90s' && echo 1 || echo 0)"
+  "$(wedge "$TMP/wn3.log" | drain_grep -qx 'API unreachable for 90s' && echo 1 || echo 0)"
 printf '%s True\n%s False\n%s True\n' $((NOW - 500)) $((NOW - 200)) $((NOW - 100)) > "$TMP/wn4.log"
 assert "a node that recovered (trailing True) is not a wedge: only a current outage aborts" "$([ -z "$(wedge "$TMP/wn4.log")" ] && echo 1 || echo 0)"
 assert "RG_WEDGE_SECS=0 disables detection (--wedge-secs 0 for deliberate long-stall studies)" "$([ -z "$(W=0 wedge "$TMP/wn1.log")" ] && echo 1 || echo 0)"
@@ -931,7 +932,7 @@ stat_rows() { # <iowait jiffies per 5 s sample> <samples> <last-ts>
 }
 stat_rows 475 14 $((NOW - 2)) > "$TMP/io95.tsv"
 assert "95% iowait over the last 60 s is a wedge even while the node still reports Ready (the 94%-iowait hang)" \
-  "$(wedge "$TMP/empty.log" "$TMP/io95.tsv" | grep -q '^iowait 9[0-9]% over the last 6[0-9]s$' && echo 1 || echo 0)"
+  "$(wedge "$TMP/empty.log" "$TMP/io95.tsv" | drain_grep -q '^iowait 9[0-9]% over the last 6[0-9]s$' && echo 1 || echo 0)"
 stat_rows 250 14 $((NOW - 2)) > "$TMP/io50.tsv"
 assert "50% iowait is a slow burst, not a wedge: do not abort a run that could still pass" "$([ -z "$(wedge "$TMP/empty.log" "$TMP/io50.tsv")" ] && echo 1 || echo 0)"
 stat_rows 475 14 $((NOW - 100)) > "$TMP/iostale.tsv"
@@ -944,7 +945,7 @@ pwedge() { RG_WEDGE_STALL_SECS="${S:-0}" IO=0 wedge "$@"; }
 stat_rows 0 14 $((NOW - 2)) > "$TMP/io0.tsv"
 printf '%s 0\n%s 1\n' $((NOW - 400)) $((NOW - 150)) > "$TMP/prog-stuck.log"
 assert "ready-pod count stuck for 150 s (120 s limit) in a burst past the 300 s cap is a wedge with node Ready and iowait 0, the reclaim-thrash that ran to the 600 s kill; the reason names the pod count" \
-  "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-stuck.log" | grep -qx 'no burst progress for 150s (1 pods Ready)' && echo 1 || echo 0)"
+  "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-stuck.log" | drain_grep -qx 'no burst progress for 150s (1 pods Ready)' && echo 1 || echo 0)"
 printf '%s 0\n%s 1\n' $((NOW - 200)) $((NOW - 150)) > "$TMP/prog-early.log"
 assert "the same stall inside the 300 s cap is NOT a wedge: the burst may still finish and pass (c), and a healthy slow-pull burst must never be failed by the monitor" \
   "$([ -z "$(S=120 pwedge "$TMP/empty.log" "$TMP/io0.tsv" "$TMP/prog-early.log")" ] && echo 1 || echo 0)"
@@ -959,7 +960,7 @@ assert "iowait signal is off by default: healthy bursts that pass (c) hit 84-88%
   "$([ -z "$(RG_WEDGE_SECS=60 rg_wedge_reason "$NOW" "$TMP/empty.log" "$TMP/io95.tsv" /dev/null)" ] && echo 1 || echo 0)"
 assert "--wedge-stall-secs reaches the VM env with the burst cap it is measured against" \
   "$(wsenv="$(gate_env ws --wedge-stall-secs 77 --burst-cap 250)"; grep -qx 'WEDGE_STALL_SECS=77' <<< "$wsenv" && grep -qx 'BURST_CAP_SECS=250' <<< "$wsenv" && echo 1 || echo 0)"
-assert "--wedge-stall-secs defaults to 120" "$(gate_env wsd | grep -qx 'WEDGE_STALL_SECS=120' && echo 1 || echo 0)"
+assert "--wedge-stall-secs defaults to 120" "$(gate_env wsd | drain_grep -qx 'WEDGE_STALL_SECS=120' && echo 1 || echo 0)"
 rc=0; "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-badws" --wedge-stall-secs x >/dev/null 2>&1 || rc=$?
 assert "--wedge-stall-secs x rejected with exit 2" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
 assert "stall signal is on by default (a gate that only waits for the 600 s kill leaves hours of nothing)" "$([ "$RG_WEDGE_STALL_SECS" -gt 0 ] && echo 1 || echo 0)"
@@ -992,7 +993,7 @@ assert "SIGTERM (host cap) mid-run pulls /var/tmp/rg/out from the VM before dele
   "$(grep -q 'copy -r u7s-rg-.*:/var/tmp/rg/out' "$LIMA_CALLS" && [ "$(cat "$TMP"/out-term/*run-1/out/run.log 2>/dev/null)" = 'wedge evidence' ] && awk '/copy -r .*:\/var\/tmp\/rg\/out/ {c = NR} /delete/ {d = NR} END {exit !(c && d && c < d)}' "$LIMA_CALLS" && echo 1 || echo 0)"
 sleep 3
 assert "a SIGTERMed gate leaves no background subshell behind (the quiet-sample loop otherwise loops forever as an orphan)" \
-  "$(ps -axo command | grep -F -- "--out $TMP/out-term" | grep -qv grep && echo 0 || echo 1)"
+  "$(ps -axo command | grep -F -- "--out $TMP/out-term" | drain_grep -qv grep && echo 0 || echo 1)"
 printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\n[ "$1" = list ] && exit 0\nexit 1\n' > "$TMP/bin/limactl"
 
 # --- ramp stops at the first failing step, wedge or not ---
@@ -1021,7 +1022,7 @@ assert "ramp stops at the first failing step (40 hit the probe hard-kill): 50/60
   "$([ "$RAN" = "30 40 " ] && echo 1 || echo 0)"
 ramp_run wedge "30=20 40=wedge 50=20 60=20"
 assert "a wedged step ends the ramp at once: recorded as ramp_40_secs=wedge with the reason" \
-  "$([ "$RAN" = "30 40 " ] && [ "$(rg_get "$OUT/results.env" ramp_40_secs)" = wedge ] && rg_get "$OUT/results.env" wedge_reason | grep -q . && echo 1 || echo 0)"
+  "$([ "$RAN" = "30 40 " ] && [ "$(rg_get "$OUT/results.env" ramp_40_secs)" = wedge ] && rg_get "$OUT/results.env" wedge_reason | drain_grep -q . && echo 1 || echo 0)"
 assert "a wedged step runs no scale-down/settle/snapshot on the dead guest (they would burn minutes)" \
   "$(grep -q 'snap burst40' "$OUT/ran" && echo 0 || echo 1)"
 rg_ramp_verdict "$OUT/results.env" "30 40 50 60" /dev/null > "$TMP/wedge.ramp" || true
@@ -1030,10 +1031,10 @@ assert "ramp verdict keeps 30 as the candidate and names the wedge" \
 good | sed 's/^burst_secs=140/burst_secs=wedge/' > "$TMP/wedge-full.env"; echo "wedge_reason=API unreachable for 61s" >> "$TMP/wedge-full.env"
 verdict_of "$TMP/wedge-full.env"
 assert "a wedged full run FAILs (c) and the verdict says why" \
-  "$([ "$V_RC" != 0 ] && echo "$V_OUT" | grep -qE '^FAIL +\(c\)' && echo "$V_OUT" | grep -q 'WEDGE: burst aborted early, API unreachable for 61s' && echo 1 || echo 0)"
+  "$([ "$V_RC" != 0 ] && echo "$V_OUT" | drain_grep -qE '^FAIL +\(c\)' && echo "$V_OUT" | drain_grep -q 'WEDGE: burst aborted early, API unreachable for 61s' && echo 1 || echo 0)"
 rc=0; "$HERE/burst-gate.sh" --wedge-secs x --tarball-dir "$TMP/tb" --out "$TMP/out-ws" >/dev/null 2>&1 || rc=$?
 assert "--wedge-secs x rejected" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
-assert "--wedge-secs reaches the VM env" "$(gate_env ws --wedge-secs 90 | grep -qx 'WEDGE_SECS=90' && echo 1 || echo 0)"
+assert "--wedge-secs reaches the VM env" "$(gate_env ws --wedge-secs 90 | drain_grep -qx 'WEDGE_SECS=90' && echo 1 || echo 0)"
 
 # --- Lima VM trim to GCP parity ---
 printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 0\n' > "$TMP/bin/limactl"
@@ -1042,13 +1043,13 @@ printf '#!/bin/sh\necho "$*" >> "$LIMA_CALLS"\nexit 0\n' > "$TMP/bin/limactl"
 trim_call="$(cat "$LIMA_CALLS")"
 trim_ok=1
 for u in udisks2 ModemManager multipathd multipathd.socket polkit; do
-  echo "$trim_call" | grep -q "mask --now .*$u" || trim_ok=0
+  echo "$trim_call" | drain_grep -q "mask --now .*$u" || trim_ok=0
 done
-echo "$trim_call" | grep -q 'disable --now lima-guestagent' || trim_ok=0
+echo "$trim_call" | drain_grep -q 'disable --now lima-guestagent' || trim_ok=0
 [ "$(echo "$trim_call" | grep -c 'mask --now.*lima-guestagent')" = 0 ] || trim_ok=0
 assert "Lima trim masks every oversized daemon and disables (not masks: it is a real unit file, mask fails live and aborts the trim) the guest agent; each left running costs 7-22 MiB of a 1 GiB node and makes Lima knees pessimistic vs GCP" "$trim_ok"
 assert "Lima trim sets MALLOC_ARENA_MAX=1 for kubelet before install (8 arm64 glibc arenas = 16 MiB)" \
-  "$(echo "$trim_call" | grep -q 'kubelet.service.d' && echo "$trim_call" | grep -q 'MALLOC_ARENA_MAX=1' && echo 1 || echo 0)"
+  "$(echo "$trim_call" | drain_grep -q 'kubelet.service.d' && echo "$trim_call" | drain_grep -q 'MALLOC_ARENA_MAX=1' && echo 1 || echo 0)"
 : > "$LIMA_CALLS"
 (BACKEND=gcp; . "$HERE/backend.sh"; vm_trim x)
 assert "GCP is never trimmed (its agents are real production cost the gate must model)" "$([ ! -s "$LIMA_CALLS" ] && echo 1 || echo 0)"

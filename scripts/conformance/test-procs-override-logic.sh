@@ -19,6 +19,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 RUN_ALL="$REPO/scripts/conformance/run-all.sh"
@@ -63,9 +64,9 @@ build_filter_args() {
 DEFAULT_APPLY1=$(build_filter_args 1 16)
 DEFAULT_APPLY0=$(build_filter_args 0 16)
 assert "default (apply=1, --focus/--all-e2e path) emits --procs=16" \
-  "$(printf '%s' "$DEFAULT_APPLY1" | grep -q -- '--procs=16' && echo 1 || echo 0)"
+  "$(printf '%s' "$DEFAULT_APPLY1" | drain_grep -q -- '--procs=16' && echo 1 || echo 0)"
 assert "default (apply=0, --unsafe-focus path) emits --procs=16" \
-  "$(printf '%s' "$DEFAULT_APPLY0" | grep -q -- '--procs=16' && echo 1 || echo 0)"
+  "$(printf '%s' "$DEFAULT_APPLY0" | drain_grep -q -- '--procs=16' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 2. Explicit --procs 4 (the value the dispatch brief actually
@@ -75,11 +76,11 @@ assert "default (apply=0, --unsafe-focus path) emits --procs=16" \
 PROCS4_APPLY1=$(build_filter_args 1 4)
 PROCS4_APPLY0=$(build_filter_args 0 4)
 assert "--procs 4 (apply=1 path) emits --procs=4" \
-  "$(printf '%s' "$PROCS4_APPLY1" | grep -q -- '--procs=4' && echo 1 || echo 0)"
+  "$(printf '%s' "$PROCS4_APPLY1" | drain_grep -q -- '--procs=4' && echo 1 || echo 0)"
 assert "--procs 4 (apply=1 path) does NOT emit the old hardcoded --procs=16" \
-  "$(printf '%s' "$PROCS4_APPLY1" | grep -q -- '--procs=16' && echo 0 || echo 1)"
+  "$(printf '%s' "$PROCS4_APPLY1" | drain_grep -q -- '--procs=16' && echo 0 || echo 1)"
 assert "--procs 4 (apply=0 path) emits --procs=4" \
-  "$(printf '%s' "$PROCS4_APPLY0" | grep -q -- '--procs=4' && echo 1 || echo 0)"
+  "$(printf '%s' "$PROCS4_APPLY0" | drain_grep -q -- '--procs=4' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 3. Explicit --procs 1 (serial -- the other option the dispatch
@@ -88,9 +89,9 @@ assert "--procs 4 (apply=0 path) emits --procs=4" \
 # ---------------------------------------------------------------------------
 PROCS1_APPLY1=$(build_filter_args 1 1)
 assert "--procs 1 (apply=1 path) emits --procs=1" \
-  "$(printf '%s' "$PROCS1_APPLY1" | grep -q -- '--procs=1' && echo 1 || echo 0)"
+  "$(printf '%s' "$PROCS1_APPLY1" | drain_grep -q -- '--procs=1' && echo 1 || echo 0)"
 assert "--procs 1 (apply=1 path) does NOT emit --procs=16" \
-  "$(printf '%s' "$PROCS1_APPLY1" | grep -q -- '--procs=16' && echo 0 || echo 1)"
+  "$(printf '%s' "$PROCS1_APPLY1" | drain_grep -q -- '--procs=16' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 4. Structural checks against the real sources -- these fail if the fix is
@@ -123,7 +124,7 @@ set -e
 assert "run-all.sh exits non-zero on a malformed --procs value" \
   "$([ "$PROCS_INVALID_EXIT" -ne 0 ] && echo 1 || echo 0)"
 assert "run-all.sh's rejection message names the --procs flag, not a generic parse error" \
-  "$(printf '%s' "$PROCS_INVALID_OUT" | grep -qF -- '--procs' && echo 1 || echo 0)"
+  "$(printf '%s' "$PROCS_INVALID_OUT" | drain_grep -qF -- '--procs' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

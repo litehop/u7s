@@ -24,6 +24,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/conformance/_lib.sh
@@ -99,7 +100,7 @@ set +e
 ERR_OUTPUT="$(check_port_free "$OCC_PORT" "test-occupied-port" 2>&1)"
 ERR_EXIT=$?
 set -e
-if [ "$ERR_EXIT" -eq 1 ] && echo "$ERR_OUTPUT" | grep -q "already bound"; then
+if [ "$ERR_EXIT" -eq 1 ] && echo "$ERR_OUTPUT" | drain_grep -q "already bound"; then
   echo "PASS: check_port_free() still hard-fails on an occupied port"
   PASS=$(( PASS + 1 ))
 else

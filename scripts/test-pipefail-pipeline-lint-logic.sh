@@ -8,6 +8,10 @@
 # sink that drains its input (`sed -n 1p`), or carry an audited
 # `# pipefail-ok: <reason>` marker on the same line.
 #
+# In test-*.sh files even a single-stage `producer | grep -q` is rejected
+# (printf writes its format pieces separately); use `drain_grep` from
+# lib/drain-grep.sh or a here-string.
+#
 # Lines already guarded with `|| true` / `; true` / `|| :` cannot propagate the
 # failure and are skipped. Quoted-string contents are not parsed; a `|` inside
 # a double-quoted string can be a false positive -- mark it.
@@ -17,7 +21,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Prints "<file>:<line>:<text>" for each offending logical line of $1.
 lint_file() {
-  awk -v file="$1" '
+  local strict=0
+  case "$(basename "$1")" in test-*) strict=1 ;; esac
+  awk -v file="$1" -v strict="$strict" '
     function check(s, n,   segs, i, seg, pre) {
       if (s ~ /pipefail-ok:/) return
       if (s ~ /(\|\||;)[ \t]*(true|:)([ \t;)}"]|$)/) return
@@ -27,9 +33,10 @@ lint_file() {
       n = split(s, segs, ";")
       for (i = 1; i <= n; i++) {
         seg = segs[i]
-        if (match(seg, /\|[ \t]*(grep[ \t]+(-[a-zA-Z]*[qm][0-9]*|--quiet|--max-count)|head)([ \t]|$)/)) {
+        if (match(seg, /\|[ \t]*(grep[ \t]+(-[a-zA-Z0-9]+[ \t]+)*(-[a-zA-Z]*[qm][a-zA-Z0-9]*|--quiet|--max-count)|head)([ \t]|$)/)) {
           pre = substr(seg, 1, RSTART - 1)
           if (pre ~ /\|/) return 1
+          if (strict && substr(seg, RSTART) ~ /^\|[ \t]*grep/ && pre ~ /[^ \t]/) return 1
           # tar flushes per entry, so even a single-stage listing dies of SIGPIPE
           if (pre ~ /(^|[ \t(])tar[ \t]+-?[a-zA-Z]*t[a-zA-Z]*[ \t]/) return 1
         }
@@ -63,6 +70,8 @@ SELF_DIR="$(mktemp -d)"
 trap 'rm -rf "$SELF_DIR"' EXIT
 
 clean() { ! flags "$@"; }
+clean_test() { ! flags_test "$@"; }
+flags_test() { printf '%s\n' "$1" >"$SELF_DIR/test-f.sh"; [ -n "$(lint_file "$SELF_DIR/test-f.sh")" ]; }
 flags() { printf '%s\n' "$1" >"$SELF_DIR/f.sh"; [ -n "$(lint_file "$SELF_DIR/f.sh")" ]; }
 
 assert_true "multi-stage pipeline into grep -q is rejected (SIGPIPE false-FAIL)" \
@@ -73,8 +82,14 @@ assert_true "grep -m1 sink is rejected" \
   flags 'a | b | grep -m1 x'
 assert_true "pipeline split across a trailing backslash is still seen" \
   flags $'a | b \\\n  | grep -q x'
-assert_true "single-stage producer | grep -q is allowed (policy is multi-stage)" \
+assert_true "single-stage producer into grep -q is allowed in non-test scripts (policy there is multi-stage)" \
   clean 'printf "%s" "$x" | grep -q y'
+assert_true "single-stage producer into grep -q is rejected in test files (a second producer write after grep exits on the first match dies of SIGPIPE)" \
+  flags_test 'printf "%s\n" "$x" | grep -qx y'
+assert_true "a producer drained by drain_grep is clean in test files" \
+  clean_test 'printf "%s\n" "$x" | drain_grep -qx y'
+assert_true "a here-string grep is clean in test files" \
+  clean_test 'grep -qx y <<<"$x"'
 assert_true "a single-stage tar listing into grep -q is rejected (tar dies of SIGPIPE once grep exits on the first hit)" \
   flags 'ok="$(tar tzf "$T" 2>/dev/null | grep -q x && echo 1 || echo 0)"'
 assert_true "capturing the tar listing before matching is clean" \

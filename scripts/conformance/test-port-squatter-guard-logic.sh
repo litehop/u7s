@@ -25,6 +25,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=scripts/conformance/_lib.sh
@@ -145,7 +146,7 @@ set -e
 assert "a foreign squatter that survives the wait produces a hard-fail (exit 1), not a silent proceed" \
   "$([ "$SQUAT_EXIT" -eq 1 ] && echo 1 || echo 0)"
 assert "the hard-fail names the actual failure (port already bound), not a generic error" \
-  "$(echo "$SQUAT_OUTPUT" | grep -q "already bound" && echo 1 || echo 0)"
+  "$(echo "$SQUAT_OUTPUT" | drain_grep -q "already bound" && echo 1 || echo 0)"
 
 # Regression guard: prove the OLD shape genuinely proceeds unconditionally
 # against the same squatter -- the actual silent-proceed bug this fix

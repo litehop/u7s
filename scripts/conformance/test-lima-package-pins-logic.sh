@@ -11,6 +11,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LIMA_YAML="$DIR/../../lima/kubelet.yaml"
@@ -25,7 +26,7 @@ assert_pinned() {
   if [ -z "$lines" ]; then
     echo "FAIL: $label — no apt-get install line for '${pkg}' found in $LIMA_YAML"
     FAIL=$(( FAIL + 1 ))
-  elif printf '%s\n' "$lines" | grep -vqE "(^|[ \"])${pkg}="; then
+  elif printf '%s\n' "$lines" | drain_grep -vqE "(^|[ \"])${pkg}="; then
     echo "FAIL: $label — unpinned install: $(printf '%s\n' "$lines" | grep -vE "(^|[ \"])${pkg}=")"
     FAIL=$(( FAIL + 1 ))
   else

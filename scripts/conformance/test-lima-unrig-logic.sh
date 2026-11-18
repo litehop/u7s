@@ -7,6 +7,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
@@ -28,7 +29,7 @@ assert() {
   if [ "$2" = 1 ]; then echo "PASS: $1"; PASS=$((PASS + 1)); else echo "FAIL: $1"; FAIL=$((FAIL + 1)); fi
 }
 CALLS=""
-has() { printf '%s' "$CALLS" | grep -qF -- "$1" && echo 1 || echo 0; }
+has() { printf '%s' "$CALLS" | drain_grep -qF -- "$1" && echo 1 || echo 0; }
 line_of() { printf '%s\n' "$CALLS" | grep -nF -- "$1" | sed -n 1p | cut -d: -f1; }
 run() { : > "$TMP/calls"; rc=0; PATH="$TMP/bin:$PATH" "$@" >/dev/null 2>"$TMP/err" || rc=$?; CALLS="$(cat "$TMP/calls")"; }
 

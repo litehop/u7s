@@ -4,6 +4,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 RUN_SONOBUOY="$(cd "$(dirname "$0")" && pwd)/06-run-sonobuoy.sh"
 
@@ -34,7 +35,7 @@ assert "results are fetched with sonobuoy retrieve" \
 assert "kubelet emptyDir crawl and its timeout helper are gone" \
   "$(grep -qE 'kubernetes.io~empty-dir|Results available at|run_with_timeout' "$RUN_SONOBUOY" && echo 0 || echo 1)"
 assert "a run killed before completion still exits with sonobuoy's status when retrieve yields nothing" \
-  "$(grep -A4 'RETRIEVE_OK" -eq 0' "$RUN_SONOBUOY" | grep -q 'exit "${SONOBUOY_EXIT}"' && echo 1 || echo 0)"
+  "$(grep -A4 'RETRIEVE_OK" -eq 0' "$RUN_SONOBUOY" | drain_grep -q 'exit "${SONOBUOY_EXIT}"' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # evacuate_pod_logs() -- mirrors 06-run-sonobuoy.sh's per-node log-evacuation
@@ -126,7 +127,7 @@ ROTATION_TARBALL="$TMPDIR_TEST/rotation.tar.gz"
 tar -czf "$ROTATION_TARBALL" -C "$TMPDIR_TEST/rotation-src" foo
 ROTATION_CONTENTS=$(tar -tzf "$ROTATION_TARBALL")
 assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log.YYYYMMDDT... variants -- no separate glob needed" \
-  "$(printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log$" && printf '%s' "$ROTATION_CONTENTS" | grep -q "0.log.20260806-000000$" && echo 1 || echo 0)"
+  "$(printf '%s' "$ROTATION_CONTENTS" | drain_grep -q "0.log$" && printf '%s' "$ROTATION_CONTENTS" | drain_grep -q "0.log.20260806-000000$" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 8. journald_system_max_use_is_5g -- lima-start.sh's journald drop-in caps

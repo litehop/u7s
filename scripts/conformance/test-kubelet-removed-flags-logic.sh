@@ -14,6 +14,7 @@
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LIMA_START="$DIR/lima-start.sh"
@@ -41,7 +42,7 @@ code_lines() { grep -vE '^[[:space:]]*#' "$1"; }
 # current (1.37+) kubelet, so its code is checked as text.
 lima_code="$(code_lines "$LIMA_START")"
 for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
-  if printf '%s' "$lima_code" | grep -qF -- "$name"; then
+  if printf '%s' "$lima_code" | drain_grep -qF -- "$name"; then
     echo "FAIL: lima-start.sh passes '$name', which kubelet 1.37 rejects at startup (crash-loop)"
     FAIL=$(( FAIL + 1 ))
   else
@@ -50,7 +51,7 @@ for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
   fi
 done
 for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
-  if printf '%s' "$lima_code" | grep -qF -- "${gate}=false"; then
+  if printf '%s' "$lima_code" | drain_grep -qF -- "${gate}=false"; then
     echo "PASS: lima-start.sh disables '$gate' alongside PodLevelResources=false"
     PASS=$(( PASS + 1 ))
   else
@@ -72,7 +73,7 @@ flags_136="$(kubelet_round2_flags 1.36)"
 flags_137="$(kubelet_round2_flags 1.37)"
 
 check_absent() { # label flags name why
-  if printf '%s' "$2" | grep -qF -- "$3"; then
+  if printf '%s' "$2" | drain_grep -qF -- "$3"; then
     echo "FAIL: install.sh flags for $1 contain '$3'; $4"
     FAIL=$(( FAIL + 1 ))
   else
@@ -88,7 +89,7 @@ done
 
 for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
   check_absent "1.36" "$flags_136" "${gate}=false" "a 1.36 kubelet rejects 1.37-only gates as unrecognized"
-  if printf '%s' "$flags_137" | grep -qF -- "${gate}=false"; then
+  if printf '%s' "$flags_137" | drain_grep -qF -- "${gate}=false"; then
     echo "PASS: install.sh flags for 1.37 disable '$gate'"
     PASS=$(( PASS + 1 ))
   else
@@ -97,7 +98,7 @@ for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
   fi
 done
 
-if printf '%s' "$flags_136" | grep -qF -- 'PodLevelResources=false'; then
+if printf '%s' "$flags_136" | drain_grep -qF -- 'PodLevelResources=false'; then
   echo "PASS: install.sh keeps PodLevelResources=false on 1.36"
   PASS=$(( PASS + 1 ))
 else
