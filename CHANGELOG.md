@@ -14,6 +14,11 @@ individually; their changes land in the next release's section.
   `kubectl api-resources` and `kubectl get controllerrevisions` now list
   `controllerrevisions`, which were previously reported as not served.
 
+### Changed
+
+- The apiserver records the store's on-disk format and refuses to start on a
+  store written by a newer u7s. Downgrades are not supported.
+
 ## [0.4.6] - 2026-11-18
 
 ### Added
