@@ -103,7 +103,7 @@ Needs `limactl` (vz), `cargo-zigbuild` + `zig`, and a quiet host (no other VM wo
 ### Upgrade check
 
 `scripts/release-gate/upgrade-gate.sh` checks that re-running the
-candidate's `install.sh` with no flags (docs/install.md, "Upgrading") over
+candidate's `install.sh` with no flags ([upgrading.md](upgrading.md)) over
 the previous release keeps the cluster intact. The supported path is the
 immediately previous release only. Per run it boots a fresh gate-shaped VM
 (1 vCPU, 1 GiB), installs the previous release, deploys a ConfigMap marker,
