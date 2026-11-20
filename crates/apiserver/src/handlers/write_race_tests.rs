@@ -282,7 +282,6 @@ async fn scale_patch_keeps_a_concurrent_write() {
         bytes_of(&json!({"spec": {"replicas": 5}})),
     )
     .await
-    .ok()
     .expect("a lost race is retried, not surfaced");
     let stored: Value =
         serde_json::from_slice(&mock.inner.get(key).await.unwrap().unwrap().value).unwrap();
@@ -483,7 +482,6 @@ async fn install_cluster_cr(mock: &Arc<MockStore>) -> (AppState<MockStore>, Stri
         bytes_of(&crd),
     )
     .await
-    .ok()
     .expect("install CRD");
     let key = "/registry/cr/example.io/widgets/w".to_string();
     seed(
@@ -630,7 +628,6 @@ async fn delete_collection_soft_delete_does_not_resurrect() {
         ("", "configmaps", "held", "ConfigMap"),
     )
     .await
-    .ok()
     .expect("a vanished item is not an error");
     assert!(done, "nothing is left to hard-delete");
     assert!(mock.inner.get(key).await.unwrap().is_none());
