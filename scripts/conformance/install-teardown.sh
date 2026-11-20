@@ -26,8 +26,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -f "$WORKDIR/install-tunnel.pid" ]; then
-  pid="$(cat "$WORKDIR/install-tunnel.pid")"
-  if is_install_tunnel_pid "$pid"; then kill "$pid" 2>/dev/null || true; fi
+  read -r pid port < "$WORKDIR/install-tunnel.pid" || true
+  if is_install_tunnel_pid "$pid" "$port"; then kill "$pid" 2>/dev/null || true; fi
   rm -f "$WORKDIR/install-tunnel.pid"
 fi
 # The install kubeconfig points at a CA that no longer exists; the host rig mints its own.

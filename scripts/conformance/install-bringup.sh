@@ -49,15 +49,7 @@ VM_STATE_DIR=/var/lib/u7s
 
 banner() { echo ""; echo "--- $* ---"; }
 
-# Mirrors lima-start.sh's per-VM network default.
-if [ -z "$NETWORK" ]; then
-  case "$VM_NAME" in
-    lima-node) NETWORK="user-v2-mayor" ;;
-    lima-node-2|lima-node-3|lima-node-4) NETWORK="user-v2-workers-a" ;;
-    lima-node-5|lima-node-smoke) NETWORK="user-v2-workers-b" ;;
-    *) NETWORK="user-v2" ;;
-  esac
-fi
+NETWORK="${NETWORK:-$(default_network_for_vm "$VM_NAME")}"
 
 # ── VM ───────────────────────────────────────────────────────────────────────
 banner "VM: provision or resume $VM_NAME"
@@ -107,15 +99,15 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" config set-cluster "$CLUSTER_NAME" \
   --server="https://127.0.0.1:${PORT}" --tls-server-name=kubernetes >/dev/null
 
 if [ -f "$TUNNEL_PIDFILE" ]; then
-  old_pid="$(cat "$TUNNEL_PIDFILE")"
-  if is_install_tunnel_pid "$old_pid"; then kill "$old_pid" 2>/dev/null || true; sleep 1; fi
+  read -r old_pid old_port < "$TUNNEL_PIDFILE" || true
+  if is_install_tunnel_pid "$old_pid" "$old_port"; then kill "$old_pid" 2>/dev/null || true; sleep 1; fi
   rm -f "$TUNNEL_PIDFILE"
 fi
 check_port_free "$PORT" "apiserver"
 # ControlPath=none: through Lima's shared mux master the forward would outlive this pid.
 nohup ssh -F "$VM_DIR/ssh.config" -o ControlPath=none -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
   -L "127.0.0.1:${PORT}:${TUNNEL_TARGET}" "lima-${VM_NAME}" >"$WORKDIR/install-tunnel.log" 2>&1 &
-echo $! > "$TUNNEL_PIDFILE"
+echo "$! $PORT" > "$TUNNEL_PIDFILE"
 for _ in $(seq 1 30); do
   kubectl --kubeconfig="$KUBECONFIG_PATH" get --raw=/healthz >/dev/null 2>&1 && break
   sleep 1

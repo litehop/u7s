@@ -620,13 +620,27 @@ install_mode_incompatible_flags() {
   done
 }
 
-# True when <pid> is an ssh process forwarding a port (the install-mode apiserver
-# tunnel). Guards pidfile-driven kills against a recycled PID.
+# True when <pid> is an ssh process forwarding exactly 127.0.0.1:<port> (this slot's
+# install-mode apiserver tunnel). Guards pidfile-driven kills against a recycled PID,
+# including one now owned by another slot's tunnel.
 is_install_tunnel_pid() {
   local cmd
+  [ -n "${2:-}" ] || return 1
   cmd=$(ps -p "$1" -o command= 2>/dev/null) || return 1
   case "$cmd" in
-    *ssh*" -L "*) return 0 ;;
+    *ssh*" -L 127.0.0.1:$2:"*) return 0 ;;
     *) return 1 ;;
+  esac
+}
+
+# Prints the per-VM default Lima network. Single source for lima-start.sh and
+# install-bringup.sh; mirrors the Network column of the Lima VM protocol table in the
+# dispatch template doc. VMs outside the known set fall back to the flat "user-v2".
+default_network_for_vm() {
+  case "$1" in
+    lima-node) echo "user-v2-mayor" ;;
+    lima-node-2|lima-node-3|lima-node-4) echo "user-v2-workers-a" ;;
+    lima-node-5|lima-node-smoke) echo "user-v2-workers-b" ;;
+    *) echo "user-v2" ;;
   esac
 }
