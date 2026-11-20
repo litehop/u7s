@@ -137,8 +137,8 @@ Prerequisites:
 
    The output lists both ranges.
 
-The ranges are fixed at first install: a re-run with a different value is
-refused. The only supported change is the
+The ranges are fixed at first install: `install.sh` refuses a re-run with a
+different value. The only supported change is the
 [single-stack to dual-stack upgrade](upgrading.md#upgrading-to-dual-stack).
 A dual-stack install enables IPv6 forwarding in
 `/etc/sysctl.d/u7s-ipv6-forwarding.conf`. A joining worker reads the ranges
