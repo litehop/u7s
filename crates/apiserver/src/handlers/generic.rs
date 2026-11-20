@@ -846,6 +846,37 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
     }
 }
 
+/// The soft-delete of one DeleteCollection item, decided on the object as it is now rather
+/// than on the list snapshot (as upstream's per-item Delete does): an item deleted since the
+/// list stays deleted, and a concurrent write to it is not overwritten.
+///
+/// `Ok(true)`: nothing left to hard-delete (soft-deleted, or already gone). `Ok(false)`: the
+/// object has no finalizers and the caller must hard-delete it.
+pub(crate) async fn soft_delete_collection_item<S: Store>(
+    store: std::sync::Arc<S>,
+    key: &str,
+    ctx: (&str, &str, &str, &str),
+) -> Result<bool, crate::status::StatusError> {
+    let mut gu = crate::guaranteed_update::GuaranteedUpdate::new(store, key, None, ctx);
+    loop {
+        let Some(stored) = gu.read().await? else {
+            return Ok(true);
+        };
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&stored.value) else {
+            return Ok(false);
+        };
+        let Some(soft) = apply_delete_policy(&mut Object { body }) else {
+            return Ok(false);
+        };
+        match gu.commit(Object { body: soft }.to_bytes()).await {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => return Ok(true),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Stamp server-owned identity fields on a newly-created object.
 ///
 /// `uid` is ALWAYS assigned fresh here, unconditionally overwriting any client-supplied

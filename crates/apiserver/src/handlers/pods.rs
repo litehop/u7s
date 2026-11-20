@@ -14,6 +14,7 @@ use crate::{
         AdmissionContext, AdmissionTarget, LabelSelector,
     },
     auth::UserInfo,
+    guaranteed_update::GuaranteedUpdate,
     handlers::{field_selector::FieldSelector, generic::validate_path_segment},
     keys::{cluster_object_key, group_list_prefix, group_object_key, list_prefix, object_key},
     limit_range::parse_quantity,
@@ -695,7 +696,7 @@ pub(crate) async fn replace_pod<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct)?;
-    let mut obj =
+    let obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
@@ -709,148 +710,151 @@ pub(crate) async fn replace_pod<S: Store>(
 
     // Fetch the stored object to compare spec (needed for generation tracking).
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "pods", &name))?;
+    let incoming_obj = obj;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_revision,
+        ("", "pods", &name, "Pod"),
+    );
+    let (mut obj, new_rv, spec_before) = loop {
+        let mut obj = incoming_obj.clone();
+        let stored = gu.read_existing().await?;
 
-    // Stale-resourceVersion PUTs must 409, not fall through into
-    // validate_pod_spec_immutable using the freshly-read `stored` below — see
-    // check_replace_resource_version_precondition in resource.rs for the same invariant.
-    // Concrete pod instance: a controller GETs a pod, then PUTs it back with
-    // only e.g. metadata.labels changed to release it from a selector. If the scheduler binds
-    // spec.nodeName via /binding in between, the stored spec has moved on by the time this PUT
-    // arrives — the controller's PUT body still carries the pre-bind (blank) nodeName it read.
-    // Comparing that stale body's spec against the just-fetched, already-scheduled `stored`
-    // spec makes validate_pod_spec_immutable see a genuine nodeName change and permanently
-    // reject with 422, instead of the retryable 409 a resourceVersion mismatch should give —
-    // which is what tells the controller's own conflict-retry loop to re-GET and resubmit
-    // against the now-scheduled pod.
-    if let Some(expected) = expected_revision {
-        if expected != stored.revision {
-            return Err(store_err_to_status(
-                StoreError::RevisionMismatch {
-                    expected,
-                    current: stored.revision,
-                },
-                &name,
-            ));
-        }
-    }
-
-    let stored_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    let spec_before = stored_obj.body["spec"].clone();
-    // PUT to the main /pods endpoint updates spec+metadata only; status is managed by
-    // the /status subresource. Client bodies may carry stale status (e.g. a local cache
-    // from before kubelet's latest status patch), which would silently clobber real
-    // status updates if not stripped. Mirrors patch_pod's stored_status handling below.
-    let stored_status = stored_obj.body["status"].clone();
-    // metadata.generation is server-managed. Restore the stored value so a
-    // client-supplied generation (e.g. the conformance test case that sends
-    // generation=1 on a pod already at generation=5) cannot downgrade it.
-    // increment_pod_generation_if_spec_changed then increments from the
-    // stored value (if spec changed) or leaves it unchanged (if spec unchanged).
-    let stored_generation = stored_obj.body["metadata"]["generation"].clone();
-    obj.body["metadata"]["generation"] = stored_generation;
-
-    // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
-    // path (resource.rs): a blank incoming uid is restored from the stored object, but a
-    // non-blank incoming uid that mismatches the stored one is identity forgery, not a
-    // legitimate update — allowing it would let a caller holding only `update pods` (not
-    // `create`/`delete pods`) forge a match against a stale/foreign ownerReference, corrupting
-    // the garbage collector's cascade-GC decision for ReplicaSet/Job/DaemonSet controllers.
-    let stored_uid = stored_obj.body["metadata"]["uid"].clone();
-    let incoming_uid_blank = obj.body["metadata"]["uid"]
-        .as_str()
-        .map(str::is_empty)
-        .unwrap_or(true);
-    if incoming_uid_blank {
-        if let Some(uid) = stored_uid.as_str() {
-            if !uid.is_empty() {
-                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+        // Stale-resourceVersion PUTs must 409, not fall through into
+        // validate_pod_spec_immutable using the freshly-read `stored` below — see
+        // check_replace_resource_version_precondition in resource.rs for the same invariant.
+        // Concrete pod instance: a controller GETs a pod, then PUTs it back with
+        // only e.g. metadata.labels changed to release it from a selector. If the scheduler binds
+        // spec.nodeName via /binding in between, the stored spec has moved on by the time this PUT
+        // arrives — the controller's PUT body still carries the pre-bind (blank) nodeName it read.
+        // Comparing that stale body's spec against the just-fetched, already-scheduled `stored`
+        // spec makes validate_pod_spec_immutable see a genuine nodeName change and permanently
+        // reject with 422, instead of the retryable 409 a resourceVersion mismatch should give —
+        // which is what tells the controller's own conflict-retry loop to re-GET and resubmit
+        // against the now-scheduled pod.
+        if let Some(expected) = expected_revision {
+            if expected != stored.revision {
+                return Err(store_err_to_status(
+                    StoreError::RevisionMismatch {
+                        expected,
+                        current: stored.revision,
+                    },
+                    &name,
+                ));
             }
         }
-    } else if let Some(stored_uid_str) = stored_uid.as_str().filter(|s| !s.is_empty()) {
-        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
-        if incoming_uid_str != stored_uid_str {
-            return Err(Status::conflict(format!(
-                "Pod \"{name}\": the object was updated with a mismatched uid \
+
+        let stored_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let spec_before = stored_obj.body["spec"].clone();
+        // PUT to the main /pods endpoint updates spec+metadata only; status is managed by
+        // the /status subresource. Client bodies may carry stale status (e.g. a local cache
+        // from before kubelet's latest status patch), which would silently clobber real
+        // status updates if not stripped. Mirrors patch_pod's stored_status handling below.
+        let stored_status = stored_obj.body["status"].clone();
+        // metadata.generation is server-managed. Restore the stored value so a
+        // client-supplied generation (e.g. the conformance test case that sends
+        // generation=1 on a pod already at generation=5) cannot downgrade it.
+        // increment_pod_generation_if_spec_changed then increments from the
+        // stored value (if spec changed) or leaves it unchanged (if spec unchanged).
+        let stored_generation = stored_obj.body["metadata"]["generation"].clone();
+        obj.body["metadata"]["generation"] = stored_generation;
+
+        // metadata.uid is immutable identity, exactly like the generic replace_namespaced_resource
+        // path (resource.rs): a blank incoming uid is restored from the stored object, but a
+        // non-blank incoming uid that mismatches the stored one is identity forgery, not a
+        // legitimate update — allowing it would let a caller holding only `update pods` (not
+        // `create`/`delete pods`) forge a match against a stale/foreign ownerReference, corrupting
+        // the garbage collector's cascade-GC decision for ReplicaSet/Job/DaemonSet controllers.
+        let stored_uid = stored_obj.body["metadata"]["uid"].clone();
+        let incoming_uid_blank = obj.body["metadata"]["uid"]
+            .as_str()
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if incoming_uid_blank {
+            if let Some(uid) = stored_uid.as_str() {
+                if !uid.is_empty() {
+                    obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+                }
+            }
+        } else if let Some(stored_uid_str) = stored_uid.as_str().filter(|s| !s.is_empty()) {
+            let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+            if incoming_uid_str != stored_uid_str {
+                return Err(Status::conflict(format!(
+                    "Pod \"{name}\": the object was updated with a mismatched uid \
                  (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable"
-            )));
+                )));
+            }
         }
-    }
 
-    // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
-    // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
-    super::generic::pin_server_owned_deletion_fields(&mut obj.body, Some(&stored_obj.body));
+        // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
+        // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
+        super::generic::pin_server_owned_deletion_fields(&mut obj.body, Some(&stored_obj.body));
 
-    // Admission webhook pipeline (mutating then validating).
-    let admission_ctx = AdmissionContext {
-        group: "",
-        version: "v1",
-        resource: "pods",
-        name: &name,
-        namespace: Some(ns.as_str()),
-        operation: "UPDATE",
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run: replace_query.is_dry_run(),
+        // Admission webhook pipeline (mutating then validating).
+        let admission_ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: &name,
+            namespace: Some(ns.as_str()),
+            operation: "UPDATE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+                "extra": user.extra,
+            })),
+            dry_run: replace_query.is_dry_run(),
+        };
+        apply_default_toleration_seconds(&mut obj.body);
+        obj.body =
+            run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
+        validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
+            .map_err(Status::unprocessable_entity)?;
+        run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
+
+        increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
+
+        // Restore the stored status now that spec/metadata processing is done: whatever
+        // status the client's PUT body carried (see stored_status comment above) is
+        // discarded in favor of the server's own record.
+        obj.body["status"] = stored_status;
+        crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+            .record(&stored_obj.body, &mut obj.body, "v1", None, None);
+
+        // Dry-run: validation and admission passed; return the would-be replaced object without
+        // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
+        if replace_query.is_dry_run() {
+            return Ok(Json(obj.body));
+        }
+
+        // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+        // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+        // remove their finalizer via PUT, not PATCH. Mirrors patch_pod's post-patch check below —
+        // complete the delete instead of storing an update, or the pod stays stuck Terminating
+        // forever.
+        if super::resource::finalizer_drain_complete(&obj.body) {
+            state
+                .store
+                .delete(&key, None)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+            state.node_graph.remove_pod(ns.as_str(), &name);
+            // Same per-namespace lock the create path holds across its check-then-write —
+            // without it here, this decrement can interleave with a concurrent
+            // create/delete/resize's read-modify-write of the same quota's status.used and lose
+            // an update.
+            let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
+            crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
+            return Ok(Json(obj.body));
+        }
+
+        if let Some(rv) = gu.commit(obj.to_bytes()).await? {
+            break (obj, rv, spec_before);
+        }
     };
-    apply_default_toleration_seconds(&mut obj.body);
-    obj.body =
-        run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
-    validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
-        .map_err(Status::unprocessable_entity)?;
-    run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
-
-    increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
-
-    // Restore the stored status now that spec/metadata processing is done: whatever
-    // status the client's PUT body carried (see stored_status comment above) is
-    // discarded in favor of the server's own record.
-    obj.body["status"] = stored_status;
-    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
-        .record(&stored_obj.body, &mut obj.body, "v1", None, None);
-
-    // Dry-run: validation and admission passed; return the would-be replaced object without
-    // persisting — mirrors replace_namespaced_resource's dry-run early-return in resource.rs.
-    if replace_query.is_dry_run() {
-        return Ok(Json(obj.body));
-    }
-
-    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
-    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
-    // remove their finalizer via PUT, not PATCH. Mirrors patch_pod's post-patch check below —
-    // complete the delete instead of storing an update, or the pod stays stuck Terminating
-    // forever.
-    if super::resource::finalizer_drain_complete(&obj.body) {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        state.node_graph.remove_pod(ns.as_str(), &name);
-        // Same per-namespace lock the create path holds across its check-then-write —
-        // without it here, this decrement can interleave with a concurrent
-        // create/delete/resize's read-modify-write of the same quota's status.used and lose
-        // an update.
-        let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
-        crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
-        return Ok(Json(obj.body));
-    }
-
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
 
@@ -1048,6 +1052,43 @@ mod shorten_grace_period_secs_tests {
 ///
 /// sonobuoy cleanup sends this to remove all pods it created in a namespace.
 /// Applies the labelSelector if present; deletes all matching pods.
+/// The soft-deleted form of `pod`, or `None` when the delete is a no-op.
+fn soft_delete_update(
+    mut pod: serde_json::Value,
+    requested_grace: Option<i64>,
+) -> Option<serde_json::Value> {
+    let meta: ObjectMeta = ObjectMeta::deserialize(&pod["metadata"]).unwrap_or_default();
+    if meta.deletion_timestamp.is_some() {
+        // Redundant re-DELETE of an already-Terminating, finalizer-carrying pod (e.g. a Job
+        // controller re-issuing Delete() on resync): only a legitimate grace-period shortening
+        // writes; anything else is a no-op so it doesn't churn resourceVersion. See
+        // shorten_grace_period_secs for why.
+        let stored_ts_secs = meta
+            .deletion_timestamp
+            .as_deref()
+            .and_then(rfc3339_to_unix_secs);
+        let (new_ts_secs, new_grace) = stored_ts_secs.and_then(|ts| {
+            shorten_grace_period_secs(
+                unix_now_secs(),
+                ts,
+                meta.deletion_grace_period_seconds,
+                requested_grace,
+            )
+        })?;
+        pod["metadata"]["deletionTimestamp"] =
+            serde_json::Value::String(secs_to_rfc3339(new_ts_secs));
+        pod["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(new_grace);
+        return Some(pod);
+    }
+    let grace = effective_grace_period_seconds(requested_grace, &pod);
+    pod["metadata"]["deletionTimestamp"] =
+        serde_json::Value::String(deletion_timestamp_after_grace(grace));
+    pod["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
+    let current_gen = pod["metadata"]["generation"].as_i64().unwrap_or(1);
+    pod["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+    Some(pod)
+}
+
 pub(crate) async fn delete_collection_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
@@ -1164,45 +1205,29 @@ pub(crate) async fn delete_collection_pods<S: Store>(
             }
 
             if !hard_delete_now {
-                if already_terminating {
-                    // Redundant re-DELETE of an already-Terminating, finalizer-carrying pod
-                    // (e.g. a Job controller re-issuing Delete() on resync): only a legitimate
-                    // grace-period shortening writes; anything else is a no-op so it doesn't
-                    // churn resourceVersion. See shorten_grace_period_secs for why.
-                    let stored_ts_secs = meta
-                        .deletion_timestamp
-                        .as_deref()
-                        .and_then(rfc3339_to_unix_secs);
-                    if let Some((new_ts_secs, new_grace)) = stored_ts_secs.and_then(|ts| {
-                        shorten_grace_period_secs(
-                            unix_now_secs(),
-                            ts,
-                            meta.deletion_grace_period_seconds,
-                            requested_grace,
-                        )
-                    }) {
-                        let mut updated = parsed;
-                        updated["metadata"]["deletionTimestamp"] =
-                            serde_json::Value::String(secs_to_rfc3339(new_ts_secs));
-                        updated["metadata"]["deletionGracePeriodSeconds"] =
-                            serde_json::json!(new_grace);
-                        let _ = state
-                            .store
-                            .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
-                            .await;
+                // Like upstream's per-item Delete, the soft-delete is decided on the object as
+                // it is now, not on the list snapshot: a pod deleted since the list stays
+                // deleted, and a pod a kubelet just updated keeps that update.
+                let mut gu = GuaranteedUpdate::new(
+                    state.store.clone(),
+                    &obj.key,
+                    None,
+                    ("", "pods", &pod_name, "Pod"),
+                );
+                while let Ok(fresh) = gu.read_existing().await {
+                    let Ok(fresh) = serde_json::from_slice::<serde_json::Value>(&fresh.value)
+                    else {
+                        break;
+                    };
+                    let Some(updated) = soft_delete_update(fresh, requested_grace) else {
+                        break;
+                    };
+                    if !matches!(
+                        gu.commit(bytes::Bytes::from(updated.to_string())).await,
+                        Ok(None)
+                    ) {
+                        break;
                     }
-                } else {
-                    let mut updated = parsed;
-                    let grace = effective_grace_period_seconds(requested_grace, &updated);
-                    updated["metadata"]["deletionTimestamp"] =
-                        serde_json::Value::String(deletion_timestamp_after_grace(grace));
-                    updated["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(grace);
-                    let current_gen = updated["metadata"]["generation"].as_i64().unwrap_or(1);
-                    updated["metadata"]["generation"] = serde_json::json!(current_gen + 1);
-                    let _ = state
-                        .store
-                        .put(&obj.key, bytes::Bytes::from(updated.to_string()), None)
-                        .await;
                 }
                 soft_deleted = true;
             } else {
@@ -1483,12 +1508,15 @@ pub(crate) async fn patch_pod<S: Store>(
     // KCM can complete a single round-trip, so every attempt conflicts and the
     // batch.kubernetes.io/job-tracking finalizer is never removed, leaving pods stuck
     // Terminating forever and Job GC never completing.
+    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        client_rv,
+        ("", "pods", &name, "Pod"),
+    );
     loop {
-        let stored = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let stored = gu.read().await?;
         let Some(stored) = stored else {
             if !is_ssa {
                 return Err(Status::not_found("", "pods", &name));
@@ -1694,34 +1722,20 @@ pub(crate) async fn patch_pod<S: Store>(
             return Ok(Json(current_obj.body).into_response());
         }
 
-        let expected_revision = parse_resource_version(current_obj.resource_version())?;
-
-        match state
-            .store
-            .put(&key, current_obj.to_bytes(), expected_revision)
-            .await
-        {
-            Ok(new_rv) => {
-                current_obj.set_resource_version(new_rv);
-                // Every patch content-type (strategic-merge, merge, JSON Patch, SSA) has
-                // already folded into current_obj.body above, so this one call —
-                // record_scope_change_if_spec_changed, shared with replace_pod's PUT path —
-                // covers all of them.
-                record_scope_change_if_spec_changed(
-                    &state,
-                    ns.as_str(),
-                    &spec_before,
-                    &current_obj.body,
-                )
-                .await;
-                return Ok(Json(current_obj.body).into_response());
-            }
-            Err(StoreError::RevisionMismatch { .. }) => {
-                // A concurrent write advanced the stored revision between our read and write.
-                // Re-read the fresh object and re-apply the patch.
-                continue;
-            }
-            Err(e) => return Err(store_err_to_status(e, &name)),
+        if let Some(new_rv) = gu.commit(current_obj.to_bytes()).await? {
+            current_obj.set_resource_version(new_rv);
+            // Every patch content-type (strategic-merge, merge, JSON Patch, SSA) has
+            // already folded into current_obj.body above, so this one call —
+            // record_scope_change_if_spec_changed, shared with replace_pod's PUT path —
+            // covers all of them.
+            record_scope_change_if_spec_changed(
+                &state,
+                ns.as_str(),
+                &spec_before,
+                &current_obj.body,
+            )
+            .await;
+            return Ok(Json(current_obj.body).into_response());
         }
     }
 }
@@ -2619,66 +2633,71 @@ pub(crate) async fn replace_pod_status<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "pods", &name))?;
-
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    let before_write = current_obj.body.clone();
-
-    // Typed dispatch: Pod is always registered in status_dispatch (mirrors
-    // put_namespace_status's identical null/typed-decode split), so a scalar or
-    // wrong-typed status fails at typed decode (400) instead of the old
-    // reject-non-object-only check.
-    let incoming_status = &incoming["status"];
-    if incoming_status.is_null() {
-        current_obj.body.as_object_mut().map(|m| m.remove("status"));
-    } else {
-        current_obj.body["status"] =
-            crate::status_dispatch::decode_status_put("v1", "Pod", incoming_status)
-                .expect("Pod is always registered in status_dispatch")?;
-    }
-
-    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming, Some("Pod"));
-    current_obj.body = admit_pod_status_update(
-        &state,
-        ns.as_str(),
-        &name,
-        user.as_ref().map(|u| &u.0),
-        super::json_patch::is_dry_run_header(&headers),
-        &before_write,
-        current_obj.body,
-    )
-    .await?;
-    crate::field_manager::WriteIdentity::new(None, &headers).record(
-        &before_write,
-        &mut current_obj.body,
-        "v1",
-        Some("status"),
-        None,
-    );
-
-    // Dry-run: return the would-be status object without persisting — mirrors
-    // put_resource_status's dry-run early-return.
-    if super::json_patch::is_dry_run_header(&headers) {
-        return Ok(Json(current_obj.body));
-    }
-
     // CAS on the INCOMING body's resourceVersion, not the stored object's: a client
     // holding a stale snapshot must get 409 and retry, not silently clobber a concurrent
-    // write. Absent rv stays unconditional (parse_resource_version returns None).
+    // write.
     let incoming_meta: ObjectMeta =
         ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        ("", "pods", &name, "Pod"),
+    );
+    let (mut current_obj, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let before_write = current_obj.body.clone();
+
+        // Typed dispatch: Pod is always registered in status_dispatch (mirrors
+        // put_namespace_status's identical null/typed-decode split), so a scalar or
+        // wrong-typed status fails at typed decode (400) instead of the old
+        // reject-non-object-only check.
+        let incoming_status = &incoming["status"];
+        if incoming_status.is_null() {
+            current_obj.body.as_object_mut().map(|m| m.remove("status"));
+        } else {
+            current_obj.body["status"] =
+                crate::status_dispatch::decode_status_put("v1", "Pod", incoming_status)
+                    .expect("Pod is always registered in status_dispatch")?;
+        }
+
+        crate::handlers::status::merge_incoming_metadata(
+            &mut current_obj.body,
+            &incoming,
+            Some("Pod"),
+        );
+        current_obj.body = admit_pod_status_update(
+            &state,
+            ns.as_str(),
+            &name,
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+            &before_write,
+            current_obj.body,
+        )
+        .await?;
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            Some("status"),
+            None,
+        );
+
+        // Dry-run: return the would-be status object without persisting — mirrors
+        // put_resource_status's dry-run early-return.
+        if super::json_patch::is_dry_run_header(&headers) {
+            return Ok(Json(current_obj.body));
+        }
+
+        if let Some(rv) = gu.commit(current_obj.to_bytes()).await? {
+            break (current_obj, rv);
+        }
+    };
 
     current_obj.set_resource_version(new_rv);
 
@@ -2950,15 +2969,17 @@ pub(crate) async fn patch_pod_status<S: Store>(
     };
     super::status::reject_patch_identity_mismatch(&patch, &name, Some(ns.as_str()))?;
 
-    // Retry on RevisionMismatch: PATCH is not a conditional operation — re-read and
-    // re-apply when a concurrent write advances the stored rv between our read and write.
+    // PATCH is not a conditional operation — re-read and re-apply when a concurrent write
+    // advances the stored rv between our read and write, unless the patch pins one.
+    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        client_rv,
+        ("", "pods", &name, "Pod"),
+    );
     loop {
-        let stored = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("", "pods", &name))?;
+        let stored = gu.read_existing().await?;
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3002,18 +3023,9 @@ pub(crate) async fn patch_pod_status<S: Store>(
             return Ok(Json(current_obj.body));
         }
 
-        let expected_rv = parse_resource_version(current_obj.resource_version())?;
-        match state
-            .store
-            .put(&key, current_obj.to_bytes(), expected_rv)
-            .await
-        {
-            Ok(new_rv) => {
-                current_obj.set_resource_version(new_rv);
-                return Ok(Json(current_obj.body));
-            }
-            Err(StoreError::RevisionMismatch { .. }) => continue,
-            Err(e) => return Err(store_err_to_status(e, &name)),
+        if let Some(new_rv) = gu.commit(current_obj.to_bytes()).await? {
+            current_obj.set_resource_version(new_rv);
+            return Ok(Json(current_obj.body));
         }
     }
 }
@@ -3531,78 +3543,81 @@ pub(crate) async fn patch_pod_resize<S: Store>(
     };
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "pods", &name))?;
-
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    validate_resize_patch(&current_obj.body, &incoming).map_err(Status::unprocessable_entity)?;
-
-    let spec_before = current_obj.body["spec"].clone();
-    let before_write = current_obj.body.clone();
-    let mut resize_plan = is_ssa
-        .then(|| {
-            plan_pod_subresource_apply(
-                &headers,
-                &before_write,
-                &resize_applied_fields(&incoming),
-                "resize",
-            )
-        })
-        .transpose()?;
-    if let Some(plan) = &mut resize_plan {
-        plan.retain_owned(owns_resize_field);
-    }
-    current_obj.body = admit_write(
-        &state,
-        &pod_target(
-            ns.as_str(),
-            &name,
-            "pods/resize",
-            user.as_ref().map(|u| &u.0),
-            super::json_patch::is_dry_run_header(&headers),
-        ),
-        "UPDATE",
-        Some(&before_write),
-        apply_resize_patch(&before_write, &incoming),
-        |mutated| {
-            validate_resize_patch(&before_write, &mutated).map_err(Status::unprocessable_entity)?;
-            Ok(apply_resize_patch(&before_write, &mutated))
-        },
-    )
-    .await?;
-    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-    crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
-        resize_plan.as_ref(),
-        &before_write,
-        &mut current_obj.body,
-        "v1",
-        "resize",
-        None,
-    );
-
-    // Dry-run: validation passed; return the would-be resized pod without persisting —
-    // mirrors replace_pod's dry-run early-return.
-    if super::json_patch::is_dry_run_header(&headers) {
-        return Ok(Json(current_obj.body));
-    }
-
     // CAS on the INCOMING body's resourceVersion. This route serves both PUT and PATCH:
-    // a PUT client sends its rv and must get 409 on a stale write; a PATCH omits rv, so
-    // parse_resource_version returns None and the write stays unconditional.
+    // a PUT client sends its rv and must get 409 on a stale write; a PATCH omits rv and
+    // is re-applied to the fresh pod on a lost race.
     let incoming_meta: ObjectMeta =
         ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        ("", "pods", &name, "Pod"),
+    );
+    let (mut current_obj, new_rv, spec_before) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        validate_resize_patch(&current_obj.body, &incoming)
+            .map_err(Status::unprocessable_entity)?;
+
+        let spec_before = current_obj.body["spec"].clone();
+        let before_write = current_obj.body.clone();
+        let mut resize_plan = is_ssa
+            .then(|| {
+                plan_pod_subresource_apply(
+                    &headers,
+                    &before_write,
+                    &resize_applied_fields(&incoming),
+                    "resize",
+                )
+            })
+            .transpose()?;
+        if let Some(plan) = &mut resize_plan {
+            plan.retain_owned(owns_resize_field);
+        }
+        current_obj.body = admit_write(
+            &state,
+            &pod_target(
+                ns.as_str(),
+                &name,
+                "pods/resize",
+                user.as_ref().map(|u| &u.0),
+                super::json_patch::is_dry_run_header(&headers),
+            ),
+            "UPDATE",
+            Some(&before_write),
+            apply_resize_patch(&before_write, &incoming),
+            |mutated| {
+                validate_resize_patch(&before_write, &mutated)
+                    .map_err(Status::unprocessable_entity)?;
+                Ok(apply_resize_patch(&before_write, &mutated))
+            },
+        )
+        .await?;
+        increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+        crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
+            resize_plan.as_ref(),
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            "resize",
+            None,
+        );
+
+        // Dry-run: validation passed; return the would-be resized pod without persisting —
+        // mirrors replace_pod's dry-run early-return.
+        if super::json_patch::is_dry_run_header(&headers) {
+            return Ok(Json(current_obj.body));
+        }
+
+        if let Some(rv) = gu.commit(current_obj.to_bytes()).await? {
+            break (current_obj, rv, spec_before);
+        }
+    };
 
     current_obj.set_resource_version(new_rv);
 
@@ -3918,62 +3933,56 @@ pub(crate) async fn patch_ephemeral_containers<S: Store>(
     };
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "pods", &name))?;
+    let mut gu = GuaranteedUpdate::new(state.store.clone(), &key, None, ("", "pods", &name, "Pod"));
+    let current_obj = loop {
+        let stored = gu.read_existing().await?;
 
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let spec_before = current_obj.body["spec"].clone();
-    let before_write = current_obj.body.clone();
-    let ec_plan = is_ssa
-        .then(|| {
-            plan_pod_subresource_apply(
-                &headers,
-                &before_write,
-                &ephemeral_containers_applied_fields(&patch),
-                "ephemeralcontainers",
-            )
-        })
-        .transpose()?;
-    current_obj.body = admit_ephemeral_containers_update(
-        &state,
-        ns.as_str(),
-        &name,
-        user.as_ref().map(|u| &u.0),
-        super::json_patch::is_dry_run_header(&headers),
-        &before_write,
-        apply_ephemeral_containers_patch(&current_obj.body, &patch),
-    )
-    .await?;
-    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-    crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
-        ec_plan.as_ref(),
-        &before_write,
-        &mut current_obj.body,
-        "v1",
-        "ephemeralcontainers",
-        None,
-    );
+        let spec_before = current_obj.body["spec"].clone();
+        let before_write = current_obj.body.clone();
+        let ec_plan = is_ssa
+            .then(|| {
+                plan_pod_subresource_apply(
+                    &headers,
+                    &before_write,
+                    &ephemeral_containers_applied_fields(&patch),
+                    "ephemeralcontainers",
+                )
+            })
+            .transpose()?;
+        current_obj.body = admit_ephemeral_containers_update(
+            &state,
+            ns.as_str(),
+            &name,
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+            &before_write,
+            apply_ephemeral_containers_patch(&current_obj.body, &patch),
+        )
+        .await?;
+        increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+        crate::field_manager::WriteIdentity::new(None, &headers).record_subresource_write(
+            ec_plan.as_ref(),
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            "ephemeralcontainers",
+            None,
+        );
 
-    // Dry-run: validation passed; return the would-be patched pod without persisting —
-    // mirrors replace_pod's dry-run early-return.
-    if super::json_patch::is_dry_run_header(&headers) {
-        return Ok(Json(current_obj.body));
-    }
+        // Dry-run: validation passed; return the would-be patched pod without persisting —
+        // mirrors replace_pod's dry-run early-return.
+        if super::json_patch::is_dry_run_header(&headers) {
+            return Ok(Json(current_obj.body));
+        }
 
-    let expected_rv = parse_resource_version(current_obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
-
-    current_obj.set_resource_version(new_rv);
+        if let Some(rv) = gu.commit(current_obj.to_bytes()).await? {
+            current_obj.set_resource_version(rv);
+            break current_obj;
+        }
+    };
 
     Ok(Json(current_obj.body))
 }
@@ -3996,53 +4005,54 @@ pub(crate) async fn put_ephemeral_containers<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "pods", &name))?;
-
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let spec_before = current_obj.body["spec"].clone();
-    let before_write = current_obj.body.clone();
-    current_obj.body = admit_ephemeral_containers_update(
-        &state,
-        ns.as_str(),
-        &name,
-        user.as_ref().map(|u| &u.0),
-        super::json_patch::is_dry_run_header(&headers),
-        &before_write,
-        apply_ephemeral_containers_patch(&current_obj.body, &incoming),
-    )
-    .await?;
-    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-    crate::field_manager::WriteIdentity::new(None, &headers).record(
-        &before_write,
-        &mut current_obj.body,
-        "v1",
-        Some("ephemeralcontainers"),
-        None,
-    );
-
-    // Dry-run: validation passed; return the would-be replaced pod without persisting —
-    // mirrors replace_pod's dry-run early-return.
-    if super::json_patch::is_dry_run_header(&headers) {
-        return Ok(Json(current_obj.body));
-    }
-
     // CAS on the INCOMING body's resourceVersion, not the stored object's, so a stale
-    // PUT is rejected with 409. Absent rv stays unconditional (returns None).
+    // PUT is rejected with 409.
     let incoming_meta: ObjectMeta =
         ObjectMeta::deserialize(&incoming["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        ("", "pods", &name, "Pod"),
+    );
+    let (mut current_obj, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        let spec_before = current_obj.body["spec"].clone();
+        let before_write = current_obj.body.clone();
+        current_obj.body = admit_ephemeral_containers_update(
+            &state,
+            ns.as_str(),
+            &name,
+            user.as_ref().map(|u| &u.0),
+            super::json_patch::is_dry_run_header(&headers),
+            &before_write,
+            apply_ephemeral_containers_patch(&current_obj.body, &incoming),
+        )
+        .await?;
+        increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            &before_write,
+            &mut current_obj.body,
+            "v1",
+            Some("ephemeralcontainers"),
+            None,
+        );
+
+        // Dry-run: validation passed; return the would-be replaced pod without persisting —
+        // mirrors replace_pod's dry-run early-return.
+        if super::json_patch::is_dry_run_header(&headers) {
+            return Ok(Json(current_obj.body));
+        }
+
+        if let Some(rv) = gu.commit(current_obj.to_bytes()).await? {
+            break (current_obj, rv);
+        }
+    };
 
     current_obj.set_resource_version(new_rv);
 

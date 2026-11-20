@@ -2840,6 +2840,8 @@ mod tests {
             ".create_if_namespace_active(",
             ".delete_namespace_resources(",
             ".allocate_service_ip(",
+            ".commit(",
+            ".pending(",
         ];
         ENTRY_POINTS.iter().any(|e| body.contains(e))
     }
@@ -2925,8 +2927,8 @@ mod tests {
     const SAFE_NO_DRY_RUN_SIGNAL: &[&str] = &[
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
-        // Reached from the replace handlers only after their dry-run early-return.
-        "update_after_lost_create_race",
+        // Every DeleteCollection caller `continue`s on dry-run before reaching it.
+        "soft_delete_collection_item",
         // CRD finalization (finalize_crd and its helpers): reached from delete_crd only after
         // its dry-run early-return, and from the background terminating-CRD sweep.
         "finalize_crd",
@@ -2963,7 +2965,9 @@ mod tests {
             .flatten()
         {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            if path.extension().and_then(|e| e.to_str()) != Some("rs")
+                || path.to_string_lossy().ends_with("_tests.rs")
+            {
                 continue;
             }
             let source = std::fs::read_to_string(&path)

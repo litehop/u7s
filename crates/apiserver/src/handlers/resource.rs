@@ -13,6 +13,7 @@ use crate::{limit_range, quota};
 
 use crate::{
     auth::UserInfo,
+    guaranteed_update::{GuaranteedUpdate, WriteFailure},
     keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
@@ -801,24 +802,6 @@ fn qualified_resource(group: &str, plural: &str) -> String {
     }
 }
 
-/// Persist a PUT-create that found the object already created by a concurrent writer.
-/// Upstream `GuaranteedUpdate` retries the closure against the now-existing object, so the
-/// update rules apply: see `require_resourceversion_on_update`; a stated resourceVersion is
-/// compared by the store and conflicts (409) on mismatch.
-async fn update_after_lost_create_race<S: Store>(
-    store: &S,
-    key: &str,
-    body: Bytes,
-    expected_revision: Option<u64>,
-    (group, plural, name, kind): (&str, &str, &str, &str),
-) -> Result<u64, crate::status::StatusError> {
-    require_builtin_resourceversion_on_update(group, plural, expected_revision, name)?;
-    store
-        .put(key, body, expected_revision)
-        .await
-        .map_err(|e| store_err(e, group, plural, name, kind))
-}
-
 /// Authorize the `create` verb for a PUT/PATCH/apply that is about to create an object.
 /// The auth layer only authorized the HTTP-method verb (update/patch); upstream's
 /// create-on-update path additionally requires `create` (`withAuthorization` in
@@ -984,288 +967,267 @@ pub(crate) async fn replace_resource<S: Store>(
     // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
     // must be compared against the stored uid below (see stored_uid mismatch check) —
     // metadata.uid is immutable identity, not just something to fill in when absent.
-    let needs_stored_read = true;
-    let (
-        stored_status,
-        stored_uid,
-        pv_spec_before_replace,
-        storageclass_before_replace,
-        node_before_replace,
-        old_object,
-    ) = if needs_stored_read {
-        let parsed = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
-
-        // Stale-resourceVersion PUTs must 409, not fall through into the immutability
-        // checks below using the (by-then-moved-on) freshly-read `parsed` — see
-        // check_replace_resource_version_precondition's doc comment.
-        check_replace_resource_version_precondition(
-            expected_revision,
-            &parsed,
-            &group,
-            &plural,
-            &name,
-            &meta.kind,
-        )?;
-
-        let status = if meta.has_status_subresource {
-            parsed.as_ref().map(|v| v["status"].clone())
-        } else {
-            None
-        };
-        // UID is immutable and system-assigned. Captured whenever we already have the
-        // stored object in hand so a blind PUT that omits it can be defended against,
-        // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
-        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-        // Captured pre-`apply_defaults` (below), mirroring pvc_spec_before_replace in
-        // replace_namespaced_resource: the stored spec was defaulted at create time, so the
-        // comparison below (after apply_defaults runs on the incoming body) must compare two
-        // specs defaulted the same way, or a PUT that legitimately omits a server-defaulted
-        // field (e.g. PersistentVolume.spec.volumeMode) would false-positive-reject.
-        let pv_spec_before_replace = if is_pv {
-            parsed.as_ref().map(|v| v["spec"].clone())
-        } else {
-            None
-        };
-        let storageclass_before_replace = if is_storageclass {
-            parsed.clone()
-        } else {
-            None
-        };
-        // Full body (not just spec): restrict_node_self_write below also needs
-        // metadata.labels/ownerReferences, not only spec.
-        let node_before_replace = if is_node { parsed.clone() } else { None };
-        (
-            status,
-            uid,
+    let incoming_obj = obj;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_revision,
+        (&group, &plural, &name, &meta.kind),
+    );
+    let (mut obj, new_rv) = loop {
+        let mut obj = incoming_obj.clone();
+        let needs_stored_read = true;
+        let (
+            stored_status,
+            stored_uid,
             pv_spec_before_replace,
             storageclass_before_replace,
             node_before_replace,
-            parsed,
-        )
-    } else {
-        (None, None, None, None, None, None)
-    };
+            old_object,
+        ) = if needs_stored_read {
+            let parsed = gu
+                .read()
+                .await?
+                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-    // UID is immutable; a client's blind PUT (built from a locally-held copy that never
-    // repopulated system-assigned fields) can omit it. Real kube-apiserver's generic update
-    // preparation (rest.BeforeUpdate) unconditionally restores the existing UID whenever the
-    // incoming body's is blank ("Use the existing UID if none is provided") for every
-    // resource, every Update — cluster-scoped resources are exactly as exposed to this as
-    // namespaced ones. Without this, a blank UID is persisted and broadcast to watchers as-is.
-    if incoming_uid_blank {
-        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
-            if !uid.is_empty() {
-                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+            // Stale-resourceVersion PUTs must 409, not fall through into the immutability
+            // checks below using the (by-then-moved-on) freshly-read `parsed` — see
+            // check_replace_resource_version_precondition's doc comment.
+            check_replace_resource_version_precondition(
+                expected_revision,
+                &parsed,
+                &group,
+                &plural,
+                &name,
+                &meta.kind,
+            )?;
+
+            let status = if meta.has_status_subresource {
+                parsed.as_ref().map(|v| v["status"].clone())
+            } else {
+                None
+            };
+            // UID is immutable and system-assigned. Captured whenever we already have the
+            // stored object in hand so a blind PUT that omits it can be defended against,
+            // mirroring replace_namespaced_resource's restoration of a blank incoming UID.
+            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+            // Captured pre-`apply_defaults` (below), mirroring pvc_spec_before_replace in
+            // replace_namespaced_resource: the stored spec was defaulted at create time, so the
+            // comparison below (after apply_defaults runs on the incoming body) must compare two
+            // specs defaulted the same way, or a PUT that legitimately omits a server-defaulted
+            // field (e.g. PersistentVolume.spec.volumeMode) would false-positive-reject.
+            let pv_spec_before_replace = if is_pv {
+                parsed.as_ref().map(|v| v["spec"].clone())
+            } else {
+                None
+            };
+            let storageclass_before_replace = if is_storageclass {
+                parsed.clone()
+            } else {
+                None
+            };
+            // Full body (not just spec): restrict_node_self_write below also needs
+            // metadata.labels/ownerReferences, not only spec.
+            let node_before_replace = if is_node { parsed.clone() } else { None };
+            (
+                status,
+                uid,
+                pv_spec_before_replace,
+                storageclass_before_replace,
+                node_before_replace,
+                parsed,
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
+
+        // UID is immutable; a client's blind PUT (built from a locally-held copy that never
+        // repopulated system-assigned fields) can omit it. Real kube-apiserver's generic update
+        // preparation (rest.BeforeUpdate) unconditionally restores the existing UID whenever the
+        // incoming body's is blank ("Use the existing UID if none is provided") for every
+        // resource, every Update — cluster-scoped resources are exactly as exposed to this as
+        // namespaced ones. Without this, a blank UID is persisted and broadcast to watchers as-is.
+        if incoming_uid_blank {
+            if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+                if !uid.is_empty() {
+                    obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+                }
+            }
+        } else if let Some(stored_uid_str) = stored_uid
+            .as_ref()
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
+            // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
+            // 409. the garbage collector determines whether an ownerReference is "live"
+            // purely by comparing stored uid == ownerRef.uid — letting a client silently
+            // overwrite an object's uid would let it forge a match against a stale/foreign
+            // ownerReference and corrupt cascade-GC decisions, and would defeat controllers'
+            // "same name, different uid ⇒ different object" recreate-detection.
+            let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+            if incoming_uid_str != stored_uid_str {
+                return Err(Status::conflict(format!(
+                    "{} \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
+                    meta.kind
+                )));
             }
         }
-    } else if let Some(stored_uid_str) = stored_uid
-        .as_ref()
-        .and_then(|u| u.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
-        // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
-        // 409. the garbage collector determines whether an ownerReference is "live"
-        // purely by comparing stored uid == ownerRef.uid — letting a client silently
-        // overwrite an object's uid would let it forge a match against a stale/foreign
-        // ownerReference and corrupt cascade-GC decisions, and would defeat controllers'
-        // "same name, different uid ⇒ different object" recreate-detection.
-        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
-        if incoming_uid_str != stored_uid_str {
-            return Err(Status::conflict(format!(
-                "{} \"{name}\": the object was updated with a mismatched uid \
-                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
-                meta.kind
-            )));
+
+        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
+        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
+        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
+        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
+        // of completing the delete — persisting the object with deletionTimestamp gone and
+        // finalizers empty, i.e. silently resurrecting it as a normal live object.
+        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
+
+        if old_object.is_none() && !allows_create_on_update(&group, &plural) {
+            return Err(Status::not_found(&group, &plural, &name));
         }
-    }
-
-    // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-    // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-    // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-    // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-    // of completing the delete — persisting the object with deletionTimestamp gone and
-    // finalizers empty, i.e. silently resurrecting it as a normal live object.
-    pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
-
-    if old_object.is_none() && !allows_create_on_update(&group, &plural) {
-        return Err(Status::not_found(&group, &plural, &name));
-    }
-    if old_object.is_none() {
-        authorize_create_on_write(
-            &state.rbac_index,
-            &state.node_graph,
-            &user,
-            &group,
-            &plural,
-            None,
-            &name,
-        )?;
-    }
-    if old_object.is_none() {
-        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
-        stamp_metadata(&mut obj);
-    }
-    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::unprocessable_entity)?;
-    if let (true, Some(old)) = (super::csr::is_csr(&group, &plural), old_object.as_ref()) {
-        super::csr::preserve_csr_spec(old, &mut obj.body);
-    }
-    if let (true, Some(old)) = (
-        group == "certificates.k8s.io" && plural == "clustertrustbundles",
-        old_object.as_ref(),
-    ) {
-        super::certificates::validate_cluster_trust_bundle_signer_immutable(old, &obj.body)
+        if old_object.is_none() {
+            authorize_create_on_write(
+                &state.rbac_index,
+                &state.node_graph,
+                &user,
+                &group,
+                &plural,
+                None,
+                &name,
+            )?;
+        }
+        if old_object.is_none() {
+            resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+            stamp_metadata(&mut obj);
+        }
+        super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+        super::defaults::validate_resource(&group, &plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
-    }
-    if let (true, Some(old)) = (
-        group == "storagemigration.k8s.io" && plural == "storageversionmigrations",
-        old_object.as_ref(),
-    ) {
-        super::storagemigration::validate_spec_immutable(old, &obj.body)
-            .map_err(Status::unprocessable_entity)?;
-    }
-    if let (true, Some(old)) = (
-        group == "resource.k8s.io" && plural == "devicetaintrules",
-        old_object.as_ref(),
-    ) {
-        super::device_taint_rule::prepare_device_taint_rule_update(old, &mut obj.body);
-    }
+        if let (true, Some(old)) = (super::csr::is_csr(&group, &plural), old_object.as_ref()) {
+            super::csr::preserve_csr_spec(old, &mut obj.body);
+        }
+        if let (true, Some(old)) = (
+            group == "certificates.k8s.io" && plural == "clustertrustbundles",
+            old_object.as_ref(),
+        ) {
+            super::certificates::validate_cluster_trust_bundle_signer_immutable(old, &obj.body)
+                .map_err(Status::unprocessable_entity)?;
+        }
+        if let (true, Some(old)) = (
+            group == "storagemigration.k8s.io" && plural == "storageversionmigrations",
+            old_object.as_ref(),
+        ) {
+            super::storagemigration::validate_spec_immutable(old, &obj.body)
+                .map_err(Status::unprocessable_entity)?;
+        }
+        if let (true, Some(old)) = (
+            group == "resource.k8s.io" && plural == "devicetaintrules",
+            old_object.as_ref(),
+        ) {
+            super::device_taint_rule::prepare_device_taint_rule_update(old, &mut obj.body);
+        }
 
-    // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
-    // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
-    // apply_defaults (above) so both sides are defaulted the same way, mirroring
-    // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
-    if let Some(ref old_spec) = pv_spec_before_replace {
-        validate_pv_spec_immutable(old_spec, &obj.body["spec"])
-            .map_err(Status::unprocessable_entity)?;
-    }
-    if let Some(ref old_body) = storageclass_before_replace {
-        validate_storageclass_immutable(old_body, &obj.body)
-            .map_err(Status::unprocessable_entity)?;
-    }
-    if let Some(ref old_body) = node_before_replace {
-        validate_node_spec_immutable(&old_body["spec"], &obj.body["spec"])
-            .map_err(Status::unprocessable_entity)?;
-    }
-    // NodeRestriction-equivalent admission: see restrict_node_self_write's doc comment for why
-    // this — not RBAC/node_authz's own broader grant — is what stops a `system:node:<name>`
-    // identity from rewriting its own Node's podCIDR/taints/providerID/labels via a plain PUT.
-    if is_node {
-        crate::node_authz::restrict_node_self_write(
-            &user.username,
-            &user.groups,
-            &name,
-            node_before_replace.as_ref(),
-            &obj.body,
-        )
-        .map_err(Status::forbidden)?;
-    }
-
-    // Admission webhook pipeline (mutating then validating).
-    let admission_ctx = AdmissionContext {
-        group: &group,
-        version: &version,
-        resource: &plural,
-        name: &name,
-        namespace: None,
-        operation: if old_object.is_some() {
-            "UPDATE"
-        } else {
-            "CREATE"
-        },
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run: replace_query.is_dry_run(),
-    };
-    obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
-    if let Some(old) = old_object.as_ref() {
-        super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
-    }
-    run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
-
-    // Restore the stored status: controllers write status via /status; a full PUT on
-    // the main endpoint must preserve whatever the controller last wrote.
-    restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
-    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
-        .record(
-            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
-            &mut obj.body,
-            &group_version(&group, &version),
-            None,
-            None,
-        );
-
-    // Dry-run: validation and admission passed; return the would-be result without persisting.
-    if replace_query.is_dry_run() {
-        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
-        return Ok(Json(obj.body).into_response());
-    }
-
-    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
-    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
-    // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
-    // update, or the object stays stuck Terminating forever.
-    if finalizer_drain_complete(&obj.body) {
-        complete_finalizer_drain(
-            &state,
-            FinalizerDrainCtx {
-                key: &key,
-                meta: &meta,
-                group: &group,
-                version: &version,
-                plural: &plural,
-                ns: None,
-                name: &name,
-            },
-        )
-        .await?;
-        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
-        return Ok(Json(obj.body).into_response());
-    }
-
-    let put_start = std::time::Instant::now();
-    let create_only = old_object.is_none() && expected_revision.is_none();
-    let put_result = state
-        .store
-        .put(
-            &key,
-            obj.to_bytes(),
-            if create_only {
-                Some(0)
-            } else {
-                expected_revision
-            },
-        )
-        .await;
-    tracing::debug!(
-        key = %key,
-        elapsed_ms = put_start.elapsed().as_millis() as u64,
-        ok = put_result.is_ok(),
-        "replace_resource: store.put call completed"
-    );
-    let new_rv = match put_result {
-        Err(StoreError::AlreadyExists { .. }) if create_only => {
-            update_after_lost_create_race(
-                &*state.store,
-                &key,
-                obj.to_bytes(),
-                expected_revision,
-                (&group, &plural, &name, &meta.kind),
+        // A PUT may only change the fields ValidatePersistentVolumeUpdate/ValidateStorageClassUpdate/
+        // ValidateNodeUpdate leave mutable — see the doc comments on each validator. Runs after
+        // apply_defaults (above) so both sides are defaulted the same way, mirroring
+        // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
+        if let Some(ref old_spec) = pv_spec_before_replace {
+            validate_pv_spec_immutable(old_spec, &obj.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+        if let Some(ref old_body) = storageclass_before_replace {
+            validate_storageclass_immutable(old_body, &obj.body)
+                .map_err(Status::unprocessable_entity)?;
+        }
+        if let Some(ref old_body) = node_before_replace {
+            validate_node_spec_immutable(&old_body["spec"], &obj.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+        // NodeRestriction-equivalent admission: see restrict_node_self_write's doc comment for why
+        // this — not RBAC/node_authz's own broader grant — is what stops a `system:node:<name>`
+        // identity from rewriting its own Node's podCIDR/taints/providerID/labels via a plain PUT.
+        if is_node {
+            crate::node_authz::restrict_node_self_write(
+                &user.username,
+                &user.groups,
+                &name,
+                node_before_replace.as_ref(),
+                &obj.body,
             )
-            .await?
+            .map_err(Status::forbidden)?;
         }
-        r => r.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?,
+
+        // Admission webhook pipeline (mutating then validating).
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: None,
+            operation: if old_object.is_some() {
+                "UPDATE"
+            } else {
+                "CREATE"
+            },
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+                "extra": user.extra,
+            })),
+            dry_run: replace_query.is_dry_run(),
+        };
+        obj.body =
+            run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        if let Some(old) = old_object.as_ref() {
+            super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
+        }
+        run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
+
+        // Restore the stored status: controllers write status via /status; a full PUT on
+        // the main endpoint must preserve whatever the controller last wrote.
+        restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+        crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+            .record(
+                old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+                &mut obj.body,
+                &group_version(&group, &version),
+                None,
+                None,
+            );
+
+        // Dry-run: validation and admission passed; return the would-be result without persisting.
+        if replace_query.is_dry_run() {
+            inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+            return Ok(Json(obj.body).into_response());
+        }
+
+        // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+        // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+        // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
+        // update, or the object stays stuck Terminating forever.
+        if finalizer_drain_complete(&obj.body) {
+            complete_finalizer_drain(
+                &state,
+                FinalizerDrainCtx {
+                    key: &key,
+                    meta: &meta,
+                    group: &group,
+                    version: &version,
+                    plural: &plural,
+                    ns: None,
+                    name: &name,
+                },
+            )
+            .await?;
+            inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+            return Ok(Json(obj.body).into_response());
+        }
+
+        if let Some(rv) = gu.commit(obj.to_bytes()).await? {
+            break (obj, rv);
+        }
     };
 
     obj.set_resource_version(new_rv);
@@ -2125,25 +2087,27 @@ pub(crate) async fn do_patch<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let mut stored = stored_opt.ok_or_else(|| Status::not_found(group, plural, name))?;
+    if stored_opt.is_none() {
+        return Err(Status::not_found(group, plural, name));
+    }
 
     // A plain PATCH (merge / strategic-merge / JSON Patch) carries no resourceVersion
     // precondition unless the client's own patch body sets metadata.resourceVersion.
     // Real kube-apiserver's PATCH handler therefore read-modify-writes against the
-    // LIVE object and retries (bounded) on a conflicting concurrent write instead of
+    // LIVE object and retries on a conflicting concurrent write instead of
     // surfacing a 409 for a race the client never asked to guard against — e.g. a
     // controller reacting to the just-created object (writing a status condition)
     // bumps the resourceVersion between the client's create response and its very
-    // next PATCH. Without this retry, that PATCH fails with a spurious conflict even
-    // though it never read or depended on the resourceVersion it happened to race
-    // against. If the client's patch DOES pin metadata.resourceVersion to a stale
-    // value, reapplying it against the freshly re-fetched object still yields that
-    // same stale value, so the mismatch reproduces every attempt and correctly
-    // surfaces as 409 once retries are exhausted.
-    const MAX_PATCH_CONFLICT_RETRIES: u32 = 5;
-    let mut attempt = 0u32;
+    // next PATCH. If the client's patch DOES pin metadata.resourceVersion to a value other
+    // than the one just read, that is a 409 without retrying.
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        key,
+        None,
+        (group, plural, name, &meta.kind),
+    );
     loop {
-        attempt += 1;
+        let stored = gu.read_existing().await?;
         let mut current = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
@@ -2618,15 +2582,22 @@ pub(crate) async fn do_patch<S: Store>(
             return Ok(Json(current.body).into_response());
         }
 
-        let expected_rv = parse_resource_version(current.resource_version())?;
-        let (put, svc_alloc) = crate::service_alloc::put_committing(
-            state.store.clone(),
-            key.to_string(),
-            current.to_bytes(),
-            expected_rv,
-            svc_alloc,
-        )
-        .await?;
+        if let Some(pinned) = parse_resource_version(current.resource_version())? {
+            if pinned != stored.revision {
+                return Err(store_err(
+                    StoreError::RevisionMismatch {
+                        expected: pinned,
+                        current: stored.revision,
+                    },
+                    group,
+                    plural,
+                    name,
+                    &meta.kind,
+                ));
+            }
+        }
+        let (put, svc_alloc) =
+            crate::service_alloc::commit_on_task(svc_alloc, gu.pending(current.to_bytes())).await?;
         match put {
             Ok(new_rv) => {
                 current.set_resource_version(new_rv);
@@ -2648,19 +2619,13 @@ pub(crate) async fn do_patch<S: Store>(
                 inject_type_meta(&mut current.body, group, version, &meta.kind);
                 return Ok(Json(current.body).into_response());
             }
-            Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PATCH_CONFLICT_RETRIES => {
+            Err(WriteFailure::Retry) => {
                 // Await the rollback so the retry can re-reserve the same values.
                 if let Some(txn) = svc_alloc {
                     txn.rollback().await;
                 }
-                stored = state
-                    .store
-                    .get(key)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(group, plural, name))?;
             }
-            Err(e) => return Err(store_err(e, group, plural, name, &meta.kind)),
+            Err(WriteFailure::Fail(e)) => return Err(e),
         }
     }
 }
@@ -4096,461 +4061,433 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // Always read the stored object on a PUT: even when the incoming uid is non-blank, it
     // must be compared against the stored uid below (see stored_uid mismatch check) —
     // metadata.uid is immutable identity, not just something to fill in when absent.
-    let needs_stored_read = true;
-    let (
-        spec_before_replace,
-        pvc_spec_before_replace,
-        svc_spec_before_replace,
-        stored_status,
-        stored_generation,
-        stored_uid,
-        eps_before_replace,
-        object_existed,
-        old_object,
-    ) = if needs_stored_read {
-        let parsed = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+    let incoming_obj = obj;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_revision,
+        (&group, &plural, &name, &meta.kind),
+    )
+    .in_namespace(&ns);
+    let (mut obj, new_rv, object_existed) = loop {
+        let mut obj = incoming_obj.clone();
+        let needs_stored_read = true;
+        let (
+            spec_before_replace,
+            pvc_spec_before_replace,
+            svc_spec_before_replace,
+            stored_status,
+            stored_generation,
+            stored_uid,
+            eps_before_replace,
+            object_existed,
+            old_object,
+        ) = if needs_stored_read {
+            let parsed = gu
+                .read()
+                .await?
+                .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
 
-        // Stale-resourceVersion PUTs must 409, not fall through into the immutability
-        // checks below using the (by-then-moved-on) freshly-read `parsed` — see
-        // check_replace_resource_version_precondition's doc comment.
-        check_replace_resource_version_precondition(
-            expected_revision,
-            &parsed,
-            &group,
-            &plural,
-            &name,
-            &meta.kind,
-        )?;
+            // Stale-resourceVersion PUTs must 409, not fall through into the immutability
+            // checks below using the (by-then-moved-on) freshly-read `parsed` — see
+            // check_replace_resource_version_precondition's doc comment.
+            check_replace_resource_version_precondition(
+                expected_revision,
+                &parsed,
+                &group,
+                &plural,
+                &name,
+                &meta.kind,
+            )?;
 
-        // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
-        // reject any update that modifies data/binaryData/stringData or clears the
-        // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
-        if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
-            if let Some(ref stored) = parsed {
-                if stored["immutable"] == serde_json::Value::Bool(true) {
-                    let new_immutable = &obj.body["immutable"];
-                    let immutable_cleared =
-                        new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
-                    let data_changed = obj.body["data"] != stored["data"];
-                    let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
-                    let string_data_changed = obj.body["stringData"] != stored["stringData"];
-                    if immutable_cleared
-                        || data_changed
-                        || binary_data_changed
-                        || string_data_changed
-                    {
-                        return Err(Status::unprocessable_entity(format!(
-                            "{plural}/{name} is immutable and cannot be updated"
-                        )));
+            // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+            // reject any update that modifies data/binaryData/stringData or clears the
+            // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
+            if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
+                if let Some(ref stored) = parsed {
+                    if stored["immutable"] == serde_json::Value::Bool(true) {
+                        let new_immutable = &obj.body["immutable"];
+                        let immutable_cleared = new_immutable == &serde_json::Value::Bool(false)
+                            || new_immutable.is_null();
+                        let data_changed = obj.body["data"] != stored["data"];
+                        let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
+                        let string_data_changed = obj.body["stringData"] != stored["stringData"];
+                        if immutable_cleared
+                            || data_changed
+                            || binary_data_changed
+                            || string_data_changed
+                        {
+                            return Err(Status::unprocessable_entity(format!(
+                                "{plural}/{name} is immutable and cannot be updated"
+                            )));
+                        }
                     }
                 }
             }
-        }
 
-        // A PUT growing spec.resources.requests.storage is only allowed when the bound
-        // StorageClass explicitly opts in via allowVolumeExpansion — see
-        // reject_disallowed_pvc_resize.
-        if is_pvc {
-            if let Some(ref stored) = parsed {
-                reject_disallowed_pvc_resize(
-                    &state,
-                    &plural,
-                    &name,
-                    stored["spec"]["resources"]["requests"]["storage"].as_str(),
-                    stored["spec"]["storageClassName"].as_str().unwrap_or(""),
-                    &obj.body,
-                )
-                .await?;
+            // A PUT growing spec.resources.requests.storage is only allowed when the bound
+            // StorageClass explicitly opts in via allowVolumeExpansion — see
+            // reject_disallowed_pvc_resize.
+            if is_pvc {
+                if let Some(ref stored) = parsed {
+                    reject_disallowed_pvc_resize(
+                        &state,
+                        &plural,
+                        &name,
+                        stored["spec"]["resources"]["requests"]["storage"].as_str(),
+                        stored["spec"]["storageClassName"].as_str().unwrap_or(""),
+                        &obj.body,
+                    )
+                    .await?;
+                }
             }
-        }
 
-        let spec = if super::defaults::is_workload_resource(&group, &plural) {
-            parsed.as_ref().map(|v| v["spec"].clone())
-        } else {
-            None
-        };
-        // Captured pre-`apply_defaults` (below) so validate_pvc_spec_immutable, called after
-        // it, compares two specs defaulted the same way: this stored spec was defaulted at
-        // create time, while obj.body's incoming spec is raw client input until apply_defaults
-        // runs on it further down. Comparing before that would false-positive-reject a PUT
-        // that legitimately omits a server-defaulted field (e.g. spec.volumeMode) the stored
-        // object carries.
-        let pvc_spec_before_replace = if is_pvc {
-            parsed.as_ref().map(|v| v["spec"].clone())
-        } else {
-            None
-        };
-        // Captured pre-`apply_defaults` for the same reason as pvc_spec_before_replace above:
-        // maybe_allocate_cluster_ip needs the stored spec's already-defaulted
-        // clusterIPs/ipFamilies/type to resolve and compare against.
-        let svc_spec_before_replace = if is_service {
-            parsed.as_ref().map(|v| v["spec"].clone())
-        } else {
-            None
-        };
-        let status = if meta.has_status_subresource {
-            parsed.as_ref().map(|v| v["status"].clone())
-        } else {
-            None
-        };
-        let generation = if super::defaults::is_workload_resource(&group, &plural)
-            || super::defaults::is_endpointslice(&group, &plural)
-        {
-            parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
-        } else {
-            None
-        };
-        // UID is immutable and system-assigned. Captured whenever we already have the
-        // stored object in hand (no extra read) so a blind PUT that omits it — see the
-        // restamp below — can be defended against for every resource type this read
-        // already covers, not just EndpointSlice.
-        let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
-        // Snapshot of the whole pre-update object, used by
-        // increment_endpointslice_generation_if_changed below to detect a real content
-        // change (EndpointSlice has no `.spec` to diff against).
-        let eps_before = if super::defaults::is_endpointslice(&group, &plural) {
-            parsed.clone()
-        } else {
-            None
-        };
-        (
-            spec,
-            pvc_spec_before_replace,
-            svc_spec_before_replace,
-            status,
-            generation,
-            uid,
-            eps_before,
-            parsed.is_some(),
-            parsed,
-        )
-    } else {
-        (None, None, None, None, None, None, None, false, None)
-    };
-
-    if !object_existed && !allows_create_on_update(&group, &plural) {
-        return Err(Status::not_found(&group, &plural, &name));
-    }
-    if !object_existed {
-        authorize_create_on_write(
-            &state.rbac_index,
-            &state.node_graph,
-            &user,
-            &group,
-            &plural,
-            Some(&ns),
-            &name,
-        )?;
-    }
-
-    // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
-    // omits metadata.generation. Restamp the stored value onto the incoming body before
-    // apply_defaults runs, or initialize_workload_generation treats the omission as "new
-    // object" and resets generation to 1 — silently erasing however many spec changes the
-    // Deployment has actually undergone and desyncing status.observedGeneration from the
-    // real generation history the Deployment controller expects to see increase monotonically.
-    if let Some(ref g) = stored_generation {
-        if !g.is_null() {
-            obj.body["metadata"]["generation"] = g.clone();
-        }
-    }
-
-    // UID is immutable; a client's PUT commonly omits it — e.g. KCM's EndpointSlice
-    // reconciler builds its Update() body without repopulating this field. Real
-    // kube-apiserver's generic update preparation (rest.BeforeUpdate) unconditionally
-    // restores the existing UID whenever the incoming body's is blank ("Use the existing
-    // UID if none is provided"). Without this, a blank UID is persisted and broadcast to
-    // watchers as-is: KCM's EndpointSliceTracker identifies slices by UID, so its
-    // StaleSlices() check permanently treats the tracked (real) UID as missing from the
-    // informer once the informer's cached copy carries the blank one instead — every later
-    // sync fails with "EndpointSlice informer cache is out of date" forever.
-    let incoming_uid_blank = obj.body["metadata"]["uid"]
-        .as_str()
-        .map(str::is_empty)
-        .unwrap_or(true);
-    if incoming_uid_blank {
-        if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
-            if !uid.is_empty() {
-                obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
-            }
-        }
-    } else if let Some(stored_uid_str) = stored_uid
-        .as_ref()
-        .and_then(|u| u.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
-        // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
-        // 409. the garbage collector determines whether an ownerReference is "live" purely by
-        // comparing stored uid == ownerRef.uid — letting a client silently overwrite an
-        // object's uid would let it forge a match against a stale/foreign ownerReference
-        // and corrupt cascade-GC decisions, and would defeat controllers' "same name,
-        // different uid ⇒ different object" recreate-detection.
-        let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
-        if incoming_uid_str != stored_uid_str {
-            return Err(Status::conflict(format!(
-                "{} \"{name}\": the object was updated with a mismatched uid \
-                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
-                meta.kind
-            )));
-        }
-    }
-
-    // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-    // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-    // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-    // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-    // of completing the delete — persisting the object with deletionTimestamp gone and
-    // finalizers empty, i.e. silently resurrecting it as a normal live object.
-    pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
-
-    // Allocate a clusterIP when a Service transitions away from ExternalName to a
-    // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
-    // handles initial allocation; the update path must also allocate when the type
-    // changes, because ExternalName services are created without a clusterIP and the
-    // stored object carries no IP to preserve.
-    // maybe_allocate_cluster_ip also validates the family fields before taking any
-    // address, for the same leak-avoidance reason as the create path above.
-    let mut auto_cluster_ip = None;
-    if group.is_empty() && plural == "services" {
-        if state.deny_service_external_ips {
-            super::defaults::deny_service_external_ips(
-                svc_spec_before_replace.as_ref(),
-                &obj.body["spec"],
+            let spec = if super::defaults::is_workload_resource(&group, &plural) {
+                parsed.as_ref().map(|v| v["spec"].clone())
+            } else {
+                None
+            };
+            // Captured pre-`apply_defaults` (below) so validate_pvc_spec_immutable, called after
+            // it, compares two specs defaulted the same way: this stored spec was defaulted at
+            // create time, while obj.body's incoming spec is raw client input until apply_defaults
+            // runs on it further down. Comparing before that would false-positive-reject a PUT
+            // that legitimately omits a server-defaulted field (e.g. spec.volumeMode) the stored
+            // object carries.
+            let pvc_spec_before_replace = if is_pvc {
+                parsed.as_ref().map(|v| v["spec"].clone())
+            } else {
+                None
+            };
+            // Captured pre-`apply_defaults` for the same reason as pvc_spec_before_replace above:
+            // maybe_allocate_cluster_ip needs the stored spec's already-defaulted
+            // clusterIPs/ipFamilies/type to resolve and compare against.
+            let svc_spec_before_replace = if is_service {
+                parsed.as_ref().map(|v| v["spec"].clone())
+            } else {
+                None
+            };
+            let status = if meta.has_status_subresource {
+                parsed.as_ref().map(|v| v["status"].clone())
+            } else {
+                None
+            };
+            let generation = if super::defaults::is_workload_resource(&group, &plural)
+                || super::defaults::is_endpointslice(&group, &plural)
+            {
+                parsed.as_ref().map(|v| v["metadata"]["generation"].clone())
+            } else {
+                None
+            };
+            // UID is immutable and system-assigned. Captured whenever we already have the
+            // stored object in hand (no extra read) so a blind PUT that omits it — see the
+            // restamp below — can be defended against for every resource type this read
+            // already covers, not just EndpointSlice.
+            let uid = parsed.as_ref().map(|v| v["metadata"]["uid"].clone());
+            // Snapshot of the whole pre-update object, used by
+            // increment_endpointslice_generation_if_changed below to detect a real content
+            // change (EndpointSlice has no `.spec` to diff against).
+            let eps_before = if super::defaults::is_endpointslice(&group, &plural) {
+                parsed.clone()
+            } else {
+                None
+            };
+            (
+                spec,
+                pvc_spec_before_replace,
+                svc_spec_before_replace,
+                status,
+                generation,
+                uid,
+                eps_before,
+                parsed.is_some(),
+                parsed,
             )
-            .map_err(Status::forbidden)?;
+        } else {
+            (None, None, None, None, None, None, None, false, None)
+        };
+
+        if !object_existed && !allows_create_on_update(&group, &plural) {
+            return Err(Status::not_found(&group, &plural, &name));
         }
-        auto_cluster_ip = maybe_allocate_cluster_ip(
-            &state,
-            &ns,
-            &name,
-            svc_spec_before_replace.as_ref(),
-            &mut obj.body,
-            replace_query.is_dry_run(),
-        )
-        .await?;
-    }
-
-    if !object_existed {
-        resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
-        stamp_metadata(&mut obj);
-    }
-    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::unprocessable_entity)?;
-    if let (true, Some(old)) = (
-        group == "certificates.k8s.io" && plural == "podcertificaterequests",
-        old_object.as_ref(),
-    ) {
-        super::certificates::validate_pod_certificate_request_spec_immutable(old, &obj.body)
-            .map_err(Status::unprocessable_entity)?;
-    }
-
-    // A PUT may only change spec.resources on a PVC — see validate_pvc_spec_immutable. Runs
-    // after apply_defaults (above) so both sides are defaulted the same way — see
-    // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
-    if let Some(ref old_spec) = pvc_spec_before_replace {
-        let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
-        validate_pvc_spec_immutable(old_spec, &obj.body["spec"], old_status)
-            .map_err(Status::unprocessable_entity)?;
-    }
-
-    // Deployment/DaemonSet selector and StatefulSet full-spec-freeze immutability — see
-    // validate_workload_spec_immutable. Same apply_defaults-then-compare ordering as the PVC
-    // check above.
-    if let Some(ref old_spec) = spec_before_replace {
-        validate_workload_spec_immutable(&group, &plural, old_spec, &obj.body["spec"])
-            .map_err(Status::unprocessable_entity)?;
-    }
-
-    // Admission webhook pipeline (mutating then validating).
-    let admission_ctx = AdmissionContext {
-        group: &group,
-        version: &version,
-        resource: &plural,
-        name: &name,
-        namespace: Some(&ns),
-        operation: if object_existed { "UPDATE" } else { "CREATE" },
-        user_info: Some(serde_json::json!({
-            "username": user.username,
-            "uid": user.uid,
-            "groups": user.groups,
-            "extra": user.extra,
-        })),
-        dry_run: replace_query.is_dry_run(),
-    };
-    obj.body = run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
-    if let Some(old) = old_object.as_ref() {
-        super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
-    }
-    run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
-
-    if let Some(ref spec_before) = spec_before_replace {
-        log_spec_replace(&ns, &name, &meta.kind, spec_before, &obj.body["spec"]);
-        super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
-    }
-    if let Some(ref eps_before) = eps_before_replace {
-        super::defaults::increment_endpointslice_generation_if_changed(&mut obj.body, eps_before);
-    }
-
-    // Restore the stored status: controllers write status via /status; a full PUT on
-    // the main endpoint must preserve whatever the controller last wrote.
-    restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
-    crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
-        .record(
-            old_object.as_ref().unwrap_or(&serde_json::Value::Null),
-            &mut obj.body,
-            &group_version(&group, &version),
-            None,
-            None,
-        );
-
-    // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
-    // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
-    // stamps on objects it owns; the mirroring controller skips any Endpoints that carry
-    // this annotation, so leaving it causes EndpointSliceMirroring to produce no slice.
-    if plural == "endpoints" {
-        let mut put_meta: ObjectMeta =
-            ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
-        if let Some(ref mut annotations) = put_meta.annotations {
-            annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
+        if !object_existed {
+            authorize_create_on_write(
+                &state.rbac_index,
+                &state.node_graph,
+                &user,
+                &group,
+                &plural,
+                Some(&ns),
+                &name,
+            )?;
         }
-        obj.body["metadata"] =
-            serde_json::to_value(put_meta).map_err(|e| Status::internal(e.to_string()))?;
-    }
 
-    // ResourceQuota: when the target doesn't exist, this PUT is a create just like
-    // create_namespaced_resource / do_patch's SSA-create branch — without this, a blind
-    // `kubectl replace` or kubelet's Lease-heartbeat PUT would create a namespaced object
-    // over a count/* quota with no admission check at all. Held across check-then-write for
-    // the same lost-update-race reason as the sibling create paths. The UPDATE case
-    // (object_existed) adds no new quota consumption, so it intentionally skips this check.
-    //
-    // Runs BEFORE the dry-run early-return below (moved from after it): quota admission must
-    // gate `kubectl replace --dry-run=server` the same way it gates a real create, or an
-    // over-quota dry-run create wrongly reports success instead of the denial a real create
-    // would get.
-    let _quota_lock = if !object_existed {
-        let lock = state.quota_admission_locks.lock(&ns).await;
-        quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
-        Some(lock)
-    } else {
-        None
-    };
+        // A blind PUT (dynamic/typed client round-tripping a locally-held object) commonly
+        // omits metadata.generation. Restamp the stored value onto the incoming body before
+        // apply_defaults runs, or initialize_workload_generation treats the omission as "new
+        // object" and resets generation to 1 — silently erasing however many spec changes the
+        // Deployment has actually undergone and desyncing status.observedGeneration from the
+        // real generation history the Deployment controller expects to see increase monotonically.
+        if let Some(ref g) = stored_generation {
+            if !g.is_null() {
+                obj.body["metadata"]["generation"] = g.clone();
+            }
+        }
 
-    let svc_alloc = if group.is_empty() && plural == "services" {
-        Some(
-            crate::service_alloc::begin(
+        // UID is immutable; a client's PUT commonly omits it — e.g. KCM's EndpointSlice
+        // reconciler builds its Update() body without repopulating this field. Real
+        // kube-apiserver's generic update preparation (rest.BeforeUpdate) unconditionally
+        // restores the existing UID whenever the incoming body's is blank ("Use the existing
+        // UID if none is provided"). Without this, a blank UID is persisted and broadcast to
+        // watchers as-is: KCM's EndpointSliceTracker identifies slices by UID, so its
+        // StaleSlices() check permanently treats the tracked (real) UID as missing from the
+        // informer once the informer's cached copy carries the blank one instead — every later
+        // sync fails with "EndpointSlice informer cache is out of date" forever.
+        let incoming_uid_blank = obj.body["metadata"]["uid"]
+            .as_str()
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if incoming_uid_blank {
+            if let Some(uid) = stored_uid.as_ref().and_then(|u| u.as_str()) {
+                if !uid.is_empty() {
+                    obj.body["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+                }
+            }
+        } else if let Some(stored_uid_str) = stored_uid
+            .as_ref()
+            .and_then(|u| u.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            // A non-blank incoming uid that mismatches the stored uid is identity forgery, not
+            // a legitimate update: rest.BeforeUpdate in real kube-apiserver rejects this with
+            // 409. the garbage collector determines whether an ownerReference is "live" purely by
+            // comparing stored uid == ownerRef.uid — letting a client silently overwrite an
+            // object's uid would let it forge a match against a stale/foreign ownerReference
+            // and corrupt cascade-GC decisions, and would defeat controllers' "same name,
+            // different uid ⇒ different object" recreate-detection.
+            let incoming_uid_str = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+            if incoming_uid_str != stored_uid_str {
+                return Err(Status::conflict(format!(
+                    "{} \"{name}\": the object was updated with a mismatched uid \
+                 (got {incoming_uid_str}, expected {stored_uid_str}) — uid is immutable",
+                    meta.kind
+                )));
+            }
+        }
+
+        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
+        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
+        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
+        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
+        // of completing the delete — persisting the object with deletionTimestamp gone and
+        // finalizers empty, i.e. silently resurrecting it as a normal live object.
+        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
+
+        // Allocate a clusterIP when a Service transitions away from ExternalName to a
+        // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
+        // handles initial allocation; the update path must also allocate when the type
+        // changes, because ExternalName services are created without a clusterIP and the
+        // stored object carries no IP to preserve.
+        // maybe_allocate_cluster_ip also validates the family fields before taking any
+        // address, for the same leak-avoidance reason as the create path above.
+        let mut auto_cluster_ip = None;
+        if group.is_empty() && plural == "services" {
+            if state.deny_service_external_ips {
+                super::defaults::deny_service_external_ips(
+                    svc_spec_before_replace.as_ref(),
+                    &obj.body["spec"],
+                )
+                .map_err(Status::forbidden)?;
+            }
+            auto_cluster_ip = maybe_allocate_cluster_ip(
                 &state,
                 &ns,
                 &name,
                 svc_spec_before_replace.as_ref(),
                 &mut obj.body,
-                auto_cluster_ip,
                 replace_query.is_dry_run(),
             )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    // Dry-run: validation and admission passed; return the would-be result without persisting.
-    if replace_query.is_dry_run() {
-        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
-        return Ok(Json(obj.body).into_response());
-    }
-
-    // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
-    // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
-    // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
-    // update, or the object stays stuck Terminating forever.
-    //
-    // Gated on `object_existed`: a create-on-missing PUT can't be "completing a drain" of an
-    // object that was never there, and treating it as one here would call
-    // complete_finalizer_drain while `_quota_lock` (held above for the create-admission check)
-    // is still alive — complete_finalizer_drain reacquires the same per-namespace
-    // quota_admission_locks lock, which would deadlock on that non-reentrant semaphore.
-    if object_existed && finalizer_drain_complete(&obj.body) {
-        complete_finalizer_drain(
-            &state,
-            FinalizerDrainCtx {
-                key: &key,
-                meta: &meta,
-                group: &group,
-                version: &version,
-                plural: &plural,
-                ns: Some(&ns),
-                name: &name,
-            },
-        )
-        .await?;
-        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
-        return Ok(Json(obj.body).into_response());
-    }
-
-    let put_start = std::time::Instant::now();
-    // Create-on-missing routes through the same Namespace-Terminating gate POST/SSA-create
-    // use (create_if_namespace_active) instead of a plain unconditional store.put — without
-    // this, `kubectl replace` (or any PUT resolving to a create) could create new content in
-    // a namespace mid-deletion, a bypass POST already closes via this same store method.
-    let store = state.store.clone();
-    let write_key = key.clone();
-    let write_body = obj.to_bytes();
-    let ns_key = cluster_object_key("namespaces", &ns);
-    let (group_w, plural_w, name_w, kind_w, ns_w) = (
-        group.clone(),
-        plural.clone(),
-        name.clone(),
-        meta.kind.clone(),
-        ns.clone(),
-    );
-    // The write (and its commit, for a Service) runs on its own task so a client disconnect
-    // cannot drop the reservations of an object that has landed.
-    let (written, _) = crate::service_alloc::commit_on_task(svc_alloc, async move {
-        if object_existed {
-            return store
-                .put(&write_key, write_body, expected_revision)
-                .await
-                .map_err(|e| store_err(e, &group_w, &plural_w, &name_w, &kind_w));
+            .await?;
         }
-        match store
-            .create_if_namespace_active(Some(&ns_key), &write_key, write_body.clone())
-            .await
-        {
-            Ok(rv) => Ok(rv),
-            Err(
-                e @ (CreateNamespacedError::NamespaceTerminating
-                | CreateNamespacedError::NamespaceNotFound),
-            ) => Err(Status::namespace_create_rejected(&ns_w, &e)),
-            // Lost a create race: continue as the update upstream retries into.
-            Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
-                update_after_lost_create_race(
-                    &*store,
-                    &write_key,
-                    write_body,
-                    expected_revision,
-                    (&group_w, &plural_w, &name_w, &kind_w),
+
+        if !object_existed {
+            resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
+            stamp_metadata(&mut obj);
+        }
+        super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+        super::defaults::validate_resource(&group, &plural, &obj.body)
+            .map_err(Status::unprocessable_entity)?;
+        if let (true, Some(old)) = (
+            group == "certificates.k8s.io" && plural == "podcertificaterequests",
+            old_object.as_ref(),
+        ) {
+            super::certificates::validate_pod_certificate_request_spec_immutable(old, &obj.body)
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        // A PUT may only change spec.resources on a PVC — see validate_pvc_spec_immutable. Runs
+        // after apply_defaults (above) so both sides are defaulted the same way — see
+        // pvc_spec_before_replace's comment for why comparing pre-default would false-positive.
+        if let Some(ref old_spec) = pvc_spec_before_replace {
+            let old_status = stored_status.as_ref().unwrap_or(&serde_json::Value::Null);
+            validate_pvc_spec_immutable(old_spec, &obj.body["spec"], old_status)
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        // Deployment/DaemonSet selector and StatefulSet full-spec-freeze immutability — see
+        // validate_workload_spec_immutable. Same apply_defaults-then-compare ordering as the PVC
+        // check above.
+        if let Some(ref old_spec) = spec_before_replace {
+            validate_workload_spec_immutable(&group, &plural, old_spec, &obj.body["spec"])
+                .map_err(Status::unprocessable_entity)?;
+        }
+
+        // Admission webhook pipeline (mutating then validating).
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: Some(&ns),
+            operation: if object_existed { "UPDATE" } else { "CREATE" },
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+                "extra": user.extra,
+            })),
+            dry_run: replace_query.is_dry_run(),
+        };
+        obj.body =
+            run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        if let Some(old) = old_object.as_ref() {
+            super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
+        }
+        run_validating_webhooks(&state, &obj.body, old_object.as_ref(), &admission_ctx).await?;
+
+        if let Some(ref spec_before) = spec_before_replace {
+            log_spec_replace(&ns, &name, &meta.kind, spec_before, &obj.body["spec"]);
+            super::defaults::increment_workload_generation_if_spec_changed(
+                &mut obj.body,
+                spec_before,
+            );
+        }
+        if let Some(ref eps_before) = eps_before_replace {
+            super::defaults::increment_endpointslice_generation_if_changed(
+                &mut obj.body,
+                eps_before,
+            );
+        }
+
+        // Restore the stored status: controllers write status via /status; a full PUT on
+        // the main endpoint must preserve whatever the controller last wrote.
+        restore_or_strip_status(meta.has_status_subresource, &mut obj.body, &stored_status);
+        crate::field_manager::WriteIdentity::new(replace_query.field_manager.as_deref(), &headers)
+            .record(
+                old_object.as_ref().unwrap_or(&serde_json::Value::Null),
+                &mut obj.body,
+                &group_version(&group, &version),
+                None,
+                None,
+            );
+
+        // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
+        // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
+        // stamps on objects it owns; the mirroring controller skips any Endpoints that carry
+        // this annotation, so leaving it causes EndpointSliceMirroring to produce no slice.
+        if plural == "endpoints" {
+            let mut put_meta: ObjectMeta =
+                ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
+            if let Some(ref mut annotations) = put_meta.annotations {
+                annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
+            }
+            obj.body["metadata"] =
+                serde_json::to_value(put_meta).map_err(|e| Status::internal(e.to_string()))?;
+        }
+
+        // ResourceQuota: when the target doesn't exist, this PUT is a create just like
+        // create_namespaced_resource / do_patch's SSA-create branch — without this, a blind
+        // `kubectl replace` or kubelet's Lease-heartbeat PUT would create a namespaced object
+        // over a count/* quota with no admission check at all. Held across check-then-write for
+        // the same lost-update-race reason as the sibling create paths. The UPDATE case
+        // (object_existed) adds no new quota consumption, so it intentionally skips this check.
+        //
+        // Runs BEFORE the dry-run early-return below (moved from after it): quota admission must
+        // gate `kubectl replace --dry-run=server` the same way it gates a real create, or an
+        // over-quota dry-run create wrongly reports success instead of the denial a real create
+        // would get.
+        let _quota_lock = if !object_existed {
+            let lock = state.quota_admission_locks.lock(&ns).await;
+            quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
+            Some(lock)
+        } else {
+            None
+        };
+
+        let svc_alloc = if group.is_empty() && plural == "services" {
+            Some(
+                crate::service_alloc::begin(
+                    &state,
+                    &ns,
+                    &name,
+                    svc_spec_before_replace.as_ref(),
+                    &mut obj.body,
+                    auto_cluster_ip,
+                    replace_query.is_dry_run(),
                 )
-                .await
-            }
-            Err(CreateNamespacedError::Store(e)) => {
-                Err(store_err(e, &group_w, &plural_w, &name_w, &kind_w))
-            }
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        // Dry-run: validation and admission passed; return the would-be result without persisting.
+        if replace_query.is_dry_run() {
+            inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+            return Ok(Json(obj.body).into_response());
         }
-    })
-    .await?;
-    let new_rv = written?;
-    tracing::debug!(
-        key = %key,
-        elapsed_ms = put_start.elapsed().as_millis() as u64,
-        "replace_namespaced_resource: store write completed"
-    );
+
+        // A PUT whose body has deletionTimestamp set and finalizers now empty is how KCM's
+        // protection controllers (pvc-protection, vac-protection, ...) complete a delete: they
+        // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
+        // update, or the object stays stuck Terminating forever.
+        //
+        // Gated on `object_existed`: a create-on-missing PUT can't be "completing a drain" of an
+        // object that was never there, and treating it as one here would call
+        // complete_finalizer_drain while `_quota_lock` (held above for the create-admission check)
+        // is still alive — complete_finalizer_drain reacquires the same per-namespace
+        // quota_admission_locks lock, which would deadlock on that non-reentrant semaphore.
+        if object_existed && finalizer_drain_complete(&obj.body) {
+            complete_finalizer_drain(
+                &state,
+                FinalizerDrainCtx {
+                    key: &key,
+                    meta: &meta,
+                    group: &group,
+                    version: &version,
+                    plural: &plural,
+                    ns: Some(&ns),
+                    name: &name,
+                },
+            )
+            .await?;
+            inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+            return Ok(Json(obj.body).into_response());
+        }
+
+        // Create-on-missing routes through the same Namespace-Terminating gate POST/SSA-create
+        // use (create_if_namespace_active) instead of a plain unconditional store.put — without
+        // this, `kubectl replace` (or any PUT resolving to a create) could create new content in
+        // a namespace mid-deletion, a bypass POST already closes via this same store method.
+        // The write (and its commit, for a Service) runs on its own task so a client disconnect
+        // cannot drop the reservations of an object that has landed.
+        let (written, _) =
+            crate::service_alloc::commit_on_task(svc_alloc, gu.pending(obj.to_bytes())).await?;
+        match written {
+            Ok(rv) => break (obj, rv, object_existed),
+            Err(WriteFailure::Retry) => continue,
+            Err(WriteFailure::Fail(e)) => return Err(e),
+        }
+    };
 
     obj.set_resource_version(new_rv);
     if group == RBAC_GROUP {
@@ -5100,13 +5037,13 @@ pub(crate) async fn delete_collection_resource<S: Store>(
             // or PersistentVolume with a legitimate finalizer) must be soft-deleted
             // (deletionTimestamp stamped, kept alive), not removed outright — mirrors
             // delete_collection_namespaced_resource below.
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if super::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }
@@ -5272,13 +5209,13 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
             // type) — without this, it would silently bypass every object's finalizers,
             // breaking OrderedNamespaceDeletion (e.g. a finalizer'd pod must survive with
             // deletionTimestamp set while later resource types are still being processed).
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if super::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }
@@ -8369,50 +8306,6 @@ mod tests {
              (createOrUpdate is an unconditional replace, not a merge) — if this fails, the \
              fallback never ran and the winner's stale object was left in place"
         );
-    }
-
-    /// A create that loses the race to a concurrent writer becomes an update, so a stated
-    /// resourceVersion that no longer matches must be a retryable 409 — not a silent
-    /// overwrite of the winner's object.
-    #[tokio::test]
-    async fn lost_create_race_with_stale_stated_resource_version_conflicts() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let key = "/registry/coordination.k8s.io/leases/default/race-lease";
-        let winner = store
-            .put(key, bytes::Bytes::from_static(b"{\"winner\":true}"), None)
-            .await
-            .unwrap();
-        let ident = ("coordination.k8s.io", "leases", "race-lease", "Lease");
-
-        let err = update_after_lost_create_race(
-            &*store,
-            key,
-            bytes::Bytes::from_static(b"{\"loser\":true}"),
-            Some(winner + 100),
-            ident,
-        )
-        .await
-        .expect_err("stale stated resourceVersion must not overwrite the winner");
-        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
-
-        let stored = store.get(key).await.unwrap().unwrap();
-        assert!(
-            String::from_utf8_lossy(&stored.value).contains("winner"),
-            "the 409 must leave the winner's object in place"
-        );
-
-        update_after_lost_create_race(
-            &*store,
-            key,
-            bytes::Bytes::from_static(b"{\"loser\":true}"),
-            Some(winner),
-            ident,
-        )
-        .await
-        .expect("matching stated resourceVersion updates");
     }
 
     /// Every served kind whose upstream `AllowUnconditionalUpdate()` is false must reject an

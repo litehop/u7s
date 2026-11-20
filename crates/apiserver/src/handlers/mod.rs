@@ -42,3 +42,5 @@ pub mod tokens;
 pub mod watch;
 #[cfg(test)]
 mod webhook_client_config_tests;
+#[cfg(test)]
+mod write_race_tests;
