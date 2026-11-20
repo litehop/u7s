@@ -1508,13 +1508,7 @@ pub(crate) async fn patch_pod<S: Store>(
     // KCM can complete a single round-trip, so every attempt conflicts and the
     // batch.kubernetes.io/job-tracking finalizer is never removed, leaving pods stuck
     // Terminating forever and Job GC never completing.
-    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let mut gu = GuaranteedUpdate::new(
-        state.store.clone(),
-        &key,
-        client_rv,
-        ("", "pods", &name, "Pod"),
-    );
+    let mut gu = GuaranteedUpdate::new(state.store.clone(), &key, None, ("", "pods", &name, "Pod"));
     loop {
         let stored = gu.read().await?;
         let Some(stored) = stored else {
@@ -1587,6 +1581,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
         let stored_deletion = super::generic::snapshot_deletion_fields(&current_obj.body);
+        let rv_before_patch = current_obj.resource_version().map(str::to_owned);
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
@@ -1604,6 +1599,8 @@ pub(crate) async fn patch_pod<S: Store>(
                 super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
             }
         }
+
+        gu.check_patched_pin(rv_before_patch.as_deref(), &current_obj.body)?;
 
         if let Some(plan) = &ssa_plan {
             plan.remove_dropped_fields(&mut current_obj.body);

@@ -632,3 +632,185 @@ async fn delete_collection_soft_delete_does_not_resurrect() {
     assert!(done, "nothing is left to hard-delete");
     assert!(mock.inner.get(key).await.unwrap().is_none());
 }
+
+const PATCH_TYPES: [&str; 3] = [
+    "application/merge-patch+json",
+    "application/strategic-merge-patch+json",
+    "application/json-patch+json",
+];
+
+/// Rewrites the object so its revision moves on; returns `(stale, current)` revisions.
+async fn bump(mock: &MockStore, key: &str) -> (u64, u64) {
+    let stored = mock.inner.get(key).await.unwrap().unwrap();
+    let mut v: Value = serde_json::from_slice(&stored.value).unwrap();
+    v["metadata"]["annotations"] = json!({"bumped": stored.revision.to_string()});
+    let current = mock.inner.put(key, bytes_of(&v), None).await.unwrap();
+    (stored.revision, current)
+}
+
+/// A patch adding annotation `k` that pins `metadata.resourceVersion` to `rv`. A JSON Patch can
+/// only pin through an op, never through the raw body.
+fn pinned_patch(content_type: &str, rv: u64) -> Value {
+    if content_type.contains("json-patch") {
+        json!([
+            {"op": "add", "path": "/metadata/annotations", "value": {"k": "v"}},
+            {"op": "add", "path": "/metadata/resourceVersion", "value": rv.to_string()}
+        ])
+    } else {
+        json!({"metadata": {"annotations": {"k": "v"}, "resourceVersion": rv.to_string()}})
+    }
+}
+
+fn code<T>(r: Result<T, StatusError>) -> StatusCode {
+    r.map_or_else(|e| e.0, |_| StatusCode::OK)
+}
+
+async fn assert_patch_not_applied(mock: &MockStore, key: &str, what: &str) {
+    let stored = mock.inner.get(key).await.unwrap().unwrap();
+    let v: Value = serde_json::from_slice(&stored.value).unwrap();
+    assert!(
+        v["metadata"]["annotations"]["k"].is_null(),
+        "{what}: a patch pinned to a stale resourceVersion must not be applied"
+    );
+}
+
+/// A client that pins `metadata.resourceVersion` in its patch asked for exactly that
+/// revision: a stale pin must be a 409 for every patch type, not applied to the live object.
+#[tokio::test]
+async fn do_patch_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = "/registry/configmaps/default/cm";
+    seed(
+        &mock,
+        key,
+        &json!({"apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "cm", "namespace": "default"}, "data": {"a": "b"}}),
+    )
+    .await;
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, key).await;
+        let patch = |rv| {
+            crate::handlers::resource::patch_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "configmaps".into(),
+                    "cm".into(),
+                )),
+                Query(Default::default()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+#[tokio::test]
+async fn patch_pod_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, &key).await;
+        let patch = |rv| {
+            crate::handlers::pods::patch_pod(
+                State(state.clone()),
+                Path(("default".to_string(), "p".to_string())),
+                Query(Default::default()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, &key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+/// The pin matched the revision read, but a writer landed before the commit: the patch must
+/// not be re-applied onto the newer object the client never saw.
+#[tokio::test]
+async fn patch_pod_pin_lost_to_a_concurrent_write_is_409_not_a_blind_retry() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    let (_, current) = bump(&mock, &key).await;
+    let mut raced = pod("p");
+    raced["metadata"]["labels"] = json!({"raced": "1"});
+    mock.arm_write_before_put(&key, bytes_of(&raced));
+    let ct = "application/json-patch+json";
+    let result = crate::handlers::pods::patch_pod(
+        State(state),
+        Path(("default".to_string(), "p".to_string())),
+        Query(Default::default()),
+        Extension(user()),
+        headers(ct),
+        bytes_of(&pinned_patch(ct, current)),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::CONFLICT);
+    assert_patch_not_applied(&mock, &key, ct).await;
+}
+
+#[tokio::test]
+async fn patch_pod_status_stale_pinned_resource_version_is_409() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    for ct in &PATCH_TYPES[..2] {
+        let (stale, current) = bump(&mock, &key).await;
+        let patch = |rv: u64| {
+            crate::handlers::pods::patch_pod_status(
+                State(state.clone()),
+                Path(("default".to_string(), "p".to_string())),
+                Some(Extension(user())),
+                headers(ct),
+                bytes_of(&json!({
+                    "metadata": {"resourceVersion": rv.to_string()},
+                    "status": {"phase": ct}
+                })),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        let stored: Value =
+            serde_json::from_slice(&mock.inner.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_ne!(
+            stored["status"]["phase"], *ct,
+            "{ct}: a status patch pinned to a stale resourceVersion must not be applied"
+        );
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+#[tokio::test]
+async fn patch_crd_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let (state, _) = install_cluster_cr(&mock).await;
+    let key = "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io";
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, key).await;
+        let patch = |rv| {
+            crate::handlers::crd::patch_crd(
+                State(state.clone()),
+                Path("widgets.example.io".into()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}

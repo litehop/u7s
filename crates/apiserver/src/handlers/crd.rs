@@ -1676,11 +1676,10 @@ pub async fn patch_crd<S: Store>(
     if is_ssa {
         crate::handlers::json_patch::strip_managed_fields(&mut patch);
     }
-    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let mut gu = GuaranteedUpdate::new(
         state.store.clone(),
         &key,
-        client_rv,
+        None,
         (GROUP, PLURAL, &name, KIND),
     );
     let (mut crd, rv, old_group, old_versions, old_plural, old_rv) = loop {
@@ -1753,6 +1752,9 @@ pub async fn patch_crd<S: Store>(
         // bare `Option<serde_json::Value>` (not a typed shape that would reject a scalar).
         let stored_status = existing["status"].clone();
 
+        let rv_before_patch = existing["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_owned);
         match patch_type {
             PatchType::Merge | PatchType::StrategicMerge => {
                 crate::patch::merge_patch(&mut current, &patch);
@@ -1761,6 +1763,7 @@ pub async fn patch_crd<S: Store>(
                 apply_json_patch(&mut current, &patch)?;
             }
         }
+        gu.check_patched_pin(rv_before_patch.as_deref(), &current)?;
 
         crate::handlers::json_patch::enforce_patch_identity(&mut current, &name, None)?;
 
