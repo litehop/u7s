@@ -2963,7 +2963,9 @@ mod tests {
             .flatten()
         {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            if path.extension().and_then(|e| e.to_str()) != Some("rs")
+                || path.to_string_lossy().ends_with("_tests.rs")
+            {
                 continue;
             }
             let source = std::fs::read_to_string(&path)

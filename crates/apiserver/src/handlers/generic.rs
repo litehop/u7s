@@ -868,8 +868,11 @@ pub(crate) async fn soft_delete_collection_item<S: Store>(
         let Some(soft) = apply_delete_policy(&mut Object { body }) else {
             return Ok(false);
         };
-        if gu.commit(Object { body: soft }.to_bytes()).await?.is_some() {
-            return Ok(true);
+        match gu.commit(Object { body: soft }.to_bytes()).await {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => {}
+            Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => return Ok(true),
+            Err(e) => return Err(e),
         }
     }
 }

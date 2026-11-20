@@ -237,8 +237,8 @@ pub(crate) async fn install_namespaced_crd(
 
 /// Grant `username` `verb` on `certificates.k8s.io/signers` named `signer_resource_name`
 /// (a signer name, or `<domain>/*`) through the same RBAC index the real authorizer reads.
-pub(crate) fn grant_signer_verb(
-    state: &AppState,
+pub(crate) fn grant_signer_verb<S: u7s_store::Store>(
+    state: &AppState<S>,
     username: &str,
     verb: &str,
     signer_resource_name: &str,

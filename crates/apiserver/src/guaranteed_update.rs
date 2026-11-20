@@ -171,6 +171,10 @@ impl<S: Store> GuaranteedUpdate<S> {
             }
             match store.put(&key, bytes, Some(expected)).await {
                 Ok(rv) => Ok(rv),
+                // The store reports a missing key as a mismatch against revision 0.
+                Err(StoreError::RevisionMismatch { current: 0, .. }) if expected != 0 => Err(
+                    WriteFailure::Fail(Status::not_found(&group, &resource, &name)),
+                ),
                 Err(
                     e @ (StoreError::RevisionMismatch { .. } | StoreError::AlreadyExists { .. }),
                 ) => Err(lost(e)),
@@ -191,6 +195,160 @@ mod tests {
 
     const KEY: &str = "/registry/configmaps/default/c";
     const CTX: (&str, &str, &str, &str) = ("", "configmaps", "c", "ConfigMap");
+
+    /// Every production function that calls `.put(` directly, with why it cannot resurrect a
+    /// deleted object or clobber a write it did not see. A new entry needs the same
+    /// justification; an update-class write belongs on `GuaranteedUpdate` instead.
+    ///
+    /// create-only: `Some(0)`, fails if the key exists.
+    /// pinned: `Some(rv)` of the revision read in the same function (no retry; a lost race
+    /// is a 409, or the caller's own loop re-reads).
+    /// client rv: the handler rejects (422) a write without the client's resourceVersion.
+    /// caller: the expectation is the caller's argument.
+    /// new record: a blind write of a record nothing else updates.
+    const AUDITED: &[(&str, &str)] = &[
+        ("bootstrap_rbac.rs", "reconcile_object"), // create-only / pinned
+        ("cert_expiry.rs", "upsert_event"),        // new record
+        ("csr_approver.rs", "approve_kubelet_serving_csrs"), // pinned
+        ("guaranteed_update.rs", "pending"),       // the shared path
+        ("handlers/aggregation.rs", "check_and_persist_availability"), // pinned
+        ("handlers/cr.rs", "create_cr"),           // create-only
+        ("handlers/cr.rs", "delete_cr"),           // pinned
+        ("handlers/cr.rs", "delete_cr_namespaced"), // pinned
+        ("handlers/cr.rs", "patch_cr"),            // create-only / pinned
+        ("handlers/cr.rs", "patch_cr_namespaced"), // pinned
+        ("handlers/cr.rs", "replace_cr"),          // client rv
+        ("handlers/cr.rs", "replace_cr_namespaced"), // client rv
+        ("handlers/crd.rs", "create_crd"),         // create-only
+        ("handlers/crd.rs", "delete_instances"),   // pinned
+        ("handlers/crd.rs", "finalize_crd"),       // pinned
+        ("handlers/crd.rs", "patch_crd_status"),   // pinned
+        ("handlers/crd.rs", "purge_crd"),          // new record (tombstone)
+        ("handlers/crd.rs", "put_crd_status"),     // client rv
+        ("handlers/crd.rs", "replace_crd"),        // client rv
+        ("handlers/crd.rs", "soft_delete_crd"),    // pinned
+        ("handlers/csr.rs", "create_csr"),         // create-only
+        ("handlers/namespaces.rs", "create_namespace"), // create-only
+        ("handlers/namespaces.rs", "delete_namespace"), // pinned
+        ("handlers/namespaces.rs", "patch_namespace"), // pinned
+        ("handlers/namespaces.rs", "patch_namespace_status"), // pinned
+        ("handlers/namespaces.rs", "seed_root_ca_configmap"), // create-only
+        ("handlers/resource.rs", "create_resource"), // create-only
+        ("handlers/resource.rs", "delete_namespaced_resource"), // pinned
+        ("handlers/resource.rs", "delete_resource"), // pinned
+        (
+            "handlers/resource.rs",
+            "propagate_rs_revision_to_deployment",
+        ), // pinned
+        ("handlers/resource.rs", "write_flowcontrol_status"), // pinned
+        ("handlers/resource.rs", "write_vap_status"), // pinned
+        ("service_alloc.rs", "put_committing"),    // caller
+        ("service_alloc.rs", "repair"),            // sentinel records
+        ("service_alloc.rs", "reserve"),           // create-only
+        ("handlers/crd.rs", "patch_crd"), // create-only (SSA create); updates use GuaranteedUpdate
+        ("handlers/pods.rs", "bind_pod"), // pinned
+        ("handlers/pods.rs", "check_pdb_allows_eviction"), // pinned
+        ("handlers/pods.rs", "delete_pod"), // pinned
+        ("handlers/pods.rs", "evict_pod"), // pinned
+        ("lib.rs", "build_routes"),       // router wiring (`.put(handler)`)
+        ("lib.rs", "reconcile_extension_apiserver_authentication"), // pinned
+        ("lib.rs", "reconcile_kubernetes_endpointslice"), // pinned / create-only
+        ("lib.rs", "reconcile_quota_status"), // pinned
+        ("lib.rs", "reconcile_system_node_binding_subjects"), // pinned
+        ("lib.rs", "seed_cluster_config"), // seed: server-owned constant
+        ("lib.rs", "seed_cluster_info"),  // seed
+        ("lib.rs", "seed_flowcontrol"),   // seed
+        ("lib.rs", "seed_kube_root_ca"),  // seed
+        ("lib.rs", "seed_namespaces"),    // seed
+        ("lib.rs", "seed_priorityclasses"), // seed
+        ("lib.rs", "seed_serviceaccounts"), // seed
+        ("lib.rs", "seed_servicecidrs"),  // seed
+        ("lib.rs", "seed_services"),      // seed
+        ("lib.rs", "upgrade_default_servicecidr_to_dual_stack"), // pinned
+        ("service_resolver.rs", "put_loopback_service"), // seed
+        ("state.rs", "allocate_service_ip"), // create-only
+        ("state.rs", "seed_immortal_namespaces"), // create-only
+    ];
+
+    /// `(file, fn)` of every `.put(` outside test code under `src/`.
+    fn production_put_sites() -> std::collections::BTreeSet<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if !matches!(name.as_str(), "tests" | "test_utils" | "testdata") {
+                        walk(&p, out);
+                    }
+                } else if name.ends_with(".rs")
+                    && name != "tests.rs"
+                    && name != "test_support.rs"
+                    && !name.ends_with("_tests.rs")
+                {
+                    out.push(p);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        let mut sites = std::collections::BTreeSet::new();
+        for f in files {
+            let rel = f.strip_prefix(&src).unwrap().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(&f).unwrap();
+            let mut in_test_mod = false;
+            let mut prev_cfg_test = false;
+            let mut current_fn = String::new();
+            for line in text.lines() {
+                if in_test_mod {
+                    in_test_mod = line != "}";
+                    continue;
+                }
+                if prev_cfg_test && line.starts_with("mod ") && line.ends_with('{') {
+                    in_test_mod = true;
+                }
+                prev_cfg_test = line == "#[cfg(test)]";
+                let t = line.trim_start();
+                if let Some(i) = t.find("fn ") {
+                    let head = &t[..i];
+                    if head.is_empty() || head.ends_with("async ") || head.ends_with("pub ") {
+                        current_fn = t[i + 3..]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                    } else if head.ends_with(") ") {
+                        current_fn = t[i + 3..]
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                    }
+                }
+                if !t.starts_with("//") && t.contains(".put(") {
+                    sites.insert((rel.clone(), current_fn.clone()));
+                }
+            }
+        }
+        sites
+    }
+
+    /// An update-class write that calls `store.put` directly is the bug class this module
+    /// removes: it either overwrites a write it never saw or resurrects a deleted object.
+    /// Fails when a function starts calling `.put(` without being audited here.
+    #[test]
+    fn every_direct_store_put_is_audited() {
+        let found = production_put_sites();
+        let audited: std::collections::BTreeSet<(String, String)> = AUDITED
+            .iter()
+            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .collect();
+        let unaudited: Vec<_> = found.difference(&audited).collect();
+        let stale: Vec<_> = audited.difference(&found).collect();
+        assert!(
+            unaudited.is_empty() && stale.is_empty(),
+            "direct `.put(` sites not audited: {unaudited:?}; audited entries that no longer \
+             call `.put(`: {stale:?}"
+        );
+    }
 
     fn with_n(n: i64) -> Bytes {
         Bytes::from(format!(r#"{{"metadata":{{"name":"c"}},"n":{n}}}"#))
@@ -239,8 +397,7 @@ mod tests {
         let mut gu = GuaranteedUpdate::new(s.clone(), KEY, None, CTX);
         gu.read_existing().await.unwrap();
         s.delete(KEY, None).await.unwrap();
-        assert!(gu.commit(with_n(2)).await.unwrap().is_none());
-        let err = gu.read_existing().await.unwrap_err();
+        let err = gu.commit(with_n(2)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(s.get(KEY).await.unwrap().is_none());
     }
@@ -257,6 +414,20 @@ mod tests {
         let err = gu.commit(with_n(2)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
         assert_eq!(n_of(&s.get(KEY).await.unwrap().unwrap()), 5);
+    }
+
+    /// A client that pinned a resourceVersion and lost the object to a delete gets 404 like an
+    /// unpinned one, not a 409 that sends it into a retry loop against nothing.
+    #[tokio::test]
+    async fn client_pinned_revision_on_a_deleted_object_is_not_found() {
+        let s = seeded().await;
+        let pinned = s.get(KEY).await.unwrap().unwrap().revision;
+        let mut gu = GuaranteedUpdate::new(s.clone(), KEY, Some(pinned), CTX);
+        gu.read_existing().await.unwrap();
+        s.delete(KEY, None).await.unwrap();
+        let err = gu.commit(with_n(2)).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(s.get(KEY).await.unwrap().is_none());
     }
 
     /// Kinds with AllowCreateOnUpdate must still create on PUT to a missing key.
