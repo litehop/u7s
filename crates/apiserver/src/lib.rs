@@ -24,6 +24,7 @@ mod core_gen_adapter;
 mod csr_approver;
 mod field_manager;
 mod go_unicode;
+mod guaranteed_update;
 pub mod handlers;
 mod health;
 mod inflight;
