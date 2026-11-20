@@ -590,8 +590,9 @@ INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 # Rig-only AppArmor rule u7s does not ship: a container process stacked under a host
 # dig/nslookup profile is labelled "dig//&u7s-default", which u7s-default's own
 # peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
-# Both topologies add this one rule to u7s-default; install.sh's profile is untouched.
-RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup"
+# Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
+# the matching host dig/nslookup overrides below; either layer alone still denies.
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 
@@ -607,35 +608,48 @@ rig_aa_with_rule() {
     }'
 }
 
-# Removes the dig/nslookup local overrides an earlier rig revision wrote (they never
-# fixed the denial) and reloads the profile so the kernel drops the rule. Args: <vm>.
-rig_remove_stale_host_aa_overrides() {
-  limactl shell "$1" sudo bash -c 'set -euo pipefail
+# Rig-only host layer: the host's dig/nslookup profiles (Ubuntu 26.04) also deny the
+# stacked peer "dig//&u7s-default", so each gets a local override allowing it. Written
+# idempotently and reloaded; a failed reload restores the previous override (or removes
+# it) so no half-applied rule is left behind.
+RIG_AA_HOST_SCRIPT='set -euo pipefail
+want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
 for p in dig nslookup; do
+  [ -f /etc/apparmor.d/$p ] || continue
+  rm -f /etc/apparmor.d/disable/$p
   f=/etc/apparmor.d/local/$p
-  if [ -f $f ] && grep -qx "signal (send,receive) peer=@{profile_name}//&u7s-default," $f; then
-    rm -f $f
-    [ ! -f /etc/apparmor.d/$p ] || apparmor_parser -r /etc/apparmor.d/$p
+  if [ "$(cat $f 2>/dev/null || true)" != "$want" ] || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
+    had=0; old=""
+    if [ -f $f ]; then had=1; old="$(cat $f)"; fi
+    printf "%s\n" "$want" > $f
+    if ! apparmor_parser -r /etc/apparmor.d/$p; then
+      if [ $had = 1 ]; then printf "%s\n" "$old" > $f; else rm -f $f; fi
+      apparmor_parser -r /etc/apparmor.d/$p || true
+      exit 1
+    fi
   fi
 done'
-}
 
-# --install mode: the host rig injects the rule into the profile text before loading it
-# (lima-start.sh); here the profile install.sh already loaded is edited in place and
-# reloaded. Idempotent; fails loud if the anchor line is gone. No-op without AppArmor.
-# Args: <vm>.
-rig_apply_apparmor_rig_rule() {
+# Both topologies, after u7s-default is installed: applies both rig-only AppArmor layers
+# (the u7s-default rule edited in place and reloaded, then the host overrides). A failed
+# u7s-default reload restores the previous profile. Idempotent; fails loud if the anchor
+# line is gone. No-op without AppArmor. Args: <vm>.
+rig_apply_apparmor_rig_setup() {
   local vm="$1" cur new
   limactl shell "$vm" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null' || return 0
-  rig_remove_stale_host_aa_overrides "$vm"
   cur="$(limactl shell "$vm" sudo cat /etc/apparmor.d/u7s-default)" \
     || { echo "FATAL: cannot read installed /etc/apparmor.d/u7s-default on $vm" >&2; return 1; }
   new="$(printf '%s\n' "$cur" | rig_aa_with_rule)" \
     || { echo "FATAL: u7s-default anchor line '$RIG_AA_ANCHOR' not found exactly once in installed profile" >&2; return 1; }
   if [ "$new" != "$cur" ]; then
     printf '%s\n' "$new" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
-    limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default
+    if ! limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default; then
+      printf '%s\n' "$cur" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+      limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default || true
+      return 1
+    fi
   fi
+  limactl shell "$vm" sudo bash -c "$RIG_AA_HOST_SCRIPT"
 }
 
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only

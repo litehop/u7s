@@ -38,18 +38,53 @@ write_run_meta "$TMP/rig" host-rig
 assert_eq "host-rig archive is stamped topology=host-rig so it is never read as a sign-off run" \
   "$(sed -n 1p "$TMP/rig/run-meta")" "topology=host-rig"
 assert_eq "host-rig archive records the rig-only setup -- DNS specs pass only with it, so an archive must say it was applied" \
-  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup"
+  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
 write_run_meta "$TMP/inst" install
 assert_eq "install archive is stamped topology=install" "$(sed -n 1p "$TMP/inst/run-meta")" "topology=install"
 assert_eq "install archive lists the rig-only add-ons that are not shipped by install.sh" \
   "$(sed -n 2p "$TMP/inst/run-meta")" "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"
 assert_eq "install archive records the same rig-only setup as the host rig" \
-  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup"
-for pair in lima-start.sh:rig_aa_with_rule install-bringup.sh:rig_apply_apparmor_rig_rule; do
-  grep -q "${pair#*:}" "$REPO/scripts/conformance/${pair%%:*}" \
-    && ok "${pair%%:*} applies the rig-only u7s-default rule via ${pair#*:} -- without it dig/nslookup in pods segfault (rc 139) and 7 DNS/Service specs fail in that mode" \
-    || bad "${pair%%:*} does not use ${pair#*:} -- DNS specs fail in that mode"
+  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+for f in lima-start.sh install-bringup.sh; do
+  grep -q "rig_apply_apparmor_rig_setup" "$REPO/scripts/conformance/$f" \
+    && ok "$f applies both AppArmor layers via the shared step -- without them dig/nslookup in pods abort (rc 139) and 7 DNS/Service specs fail in that mode" \
+    || bad "$f does not call rig_apply_apparmor_rig_setup -- DNS specs fail in that mode"
 done
+# The shared step against a stubbed limactl: each layer must be issued, since either one
+# missing still denies the stacked peer.
+AASTUB="$TMP/aastub"
+AALOG="$TMP/aalog"
+mkdir -p "$AASTUB"
+: > "$AALOG"
+cat > "$AASTUB/limactl" <<'EOF'
+#!/usr/bin/env bash
+shift 2
+[ "$1" = sudo ] && shift
+case "$*" in
+  "cat /etc/apparmor.d/u7s-default") printf '  signal (send,receive) peer=u7s-default//&*,\n' ;;
+  tee*) echo "TEE $(cat)" >> "$AA_LOG" ;;
+  bash\ -c*) printf "%s\n" "$3" > "$AA_LOG.host" ;;
+  apparmor_parser*) echo "RELOAD $*" >> "$AA_LOG" ;;
+  sh\ -c*) ;;
+esac
+EOF
+chmod +x "$AASTUB/limactl"
+AA_LOG="$AALOG" PATH="$AASTUB:$PATH" rig_apply_apparmor_rig_setup stubvm >/dev/null 2>&1 && rc=0 || rc=$?
+assert_eq "shared AppArmor step succeeds against a stubbed VM" "$rc" "0"
+grep -qF "TEE   signal (send,receive) peer=u7s-default//&*,"$'\n'"  signal (send,receive) peer={dig,nslookup}//&u7s-default," "$AALOG" \
+  && ok "u7s-default layer: the rule is written into the profile" \
+  || bad "u7s-default layer missing: container dig/nslookup is denied at profile=u7s-default"
+grep -qF "RELOAD apparmor_parser -r -W /etc/apparmor.d/u7s-default" "$AALOG" \
+  && ok "u7s-default layer: the profile is reloaded so the kernel enforces the rule" \
+  || bad "u7s-default is not reloaded, so the rule never takes effect"
+grep -qF 'peer=@{profile_name}//&u7s-default,' "$AALOG.host" \
+  && grep -qF '/etc/apparmor.d/local/' "$AALOG.host" \
+  && ok "host layer: dig/nslookup local overrides are written -- the host profiles deny the stacked peer too" \
+  || bad "host layer missing: container dig/nslookup is denied at profile=dig/nslookup"
+grep -qF 'apparmor_parser -r /etc/apparmor.d/$p' "$AALOG.host" \
+  && grep -qF 'rm -f $f' "$AALOG.host" \
+  && ok "host layer reloads both profiles and undoes the override when the reload fails" \
+  || bad "host layer does not reload or does not roll back a failed reload"
 if write_run_meta "$TMP/bogus" hostrig 2>/dev/null; then bad "unknown topology must be refused"; else ok "unknown topology is refused instead of writing a mislabelled archive"; fi
 [ ! -e "$TMP/bogus/run-meta" ] && ok "refused topology leaves no run-meta behind" || bad "refused topology wrote run-meta"
 

@@ -71,17 +71,23 @@ To run the Kubernetes conformance suite against u7s locally:
 
 ### Rig-only add-ons and AppArmor rule
 
-The rig adds one AppArmor rule to u7s's own `u7s-default` profile that u7s does not ship:
-`signal (send,receive) peer={dig,nslookup}//&u7s-default,`. On hosts whose kernel stacks AppArmor
-profiles (Ubuntu 26.04, kernel 7.0.0-43 and later) a container's `dig`/`nslookup` is labelled
-`dig//&u7s-default`, which `u7s-default`'s own `peer=u7s-default//&*` does not match, so BIND's
-self-signal is denied: `dig` aborts and `nslookup` exits 139. The host `dig`/`nslookup` profiles
-deny nothing here, so no host-side change helps. By operator decision the rule stays rig-only;
-`install.sh` and its profile are unchanged. The host rig injects it into the profile text taken from
-`install.sh` (`lima-start.sh`); `run-all.sh --install` edits the installed
-`/etc/apparmor.d/u7s-default` after `install.sh` runs and reloads it. Both modes record
-`rig_only_setup=apparmor-u7s-default-dig-nslookup` in the archive's `run-meta`. Seven specs depend on
-it: `should provide DNS for the cluster`, `should provide DNS for services`, `should provide DNS for pods
+The rig changes two AppArmor layers, in both modes. On hosts whose kernel stacks AppArmor profiles
+(Ubuntu 26.04, kernel 7.0.0-43 and later) a container's `dig`/`nslookup` is labelled
+`dig//&u7s-default`, and BIND's self-signal is denied (`dig` aborts, `nslookup` exits 139) at both:
+
+1. u7s's own `u7s-default` profile, which does not match that peer. The rig adds
+   `signal (send,receive) peer={dig,nslookup}//&u7s-default,` to it. u7s does not ship this rule;
+   by operator decision it stays rig-only and `install.sh` is unchanged.
+2. The host's `dig` and `nslookup` profiles. The rig changes them through
+   `/etc/apparmor.d/local/{dig,nslookup}` with
+   `signal (send,receive) peer=@{profile_name}//&u7s-default,` and reloads both. This is host setup a
+   user would do themselves.
+
+Either layer alone still denies. The host rig injects the `u7s-default` rule into the profile text
+taken from `install.sh` (`lima-start.sh`); `run-all.sh --install` edits the installed
+`/etc/apparmor.d/u7s-default` after `install.sh` runs. Both modes then apply the host overrides and
+record `rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup` in the archive's
+`run-meta`. Seven specs depend on them: `should provide DNS for the cluster`, `should provide DNS for services`, `should provide DNS for pods
 for Subdomain`, `should resolve DNS of partial qualified names for the cluster`, and the three
 ExternalName specs (`should provide DNS for ExternalName services`, `should be able to change the type
 from ClusterIP to ExternalName`, `... from NodePort to ExternalName`).
