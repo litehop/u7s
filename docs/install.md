@@ -168,7 +168,8 @@ script reads the token from stdin, which is the script itself in the one-liner.
    [Pinning a release tag](#pinning-a-release-tag)), then download `install.sh`:
 
    ```bash
-   TAG=<tag>
+   TAG=vX.Y.Z  # replace with the control plane's release tag
+   [ "$TAG" != vX.Y.Z ] &&
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
    ```
 

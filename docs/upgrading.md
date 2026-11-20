@@ -12,7 +12,8 @@ release N.
 - To skip releases, step through each one in order.
 - Downgrades are unsupported. The API server refuses to start on a store
   whose format is newer than it supports and names both formats. The store
-  format is SQLite's `PRAGMA user_version` (today 1).
+  format is SQLite's `PRAGMA user_version` (today 1), independent of the
+  release version.
 - u7s sends no update notification. Watch
   [GitHub Releases](https://github.com/litehop/u7s/releases).
 
@@ -31,7 +32,9 @@ Download the target release's `install.sh` and re-run it with no flags. Set
 `TAG` to the target release tag:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+TAG=vX.Y.Z  # replace with the target release tag
+[ "$TAG" != vX.Y.Z ] &&
+curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh" &&
 sudo bash install.sh
 ```
 
@@ -45,7 +48,11 @@ the API server rotates it on its own schedule and keeps the previous key
 verifying until its tokens expire.
 
 The script reads `/var/lib/u7s/config`, so `--iface` and `--node-name` need
-no repeat, and a different value is refused.
+no repeat, and a different value is refused. The one exception is a
+single-stack cluster gaining exactly one range of the other IP family in
+`--cluster-cidr` or `--service-cidr`; every other range change is refused. A
+re-run keeps a single-stack cluster single-stack.
+
 ## Upgrade a worker
 
 After the control plane is done, re-run `install.sh` on each worker with no
@@ -69,7 +76,8 @@ single-node GCP VM from v0.4.5 to v0.4.6: the script ran 99 s, and one of 132
 `/readyz` polls at 2 s failed. CoreDNS, kube-proxy, and the `servicelb` pods
 kept their UIDs with 0 restarts, and the flannel pod was recreated by design.
 The release gate asserts at most 60 s
-([dev-setup.md](dev-setup.md#upgrade-check)).
+([dev-setup.md](dev-setup.md#upgrade-check)). Multi-node is not probed.
+
 ## Back up and restore
 
 This is disaster recovery, not a supported downgrade. It discards every
@@ -101,7 +109,8 @@ v0.4.6 after an upgrade to v0.4.7.
    `--tarball` install, not this download:
 
    ```bash
-   TAG=<previous-release-tag>
+   TAG=vX.Y.Z  # replace with the previous release tag
+   [ "$TAG" != vX.Y.Z ] &&
    curl --proto '=https' --tlsv1.2 -fsSL -o "install-${TAG}.sh" "https://u7s.dekiru.tech/${TAG}/install.sh" &&
    sudo systemctl stop kubelet u7s-kcm u7s-apiserver &&
    sudo rm -rf /var/lib/u7s &&
