@@ -69,9 +69,30 @@ To run the Kubernetes conformance suite against u7s locally:
    scripts/conformance/06-run-sonobuoy.sh --focus "ConfigMap"
    ```
 
-### Rig-only add-ons
+### Rig-only add-ons and AppArmor rule
 
-The local conformance rig applies three upstream add-ons that u7s does not ship:
+The rig changes two AppArmor layers, in both modes. On hosts whose kernel stacks AppArmor profiles
+(Ubuntu 26.04, kernel 7.0.0-43 and later) a container's `dig`/`nslookup` is labelled
+`dig//&u7s-default`, and BIND's self-signal is denied (`dig` aborts, `nslookup` exits 139) at both:
+
+1. u7s's own `u7s-default` profile, which does not match that peer. The rig adds
+   `signal (send,receive) peer={dig,nslookup}//&u7s-default,` to it. u7s does not ship this rule;
+   by operator decision it stays rig-only and `install.sh` is unchanged.
+2. The host's `dig` and `nslookup` profiles. The rig changes them through
+   `/etc/apparmor.d/local/{dig,nslookup}` with
+   `signal (send,receive) peer=@{profile_name}//&u7s-default,` and reloads both. This is host setup a
+   user would do themselves.
+
+Either layer alone still denies. The host rig injects the `u7s-default` rule into the profile text
+taken from `install.sh` (`lima-start.sh`); `run-all.sh --install` edits the installed
+`/etc/apparmor.d/u7s-default` after `install.sh` runs. Both modes then apply the host overrides and
+record `rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup` in the archive's
+`run-meta`. Seven specs depend on them: `should provide DNS for the cluster`, `should provide DNS for services`, `should provide DNS for pods
+for Subdomain`, `should resolve DNS of partial qualified names for the cluster`, and the three
+ExternalName specs (`should provide DNS for ExternalName services`, `should be able to change the type
+from ClusterIP to ExternalName`, `... from NodePort to ExternalName`).
+
+The rig also applies three upstream add-ons that u7s does not ship:
 
 - `kube-network-policies`
 - `metrics-server`

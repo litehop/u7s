@@ -340,8 +340,8 @@ AA_PROFILE="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_A
 # (operator decision: user hosts' profiles are untouched; detection is planned
 # instead). Removing it here, or adding it to install.sh, means updating the
 # other side and scripts/test-install-logic.sh.
-AA_PROFILE="$(printf '%s\n' "$AA_PROFILE" | awk '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print "  signal (send,receive) peer={dig,nslookup}//&u7s-default,"; n++} END {if (n != 1) exit 1}')" \
-  || { echo "FATAL: u7s-default stacked-peer signal rule not found in install.sh" >&2; exit 1; }
+AA_PROFILE="$(printf '%s\n' "$AA_PROFILE" | rig_aa_with_rule)" \
+  || { echo "FATAL: u7s-default anchor line '$RIG_AA_ANCHOR' not found exactly once in install.sh" >&2; exit 1; }
 AA_CRIO_CONF="/etc/crio/crio.conf.d/10-apparmor.conf"
 if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null'; then
   AA_INSTALLED="$(limactl shell "$VM_NAME" sudo cat /etc/apparmor.d/u7s-default 2>/dev/null || true)"
@@ -353,24 +353,8 @@ if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enab
     limactl shell "$VM_NAME" sudo bash -c "printf '[crio.runtime]\napparmor_profile = \"u7s-default\"\n' > $AA_CRIO_CONF"
     limactl shell "$VM_NAME" sudo systemctl restart crio
   fi
-  # Rig-only, not part of install.sh: Ubuntu 26.04 ships host profiles for
-  # dig/nslookup that attach by path to the same binaries inside containers;
-  # their signal rules lack the stacked-peer form, so BIND's self-signal is
-  # DENIED under AppArmor 5 stacking even with u7s-default (arm64 rig; real
-  # x86_64 installs were verified unaffected). Add only that rule via the
-  # profiles' local overrides; everything
-  # else stays enforced. Also undoes an earlier disable of these profiles.
-  limactl shell "$VM_NAME" sudo bash -c 'set -euo pipefail
-for p in dig nslookup; do
-  [ -f /etc/apparmor.d/$p ] || continue
-  rm -f /etc/apparmor.d/disable/$p
-  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
-  if [ "$(cat /etc/apparmor.d/local/$p 2>/dev/null || true)" != "$want" ] \
-    || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
-    printf "%s\n" "$want" > /etc/apparmor.d/local/$p
-    apparmor_parser -r /etc/apparmor.d/$p || { rm -f /etc/apparmor.d/local/$p; exit 1; }
-  fi
-done'
+  # Rig-only: the shared step also adds the host dig/nslookup local overrides.
+  rig_apply_apparmor_rig_setup "$VM_NAME"
 fi
 
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance

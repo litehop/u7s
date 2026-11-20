@@ -587,6 +587,78 @@ INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-polici
 # shellcheck disable=SC2034 # used by install-bringup.sh
 INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 
+# Rig-only AppArmor rule u7s does not ship: a container process stacked under a host
+# dig/nslookup profile is labelled "dig//&u7s-default", which u7s-default's own
+# peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
+# Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
+# the matching host dig/nslookup overrides below; either layer alone still denies.
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
+RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
+
+# Filter: u7s-default profile text on stdin -> same text with RIG_AA_RULE after the
+# anchor line. An already-present rule passes through unchanged (idempotent); a missing
+# or duplicated anchor fails so a profile restructure cannot silently drop the rule.
+rig_aa_with_rule() {
+  awk -v a="$RIG_AA_ANCHOR" -v r="$RIG_AA_RULE" '
+    {buf[NR] = $0; if ($0 == r) have = 1; if ($0 == a) n++}
+    END {
+      if (!have && n != 1) exit 1
+      for (i = 1; i <= NR; i++) { print buf[i]; if (!have && buf[i] == a) print r }
+    }'
+}
+
+# Rig-only host layer: the host's dig/nslookup profiles (Ubuntu 26.04) also deny the
+# stacked peer "dig//&u7s-default", so each gets a local override allowing it. Written
+# idempotently and reloaded; a failed reload restores the previous override (or removes
+# it) so no half-applied rule is left behind.
+RIG_AA_HOST_SCRIPT='set -euo pipefail
+want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
+for p in dig nslookup; do
+  [ -f /etc/apparmor.d/$p ] || continue
+  rm -f /etc/apparmor.d/disable/$p
+  f=/etc/apparmor.d/local/$p
+  if [ "$(cat $f 2>/dev/null || true)" != "$want" ] || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
+    had=0; old=""
+    if [ -f $f ]; then had=1; old="$(cat $f)"; fi
+    printf "%s\n" "$want" > $f
+    if ! apparmor_parser -r /etc/apparmor.d/$p; then
+      if [ $had = 1 ]; then printf "%s\n" "$old" > $f; else rm -f $f; fi
+      apparmor_parser -r /etc/apparmor.d/$p || true
+      exit 1
+    fi
+  fi
+done'
+
+# Both topologies, after u7s-default is installed: applies both rig-only AppArmor layers
+# (the u7s-default rule edited in place and reloaded, then the host overrides). A failed
+# u7s-default reload, or a failed host layer, restores the previous profile so the step is
+# all-or-nothing. Idempotent; fails loud if the anchor
+# line is gone. No-op without AppArmor. Args: <vm>.
+rig_apply_apparmor_rig_setup() {
+  local vm="$1" cur new
+  limactl shell "$vm" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null' || return 0
+  cur="$(limactl shell "$vm" sudo cat /etc/apparmor.d/u7s-default)" \
+    || { echo "FATAL: cannot read installed /etc/apparmor.d/u7s-default on $vm" >&2; return 1; }
+  new="$(printf '%s\n' "$cur" | rig_aa_with_rule)" \
+    || { echo "FATAL: u7s-default anchor line '$RIG_AA_ANCHOR' not found exactly once in installed profile" >&2; return 1; }
+  if [ "$new" != "$cur" ]; then
+    printf '%s\n' "$new" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+    if ! limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default; then
+      printf '%s\n' "$cur" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+      limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default || true
+      return 1
+    fi
+  fi
+  if ! limactl shell "$vm" sudo bash -c "$RIG_AA_HOST_SCRIPT"; then
+    if [ "$new" != "$cur" ]; then
+      printf '%s\n' "$cur" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+      limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default || true
+    fi
+    return 1
+  fi
+}
+
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only
 # VM. "install": the real scripts/install.sh on the VM (the release sign-off path).
 # A host-rig PASS is not a delivered-behaviour PASS, so every archive says which it is.
@@ -602,6 +674,7 @@ write_run_meta() {
   {
     echo "topology=$topology"
     if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
+    echo "rig_only_setup=$RIG_ONLY_SETUP"
   } > "$run_dir/run-meta"
 }
 
