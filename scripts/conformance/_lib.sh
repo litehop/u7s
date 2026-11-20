@@ -632,7 +632,8 @@ done'
 
 # Both topologies, after u7s-default is installed: applies both rig-only AppArmor layers
 # (the u7s-default rule edited in place and reloaded, then the host overrides). A failed
-# u7s-default reload restores the previous profile. Idempotent; fails loud if the anchor
+# u7s-default reload, or a failed host layer, restores the previous profile so the step is
+# all-or-nothing. Idempotent; fails loud if the anchor
 # line is gone. No-op without AppArmor. Args: <vm>.
 rig_apply_apparmor_rig_setup() {
   local vm="$1" cur new
@@ -649,7 +650,13 @@ rig_apply_apparmor_rig_setup() {
       return 1
     fi
   fi
-  limactl shell "$vm" sudo bash -c "$RIG_AA_HOST_SCRIPT"
+  if ! limactl shell "$vm" sudo bash -c "$RIG_AA_HOST_SCRIPT"; then
+    if [ "$new" != "$cur" ]; then
+      printf '%s\n' "$cur" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+      limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default || true
+    fi
+    return 1
+  fi
 }
 
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only

@@ -3069,12 +3069,14 @@ assert "lima-start.sh reloads when the installed profile differs from install.sh
 L_AAADD="$(ls_line 'rig_aa_with_rule')"
 assert "lima-start.sh adds the rig-only dig/nslookup signal rule to the profile text before loading it, and fails loud if the anchor is gone -- the stacked label 'dig//&u7s-default' does not match peer=u7s-default//&*, so without the rule BIND's self-signal is DENIED (rc 139) and the DNS conformance specs fail" \
   "$([ -n "$L_AAADD" ] && [ -n "$L_LOAD" ] && [ "$L_AAADD" -lt "$L_LOAD" ] && printf '%s\n' "$LS_CODE" | drain_grep -qF 'FATAL: u7s-default anchor line' && echo 1 || echo 0)"
-assert "install-bringup.sh applies the rig-only rule to the installed profile after install.sh runs -- otherwise --install mode fails the 7 DNS specs while the host rig passes" \
-  "$(grep -vE '^[[:space:]]*#' "$DIR/conformance/install-bringup.sh" | drain_grep -qxF 'rig_apply_apparmor_rig_rule "$VM_NAME"' && echo 1 || echo 0)"
-assert "the rig never touches the host dig/nslookup profiles -- the denial is in u7s-default, and editing host profiles is the user's job" \
-  "$(grep -vE '^[[:space:]]*#' "$DIR/conformance/_lib.sh" | awk '/^rig_apply_apparmor_rig_rule\(\)/ {p=1} p {print} p && /^}$/ {exit}' | drain_grep -qE 'apparmor.d/(local/)?(dig|nslookup)' && echo 0 || echo 1)"
+assert "install-bringup.sh applies the rig-only AppArmor setup after install.sh runs -- otherwise --install mode fails the 7 DNS specs while the host rig passes" \
+  "$(grep -vE '^[[:space:]]*#' "$DIR/conformance/install-bringup.sh" | drain_grep -qxF 'rig_apply_apparmor_rig_setup "$VM_NAME"' && echo 1 || echo 0)"
+assert "the rig step never names host override paths itself; they live only in the script it hands to 'limactl shell' -- editing the operator's own host profiles would be a silent side effect" \
+  "$(grep -vE '^[[:space:]]*#' "$DIR/conformance/_lib.sh" | awk '/^rig_apply_apparmor_rig_setup\(\)/ {p=1} p {print} p && /^}$/ {exit}' | drain_grep -qE 'apparmor.d/(local/)?(dig|nslookup)' && echo 0 || echo 1)"
+assert "the only bash -c running the host-override script goes through limactl shell" \
+  "$(grep -vE '^[[:space:]]*#' "$DIR/conformance/_lib.sh" | awk 'index($0, "RIG_AA_HOST_SCRIPT\"") {n++; if (index($0, "limactl shell \"$vm\" sudo bash -c")) ok++} END {print (n >= 1 && n == ok) ? 1 : 0}')"
 AR_DIR="$(mktemp -d)"
-mkdir -p "$AR_DIR/bin"
+mkdir -p "$AR_DIR/bin" "$AR_DIR/etc/local"
 AR_PROFILE="$(awk '/^  cat > \/etc\/apparmor.d\/u7s-default/ {p=1; next} /^U7S_AA_EOF$/ {p=0} p' "$INSTALL")"
 printf '%s\n' "$AR_PROFILE" > "$AR_DIR/profile"
 cat > "$AR_DIR/bin/limactl" <<'STUB'
@@ -3086,25 +3088,56 @@ case "$1" in
     case "$1" in
       cat) cat "$AR_DIR/profile" ;;
       tee) tee "$AR_DIR/profile" ;;
-      apparmor_parser) echo reload >> "$AR_DIR/reloads" ;;
-      bash) exit 0 ;;
+      apparmor_parser) echo reload >> "$AR_DIR/reloads"; [ "${AR_U7S_FAIL:-0}" = 1 ] && exit 1; exit 0 ;;
+      bash) echo via-limactl >> "$AR_DIR/hostscript"
+        script="$(printf '%s' "$3" | sed -e "s#/etc/apparmor.d#$AR_DIR/etc#g" -e "s#/sys/kernel/security/apparmor/profiles#$AR_DIR/kprofiles#g")"
+        bash -c "$script" ;;
     esac ;;
 esac
 STUB
-chmod +x "$AR_DIR/bin/limactl"
-ar_run() { env AR_DIR="$AR_DIR" PATH="$AR_DIR/bin:$PATH" bash -c 'source "$1"; rig_apply_apparmor_rig_rule vm' _ "$DIR/conformance/_lib.sh" >/dev/null 2>&1; }
+cat > "$AR_DIR/bin/apparmor_parser" <<'STUB'
+#!/bin/bash
+echo "$2" >> "$AR_DIR/hostreloads"
+[ "${AR_HOST_FAIL:-0}" = 1 ] && exit 1
+echo "$(basename "$2") (enforce)" >> "$AR_DIR/kprofiles"
+STUB
+chmod +x "$AR_DIR/bin/limactl" "$AR_DIR/bin/apparmor_parser"
+: > "$AR_DIR/kprofiles"
+printf 'profile dig {\n}\n' > "$AR_DIR/etc/dig"
+printf 'profile nslookup {\n}\n' > "$AR_DIR/etc/nslookup"
+ar_run() { env AR_DIR="$AR_DIR" AR_HOST_FAIL="${AR_HOST_FAIL:-0}" AR_U7S_FAIL="${AR_U7S_FAIL:-0}" PATH="$AR_DIR/bin:$PATH" bash -c 'source "$1"; rig_apply_apparmor_rig_setup vm' _ "$DIR/conformance/_lib.sh" >/dev/null 2>&1; }
+ar_want_override='signal (send,receive) peer=@{profile_name}//&u7s-default,'
 ar_run && ar_rc=0 || ar_rc=$?
 AR_WANT="$(printf '%s\n' "$AR_PROFILE" | awk '{print} /^  signal \(send,receive\) peer=u7s-default\/\/&\*,$/ {print "  signal (send,receive) peer={dig,nslookup}//&u7s-default,"}')"
 assert "the --install step inserts exactly the rig-only rule after the anchor in the installed profile and reloads it once -- the reload is what makes running containers pick the rule up" \
   "$([ "$ar_rc" -eq 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_WANT" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 1 ] && echo 1 || echo 0)"
+assert "the host layer writes the dig and nslookup local overrides inside the VM and reloads each profile -- either layer alone still denies BIND's self-signal" \
+  "$([ "$(cat "$AR_DIR/etc/local/dig")" = "$ar_want_override" ] && [ "$(cat "$AR_DIR/etc/local/nslookup")" = "$ar_want_override" ] && [ "$(wc -l < "$AR_DIR/hostreloads")" -eq 2 ] && [ "$(cat "$AR_DIR/hostscript")" = via-limactl ] && echo 1 || echo 0)"
 ar_run && ar_rc=0 || ar_rc=$?
-assert "re-running the --install step is a no-op (no duplicate rule, no extra reload) -- run-all.sh --install is re-run on the same VM" \
-  "$([ "$ar_rc" -eq 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_WANT" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 1 ] && echo 1 || echo 0)"
+assert "re-running the --install step is a no-op for both layers (no duplicate rule, no extra reload) -- run-all.sh --install is re-run on the same VM" \
+  "$([ "$ar_rc" -eq 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_WANT" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 1 ] && [ "$(wc -l < "$AR_DIR/hostreloads")" -eq 2 ] && echo 1 || echo 0)"
 printf 'profile u7s-default {\n}\n' > "$AR_DIR/profile"
-rm -f "$AR_DIR/reloads"
+rm -f "$AR_DIR/reloads" "$AR_DIR/hostreloads"
 ar_run && ar_rc=0 || ar_rc=$?
 assert "the --install step fails loud and leaves the profile untouched when the anchor line is missing -- a silently skipped rule would resurface as 7 DNS spec failures" \
-  "$([ "$ar_rc" -ne 0 ] && [ "$(cat "$AR_DIR/profile")" = $'profile u7s-default {\n}' ] && [ ! -e "$AR_DIR/reloads" ] && echo 1 || echo 0)"
+  "$([ "$ar_rc" -ne 0 ] && [ "$(cat "$AR_DIR/profile")" = $'profile u7s-default {\n}' ] && [ ! -e "$AR_DIR/reloads" ] && [ ! -e "$AR_DIR/hostreloads" ] && echo 1 || echo 0)"
+printf '%s\n' "$AR_PROFILE" > "$AR_DIR/profile"
+rm -f "$AR_DIR/reloads" "$AR_DIR/hostreloads" "$AR_DIR/etc/local/dig" "$AR_DIR/etc/local/nslookup" "$AR_DIR/hostscript"
+: > "$AR_DIR/kprofiles"
+AR_HOST_FAIL=1 ar_run && ar_rc=0 || ar_rc=$?
+assert "a failed host-profile reload removes the override it just wrote -- a half-applied override would be loaded by the next unrelated apparmor reload" \
+  "$([ "$ar_rc" -ne 0 ] && [ ! -e "$AR_DIR/etc/local/dig" ] && echo 1 || echo 0)"
+assert "a failed host layer rolls back the u7s-default rule too, so the step is all-or-nothing and a retry starts from the pristine profile" \
+  "$([ "$(cat "$AR_DIR/profile")" = "$AR_PROFILE" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 2 ] && echo 1 || echo 0)"
+printf '%s\n' "# operator line" > "$AR_DIR/etc/local/dig"
+: > "$AR_DIR/kprofiles"
+AR_HOST_FAIL=1 ar_run && ar_rc=0 || ar_rc=$?
+assert "a failed host reload restores a pre-existing operator override verbatim rather than deleting it" \
+  "$([ "$ar_rc" -ne 0 ] && [ "$(cat "$AR_DIR/etc/local/dig")" = "# operator line" ] && echo 1 || echo 0)"
+rm -f "$AR_DIR/hostscript"
+AR_U7S_FAIL=1 ar_run && ar_rc=0 || ar_rc=$?
+assert "a failed u7s-default reload restores the previous profile and never reaches the host layer" \
+  "$([ "$ar_rc" -ne 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_PROFILE" ] && [ ! -e "$AR_DIR/hostscript" ] && echo 1 || echo 0)"
 rm -rf "$AR_DIR"
 assert "install.sh points CRI-O at u7s-default via a crio.conf.d drop-in -- without it MariaDB and other self-signalling workloads hang on AppArmor 5 kernels because crio-default lacks the stacked-peer rules" \
   "$(awk '/^cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf|^  cat > \/etc\/crio\/crio.conf.d\/10-apparmor.conf/ {p=1} p && /^apparmor_profile = "u7s-default"$/ {ok=1} END {print ok ? 1 : 0}' "$INSTALL")"
