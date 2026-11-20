@@ -140,6 +140,50 @@ for unit in $enabled; do
 done
 grep -qxF "systemctl daemon-reload" "$CALLS" && ok "teardown reloads systemd after removing units" || bad "teardown skips daemon-reload"
 
+# 6. Host-rig bring-up clears leftover native units. The stubbed systemctl reports only
+# u7s-kcm.service as running, as on a slot where install.sh ran earlier.
+cat > "$STUBS/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$STUB_CALLS"
+[ "$1 $2 $3" = "is-active --quiet u7s-kcm.service" ] && exit 0
+[ "$1" = is-active ] || [ "$1" = is-enabled ] && exit 3
+exit 0
+EOF
+: > "$CALLS"
+out=$(STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/clear-native-units.sh" 2>&1)
+case "$out" in
+  *"removed leftover native u7s units: u7s-kcm.service") ok "a running native u7s-kcm is detected and reported alone" ;;
+  *) bad "bring-up did not report exactly the running leftover u7s-kcm.service; got: $out" ;;
+esac
+for unit in $enabled; do
+  case "$unit" in kubelet.service) continue ;; esac
+  grep -qxF "systemctl disable --now $unit" "$CALLS" && grep -qxF "rm -f /etc/systemd/system/$unit" "$CALLS" \
+    && ok "bring-up stops, disables and removes $unit" || bad "bring-up leaves $unit enabled, so it fights the rig's own control plane"
+done
+grep -q "kubelet.service" "$CALLS" && bad "bring-up touched kubelet.service, which the rig itself runs" || ok "bring-up leaves the rig's kubelet.service alone"
+grep -q "u7s-lan-v6" "$CALLS" && bad "bring-up touched the rig's u7s-lan-v6 unit" || ok "bring-up leaves the rig's u7s-lan-v6 unit alone"
+: > "$CALLS"
+out=$(STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash -c 'systemctl() { [ "$1" = is-active ] && return 3; [ "$1" = is-enabled ] && return 1; return 0; }; export -f systemctl; bash "$0"' "$REPO/scripts/conformance/clear-native-units.sh" 2>&1)
+case "$out" in *"no leftover native u7s units") ok "a clean slot reports nothing to remove" ;; *) bad "clean slot output wrong: $out" ;; esac
+# install.sh's kubelet.service Requires=u7s-apiserver.service; left in place after the
+# apiserver unit is removed it fails every rig kubelet start ("Unit u7s-apiserver.service not found").
+UD="$TMP/unitdir"
+mkdir -p "$UD"
+printf '[Unit]\nRequires=crio.service u7s-apiserver.service\n' > "$UD/kubelet.service"
+out=$(U7S_UNIT_DIR="$UD" STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/clear-native-units.sh" 2>&1)
+grep -qxF "rm -f $UD/kubelet.service" "$CALLS" && ok "install.sh's kubelet.service (requires u7s-apiserver) is removed" \
+  || bad "install.sh's kubelet.service still requires the removed u7s-apiserver, so the rig kubelet cannot start"
+case "$out" in *kubelet.service) ok "the removed kubelet.service is reported" ;; *) bad "kubelet.service removal not reported: $out" ;; esac
+printf '[Service]\nExecStart=/usr/bin/kubelet\n' > "$UD/kubelet.service"
+: > "$CALLS"
+U7S_UNIT_DIR="$UD" STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/clear-native-units.sh" >/dev/null 2>&1
+! grep -qF "kubelet.service" "$CALLS" && ok "a kubelet.service that does not require u7s-apiserver is left alone" \
+  || bad "bring-up removed a kubelet.service that is not install.sh's"
+grep -q 'clear-native-units.sh' "$REPO/scripts/conformance/lima-start.sh" \
+  && ok "lima-start.sh runs the leftover-unit clearing" || bad "lima-start.sh never clears leftover native units, so a post-install slot breaks the rig bring-up"
+grep -q 'clear-native-units.sh' "$REPO/scripts/conformance/install-teardown.sh" \
+  && ok "install-teardown.sh shares the unit list" || bad "install-teardown.sh carries its own unit list"
+
 # One network-default table, shared by lima-start.sh and install-bringup.sh.
 assert_eq "lima-node defaults to its own network" "$(default_network_for_vm lima-node)" "user-v2-mayor"
 assert_eq "lima-node-3 defaults to worker network a" "$(default_network_for_vm lima-node-3)" "user-v2-workers-a"

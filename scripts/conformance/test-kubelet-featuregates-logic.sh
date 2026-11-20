@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 # Regression test for the kubelet feature-gate config in lima/kubelet.yaml.
 #
-# ClusterTrustBundle and ClusterTrustBundleProjection are Beta-since-1.33,
-# PodCertificateRequest is Beta-since-1.35, but all three are default-OFF in
-# the real kubelet binary (`kubelet --help`
-# lists all three as "BETA - default=false"). Without all three gates set,
-# kubelet silently ignores the `clusterTrustBundle`/`podCertificate`
-# projected-volume sources on a Pod spec instead of erroring — a pod using
-# either source just hangs waiting for Ready with no file ever written, which
-# is exactly the symptom an e2e run observed. If a future edit drops
-# any gate from the generated KubeletConfiguration, this test must fail —
-# kubectl-level verification alone would not catch a regression until the next
-# full conformance run.
+# ClusterTrustBundle, ClusterTrustBundleProjection and PodCertificateRequest are
+# GA and default-ON in kubelet 1.37 (install.sh appends them only for kubelet
+# >= 1.37). The rig must leave them unset so it runs the same defaults a real
+# install does; an explicit setting would mask a default flip. AtomicWriteVolumeUserFields
+# is still default-off and must stay set, or projected-volume file ownership
+# silently stays UID 0.
 #
 # Exits 0 on success, 1 on any assertion failure.
 set -euo pipefail
@@ -45,14 +40,21 @@ if [ -z "$KUBELET_CONFIG_LINE" ]; then
   exit 1
 fi
 
-assert_contains "KubeletConfiguration enables ClusterTrustBundle (kubelet's client-go lister/informer for the resource type)" \
-  "$KUBELET_CONFIG_LINE" 'ClusterTrustBundle: true'
+assert_lacks() {
+  local label="$1" haystack="$2" needle="$3"
+  if printf '%s' "$haystack" | drain_grep -qF -- "$needle"; then
+    echo "FAIL: $label — found '${needle}'"
+    FAIL=$(( FAIL + 1 ))
+  else
+    echo "PASS: $label"
+    PASS=$(( PASS + 1 ))
+  fi
+}
 
-assert_contains "KubeletConfiguration enables ClusterTrustBundleProjection (kubelet honors clusterTrustBundle projected sources)" \
-  "$KUBELET_CONFIG_LINE" 'ClusterTrustBundleProjection: true'
-
-assert_contains "KubeletConfiguration enables PodCertificateRequest (kubelet honors podCertificate projected sources)" \
-  "$KUBELET_CONFIG_LINE" 'PodCertificateRequest: true'
+for gate in ClusterTrustBundle ClusterTrustBundleProjection PodCertificateRequest; do
+  assert_lacks "KubeletConfiguration leaves GA-default-on gate $gate unset (rig must match install's kubelet defaults)" \
+    "$KUBELET_CONFIG_LINE" "$gate:"
+done
 
 assert_contains "KubeletConfiguration enables AtomicWriteVolumeUserFields (Alpha, default-off: without it kubelet ignores projected defaultUser/user and files are owned by UID 0)" \
   "$KUBELET_CONFIG_LINE" 'AtomicWriteVolumeUserFields: true'

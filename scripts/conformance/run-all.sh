@@ -42,9 +42,9 @@
 #                run u7s-scheduler as a supervised task inside the
 #                apiserver process instead of the standalone binary Step 5 otherwise
 #                starts. Given `true`, Step 5 is skipped entirely (starting the
-#                standalone binary too would double-schedule every pod). Omit to keep
-#                today's default: standalone scheduler via Step 5, apiserver's own
-#                --embedded-scheduler left at its own default (false).
+#                standalone binary too would double-schedule every pod). Default is
+#                `true`, as install.sh runs it; `false` runs the standalone binary via
+#                Step 5 for debugging the scheduler on its own.
 #
 #   --reset      Run reset.sh before building — kills host processes, deletes the
 #                lima-node VM (and the --extra-node VM too, if one is given on
@@ -496,6 +496,8 @@ _PROCS_ARG=""
 [ -n "$PROCS" ] && _PROCS_ARG="--procs $PROCS"
 _K8S_VERSION_ARG=""
 [ -n "$K8S_VERSION" ] && _K8S_VERSION_ARG="--k8s-version $K8S_VERSION"
+# install.sh runs the scheduler embedded in the apiserver; the rig does too unless told otherwise.
+EMBEDDED_SCHEDULER="${EMBEDDED_SCHEDULER:-true}"
 _EMBEDDED_SCHEDULER_ARG=""
 [ -n "$EMBEDDED_SCHEDULER" ] && _EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $EMBEDDED_SCHEDULER"
 _SERVICE_CIDR_ARG=""
@@ -554,11 +556,11 @@ if [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ]; then
   # here at all -- main.rs's own default of 10 applies.
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG}
+  U7S_DHAT_BACKTRACE_DEPTH="$DHAT_DEPTH" source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG} ${_DUAL_STACK_ARG}
 else
   # shellcheck source=02-start-apiserver.sh
   # shellcheck disable=SC2086
-  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG}
+  source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NODE_KUBELET_PORT_ARG} ${_EMBEDDED_SCHEDULER_ARG} ${_SERVICE_CIDR_ARG} ${_DUAL_STACK_ARG}
 fi
 
 # KUBECONFIG is now set (either from the running instance or newly started).

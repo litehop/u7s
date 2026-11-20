@@ -24,6 +24,7 @@ _WORKDIR_OVERRIDE=""
 _NODE_KUBELET_PORT_OVERRIDE=""
 _EMBEDDED_SCHEDULER_OVERRIDE=""
 _SERVICE_CIDR_OVERRIDE=""
+_DUAL_STACK_ARG=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --node-kubelet-port) _NODE_KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     --embedded-scheduler) _EMBEDDED_SCHEDULER_OVERRIDE="$2"; shift 2 ;;
     --service-cidr) _SERVICE_CIDR_OVERRIDE="$2"; shift 2 ;;
+    --dual-stack) _DUAL_STACK_ARG="--dual-stack"; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -53,6 +55,7 @@ EXTRA_ARGS=""
 [ -n "$_NODE_KUBELET_PORT_OVERRIDE" ]       && EXTRA_ARGS="$EXTRA_ARGS --node-kubelet-port $_NODE_KUBELET_PORT_OVERRIDE"
 [ -n "$_EMBEDDED_SCHEDULER_OVERRIDE" ]      && EXTRA_ARGS="$EXTRA_ARGS --embedded-scheduler $_EMBEDDED_SCHEDULER_OVERRIDE"
 [ -n "$_SERVICE_CIDR_OVERRIDE" ]             && EXTRA_ARGS="$EXTRA_ARGS --service-cidr $_SERVICE_CIDR_OVERRIDE"
+EXTRA_ARGS="$EXTRA_ARGS $_DUAL_STACK_ARG"
 
 # shellcheck disable=SC2086
 bash "$REPO/scripts/u7s-start.sh" --background $EXTRA_ARGS
