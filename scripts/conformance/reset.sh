@@ -94,7 +94,7 @@ teardown_vm() {
     ha_pid="$(cat "$ha_pidfile")"
   fi
 
-  if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${vm}$"; then
+  if grep -q "^${vm}$" < <(limactl list --format '{{.Name}}' 2>/dev/null); then
     local vm_status
     vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${vm} / {print \$2}")"
     if [ "$vm_status" = "Running" ]; then

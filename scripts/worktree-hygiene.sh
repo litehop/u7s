@@ -358,7 +358,7 @@ find_orphans() {
     [ -n "$ptype" ] || continue
     wpath=$(extract_worktree_path_from_psline "$line")
     [ -n "$wpath" ] || continue
-    if ! printf '%s\n' "$live_worktrees" | grep -qxF "$wpath"; then
+    if ! grep -qxF "$wpath" <<<"$live_worktrees"; then
       pid=$(pid_from_psline "$line")
       printf '%s|%s|%s\n' "$pid" "$ptype" "$wpath"
     fi
@@ -384,8 +384,8 @@ find_apiserverless_konnectivity() {
     [ "$(proc_type_from_psline "$line")" = "konnectivity-server" ] || continue
     wpath=$(extract_worktree_path_from_psline "$line")
     [ -n "$wpath" ] || continue
-    printf '%s\n' "$live_worktrees" | grep -qxF "$wpath" || continue
-    if printf '%s\n' "$api_paths" | grep -qxF "$wpath"; then continue; fi
+    grep -qxF "$wpath" <<<"$live_worktrees" || continue
+    if grep -qxF "$wpath" <<<"$api_paths"; then continue; fi
     if [ -z "$(agent_id_from_worktree_path "$wpath")" ]; then
       is_worker_slot_konnectivity_port "$(konnectivity_port_from_psline "$line")" || continue
     fi
@@ -420,11 +420,11 @@ find_mayor_worker_slot_squatters() {
     [ "$ptype" = "apiserver" ] || [ "$ptype" = "scheduler" ] || continue
     wpath=$(extract_worktree_path_from_psline "$line")
     [ -n "$wpath" ] || continue
-    printf '%s\n' "$live_worktrees" | grep -qxF "$wpath" || continue
+    grep -qxF "$wpath" <<<"$live_worktrees" || continue
     [ -z "$(agent_id_from_worktree_path "$wpath")" ] || continue
     port=$(apiserver_port_from_psline "$line")
     is_worker_slot_apiserver_port "$port" || continue
-    if printf '%s\n' "$agent_ports" | grep -qxF "$port"; then continue; fi
+    if grep -qxF "$port" <<<"$agent_ports"; then continue; fi
     printf '%s|slot-squatter-%s|%s\n' "$(pid_from_psline "$line")" "$ptype" "$wpath"
   done <<< "$ps_output"
 }
@@ -544,7 +544,7 @@ checked_out_branches() {
 # checked_out_branches set -- the in-flight guard.
 is_checked_out() {
   local branch="$1" checked_out="$2"
-  printf '%s\n' "$checked_out" | grep -qxF "$branch"
+  grep -qxF "$branch" <<<"$checked_out"
 }
 
 # True (exit 0) iff `branch` has commits not yet reflected (by patch-id) in
@@ -568,7 +568,7 @@ is_unmerged_by_patch_id() {
 has_open_pr() {
   local branch="$1" open_pr_branches="$2"
   [ -n "$branch" ] || return 1
-  printf '%s\n' "$open_pr_branches" | grep -qxF "$branch"
+  grep -qxF "$branch" <<<"$open_pr_branches"
 }
 
 # All open PRs as "<headRefName> <headRefOid>" lines -- the shared query behind

@@ -132,7 +132,7 @@ if [ ! -f "$KUBECONFIG" ]; then
   echo "error: kubeconfig not found at $KUBECONFIG — start u7s first (run-all.sh --stack-only)" >&2
   exit 1
 fi
-if ! kubectl --kubeconfig="$KUBECONFIG" get nodes -o name 2>/dev/null | grep -Fxq "node/$VM_NAME"; then
+if ! grep -Fxq "node/$VM_NAME" < <(kubectl --kubeconfig="$KUBECONFIG" get nodes -o name 2>/dev/null); then
   echo "error: $VM_NAME not registered — run scripts/conformance/run-all.sh --stack-only first" >&2
   exit 1
 fi

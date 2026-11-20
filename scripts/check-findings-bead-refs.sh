@@ -18,7 +18,7 @@ new_findings=$(git diff --cached --name-only --diff-filter=AMR -- 'ai/findings/*
 
 fail=0
 for f in $new_findings; do
-  if ! head -n 5 "$f" | grep -qE '^Bead: '; then
+  if ! grep -qE '^Bead: ' < <(head -n 5 "$f"); then
     echo "ERROR: $f missing 'Bead: <bead-id>' reference in first 5 lines" >&2
     fail=1
   fi

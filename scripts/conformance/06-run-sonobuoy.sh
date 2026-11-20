@@ -138,7 +138,7 @@ fi
 if [ -z "${KUBECONFIG:-}" ] || [ ! -f "$KUBECONFIG" ]; then
   echo "error: KUBECONFIG not set or file not found — start u7s first" >&2; exit 1
 fi
-if ! kubectl --kubeconfig="$KUBECONFIG" get nodes -o name 2>/dev/null | grep -Fxq "node/$VM_NAME"; then
+if ! grep -Fxq "node/$VM_NAME" < <(kubectl --kubeconfig="$KUBECONFIG" get nodes -o name 2>/dev/null); then
   echo "error: $VM_NAME not registered — run scripts/conformance/lima-start.sh first" >&2; exit 1
 fi
 

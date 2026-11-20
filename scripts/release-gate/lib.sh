@@ -261,7 +261,7 @@ rg_mariadb_emptydir_rewrite() {
     /^        - name: temp$/ {print "        - name: data"; print "          emptyDir: {}"}
     !skip {print}
   ' "$1" > "$2" || return 1
-  grep -A1 '^        - name: data$' "$2" | grep -q '^          emptyDir: {}$' || return 1
+  grep -q '^          emptyDir: {}$' < <(grep -A1 '^        - name: data$' "$2") || return 1
   ! grep -q 'volumeClaimTemplates\|PersistentVolumeClaim' "$2"
 }
 

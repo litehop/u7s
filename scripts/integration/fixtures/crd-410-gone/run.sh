@@ -24,7 +24,7 @@ kubectl delete crd "$CRD_NAME" --timeout=15s
 # --v=6 prints the HTTP response line: status="410 Gone"
 output="$(kubectl get --raw /apis/stable.example.com/v1/crontabs --v=6 2>&1 || true)"
 
-if echo "$output" | grep -q 'status="410 Gone"'; then
+if grep -q 'status="410 Gone"' <<<"$output"; then
   echo "ASSERT OK: group endpoint returned 410 Gone after CRD deletion"
   exit 0
 else

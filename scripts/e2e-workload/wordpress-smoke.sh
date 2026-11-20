@@ -143,7 +143,7 @@ BODY="$(curl_wp -s -b "$JAR" -c "$JAR" \
   --data-urlencode "Submit=Install WordPress" \
   --data-urlencode "language=" \
   "$BASE/wp-admin/install.php?step=2")"
-echo "$BODY" | grep -q "Success!" || fail "install POST response did not contain 'Success!' -- WordPress install did not complete"
+grep -q "Success!" <<<"$BODY" || fail "install POST response did not contain 'Success!' -- WordPress install did not complete"
 echo "  -> Success! (install completed, site title: $SITE_TITLE)"
 
 echo "== GET / (expect the rendered page to contain the submitted site title) =="
@@ -154,7 +154,7 @@ echo "== GET / (expect the rendered page to contain the submitted site title) ==
 FOUND=0
 for _ in $(seq 1 15); do
   FINAL_BODY="$(curl_wp -s -b "$JAR" -c "$JAR" "$BASE/")"
-  if echo "$FINAL_BODY" | grep -qF "$SITE_TITLE"; then
+  if grep -qF "$SITE_TITLE" <<<"$FINAL_BODY"; then
     FOUND=1
     break
   fi
