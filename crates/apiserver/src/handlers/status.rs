@@ -7126,7 +7126,12 @@ mod tests {
     /// `.put(` substring in its own body and would otherwise be silently skipped by
     /// `every_main_resource_write_handler_preserves_stored_status`.
     fn calls_store_write_entry_point(body: &str) -> bool {
-        const STORE_WRITE_ENTRY_POINTS: &[&str] = &[".put(", ".create_if_namespace_active("];
+        const STORE_WRITE_ENTRY_POINTS: &[&str] = &[
+            ".put(",
+            ".create_if_namespace_active(",
+            ".commit(",
+            ".pending(",
+        ];
         STORE_WRITE_ENTRY_POINTS
             .iter()
             .any(|entry_point| body.contains(entry_point))
