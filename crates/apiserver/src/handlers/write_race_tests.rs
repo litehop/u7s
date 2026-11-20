@@ -622,13 +622,522 @@ async fn delete_collection_soft_delete_does_not_resurrect() {
     )
     .await;
     mock.arm_delete_before_put(key);
-    let done = crate::handlers::generic::soft_delete_collection_item(
+    let done = crate::handlers::generic::delete_collection_item(
         Arc::clone(&mock),
         key,
         ("", "configmaps", "held", "ConfigMap"),
     )
     .await
     .expect("a vanished item is not an error");
-    assert!(done, "nothing is left to hard-delete");
+    assert!(
+        matches!(done, crate::handlers::generic::CollectedItem::Kept),
+        "nothing is left to hard-delete"
+    );
     assert!(mock.inner.get(key).await.unwrap().is_none());
+}
+
+async fn stored_json(mock: &MockStore, key: &str) -> Option<Value> {
+    let o = mock.inner.get(key).await.unwrap()?;
+    Some(serde_json::from_slice(&o.value).unwrap())
+}
+
+/// `base` as a Terminating object holding `finalizers`.
+fn terminating(mut base: Value, finalizers: &[&str]) -> Value {
+    base["metadata"]["deletionTimestamp"] = json!("2024-01-01T00:00:00Z");
+    base["metadata"]["finalizers"] = json!(finalizers);
+    base
+}
+
+/// The object must outlive a delete whose decision a concurrent write invalidated: that write
+/// re-added finalizer `g`, which the delete must not discard.
+async fn assert_survives_with_finalizer_g(mock: &MockStore, key: &str, what: &str) {
+    let v = stored_json(mock, key).await.unwrap_or_else(|| {
+        panic!("{what}: a delete decided before a finalizer was re-added removed the object")
+    });
+    assert!(
+        v["metadata"]["finalizers"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|x| x == "g")),
+        "{what}: the concurrent write's finalizer must survive, got {}",
+        v["metadata"]["finalizers"]
+    );
+}
+
+fn drop_first_finalizer() -> Bytes {
+    bytes_of(&json!([{"op": "remove", "path": "/metadata/finalizers/0"}]))
+}
+
+/// An update that drained the last finalizer deletes the pod, conditional on the revision it
+/// read: a write that re-added a finalizer first is re-evaluated against, not deleted over.
+#[tokio::test]
+async fn patch_pod_drain_does_not_delete_over_a_concurrent_write() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &terminating(pod("p"), &["f"])).await;
+    mock.arm_write_before_delete(&key, bytes_of(&terminating(pod("p"), &["f", "g"])));
+    let result = crate::handlers::pods::patch_pod(
+        State(state),
+        Path(("default".to_string(), "p".to_string())),
+        Query(Default::default()),
+        Extension(user()),
+        headers("application/json-patch+json"),
+        drop_first_finalizer(),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    assert_survives_with_finalizer_g(&mock, &key, "patch_pod").await;
+}
+
+#[tokio::test]
+async fn replace_pod_drain_does_not_delete_over_a_concurrent_write() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &terminating(pod("p"), &["f"])).await;
+    let rv = mock.inner.get(&key).await.unwrap().unwrap().revision;
+    mock.arm_write_before_delete(&key, bytes_of(&terminating(pod("p"), &["f", "g"])));
+    let result = crate::handlers::pods::replace_pod(
+        State(state),
+        Path(("default".to_string(), "p".to_string())),
+        Query(Default::default()),
+        Extension(user()),
+        json_headers(),
+        bytes_of(&pinned(terminating(pod("p"), &[]), rv)),
+    )
+    .await;
+    assert_eq!(
+        code(result),
+        StatusCode::CONFLICT,
+        "a PUT pinned to a revision a concurrent write replaced must not delete over it"
+    );
+    assert_survives_with_finalizer_g(&mock, &key, "replace_pod").await;
+}
+
+/// `body` as a PUT that requires the object to still be at revision `rv`.
+fn pinned(mut body: Value, rv: u64) -> Value {
+    body["metadata"]["resourceVersion"] = json!(rv.to_string());
+    body
+}
+
+fn config_map(name: &str) -> Value {
+    json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": name, "namespace": "default", "uid": "cm-uid"}, "data": {"a": "b"}
+    })
+}
+
+const CM_KEY: &str = "/registry/configmaps/default/cm";
+
+fn cm_path() -> Path<(String, String, String, String, String)> {
+    Path((
+        "".into(),
+        "v1".into(),
+        "default".into(),
+        "configmaps".into(),
+        "cm".into(),
+    ))
+}
+
+#[tokio::test]
+async fn do_patch_drain_does_not_delete_over_a_concurrent_write() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    seed(&mock, CM_KEY, &terminating(config_map("cm"), &["f"])).await;
+    mock.arm_write_before_delete(
+        CM_KEY,
+        bytes_of(&terminating(config_map("cm"), &["f", "g"])),
+    );
+    let result = crate::handlers::resource::patch_namespaced_resource(
+        State(state),
+        cm_path(),
+        Query(Default::default()),
+        Extension(user()),
+        headers("application/json-patch+json"),
+        drop_first_finalizer(),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    assert_survives_with_finalizer_g(&mock, CM_KEY, "do_patch").await;
+}
+
+#[tokio::test]
+async fn replace_namespaced_resource_drain_does_not_delete_over_a_concurrent_write() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    seed(&mock, CM_KEY, &terminating(config_map("cm"), &["f"])).await;
+    let rv = mock.inner.get(CM_KEY).await.unwrap().unwrap().revision;
+    mock.arm_write_before_delete(
+        CM_KEY,
+        bytes_of(&terminating(config_map("cm"), &["f", "g"])),
+    );
+    let result = crate::handlers::resource::replace_namespaced_resource(
+        State(state),
+        cm_path(),
+        Query(Default::default()),
+        Extension(user()),
+        json_headers(),
+        bytes_of(&pinned(terminating(config_map("cm"), &[]), rv)),
+    )
+    .await;
+    assert_eq!(
+        code(result),
+        StatusCode::CONFLICT,
+        "a PUT pinned to a revision a concurrent write replaced must not delete over it"
+    );
+    assert_survives_with_finalizer_g(&mock, CM_KEY, "replace_namespaced_resource").await;
+}
+
+/// DELETE of a Terminating object without finalizers hard-deletes it; a finalizer added
+/// between the read and the delete must make it wait for that finalizer.
+#[tokio::test]
+async fn delete_pod_hard_delete_keeps_a_finalizer_added_after_the_read() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &terminating(pod("p"), &[])).await;
+    mock.arm_write_before_delete(&key, bytes_of(&terminating(pod("p"), &["g"])));
+    let result = crate::handlers::pods::delete_pod(
+        State(state),
+        Path(("default".to_string(), "p".to_string())),
+        Extension(user()),
+        Query(crate::handlers::pods::GracePeriodQuery {
+            grace_period_seconds: None,
+        }),
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    assert_survives_with_finalizer_g(&mock, &key, "delete_pod").await;
+}
+
+#[tokio::test]
+async fn delete_namespaced_resource_hard_delete_keeps_a_finalizer_added_after_the_read() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    seed(&mock, CM_KEY, &config_map("cm")).await;
+    let mut raced = config_map("cm");
+    raced["metadata"]["finalizers"] = json!(["g"]);
+    mock.arm_write_before_delete(CM_KEY, bytes_of(&raced));
+    let result = crate::handlers::resource::delete_namespaced_resource(
+        State(state),
+        cm_path(),
+        Extension(user()),
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    assert_survives_with_finalizer_g(&mock, CM_KEY, "delete_namespaced_resource").await;
+}
+
+/// DeleteCollection decides per item on the object as it is now; an item that gained a
+/// finalizer before the delete lands is soft-deleted instead of removed.
+#[tokio::test]
+async fn delete_collection_item_keeps_a_finalizer_added_after_the_read() {
+    let mock = Arc::new(MockStore::new());
+    seed(&mock, CM_KEY, &config_map("cm")).await;
+    let mut raced = config_map("cm");
+    raced["metadata"]["finalizers"] = json!(["g"]);
+    mock.arm_write_before_delete(CM_KEY, bytes_of(&raced));
+    let done = crate::handlers::generic::delete_collection_item(
+        Arc::clone(&mock),
+        CM_KEY,
+        ("", "configmaps", "cm", "ConfigMap"),
+    )
+    .await
+    .expect("delete");
+    assert!(matches!(
+        done,
+        crate::handlers::generic::CollectedItem::Kept
+    ));
+    assert_survives_with_finalizer_g(&mock, CM_KEY, "delete_collection_item").await;
+    assert!(
+        stored_json(&mock, CM_KEY).await.unwrap()["metadata"]["deletionTimestamp"].is_string(),
+        "the item must be soft-deleted, not left untouched"
+    );
+}
+
+#[tokio::test]
+async fn delete_collection_pods_keeps_a_finalizer_added_after_the_list() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &terminating(pod("p"), &[])).await;
+    mock.arm_write_before_delete(&key, bytes_of(&terminating(pod("p"), &["g"])));
+    let result = crate::handlers::pods::delete_collection_pods(
+        State(state),
+        Path(("default".to_string(),)),
+        Extension(user()),
+        Query(crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        }),
+        Query(crate::handlers::pods::GracePeriodQuery {
+            grace_period_seconds: None,
+        }),
+        HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    assert_survives_with_finalizer_g(&mock, &key, "delete_collection_pods").await;
+}
+
+/// The namespace is removed after the write that emptied spec.finalizers; a finalizer
+/// re-added since keeps it alive.
+#[tokio::test]
+async fn finalize_namespace_delete_keeps_a_finalizer_re_added_after_the_write() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = "/registry/namespaces/doomed";
+    let ns = |finalizers: &[&str]| {
+        json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": {"name": "doomed", "uid": "ns-uid",
+                         "deletionTimestamp": "2024-01-01T00:00:00Z"},
+            "spec": {"finalizers": finalizers}, "status": {"phase": "Terminating"}
+        })
+    };
+    seed(&mock, key, &ns(&["kubernetes"])).await;
+    mock.arm_write_before_delete(key, bytes_of(&ns(&["kubernetes"])));
+    let result = crate::handlers::namespaces::finalize_namespace(
+        State(state),
+        Path("doomed".into()),
+        Some(Extension(user())),
+        json_headers(),
+        bytes_of(&json!({"spec": {"finalizers": []}})),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::OK);
+    let v = stored_json(&mock, key)
+        .await
+        .expect("a finalizer re-added after the drain must keep the namespace");
+    assert_eq!(v["spec"]["finalizers"], json!(["kubernetes"]));
+}
+
+#[tokio::test]
+async fn patch_cr_drain_does_not_delete_over_a_concurrent_write() {
+    let mock = Arc::new(MockStore::new());
+    let (state, key) = install_cluster_cr(&mock).await;
+    let cr = |finalizers: &[&str]| {
+        terminating(
+            json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": {"name": "w", "uid": "w-uid"}, "spec": {"replicas": 1}
+            }),
+            finalizers,
+        )
+    };
+    seed(&mock, &key, &cr(&["f"])).await;
+    mock.arm_write_before_delete(&key, bytes_of(&cr(&["f", "g"])));
+    let result = crate::handlers::cr::patch_cr(
+        State(state),
+        Path((
+            "example.io".into(),
+            "v1".into(),
+            "widgets".into(),
+            "w".into(),
+        )),
+        Extension(user()),
+        headers("application/json-patch+json"),
+        drop_first_finalizer(),
+    )
+    .await;
+    assert_eq!(
+        code(result),
+        StatusCode::CONFLICT,
+        "the drain lost to a concurrent write is a conflict, not a delete over it"
+    );
+    assert_survives_with_finalizer_g(&mock, &key, "patch_cr").await;
+}
+
+const PATCH_TYPES: [&str; 3] = [
+    "application/merge-patch+json",
+    "application/strategic-merge-patch+json",
+    "application/json-patch+json",
+];
+
+/// Rewrites the object so its revision moves on; returns `(stale, current)` revisions.
+async fn bump(mock: &MockStore, key: &str) -> (u64, u64) {
+    let stored = mock.inner.get(key).await.unwrap().unwrap();
+    let mut v: Value = serde_json::from_slice(&stored.value).unwrap();
+    v["metadata"]["annotations"] = json!({"bumped": stored.revision.to_string()});
+    let current = mock.inner.put(key, bytes_of(&v), None).await.unwrap();
+    (stored.revision, current)
+}
+
+/// A patch adding annotation `k` that pins `metadata.resourceVersion` to `rv`. A JSON Patch can
+/// only pin through an op, never through the raw body.
+fn pinned_patch(content_type: &str, rv: u64) -> Value {
+    if content_type.contains("json-patch") {
+        json!([
+            {"op": "add", "path": "/metadata/annotations", "value": {"k": "v"}},
+            {"op": "add", "path": "/metadata/resourceVersion", "value": rv.to_string()}
+        ])
+    } else {
+        json!({"metadata": {"annotations": {"k": "v"}, "resourceVersion": rv.to_string()}})
+    }
+}
+
+fn code<T>(r: Result<T, StatusError>) -> StatusCode {
+    r.map_or_else(|e| e.0, |_| StatusCode::OK)
+}
+
+async fn assert_patch_not_applied(mock: &MockStore, key: &str, what: &str) {
+    let stored = mock.inner.get(key).await.unwrap().unwrap();
+    let v: Value = serde_json::from_slice(&stored.value).unwrap();
+    assert!(
+        v["metadata"]["annotations"]["k"].is_null(),
+        "{what}: a patch pinned to a stale resourceVersion must not be applied"
+    );
+}
+
+/// A client that pins `metadata.resourceVersion` in its patch asked for exactly that
+/// revision: a stale pin must be a 409 for every patch type, not applied to the live object.
+#[tokio::test]
+async fn do_patch_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = "/registry/configmaps/default/cm";
+    seed(
+        &mock,
+        key,
+        &json!({"apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "cm", "namespace": "default"}, "data": {"a": "b"}}),
+    )
+    .await;
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, key).await;
+        let patch = |rv| {
+            crate::handlers::resource::patch_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "".into(),
+                    "v1".into(),
+                    "default".into(),
+                    "configmaps".into(),
+                    "cm".into(),
+                )),
+                Query(Default::default()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+#[tokio::test]
+async fn patch_pod_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, &key).await;
+        let patch = |rv| {
+            crate::handlers::pods::patch_pod(
+                State(state.clone()),
+                Path(("default".to_string(), "p".to_string())),
+                Query(Default::default()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, &key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+/// The pin matched the revision read, but a writer landed before the commit: the patch must
+/// not be re-applied onto the newer object the client never saw.
+#[tokio::test]
+async fn patch_pod_pin_lost_to_a_concurrent_write_is_409_not_a_blind_retry() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    let (_, current) = bump(&mock, &key).await;
+    let mut raced = pod("p");
+    raced["metadata"]["labels"] = json!({"raced": "1"});
+    mock.arm_write_before_put(&key, bytes_of(&raced));
+    let ct = "application/json-patch+json";
+    let result = crate::handlers::pods::patch_pod(
+        State(state),
+        Path(("default".to_string(), "p".to_string())),
+        Query(Default::default()),
+        Extension(user()),
+        headers(ct),
+        bytes_of(&pinned_patch(ct, current)),
+    )
+    .await;
+    assert_eq!(code(result), StatusCode::CONFLICT);
+    assert_patch_not_applied(&mock, &key, ct).await;
+}
+
+#[tokio::test]
+async fn patch_pod_status_stale_pinned_resource_version_is_409() {
+    let mock = Arc::new(MockStore::new());
+    let state = state_of(&mock);
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    for ct in &PATCH_TYPES[..2] {
+        let (stale, current) = bump(&mock, &key).await;
+        let patch = |rv: u64| {
+            crate::handlers::pods::patch_pod_status(
+                State(state.clone()),
+                Path(("default".to_string(), "p".to_string())),
+                Some(Extension(user())),
+                headers(ct),
+                bytes_of(&json!({
+                    "metadata": {"resourceVersion": rv.to_string()},
+                    "status": {"phase": ct}
+                })),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        let stored: Value =
+            serde_json::from_slice(&mock.inner.get(&key).await.unwrap().unwrap().value).unwrap();
+        assert_ne!(
+            stored["status"]["phase"], *ct,
+            "{ct}: a status patch pinned to a stale resourceVersion must not be applied"
+        );
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
+}
+
+#[tokio::test]
+async fn patch_crd_stale_pinned_resource_version_is_409_for_every_patch_type() {
+    let mock = Arc::new(MockStore::new());
+    let (state, _) = install_cluster_cr(&mock).await;
+    let key = "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io";
+    for ct in PATCH_TYPES {
+        let (stale, current) = bump(&mock, key).await;
+        let patch = |rv| {
+            crate::handlers::crd::patch_crd(
+                State(state.clone()),
+                Path("widgets.example.io".into()),
+                Extension(user()),
+                headers(ct),
+                bytes_of(&pinned_patch(ct, rv)),
+            )
+        };
+        assert_eq!(code(patch(stale).await), StatusCode::CONFLICT, "{ct}");
+        assert_patch_not_applied(&mock, key, ct).await;
+        assert_eq!(code(patch(current).await), StatusCode::OK, "{ct}");
+    }
 }

@@ -13,7 +13,7 @@ use crate::{limit_range, quota};
 
 use crate::{
     auth::UserInfo,
-    guaranteed_update::{GuaranteedUpdate, WriteFailure},
+    guaranteed_update::{delete_read, Deleted, Drain, GuaranteedUpdate, WriteFailure},
     keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
@@ -1208,11 +1208,11 @@ pub(crate) async fn replace_resource<S: Store>(
         // remove their finalizer via PUT, not PATCH. Complete the delete instead of storing an
         // update, or the object stays stuck Terminating forever.
         if finalizer_drain_complete(&obj.body) {
-            complete_finalizer_drain(
+            let drained = complete_finalizer_drain(
                 &state,
+                &mut gu,
                 FinalizerDrainCtx {
                     key: &key,
-                    meta: &meta,
                     group: &group,
                     version: &version,
                     plural: &plural,
@@ -1221,6 +1221,9 @@ pub(crate) async fn replace_resource<S: Store>(
                 },
             )
             .await?;
+            if !drained {
+                continue;
+            }
             inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
             return Ok(Json(obj.body).into_response());
         }
@@ -1426,11 +1429,13 @@ pub(crate) async fn delete_resource<S: Store>(
             .into_response());
         }
 
-        state
-            .store
-            .delete(&key, None)
+        match delete_read(&*state.store, &key, &stored, |_| true)
             .await
-            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
+            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
+        {
+            Deleted::Kept => continue,
+            Deleted::Removed | Deleted::Gone => {}
+        }
 
         if group == RBAC_GROUP {
             let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
@@ -1474,7 +1479,6 @@ pub(crate) fn finalizer_drain_complete(body: &serde_json::Value) -> bool {
 /// matching the `PatchConfig` convention already used for `do_patch` below.
 struct FinalizerDrainCtx<'a> {
     key: &'a str,
-    meta: &'a crate::types::ResourceMeta,
     group: &'a str,
     version: &'a str,
     plural: &'a str,
@@ -1490,11 +1494,11 @@ struct FinalizerDrainCtx<'a> {
 /// don't need to do anything further for watchers to observe the deletion.
 async fn complete_finalizer_drain<S: Store>(
     state: &AppState<S>,
+    gu: &mut GuaranteedUpdate<S>,
     ctx: FinalizerDrainCtx<'_>,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<bool, crate::status::StatusError> {
     let FinalizerDrainCtx {
         key,
-        meta,
         group,
         version,
         plural,
@@ -1513,13 +1517,15 @@ async fn complete_finalizer_drain<S: Store>(
     } else {
         None
     };
-    state
-        .store
-        .delete(key, None)
-        .await
-        .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
-    if let Some(spec) = released_service_spec {
-        crate::service_alloc::release_service_allocations(state, &spec).await;
+    match gu.delete().await? {
+        Drain::Lost => return Ok(false),
+        // Whoever removed it released its reservations.
+        Drain::Gone => {}
+        Drain::Removed => {
+            if let Some(spec) = released_service_spec {
+                crate::service_alloc::release_service_allocations(state, &spec).await;
+            }
+        }
     }
     if group == RBAC_GROUP {
         let rbac_key = match ns {
@@ -1550,7 +1556,7 @@ async fn complete_finalizer_drain<S: Store>(
         let _quota_lock = state.quota_admission_locks.lock(namespace).await;
         quota::update_quota_status(state, namespace).await;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Parameters for `do_patch`.
@@ -2498,11 +2504,11 @@ pub(crate) async fn do_patch<S: Store>(
         // delete below, since this branch returns before do_patch's own later dry_run check.
         if finalizer_drain_complete(&current.body) {
             if !dry_run {
-                complete_finalizer_drain(
+                let drained = complete_finalizer_drain(
                     state,
+                    &mut gu,
                     FinalizerDrainCtx {
                         key,
-                        meta,
                         group,
                         version,
                         plural,
@@ -2511,6 +2517,9 @@ pub(crate) async fn do_patch<S: Store>(
                     },
                 )
                 .await?;
+                if !drained {
+                    continue;
+                }
             }
             return Ok(Json(current.body).into_response());
         }
@@ -4457,11 +4466,11 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         // is still alive — complete_finalizer_drain reacquires the same per-namespace
         // quota_admission_locks lock, which would deadlock on that non-reentrant semaphore.
         if object_existed && finalizer_drain_complete(&obj.body) {
-            complete_finalizer_drain(
+            let drained = complete_finalizer_drain(
                 &state,
+                &mut gu,
                 FinalizerDrainCtx {
                     key: &key,
-                    meta: &meta,
                     group: &group,
                     version: &version,
                     plural: &plural,
@@ -4470,6 +4479,9 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                 },
             )
             .await?;
+            if !drained {
+                continue;
+            }
             inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
             return Ok(Json(obj.body).into_response());
         }
@@ -4668,11 +4680,13 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .into_response());
         }
 
-        state
-            .store
-            .delete(&key, None)
+        match delete_read(&*state.store, &key, &stored, |_| true)
             .await
-            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
+            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
+        {
+            Deleted::Kept => continue,
+            Deleted::Removed | Deleted::Gone => {}
+        }
 
         // Capture what post-loop cascade side effects need from the freshly-read `obj`
         // before it drops at the end of this iteration — `obj` itself is loop-scoped
@@ -5037,28 +5051,27 @@ pub(crate) async fn delete_collection_resource<S: Store>(
             // or PersistentVolume with a legitimate finalizer) must be soft-deleted
             // (deletionTimestamp stamped, kept alive), not removed outright — mirrors
             // delete_collection_namespaced_resource below.
-            if super::generic::soft_delete_collection_item(
+            if let super::generic::CollectedItem::Removed = super::generic::delete_collection_item(
                 state.store.clone(),
                 &obj.key,
                 (&group, &plural, &name, &plural),
             )
             .await?
             {
-                continue;
+                if let Some(ref spec) = spec_to_release {
+                    crate::service_alloc::release_service_allocations(&state, spec).await;
+                }
             }
+            continue;
         }
-        // NotFound means another writer deleted this object concurrently — tolerate it.
-        // Any other error (disk full, DB corruption, …) means some objects survived;
-        // propagate so the caller does not believe all objects were deleted. Also covers
-        // the (unparseable-JSON) fallback case for a dry-run request: skip the write.
+        // The list snapshot did not parse, so the object cannot be judged: delete it only if
+        // it is still the snapshot. Any error other than a concurrent delete (disk full, DB
+        // corruption, …) means some objects survived; propagate so the caller does not
+        // believe all objects were deleted. A dry-run request skips the write.
         if !dry_run {
-            match state.store.delete(&obj.key, None).await {
-                Ok(_) | Err(StoreError::NotFound { .. }) => {}
-                Err(e) => return Err(Status::internal(e.to_string())),
-            }
-            if let Some(ref spec) = spec_to_release {
-                crate::service_alloc::release_service_allocations(&state, spec).await;
-            }
+            delete_read(&*state.store, &obj.key, &obj, |_| true)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
     }
     if !dry_run && group == ADMISSION_GROUP {
@@ -5209,28 +5222,27 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
             // type) — without this, it would silently bypass every object's finalizers,
             // breaking OrderedNamespaceDeletion (e.g. a finalizer'd pod must survive with
             // deletionTimestamp set while later resource types are still being processed).
-            if super::generic::soft_delete_collection_item(
+            if let super::generic::CollectedItem::Removed = super::generic::delete_collection_item(
                 state.store.clone(),
                 &obj.key,
                 (&group, &plural, &name, &plural),
             )
             .await?
             {
-                continue;
+                if let Some(ref spec) = spec_to_release {
+                    crate::service_alloc::release_service_allocations(&state, spec).await;
+                }
             }
+            continue;
         }
-        // NotFound means another writer deleted this object concurrently — tolerate it.
-        // Any other error (disk full, DB corruption, …) means some objects survived;
-        // propagate so the caller does not believe all objects were deleted. Also covers
-        // the (unparseable-JSON) fallback case for a dry-run request: skip the write.
+        // The list snapshot did not parse, so the object cannot be judged: delete it only if
+        // it is still the snapshot. Any error other than a concurrent delete (disk full, DB
+        // corruption, …) means some objects survived; propagate so the caller does not
+        // believe all objects were deleted. A dry-run request skips the write.
         if !dry_run {
-            match state.store.delete(&obj.key, None).await {
-                Ok(_) | Err(StoreError::NotFound { .. }) => {}
-                Err(e) => return Err(Status::internal(e.to_string())),
-            }
-            if let Some(ref spec) = spec_to_release {
-                crate::service_alloc::release_service_allocations(&state, spec).await;
-            }
+            delete_read(&*state.store, &obj.key, &obj, |_| true)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
         }
     }
 
@@ -25873,12 +25885,10 @@ mod tests {
             let key: String = key.into();
             async move {
                 if inject {
-                    // Simulate a storage-layer failure (revision mismatch is a concrete
-                    // non-NotFound variant that requires no external crates to construct).
-                    Err(u7s_store::StoreError::RevisionMismatch {
-                        expected: 999,
-                        current: 1,
-                    })
+                    // A storage-layer failure that is neither NotFound nor a lost race.
+                    Err(u7s_store::StoreError::Io(std::io::Error::other(
+                        "disk full",
+                    )))
                 } else {
                     inner.delete(&key, expected_revision).await
                 }

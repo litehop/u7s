@@ -846,32 +846,43 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
     }
 }
 
-/// The soft-delete of one DeleteCollection item, decided on the object as it is now rather
-/// than on the list snapshot (as upstream's per-item Delete does): an item deleted since the
-/// list stays deleted, and a concurrent write to it is not overwritten.
-///
-/// `Ok(true)`: nothing left to hard-delete (soft-deleted, or already gone). `Ok(false)`: the
-/// object has no finalizers and the caller must hard-delete it.
-pub(crate) async fn soft_delete_collection_item<S: Store>(
+/// What a DeleteCollection item's delete left behind.
+pub(crate) enum CollectedItem {
+    /// Soft-deleted, or already gone: nothing was hard-deleted by this call.
+    Kept,
+    /// Hard-deleted by this call.
+    Removed,
+}
+
+/// The delete of one DeleteCollection item, decided on the object as it is now rather than on
+/// the list snapshot (as upstream's per-item Delete does): an item deleted since the list stays
+/// deleted, a concurrent write to it is not overwritten, and the hard-delete of an object
+/// without finalizers is conditional on the revision it was decided at.
+pub(crate) async fn delete_collection_item<S: Store>(
     store: std::sync::Arc<S>,
     key: &str,
     ctx: (&str, &str, &str, &str),
-) -> Result<bool, crate::status::StatusError> {
+) -> Result<CollectedItem, crate::status::StatusError> {
+    use crate::guaranteed_update::Drain;
     let mut gu = crate::guaranteed_update::GuaranteedUpdate::new(store, key, None, ctx);
     loop {
         let Some(stored) = gu.read().await? else {
-            return Ok(true);
+            return Ok(CollectedItem::Kept);
         };
-        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&stored.value) else {
-            return Ok(false);
-        };
-        let Some(soft) = apply_delete_policy(&mut Object { body }) else {
-            return Ok(false);
+        let soft = serde_json::from_slice::<serde_json::Value>(&stored.value)
+            .ok()
+            .and_then(|body| apply_delete_policy(&mut Object { body }));
+        let Some(soft) = soft else {
+            match gu.delete().await? {
+                Drain::Removed => return Ok(CollectedItem::Removed),
+                Drain::Gone => return Ok(CollectedItem::Kept),
+                Drain::Lost => continue,
+            }
         };
         match gu.commit(Object { body: soft }.to_bytes()).await {
-            Ok(Some(_)) => return Ok(true),
+            Ok(Some(_)) => return Ok(CollectedItem::Kept),
             Ok(None) => {}
-            Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => return Ok(true),
+            Err(e) if e.0 == axum::http::StatusCode::NOT_FOUND => return Ok(CollectedItem::Kept),
             Err(e) => return Err(e),
         }
     }
