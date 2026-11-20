@@ -1883,7 +1883,8 @@ pub(crate) async fn evict_pod<S: Store>(
             crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
         }
     } else if !already_terminating {
-        check_pdb_allows_eviction(&state, ns.as_str(), &obj.body, dry_run).await?;
+        let unhealthy_bypass =
+            check_pdb_allows_eviction(&state, ns.as_str(), &obj.body, dry_run).await?;
 
         // Dry-run: validation passed and this is what a real eviction would soft-delete to
         // (deletionTimestamp stamped); return without persisting.
@@ -1891,26 +1892,52 @@ pub(crate) async fn evict_pod<S: Store>(
             // The budget is already spent, so a concurrent write (a kubelet status update) is
             // retried on the fresh pod rather than re-running the check; a pinned
             // resourceVersion fails its precondition on the first change, as upstream.
+            // An unhealthy pod evicted without spending the budget is pinned to the revision
+            // its health was judged at and not retried: a conflict there is a 429, as upstream,
+            // so the client retries and the budget is judged again against the pod's new state.
+            let bypassed_pdb = unhealthy_bypass.filter(|_| {
+                delete_opts
+                    .preconditions
+                    .as_ref()
+                    .is_none_or(|p| p.resource_version.is_none())
+            });
+            let pin = bypassed_pdb.as_ref().map(|_| stored.revision);
             let mut gu =
-                GuaranteedUpdate::new(state.store.clone(), &key, None, ("", "pods", &name, "Pod"))
+                GuaranteedUpdate::new(state.store.clone(), &key, pin, ("", "pods", &name, "Pod"))
                     .with_preconditions(delete_opts.preconditions.clone());
-            loop {
-                let fresh = gu.read_existing().await?;
-                let mut body: serde_json::Value = serde_json::from_slice(&fresh.value)
-                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-                if body["metadata"]["deletionTimestamp"].is_null() {
-                    body["metadata"]["deletionTimestamp"] =
-                        serde_json::Value::String(utc_now_rfc3339());
+            let evicted: Result<(), crate::status::StatusError> = async {
+                loop {
+                    let fresh = gu.read_existing().await?;
+                    let mut body: serde_json::Value = serde_json::from_slice(&fresh.value)
+                        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                    if body["metadata"]["deletionTimestamp"].is_null() {
+                        body["metadata"]["deletionTimestamp"] =
+                            serde_json::Value::String(utc_now_rfc3339());
+                    }
+                    set_disruption_target_condition(
+                        &mut body,
+                        &utc_now_rfc3339(),
+                        "EvictionByEvictionAPI",
+                        "Eviction API: evicting pod",
+                    );
+                    if gu.commit(Object { body }.to_bytes()).await?.is_some() {
+                        return Ok(());
+                    }
                 }
-                set_disruption_target_condition(
-                    &mut body,
-                    &utc_now_rfc3339(),
-                    "EvictionByEvictionAPI",
-                    "Eviction API: evicting pod",
-                );
-                if gu.commit(Object { body }.to_bytes()).await?.is_some() {
-                    break;
+            }
+            .await;
+            match (evicted, bypassed_pdb) {
+                (Err(e), Some(pdb)) if e.0 == StatusCode::CONFLICT => {
+                    return Err(Status::too_many_requests_with_cause(
+                        "Cannot evict pod as it would violate the pod's disruption budget."
+                            .to_string(),
+                        "DisruptionBudget",
+                        format!(
+                            "The disruption budget {pdb} is still being processed by the server."
+                        ),
+                    ));
                 }
+                (other, _) => other?,
             }
         }
     }
@@ -2032,7 +2059,7 @@ async fn check_pdb_allows_eviction<S: Store>(
     ns: &str,
     pod: &serde_json::Value,
     dry_run: bool,
-) -> Result<(), crate::status::StatusError> {
+) -> Result<Option<String>, crate::status::StatusError> {
     let pod_labels: std::collections::BTreeMap<String, String> = pod["metadata"]["labels"]
         .as_object()
         .map(|m| {
@@ -2050,7 +2077,7 @@ async fn check_pdb_allows_eviction<S: Store>(
             // in the namespace, since that would be worse for availability than the disruption
             // this check exists to prevent.
             tracing::warn!("evict_pod: failed to list PodDisruptionBudgets in {ns}: {e}");
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -2083,7 +2110,7 @@ async fn check_pdb_allows_eviction<S: Store>(
     }
 
     let Some((pdb_key, mut pdb)) = matching.into_iter().next() else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Upstream (pkg/registry/core/pod/storage/eviction.go): a healthy (Ready) pod is
@@ -2094,15 +2121,23 @@ async fn check_pdb_allows_eviction<S: Store>(
     // bypass is evaluated once, before the CAS loop, exactly as upstream does: unhealthy-pod
     // eviction never spends a disruption, so there is nothing to retry.
     if !is_pod_ready(pod) {
+        let bypassed = || {
+            Ok(Some(
+                pdb["metadata"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        };
         let always_allow =
             pdb["spec"]["unhealthyPodEvictionPolicy"].as_str() == Some("AlwaysAllow");
         if always_allow {
-            return Ok(());
+            return bypassed();
         }
         let current_healthy = pdb["status"]["currentHealthy"].as_i64().unwrap_or(0);
         let desired_healthy = pdb["status"]["desiredHealthy"].as_i64().unwrap_or(0);
         if desired_healthy > 0 && current_healthy >= desired_healthy {
-            return Ok(());
+            return bypassed();
         }
     }
 
@@ -2116,7 +2151,7 @@ async fn check_pdb_allows_eviction<S: Store>(
         // A dry-run eviction must validate that a disruption is available without actually
         // spending it — matching evict_pod's own dry-run contract of never mutating the store.
         if dry_run {
-            return Ok(());
+            return Ok(None);
         }
 
         let expected_rv = parse_resource_version(pdb["metadata"]["resourceVersion"].as_str())?;
@@ -2129,7 +2164,7 @@ async fn check_pdb_allows_eviction<S: Store>(
             )
             .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(None),
             Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PDB_DECREMENT_ATTEMPTS => {
                 // Lost the race to another concurrent eviction's decrement — re-read the
                 // latest PDB state and retry the verify-and-decrement against it, exactly as

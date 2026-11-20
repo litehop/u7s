@@ -415,3 +415,148 @@ async fn deleting_an_object_deleted_mid_request_is_404() {
     .await;
     assert_eq!(code(r), StatusCode::NOT_FOUND, "delete_namespaced_resource");
 }
+
+const CRD_KEY: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.io";
+
+async fn crd_uid_and_rv(mock: &MockStore) -> (String, String) {
+    let crd = stored_json(mock, CRD_KEY).await.expect("installed CRD");
+    let meta = &crd["metadata"];
+    (
+        meta["uid"].as_str().expect("CRD uid").to_string(),
+        meta["resourceVersion"]
+            .as_str()
+            .expect("CRD rv")
+            .to_string(),
+    )
+}
+
+async fn delete_widgets_crd(
+    state: &crate::state::AppState<MockStore>,
+    options: Value,
+) -> Result<(), StatusError> {
+    super::crd::delete_crd(
+        State(state.clone()),
+        Path("widgets.example.io".to_string()),
+        Extension(user()),
+        HeaderMap::new(),
+        bytes_of(&json!({"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": options})),
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test]
+async fn delete_crd_refuses_a_uid_or_resource_version_that_does_not_match() {
+    let mock = Arc::new(MockStore::new());
+    let (state, _) = install_cluster_cr(&mock).await;
+    let (uid, _) = crd_uid_and_rv(&mock).await;
+
+    let r = delete_widgets_crd(&state, json!({"uid": "someone-else"})).await;
+    assert_precondition_refused(&mock, CRD_KEY, &uid, r).await;
+
+    let r = delete_widgets_crd(&state, json!({"resourceVersion": "1"})).await;
+    assert_eq!(code(r), StatusCode::CONFLICT);
+    let crd = stored_json(&mock, CRD_KEY).await.expect("CRD must survive");
+    assert!(
+        crd["metadata"]["deletionTimestamp"].is_null(),
+        "a refused CRD delete must not start the deletion and cascade-delete its instances"
+    );
+}
+
+#[tokio::test]
+async fn delete_collection_crds_refuses_a_uid_that_does_not_match() {
+    let mock = Arc::new(MockStore::new());
+    let (state, _) = install_cluster_cr(&mock).await;
+    let (uid, _) = crd_uid_and_rv(&mock).await;
+    let r = super::crd::delete_collection_crds(
+        State(state),
+        Query(all()),
+        Extension(user()),
+        HeaderMap::new(),
+        wrong_uid(),
+    )
+    .await
+    .map(|_| ());
+    assert_precondition_refused(&mock, CRD_KEY, &uid, r).await;
+}
+
+#[tokio::test]
+async fn delete_crd_with_matching_preconditions_deletes() {
+    let mock = Arc::new(MockStore::new());
+    let (state, _) = install_cluster_cr(&mock).await;
+    let (uid, rv) = crd_uid_and_rv(&mock).await;
+    delete_widgets_crd(&state, json!({"uid": uid, "resourceVersion": rv}))
+        .await
+        .expect("matching preconditions must not block the delete");
+    let started = stored_json(&mock, CRD_KEY)
+        .await
+        .is_none_or(|crd| crd["metadata"]["deletionTimestamp"].is_string());
+    assert!(started, "the CRD must be deleted or terminating");
+}
+
+/// Upstream's storage delete refuses on preconditions before it runs the deletion validation,
+/// so a webhook never judges a delete the client's own pin refuses.
+#[tokio::test]
+async fn delete_collection_namespaced_checks_preconditions_before_admission() {
+    let mock = Arc::new(MockStore::new());
+    seed(&mock, CM_KEY, &config_map("cm")).await;
+    seed(
+        &mock,
+        "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/deny",
+        &json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "deny"},
+            "webhooks": [{
+                "name": "deny.example.com",
+                "clientConfig": {"url": "http://127.0.0.1:1"},
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"],
+                           "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        }),
+    )
+    .await;
+    let r = super::resource::delete_collection_namespaced_resource(
+        State(state_of(&mock)),
+        Path((
+            "".into(),
+            "v1".into(),
+            "default".into(),
+            "configmaps".into(),
+        )),
+        Query(all()),
+        Extension(user()),
+        HeaderMap::new(),
+        wrong_uid(),
+    )
+    .await;
+    assert_precondition_refused(&mock, CM_KEY, "cm-uid", r).await;
+}
+
+/// An unhealthy pod evicted past its budget is pinned to the revision its health was judged
+/// at; a kubelet write in between is a 429 the client retries, not a 409 and not a silent
+/// retry that could evict a pod that has become ready.
+#[tokio::test]
+async fn evict_unhealthy_pod_with_a_pdb_conflicts_as_429() {
+    let mock = Arc::new(MockStore::new());
+    seed_default_namespace(&mock).await;
+    let key = pod_key("p");
+    seed(&mock, &key, &pod("p")).await;
+    seed(
+        &mock,
+        "/registry/policy/poddisruptionbudgets/default/pdb",
+        &json!({
+            "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+            "metadata": {"name": "pdb", "namespace": "default"},
+            "spec": {"selector": {}, "unhealthyPodEvictionPolicy": "AlwaysAllow"}
+        }),
+    )
+    .await;
+    let mut kubelet = pod("p");
+    kubelet["status"] = json!({"phase": "Running"});
+    mock.arm_write_before_put(&key, bytes_of(&kubelet));
+    let r = evict(&mock, "p", json!({})).await;
+    assert_eq!(code(r), StatusCode::TOO_MANY_REQUESTS);
+    assert!(stored_json(&mock, &key).await.unwrap()["metadata"]["deletionTimestamp"].is_null());
+}

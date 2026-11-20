@@ -5219,6 +5219,12 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 }
             }
 
+            // Before admission, as upstream's storage delete checks them before running the
+            // deletion validation: a webhook must not see (or deny) a delete the client's own
+            // uid/resourceVersion pin already refuses.
+            check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
+                .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
+
             // Admission webhook pipeline (validating only — mutating webhooks do not apply
             // to DELETE), invoked per object exactly like the single-delete handlers and
             // mirroring delete_collection_resource above. A Fail-policy deny propagates here
