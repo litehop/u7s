@@ -20,7 +20,7 @@ use crate::handlers::test_support::{grant_signer_verb, MockStore};
 use crate::state::AppState;
 use crate::status::StatusError;
 
-fn state_of(mock: &Arc<MockStore>) -> AppState<MockStore> {
+pub(super) fn state_of(mock: &Arc<MockStore>) -> AppState<MockStore> {
     AppState::new(
         Arc::clone(mock),
         None,
@@ -29,7 +29,7 @@ fn state_of(mock: &Arc<MockStore>) -> AppState<MockStore> {
     )
 }
 
-fn user() -> UserInfo {
+pub(super) fn user() -> UserInfo {
     UserInfo {
         username: "test-user".into(),
         uid: "test-uid".into(),
@@ -44,15 +44,15 @@ fn headers(ct: &'static str) -> HeaderMap {
     h
 }
 
-fn json_headers() -> HeaderMap {
+pub(super) fn json_headers() -> HeaderMap {
     headers("application/json")
 }
 
-fn bytes_of(v: &Value) -> Bytes {
+pub(super) fn bytes_of(v: &Value) -> Bytes {
     Bytes::from(serde_json::to_vec(v).unwrap())
 }
 
-async fn seed(mock: &MockStore, key: &str, body: &Value) {
+pub(super) async fn seed(mock: &MockStore, key: &str, body: &Value) {
     mock.inner.put(key, bytes_of(body), None).await.unwrap();
 }
 
@@ -84,7 +84,7 @@ fn deployment(name: &str) -> Value {
     })
 }
 
-fn pod(name: &str) -> Value {
+pub(super) fn pod(name: &str) -> Value {
     json!({
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": "default", "uid": "pod-uid"},
@@ -92,7 +92,7 @@ fn pod(name: &str) -> Value {
     })
 }
 
-fn pod_key(name: &str) -> String {
+pub(super) fn pod_key(name: &str) -> String {
     format!("/registry/pods/default/{name}")
 }
 
@@ -453,7 +453,7 @@ async fn pod_replace_status_resize_and_ephemeral_do_not_resurrect() {
 }
 
 /// A cluster-scoped CRD with status and scale, plus one CR of it.
-async fn install_cluster_cr(mock: &Arc<MockStore>) -> (AppState<MockStore>, String) {
+pub(super) async fn install_cluster_cr(mock: &Arc<MockStore>) -> (AppState<MockStore>, String) {
     let state = state_of(mock);
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
@@ -626,6 +626,7 @@ async fn delete_collection_soft_delete_does_not_resurrect() {
         Arc::clone(&mock),
         key,
         ("", "configmaps", "held", "ConfigMap"),
+        None,
     )
     .await
     .expect("a vanished item is not an error");
@@ -636,13 +637,13 @@ async fn delete_collection_soft_delete_does_not_resurrect() {
     assert!(mock.inner.get(key).await.unwrap().is_none());
 }
 
-async fn stored_json(mock: &MockStore, key: &str) -> Option<Value> {
+pub(super) async fn stored_json(mock: &MockStore, key: &str) -> Option<Value> {
     let o = mock.inner.get(key).await.unwrap()?;
     Some(serde_json::from_slice(&o.value).unwrap())
 }
 
 /// `base` as a Terminating object holding `finalizers`.
-fn terminating(mut base: Value, finalizers: &[&str]) -> Value {
+pub(super) fn terminating(mut base: Value, finalizers: &[&str]) -> Value {
     base["metadata"]["deletionTimestamp"] = json!("2024-01-01T00:00:00Z");
     base["metadata"]["finalizers"] = json!(finalizers);
     base
@@ -720,16 +721,16 @@ fn pinned(mut body: Value, rv: u64) -> Value {
     body
 }
 
-fn config_map(name: &str) -> Value {
+pub(super) fn config_map(name: &str) -> Value {
     json!({
         "apiVersion": "v1", "kind": "ConfigMap",
         "metadata": {"name": name, "namespace": "default", "uid": "cm-uid"}, "data": {"a": "b"}
     })
 }
 
-const CM_KEY: &str = "/registry/configmaps/default/cm";
+pub(super) const CM_KEY: &str = "/registry/configmaps/default/cm";
 
-fn cm_path() -> Path<(String, String, String, String, String)> {
+pub(super) fn cm_path() -> Path<(String, String, String, String, String)> {
     Path((
         "".into(),
         "v1".into(),
@@ -845,6 +846,7 @@ async fn delete_collection_item_keeps_a_finalizer_added_after_the_read() {
         Arc::clone(&mock),
         CM_KEY,
         ("", "configmaps", "cm", "ConfigMap"),
+        None,
     )
     .await
     .expect("delete");
@@ -967,7 +969,7 @@ const PATCH_TYPES: [&str; 3] = [
 ];
 
 /// Rewrites the object so its revision moves on; returns `(stale, current)` revisions.
-async fn bump(mock: &MockStore, key: &str) -> (u64, u64) {
+pub(super) async fn bump(mock: &MockStore, key: &str) -> (u64, u64) {
     let stored = mock.inner.get(key).await.unwrap().unwrap();
     let mut v: Value = serde_json::from_slice(&stored.value).unwrap();
     v["metadata"]["annotations"] = json!({"bumped": stored.revision.to_string()});
@@ -988,7 +990,7 @@ fn pinned_patch(content_type: &str, rv: u64) -> Value {
     }
 }
 
-fn code<T>(r: Result<T, StatusError>) -> StatusCode {
+pub(super) fn code<T>(r: Result<T, StatusError>) -> StatusCode {
     r.map_or_else(|e| e.0, |_| StatusCode::OK)
 }
 

@@ -1065,7 +1065,7 @@ async fn delete_finalized_namespace<S: Store>(
             .is_some_and(|f| !f.is_empty())
     };
     if !matches!(
-        crate::guaranteed_update::delete_read(&*state.store, &key, &read, kept).await,
+        crate::guaranteed_update::delete_read(&*state.store, &key, &read, kept, None).await,
         Ok(crate::guaranteed_update::Deleted::Kept)
     ) {
         state.quota_admission_locks.evict(name);
@@ -1107,6 +1107,12 @@ pub(crate) async fn delete_namespace<S: Store>(
         serde_json::from_slice(&body).unwrap_or_default()
     };
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
+    crate::guaranteed_update::check_preconditions(
+        delete_opts.preconditions.as_ref(),
+        &key,
+        &stored.value,
+    )
+    .map_err(|e| e.into_status("", "namespaces", &name, "Namespace"))?;
 
     // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
     // Run once here, before branching into soft-delete/finalizer logic below, matching every
@@ -1191,18 +1197,29 @@ pub(crate) async fn delete_namespace<S: Store>(
     // No spec.finalizers — remove the namespace at once, like upstream's namespace REST
     // Delete. Content is never cascaded here: API-created namespaces always carry
     // "kubernetes", so this is the namespace controller's final DELETE after its own drain.
-    if let crate::guaranteed_update::Deleted::Kept =
-        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?
+    match crate::guaranteed_update::delete_read(
+        &*state.store,
+        &key,
+        &stored,
+        |_| true,
+        delete_opts.preconditions.as_ref(),
+    )
+    .await
+    .map_err(|e| e.into_status("", "namespaces", &name, "Namespace"))?
     {
-        return Err(store_err_to_status(
-            u7s_store::StoreError::RevisionMismatch {
-                expected: stored.revision,
-                current: 0,
-            },
-            &name,
-        ));
+        crate::guaranteed_update::Deleted::Kept => {
+            return Err(store_err_to_status(
+                u7s_store::StoreError::RevisionMismatch {
+                    expected: stored.revision,
+                    current: 0,
+                },
+                &name,
+            ));
+        }
+        crate::guaranteed_update::Deleted::Gone => {
+            return Err(Status::not_found("", "namespaces", &name));
+        }
+        crate::guaranteed_update::Deleted::Removed => {}
     }
     state.quota_admission_locks.evict(&name);
 

@@ -954,6 +954,21 @@ fn new_cr_uid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn delete_err_cr(
+    err: crate::guaranteed_update::DeleteError,
+    group: &str,
+    plural: &str,
+    name: &str,
+    kind: &str,
+) -> crate::status::StatusError {
+    match err {
+        crate::guaranteed_update::DeleteError::Store(e) => {
+            store_err_cr(e, group, plural, name, kind)
+        }
+        other => other.into_status(group, plural, name, kind),
+    }
+}
+
 fn store_err_cr(
     err: u7s_store::StoreError,
     group: &str,
@@ -3710,9 +3725,9 @@ async fn complete_cr_finalizer_drain<S: Store>(
     ns: Option<&str>,
 ) -> Result<(), crate::status::StatusError> {
     if let crate::guaranteed_update::Deleted::Kept =
-        crate::guaranteed_update::delete_read(&*state.store, key, stored, |_| true)
+        crate::guaranteed_update::delete_read(&*state.store, key, stored, |_| true, None)
             .await
-            .map_err(|e| store_err_cr(e, group, plural, name, kind))?
+            .map_err(|e| delete_err_cr(e, group, plural, name, kind))?
     {
         return Err(store_err_cr(
             u7s_store::StoreError::RevisionMismatch {
@@ -3777,6 +3792,13 @@ pub async fn delete_cr<S: Store>(
     // caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
+
+    crate::guaranteed_update::check_preconditions(
+        delete_opts.preconditions.as_ref(),
+        &key,
+        &stored.value,
+    )
+    .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
@@ -3847,21 +3869,32 @@ pub async fn delete_cr<S: Store>(
         .into_response());
     }
 
-    if let crate::guaranteed_update::Deleted::Kept =
-        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
-            .await
-            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?
+    match crate::guaranteed_update::delete_read(
+        &*state.store,
+        &key,
+        &stored,
+        |_| true,
+        delete_opts.preconditions.as_ref(),
+    )
+    .await
+    .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?
     {
-        return Err(store_err_cr(
-            u7s_store::StoreError::RevisionMismatch {
-                expected: stored.revision,
-                current: 0,
-            },
-            &group,
-            &plural,
-            &name,
-            &ctx.kind,
-        ));
+        crate::guaranteed_update::Deleted::Kept => {
+            return Err(store_err_cr(
+                u7s_store::StoreError::RevisionMismatch {
+                    expected: stored.revision,
+                    current: 0,
+                },
+                &group,
+                &plural,
+                &name,
+                &ctx.kind,
+            ));
+        }
+        crate::guaranteed_update::Deleted::Gone => {
+            return Err(Status::not_found(&group, &plural, &name));
+        }
+        crate::guaranteed_update::Deleted::Removed => {}
     }
     state.crd_finalizer_wake.notify_one();
 
@@ -3971,6 +4004,13 @@ pub async fn delete_collection_cr<S: Store>(
                 continue;
             }
 
+            crate::guaranteed_update::check_preconditions(
+                delete_opts.preconditions.as_ref(),
+                &obj.key,
+                &obj.value,
+            )
+            .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+
             let admission_ctx = AdmissionContext {
                 group: &group,
                 version: &version,
@@ -3999,6 +4039,7 @@ pub async fn delete_collection_cr<S: Store>(
                     state.store.clone(),
                     &obj.key,
                     (&group, &plural, &name, &plural),
+                    delete_opts.preconditions.clone(),
                 )
                 .await?
             {
@@ -4006,11 +4047,18 @@ pub async fn delete_collection_cr<S: Store>(
             }
             continue;
         }
-        if let crate::guaranteed_update::Deleted::Removed =
-            crate::guaranteed_update::delete_read(&*state.store, &obj.key, &obj, |_| true)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        {
+        if let crate::guaranteed_update::Deleted::Removed = crate::guaranteed_update::delete_read(
+            &*state.store,
+            &obj.key,
+            &obj,
+            |_| true,
+            delete_opts.preconditions.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            let name = obj.key.rsplit('/').next().unwrap_or_default();
+            delete_err_cr(e, &group, &plural, name, &ctx.kind)
+        })? {
             state.crd_finalizer_wake.notify_one();
         }
     }
@@ -4823,6 +4871,13 @@ pub async fn delete_cr_namespaced<S: Store>(
     // inject_dry_run_header layer) — accept either.
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
+    crate::guaranteed_update::check_preconditions(
+        delete_opts.preconditions.as_ref(),
+        &key,
+        &stored.value,
+    )
+    .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
 
@@ -4887,21 +4942,32 @@ pub async fn delete_cr_namespaced<S: Store>(
         .into_response());
     }
 
-    if let crate::guaranteed_update::Deleted::Kept =
-        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
-            .await
-            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?
+    match crate::guaranteed_update::delete_read(
+        &*state.store,
+        &key,
+        &stored,
+        |_| true,
+        delete_opts.preconditions.as_ref(),
+    )
+    .await
+    .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?
     {
-        return Err(store_err_cr(
-            u7s_store::StoreError::RevisionMismatch {
-                expected: stored.revision,
-                current: 0,
-            },
-            &group,
-            &plural,
-            &name,
-            &ctx.kind,
-        ));
+        crate::guaranteed_update::Deleted::Kept => {
+            return Err(store_err_cr(
+                u7s_store::StoreError::RevisionMismatch {
+                    expected: stored.revision,
+                    current: 0,
+                },
+                &group,
+                &plural,
+                &name,
+                &ctx.kind,
+            ));
+        }
+        crate::guaranteed_update::Deleted::Gone => {
+            return Err(Status::not_found(&group, &plural, &name));
+        }
+        crate::guaranteed_update::Deleted::Removed => {}
     }
     state.crd_finalizer_wake.notify_one();
 
@@ -5027,6 +5093,13 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                 continue;
             }
 
+            crate::guaranteed_update::check_preconditions(
+                delete_opts.preconditions.as_ref(),
+                &obj.key,
+                &obj.value,
+            )
+            .map_err(|e| delete_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+
             let admission_ctx = AdmissionContext {
                 group: &group,
                 version: &version,
@@ -5055,6 +5128,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     state.store.clone(),
                     &obj.key,
                     (&group, &plural, &name, &plural),
+                    delete_opts.preconditions.clone(),
                 )
                 .await?
             {
@@ -5062,11 +5136,18 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
             }
             continue;
         }
-        if let crate::guaranteed_update::Deleted::Removed =
-            crate::guaranteed_update::delete_read(&*state.store, &obj.key, &obj, |_| true)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-        {
+        if let crate::guaranteed_update::Deleted::Removed = crate::guaranteed_update::delete_read(
+            &*state.store,
+            &obj.key,
+            &obj,
+            |_| true,
+            delete_opts.preconditions.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            let name = obj.key.rsplit('/').next().unwrap_or_default();
+            delete_err_cr(e, &group, &plural, name, &ctx.kind)
+        })? {
             state.crd_finalizer_wake.notify_one();
         }
     }

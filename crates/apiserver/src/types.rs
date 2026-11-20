@@ -691,6 +691,45 @@ pub struct DeleteOptions {
     /// a `?dryRun=All` query param) — see `is_dry_run` for why only "All" is meaningful.
     #[serde(default, rename = "dryRun", skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<Vec<String>>,
+    /// The delete only applies to an object that matches; see [`Preconditions`].
+    #[serde(default)]
+    pub preconditions: Option<Preconditions>,
+}
+
+/// Upstream `metav1.Preconditions`: the delete is refused with a 409 unless the stored object
+/// has this uid and resourceVersion.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preconditions {
+    #[serde(default)]
+    pub uid: Option<String>,
+    #[serde(default)]
+    pub resource_version: Option<String>,
+}
+
+impl Preconditions {
+    /// Upstream's `storage.Preconditions.Check`: `Err` carries its message.
+    pub(crate) fn check(&self, stored: &serde_json::Value) -> Result<(), String> {
+        let meta = &stored["metadata"];
+        let have = |field: &str| meta[field].as_str().unwrap_or_default();
+        if let Some(uid) = self.uid.as_deref().filter(|u| *u != have("uid")) {
+            return Err(format!(
+                "Precondition failed: UID in precondition: {uid}, UID in object meta: {}",
+                have("uid")
+            ));
+        }
+        if let Some(rv) = self
+            .resource_version
+            .as_deref()
+            .filter(|r| *r != have("resourceVersion"))
+        {
+            return Err(format!(
+                "Precondition failed: ResourceVersion in precondition: {rv}, ResourceVersion in object meta: {}",
+                have("resourceVersion")
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl DeleteOptions {

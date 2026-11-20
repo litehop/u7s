@@ -13,7 +13,9 @@ use crate::{limit_range, quota};
 
 use crate::{
     auth::UserInfo,
-    guaranteed_update::{delete_read, Deleted, Drain, GuaranteedUpdate, WriteFailure},
+    guaranteed_update::{
+        check_preconditions, delete_read, Deleted, Drain, GuaranteedUpdate, WriteFailure,
+    },
     keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
@@ -1345,6 +1347,8 @@ pub(crate) async fn delete_resource<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
+        check_preconditions(delete_opts.preconditions.as_ref(), &key, &stored.value)
+            .map_err(|e| e.into_status(&group, &plural, &name, &meta.kind))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1429,12 +1433,19 @@ pub(crate) async fn delete_resource<S: Store>(
             .into_response());
         }
 
-        match delete_read(&*state.store, &key, &stored, |_| true)
-            .await
-            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
+        match delete_read(
+            &*state.store,
+            &key,
+            &stored,
+            |_| true,
+            delete_opts.preconditions.as_ref(),
+        )
+        .await
+        .map_err(|e| e.into_status(&group, &plural, &name, &meta.kind))?
         {
             Deleted::Kept => continue,
-            Deleted::Removed | Deleted::Gone => {}
+            Deleted::Gone => return Err(Status::not_found(&group, &plural, &name)),
+            Deleted::Removed => {}
         }
 
         if group == RBAC_GROUP {
@@ -4596,6 +4607,8 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
+        check_preconditions(delete_opts.preconditions.as_ref(), &key, &stored.value)
+            .map_err(|e| e.into_status(&group, &plural, &name, &meta.kind))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -4680,12 +4693,19 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             .into_response());
         }
 
-        match delete_read(&*state.store, &key, &stored, |_| true)
-            .await
-            .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
+        match delete_read(
+            &*state.store,
+            &key,
+            &stored,
+            |_| true,
+            delete_opts.preconditions.as_ref(),
+        )
+        .await
+        .map_err(|e| e.into_status(&group, &plural, &name, &meta.kind))?
         {
             Deleted::Kept => continue,
-            Deleted::Removed | Deleted::Gone => {}
+            Deleted::Gone => return Err(Status::not_found(&group, &plural, &name)),
+            Deleted::Removed => {}
         }
 
         // Capture what post-loop cascade side effects need from the freshly-read `obj`
@@ -5013,6 +5033,9 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 continue;
             }
 
+            check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
+                .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
+
             // Admission webhook pipeline (validating only — mutating webhooks do not apply
             // to DELETE), invoked per object exactly like the single-delete handlers above.
             // Upstream kube-apiserver's DeleteCollection runs admission per object too; a
@@ -5055,6 +5078,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 state.store.clone(),
                 &obj.key,
                 (&group, &plural, &name, &plural),
+                delete_opts.preconditions.clone(),
             )
             .await?
             {
@@ -5069,9 +5093,18 @@ pub(crate) async fn delete_collection_resource<S: Store>(
         // corruption, …) means some objects survived; propagate so the caller does not
         // believe all objects were deleted. A dry-run request skips the write.
         if !dry_run {
-            delete_read(&*state.store, &obj.key, &obj, |_| true)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            delete_read(
+                &*state.store,
+                &obj.key,
+                &obj,
+                |_| true,
+                delete_opts.preconditions.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                let name = obj.key.rsplit('/').next().unwrap_or_default();
+                e.into_status(&group, &plural, name, &plural)
+            })?;
         }
     }
     if !dry_run && group == ADMISSION_GROUP {
@@ -5186,6 +5219,12 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 }
             }
 
+            // Before admission, as upstream's storage delete checks them before running the
+            // deletion validation: a webhook must not see (or deny) a delete the client's own
+            // uid/resourceVersion pin already refuses.
+            check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
+                .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
+
             // Admission webhook pipeline (validating only — mutating webhooks do not apply
             // to DELETE), invoked per object exactly like the single-delete handlers and
             // mirroring delete_collection_resource above. A Fail-policy deny propagates here
@@ -5226,6 +5265,7 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 state.store.clone(),
                 &obj.key,
                 (&group, &plural, &name, &plural),
+                delete_opts.preconditions.clone(),
             )
             .await?
             {
@@ -5240,9 +5280,18 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
         // corruption, …) means some objects survived; propagate so the caller does not
         // believe all objects were deleted. A dry-run request skips the write.
         if !dry_run {
-            delete_read(&*state.store, &obj.key, &obj, |_| true)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+            delete_read(
+                &*state.store,
+                &obj.key,
+                &obj,
+                |_| true,
+                delete_opts.preconditions.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                let name = obj.key.rsplit('/').next().unwrap_or_default();
+                e.into_status(&group, &plural, name, &plural)
+            })?;
         }
     }
 

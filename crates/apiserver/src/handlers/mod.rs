@@ -10,6 +10,8 @@ pub mod cr;
 pub mod crd;
 pub mod csr;
 pub mod defaults;
+#[cfg(test)]
+mod delete_preconditions_tests;
 pub mod device_taint_rule;
 pub mod discovery;
 #[cfg(test)]
