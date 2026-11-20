@@ -137,13 +137,12 @@ Prerequisites:
 
    The output lists both ranges.
 
-The ranges are fixed at first install: a re-run that passes a different
-value is refused. The only supported change is the single-stack to
-dual-stack upgrade in
-[Upgrading](upgrading.md#upgrading-to-dual-stack). The script enables IPv6
-forwarding for a dual-stack install by writing
-`/etc/sysctl.d/u7s-ipv6-forwarding.conf`. A joining worker reads the ranges from the cluster, so it needs no CIDR
-flags, only an address of each family.
+The ranges are fixed at first install: a re-run with a different value is
+refused. The only supported change is the
+[single-stack to dual-stack upgrade](upgrading.md#upgrading-to-dual-stack).
+A dual-stack install enables IPv6 forwarding in
+`/etc/sysctl.d/u7s-ipv6-forwarding.conf`. A joining worker reads the ranges
+from the cluster and needs only an address of each family.
 
 ## Add a worker
 

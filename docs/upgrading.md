@@ -71,34 +71,19 @@ including an existing worker's, are accepted.
 
 The API is down while the API server restarts. One probe upgraded a
 single-node GCP VM from v0.4.5 to v0.4.6: the script ran 99 s, and one of 132
-`/readyz` polls at 2 s failed (about 2 to 4 s down). CoreDNS, kube-proxy, and
-the `servicelb` pods kept their UIDs with 0 restarts, a `hostPath` marker
-kept its content, and the flannel DaemonSet pod was recreated by design. The
-release gate asserts an outage of at most 60 s
+`/readyz` polls at 2 s failed. The outage was not timed beyond that.
+CoreDNS, kube-proxy, and the `servicelb` pods kept their UIDs with 0
+restarts, a `hostPath` marker kept its content, and the flannel DaemonSet pod
+was recreated by design. The release gate asserts an outage of at most 60 s
 ([dev-setup.md](dev-setup.md#upgrade-check)). A multi-node control plane is
-not probed.
+not probed. A backup taken with the services stopped adds downtime of its own.
 
 ## Backup and rollback
 
-There is no rollback command. To make one possible, copy the state before
-you upgrade:
-
-```bash
-sudo systemctl stop kubelet u7s-kcm u7s-apiserver
-sudo tar -C /var/lib -czpf u7s-state-backup.tar.gz u7s
-sudo systemctl start u7s-apiserver u7s-kcm kubelet
-```
-
-The archive contains the CA, keys, and the store. Keep it private.
-
-To roll back, stop the services, restore the archive, and re-run the
-previous release's `install.sh`. This undoes the upgrade only at the cost of
-all changes made since the backup. It is a downgrade, so it is unsupported
-and no test covers it. If the store format changed, the old binary refuses
-the new store and you must restore the archive first.
-
-If the script reports that the CA changed, restore `ca.key` and `ca.crt`
-from the backup; every node's client identity is invalid until then.
+Before upgrading, back up `/var/lib/u7s`: it holds the CA, keys, and the
+store. Keep the copy private. Rollback and downgrade are unsupported before
+production. The tested restore procedure is added once it has been
+verified live.
 
 ## Upgrading to dual-stack
 
