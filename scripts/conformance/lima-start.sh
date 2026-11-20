@@ -36,9 +36,10 @@ set -euo pipefail
 
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 KUBE_NETWORK_POLICIES_YAML="$(dirname "$0")/manifests/kube-network-policies.yaml"
-FLANNEL_YAML="$(dirname "$0")/../../manifests/flannel.yaml"
 # shellcheck source=scripts/conformance/_lib.sh
 source "$(dirname "$0")/_lib.sh"
+# shellcheck source=scripts/_kill-pattern.sh
+source "$(dirname "$0")/../_kill-pattern.sh"
 
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
@@ -68,12 +69,6 @@ done
 # --v=2 is today's unchanged default so a non-verbose run's log volume never grows.
 KUBELET_V=2
 [ "$VERBOSE" -eq 1 ] && KUBELET_V=5
-# kube-proxy --v=5 additionally logs every EndpointSlice update it processes and every
-# iptables sync completion (this deployment runs kube-proxy in iptables mode — see config.conf
-# below) — the measurement needed to tell whether kube-proxy saw an EndpointSlice event
-# late or reprogrammed slowly. --v=2 is the unchanged default.
-KUBE_PROXY_V=2
-[ "$VERBOSE" -eq 1 ] && KUBE_PROXY_V=5
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 
@@ -659,9 +654,8 @@ ExecStart=/usr/bin/kubelet \\\\
 # disabled now requires disabling these two as well or kubelet refuses to start).
 # --max-pods/ChangeDetectionStrategy intentionally untouched -- operator scope
 # narrowing.
-# Matches kube-proxy.service's LimitNOFILE below — sustained conformance load
-# (one FD per container log/exec/attach stream) can exceed the systemd default
-# well before kube-proxy's own limit would ever be hit.
+# Sustained conformance load (one FD per container log/exec/attach stream) can
+# exceed the systemd default.
 LimitNOFILE=1048576
 EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
@@ -783,162 +777,28 @@ PODEOF
 
 echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnectivity-agent)"
 
-# kube-proxy runs as a systemd service inside the VM using the kube-proxy binary from the
-# official container image. This avoids the pod sandbox loop that occurs with hostNetwork
-# pods in u7s (strategic-merge-patch accumulation in podIPs causes the kubelet to
-# continuously recreate the sandbox). The binary runs in iptables mode to match the
-# shipped config (manifests/kube-proxy.yaml). This rig previously ran IPVS on the belief
-# that the Lima VM's nf_tables-backed iptables lacked the userspace extension for protocol
-# matching -- that belief was wrong (all matches kube-proxy needs load fine), and iptables
-# mode passes the full CI conformance focus set here.
-
-# Detect kubelet version to pull the matching kube-proxy binary. A wrong/stale
-# fallback version here is safe, not silent: it only feeds the image tag for the
-# "still missing" pull path below, and if that pulls the wrong version and the
-# binary still never lands at /usr/local/bin/kube-proxy, the KUBE_PROXY_ACTIVE
-# check further down (systemd can't exec a nonexistent binary) already fails the
-# script loud with a journalctl dump — this fallback can't produce a silently
-# broken kube-proxy. Keep the fallback in sync with KUBELET_PKG_VERSION in
-# lima/kubelet.yaml.
+# The kubelet's version selects the kube-proxy image tag, as install.sh does. The fallback
+# must stay in sync with KUBELET_PKG_VERSION in lima/kubelet.yaml.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p)
 KUBELET_VERSION="${KUBELET_VERSION:-1.37.1}"
 
-# Create kube-proxy ServiceAccount and RBAC (needed for the kubeconfig token).
-kubectl --kubeconfig="$KUBECONFIG_PATH" create serviceaccount kube-proxy -n kube-system \
-  --dry-run=client -o yaml | \
-  kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
+# kube-proxy is the shipped DaemonSet (manifests/kube-proxy.yaml, staged below), as on an
+# install.sh node. A VM last provisioned by an older rig still has the host systemd
+# kube-proxy; left running it would fight the DaemonSet over iptables.
+limactl shell "$VM_NAME" sudo bash -c '
+  systemctl disable --now kube-proxy.service 2>/dev/null || true
+  rm -f /etc/systemd/system/kube-proxy.service /usr/local/bin/kube-proxy
+  rm -rf /etc/kube-proxy
+  systemctl daemon-reload
+'
 
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<RBACEOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: kube-proxy
-rules:
-- apiGroups: [""]
-  resources: [nodes, services, endpoints]
-  verbs: [get, list, watch]
-- apiGroups: [""]
-  resources: [events]
-  verbs: [create, patch, update]
-- apiGroups: [discovery.k8s.io]
-  resources: [endpointslices]
-  verbs: [get, list, watch]
-- apiGroups: [networking.k8s.io]
-  resources: [servicecidrs]
-  verbs: [get, list, watch]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kube-proxy
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: kube-proxy
-subjects:
-- kind: ServiceAccount
-  name: kube-proxy
-  namespace: kube-system
-RBACEOF
-
-# Generate a long-lived token for kube-proxy to authenticate with u7s. No output
-# suppression / fallback here: an empty token does not crash kube-proxy — it starts,
-# systemd reports it "active", and it just spins forever as system:anonymous,
-# failing every List/Watch call ("... is not allowed to list nodes") without ever
-# programming an iptables rule. That is indistinguishable from success to the
-# KUBE_PROXY_ACTIVE check below, so a `create token` failure must stop the script
-# right here instead of surfacing as an unexplained Service-routing failure later.
-KUBE_PROXY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" create token kube-proxy \
-  -n kube-system --duration=8760h)
-
-# Write config files to the VM filesystem.
-limactl shell "$VM_NAME" sudo mkdir -p /etc/kube-proxy
-limactl shell "$VM_NAME" sudo bash -c "cat > /etc/kube-proxy/kubeconfig.conf" <<KUBEEOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://host.lima.internal:${PORT}
-    certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
-  name: default
-contexts:
-- context:
-    cluster: default
-    user: default
-  name: default
-current-context: default
-users:
-- name: default
-  user:
-    token: ${KUBE_PROXY_TOKEN}
-KUBEEOF
-
-limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<CONFEOF
-apiVersion: kubeproxy.config.k8s.io/v1alpha1
-kind: KubeProxyConfiguration
-mode: iptables
-clusterCIDR: $(rig_kube_proxy_cluster_cidr "$DUAL_STACK")
-clientConnection:
-  kubeconfig: /etc/kube-proxy/kubeconfig.conf
-CONFEOF
-
-# Extract the kube-proxy binary from the container image if not already present.
-# The image is pulled by CRI-O when applying the static pod; we reuse it from the overlay.
-if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
-  limactl shell "$VM_NAME" sudo bash -c "
-    # Pull image via static pod to populate overlay storage, then copy binary out.
-    OVERLAY=\$(find /var/lib/containers/storage/overlay -name 'kube-proxy' -path '*/usr/local/bin/*' 2>/dev/null | head -1)
-    if [ -n \"\$OVERLAY\" ]; then
-      cp \"\$OVERLAY\" /usr/local/bin/kube-proxy
-      chmod +x /usr/local/bin/kube-proxy
-      echo 'kube-proxy binary installed from overlay'
-    else
-      echo 'WARNING: kube-proxy binary not found in overlay; pull the image first' >&2
-    fi
-  " 2>/dev/null
-fi
-
-# If binary is still missing, write a static pod manifest to force CRI-O to pull the image,
-# wait for the pull, then extract the binary.
-if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
-  echo "Pulling kube-proxy image via static pod (first run)..."
-  limactl shell "$VM_NAME" sudo bash -c "mkdir -p /tmp/kubelet-pods && cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: kube-proxy-pull
-  namespace: kube-system
-spec:
-  nodeName: ${VM_NAME}
-  hostNetwork: true
-  containers:
-  - name: kube-proxy
-    image: registry.k8s.io/kube-proxy:v${KUBELET_VERSION}
-    command: ["/usr/local/bin/kube-proxy", "--version"]
-PULLEOF
-  # Wait for image pull (up to 120s)
-  for i in $(seq 1 24); do
-    OVERLAY=$(limactl shell "$VM_NAME" sudo bash -c "find /var/lib/containers/storage/overlay -name 'kube-proxy' -path '*/usr/local/bin/*' 2>/dev/null | head -1" 2>/dev/null)
-    if [ -n "$OVERLAY" ]; then
-      limactl shell "$VM_NAME" sudo cp "$OVERLAY" /usr/local/bin/kube-proxy
-      limactl shell "$VM_NAME" sudo chmod +x /usr/local/bin/kube-proxy
-      echo "kube-proxy binary installed"
-      break
-    fi
-    sleep 5
-  done
-  limactl shell "$VM_NAME" sudo rm -f /tmp/kubelet-pods/kube-proxy-pull.yaml
-fi
-
-# Install conntrack (kube-proxy flushes stale UDP conntrack entries with it, plus network
-# diagnostics) and nfs-common (provides the /sbin/mount.nfs helper). Both are load-bearing
-# — without conntrack stale Service conntrack entries linger; without nfs-common, kubelet's `mount -t nfs` fails with
+# nfs-common provides the /sbin/mount.nfs helper: without it kubelet's `mount -t nfs` fails with
 # "bad option; ... need /sbin/mount.<type> helper program" for every nfs/nfs3 driver
 # storage conformance test, even once the PV/PVC bind itself succeeds. No output
 # suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
 # if either command fails, rather than continuing with a half-provisioned VM.
 limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
-limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y conntrack nfs-common
+limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y nfs-common
 
 # Load the bridge netfilter kernel module.
 # br_netfilter is required so that bridge traffic (pod-to-pod) passes through
@@ -955,70 +815,6 @@ limactl shell "$VM_NAME" sudo bash -c '
   modprobe br_netfilter
   sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
 '
-
-# Write the systemd service unit.
-limactl shell "$VM_NAME" sudo bash -c "cat > /etc/systemd/system/kube-proxy.service" <<SVCEOF
-[Unit]
-Description=Kubernetes Kube Proxy
-After=network.target
-
-[Service]
-# Same GOMEMLIMIT/GOGC/GOMAXPROCS tuple already proven on kubelet (this
-# file's own kubelet drop-in above) and KCM (04-start-kcm.sh) -- kube-proxy
-# is the third Go binary of similar shape and was the only untuned one of
-# the three. Applied here as a first-cut, NOT independently measured yet:
-# kube-proxy's own peak RSS (53.3MB) is notably smaller than kubelet/KCM's,
-# so this 200MiB/50/2 tuple may be looser than warranted -- a pending
-# follow-on bead covers the before/after RSS + sync-latency/EndpointSlice
-# measurement pass.
-Environment=GOMEMLIMIT=200MiB
-Environment=GOGC=50
-Environment=GOMAXPROCS=2
-ExecStart=/usr/local/bin/kube-proxy \\
-  --config=/etc/kube-proxy/config.conf \\
-  --hostname-override=${VM_NAME} \\
-  --v=${KUBE_PROXY_V}
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-limactl shell "$VM_NAME" sudo systemctl daemon-reload
-# `systemctl enable`'s own confirmation ("Created symlink ...") is written to
-# stderr, not stdout, on a real Linux system — 2>/dev/null here only hides that
-# noise. It does not hide a real failure: no `|| true` follows, and verified this
-# construct's exit code still propagates through `limactl shell` under
-# `set -euo pipefail` (tested against a nonexistent unit: exit 1 as expected), so
-# a genuine `enable` failure still stops the script.
-limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
-limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
-
-# Verify kube-proxy actually reached the active state (not stuck crashlooping).
-# Without this check, any silent failure (missing kernel module,
-# bad config) leaves kube-proxy dead and the kubernetes Service VIP unreachable —
-# sonobuoy then hangs indefinitely on "dial tcp 10.96.0.1:443: i/o timeout" with
-# no actionable signal to the operator.
-KUBE_PROXY_ACTIVE=0
-for i in $(seq 1 15); do
-  STATUS=$(limactl shell "$VM_NAME" sudo systemctl is-active kube-proxy 2>&1 || true)
-  if [ "$STATUS" = "active" ]; then
-    KUBE_PROXY_ACTIVE=1
-    break
-  fi
-  sleep 1
-done
-
-if [ "$KUBE_PROXY_ACTIVE" -eq 0 ]; then
-  echo "ERROR: kube-proxy failed to reach active state (last status: $STATUS)" >&2
-  echo "--- kube-proxy log (last 30 lines) ---" >&2
-  limactl shell "$VM_NAME" sudo journalctl -u kube-proxy --no-pager -n 30 >&2
-  exit 1
-fi
-
-echo "kube-proxy systemd service started (logs: limactl shell ${VM_NAME} sudo journalctl -u kube-proxy -n 20)"
 
 # Resolve the host gateway IP used to route the kubernetes ClusterIP. This (and the
 # patch below) used to only WARN and continue on failure — but skipping either one
@@ -1068,19 +864,23 @@ echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
 
-# Flannel is the real CNI now that crio-bridge is disabled above. Render its
-# install-time placeholders the same way install.sh does (__IFACE__/
-# __POD_CLUSTER_CIDR__, install.sh:919-932) and apply. Cluster-scoped, so
-# re-applying from a 2nd node's lima-start.sh run (which may detect a different
-# LIMA_VM_IFACE) is a harmless idempotent no-op -- flannel.yaml's own
-# --iface-regex fallback already tolerates per-node interface-name variance, so
-# whichever node's --iface value wins the last apply is not a correctness issue.
-echo "Applying flannel CNI DaemonSet..."
-FLANNEL_RENDERED="$(mktemp)"
+# Stage every shipped manifests/*.yaml (flannel, kube-proxy, beep, CoreDNS, ...) into the
+# apiserver's well-known folder through install.sh's own renderer, then SIGHUP the apiserver
+# so it applies them as it does on an installed node: the VM's NIC name, MTU and kubelet
+# version are only known here, after the apiserver booted. The folder survives an apiserver
+# restart, so later boots apply the same rendered files. Cluster-scoped, so a 2nd node's
+# lima-start.sh run re-staging them (with its own NIC) is a harmless re-apply.
+echo "Staging shipped manifests into the apiserver's well-known folder..."
 LIMA_VM_IFACE_MTU=$(limactl shell "$VM_NAME" cat "/sys/class/net/$LIMA_VM_IFACE/mtu" | tr -d '[:space:]')
-rig_render_flannel "$LIMA_VM_IFACE" "$DUAL_STACK" "$LIMA_VM_IFACE_MTU" < "$FLANNEL_YAML" > "$FLANNEL_RENDERED"
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$FLANNEL_RENDERED"
-rm -f "$FLANNEL_RENDERED"
+ABS_WORKDIR="$(cd "$WORKDIR" && pwd)"
+rig_stage_manifests "$ABS_WORKDIR/manifests" "$LIMA_VM_IFACE" "$LIMA_VM_IFACE_MTU" "$DUAL_STACK" "$KUBELET_VERSION" "$PORT"
+APISERVER_PIDS=$(u7s_owned_pids apiserver "$ABS_WORKDIR")
+if [ -z "$APISERVER_PIDS" ]; then
+  echo "error: no u7s-apiserver running for $ABS_WORKDIR to SIGHUP -- the staged manifests would never be applied" >&2
+  exit 1
+fi
+# shellcheck disable=SC2086 # one PID per line
+kill -HUP $APISERVER_PIDS
 
 # kube-network-policies enforces NetworkPolicy ingress+egress via NFQUEUE+nftables+NRI
 # on top of Flannel's CNI (no additional CNI swap needed) — neither CRI-O's stock

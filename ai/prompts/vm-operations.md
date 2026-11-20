@@ -272,7 +272,7 @@ root. Afterwards `run-all.sh --stack-only` re-rigs the VM.
 ## Release sign-off — `run-all.sh --install`
 
 The host rig (everything above) is the dev loop; its PASS is not a delivered-behaviour PASS
-(apiserver on the Mac, systemd kube-proxy, no beep, rig-only add-ons). `--install` runs what
+(apiserver on the Mac, rig-only add-ons). `--install` runs what
 a user gets: it builds an arm64 tarball from the worktree (`scripts/release-gate/build-arm64-tarball.sh`),
 provisions the VM (golden clone), runs the real `scripts/install.sh --tarball` on it,
 tunnels the VM's apiserver to `127.0.0.1:<PORT>` over ssh, applies the rig-only add-ons
@@ -350,7 +350,8 @@ This provisions the VM (if needed) or reconnects the kubelet. Handles:
 - Rewriting `<IP>` → `host.lima.internal` in the kubelet kubeconfig
 - Kubelet serving cert signed by the cluster CA
 - konnectivity-agent pod (mTLS)
-- kube-proxy systemd service (iptables)
+- every shipped `manifests/*.yaml` (flannel, kube-proxy, beep, CoreDNS) staged into the
+  apiserver's well-known folder through install.sh's renderer and applied via SIGHUP
 - iptables DNAT for ClusterIP `10.96.0.1:443` → host apiserver
 
 Wait for node Ready (up to 60s):

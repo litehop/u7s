@@ -127,9 +127,9 @@ assert "a kubectl failure fails loud rather than iterating zero peers and passin
   "$([ "$rc" != 0 ] && echo "$out" | drain_grep -q 'cannot list cluster nodes' && echo 1 || echo 0)"
 unset -f kubectl
 
-APPLY_LINE=$(grep -n 'Applying flannel CNI DaemonSet' "$LIMA_START" | head -1 | cut -d: -f1 || true)
+APPLY_LINE=$(grep -n 'Staging shipped manifests into the apiserver' "$LIMA_START" | head -1 | cut -d: -f1 || true)
 CHECK_LINE=$(grep -n 'assert_same_lima_network "\$VM_NAME" "\$KUBECONFIG_PATH"' "$LIMA_START" | head -1 | cut -d: -f1 || true)
-assert "lima-start.sh runs the same-network pre-flight before applying flannel" \
+assert "lima-start.sh runs the same-network pre-flight before applying the shipped manifests (flannel included)" \
   "$([ -n "$CHECK_LINE" ] && [ -n "$APPLY_LINE" ] && [ "$CHECK_LINE" -lt "$APPLY_LINE" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------

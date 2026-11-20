@@ -662,6 +662,29 @@ if [ "$NETPOL_READY" -eq 0 ]; then
 fi
 echo "kube-network-policies DaemonSet Ready (${READY}/${DESIRED})."
 
+# The shipped manifests/*.yaml (flannel, kube-proxy, beep, ...) are staged and applied in
+# Step 3 but, like kube-network-policies above, only get pods once KCM and the scheduler run.
+# Every DaemonSet in kube-system must be fully Ready before sonobuoy: kube-proxy programs
+# the Service VIPs the sonobuoy pod itself dials, and flannel gives pods their network.
+banner "Wait for shipped kube-system DaemonSets and CoreDNS Ready"
+ADDONS_READY=0
+for i in $(seq 1 180); do
+  NOT_READY=$(kubectl --kubeconfig="$KUBECONFIG" get ds -n kube-system \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.desiredNumberScheduled}{" "}{.status.numberReady}{"\n"}{end}' 2>/dev/null \
+    | awk '$2 == "" || $2 == 0 || $2 != $3 {print $1 "(" $3+0 "/" $2+0 ")"}' || true)
+  if [ -z "$NOT_READY" ] && kubectl --kubeconfig="$KUBECONFIG" get ds -n kube-system kube-proxy >/dev/null 2>&1; then
+    ADDONS_READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ADDONS_READY" -eq 0 ]; then
+  echo "ERROR: kube-system DaemonSets not Ready within 180s (not ready: ${NOT_READY:-kube-proxy missing})" >&2
+  kubectl --kubeconfig="$KUBECONFIG" get ds,pods -n kube-system -o wide >&2
+  exit 1
+fi
+kubectl --kubeconfig="$KUBECONFIG" wait --for=condition=Available deployment/coredns -n kube-system --timeout=120s
+
 banner "Verify apiserver -> kubelet path for every node"
 _kubelet_paths=("${U7S_VM_NAME:-lima-node}=${KUBELET_PORT:-10250}")
 [ -z "$EXTRA_NODE" ] || _kubelet_paths+=("$EXTRA_NODE=$EXTRA_KUBELET_PORT")

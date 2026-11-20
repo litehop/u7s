@@ -86,14 +86,26 @@ check "dual-stack KCM gets both pod CIDRs and one mask flag per family (upstream
   "--cluster-cidr=10.244.0.0/16,fd00:244::/56 --node-cidr-mask-size-ipv4=24 --node-cidr-mask-size-ipv6=64" "$(rig_kcm_cidr_flags 1)"
 check "single-stack KCM flags stay as before" \
   "--cluster-cidr=10.244.0.0/16 --node-cidr-mask-size=24" "$(rig_kcm_cidr_flags 0)"
+# stage <dual> <nic mtu> [port]: renders the shipped manifests/ the way lima-start.sh does
+# and prints the directory. RIG_SERVICE_CIDR, when set, is the --service-cidr.
+stage() {
+  local d
+  d="$(mktemp -d)"
+  rig_stage_manifests "$d" eth0 "$2" "$1" 1.37.1 "${3:-6443}" || return 1
+  echo "$d"
+}
+dual_dir=$(stage 1 1500)
+single_dir=$(stage 0 1500)
 check "dual-stack kube-proxy clusterCIDR lists both families" \
-  "10.244.0.0/16,fd00:244::/56" "$(rig_kube_proxy_cluster_cidr 1)"
+  "1" "$(grep -cF 'clusterCIDR: 10.244.0.0/16,fd00:244::/56' "$dual_dir/kube-proxy.yaml")"
 check "single-stack kube-proxy clusterCIDR stays v4" \
-  "10.244.0.0/16" "$(rig_kube_proxy_cluster_cidr 0)"
-flannel_dual=$(rig_render_flannel eth0 1 1500 < "$ROOT/manifests/flannel.yaml")
+  "1" "$(grep -cF 'clusterCIDR: 10.244.0.0/16' "$single_dir/kube-proxy.yaml")"
+check "kube-proxy dials the slot's apiserver port on host.lima.internal, not the shipped 6443 (a wrong port leaves every Service VIP unprogrammed)" \
+  "server: https://host.lima.internal:6444" "$(grep 'server: https' "$(stage 0 1500 6444)/kube-proxy.yaml" | sed 's/^ *//')"
+flannel_dual=$(cat "$dual_dir/flannel.yaml")
 check "dual-stack flannel keeps IPv6Network (lima-start used to delete it)" \
   "1" "$(printf '%s\n' "$flannel_dual" | grep -cF '"EnableIPv6": true, "IPv6Network": "fd00:244::/56"')"
-flannel_single=$(rig_render_flannel eth0 0 1500 < "$ROOT/manifests/flannel.yaml")
+flannel_single=$(cat "$single_dir/flannel.yaml")
 check "single-stack flannel has no IPv6Network" \
   "0" "$(printf '%s\n' "$flannel_single" | grep -c 'IPv6Network"')"
 check "rig single-stack flannel gets NIC MTU - 74 (a stale constant would diverge from install.sh)" \
@@ -101,7 +113,7 @@ check "rig single-stack flannel gets NIC MTU - 74 (a stale constant would diverg
 check "rig dual-stack flannel gets NIC MTU - 94 (the larger IPv6 Geneve overhead)" \
   "1" "$(printf '%s\n' "$flannel_dual" | grep -cE '^ +"mtu": 1406,$')"
 check "a rig NIC MTU of 1460 renders 1386, not a hard-coded value" \
-  "1" "$(rig_render_flannel eth0 0 1460 < "$ROOT/manifests/flannel.yaml" | grep -cE '^ +"mtu": 1386,$')"
+  "1" "$(cat "$(stage 0 1460)/flannel.yaml" | grep -cE '^ +"mtu": 1386,$')"
 check "no unresolved placeholder in either rig flannel render (an unrendered \"mtu\" breaks every pod's CNI setup)" \
   "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z_]+__' || true)"
 check "the CI action renders flannel through the shared render, not its own sed" \
@@ -115,13 +127,17 @@ check "render_flannel refuses to emit a manifest with an unknown placeholder lef
   "1" "$(printf 'a: __NEW_THING__\n' | render_flannel eth0 10.244.0.0/16 "" 1426 >/dev/null 2>&1 && echo 0 || echo 1)"
 check "dual-stack CoreDNS Service has a VIP per family, PreferDualStack" \
   "  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack" \
-  "$(rig_render_coredns "$RIG_SERVICE_CIDR_DUAL" < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -)"
+  "$(grep -A4 '^  clusterIP: ' "$dual_dir/coredns.yaml" | paste -sd'|' -)"
 check "single-stack CoreDNS manifest is staged unchanged" \
-  "$(cat "$ROOT/manifests/coredns.yaml")" "$(rig_render_coredns "$RIG_SERVICE_CIDR_V4" < "$ROOT/manifests/coredns.yaml")"
+  "$(cat "$ROOT/manifests/coredns.yaml")" "$(cat "$single_dir/coredns.yaml")"
 
 # Pods resolve DNS only if kubelet's clusterDNS equals CoreDNS's Service IP, so
 # both are derived from the one effective Service CIDR.
-coredns_vips() { rig_render_coredns "$1" < "$ROOT/manifests/coredns.yaml" | grep -A4 '^  clusterIP: ' | paste -sd'|' -; }
+coredns_vips() {
+  local d
+  d=$(RIG_SERVICE_CIDR="$1" stage "${2:-1}" 1500)
+  grep -A4 '^  clusterIP: ' "$d/coredns.yaml" | paste -sd'|' -
+}
 check "default dual CIDR keeps today's exact kubelet clusterDNS VIPs (an existing rig must not move)" \
   "10.96.0.10 fd00:96::a" "$(rig_kube_dns_ips "$RIG_SERVICE_CIDR_DUAL" | paste -sd' ' -)"
 check "custom dual CIDR: CoreDNS Service VIPs come from that range (a hard-coded 10.96.0.10 is outside it and the apiserver rejects the Service)" \
@@ -134,7 +150,7 @@ check "v6-primary CIDR order: the v6 VIP is clusterIP and the first clusterDNS (
   "$(coredns_vips "fd00:97::/108,10.97.0.0/16")"
 check "single-stack custom CIDR also moves the CoreDNS clusterIP" \
   "  clusterIP: 10.97.0.10" \
-  "$(rig_render_coredns "10.97.0.0/16" < "$ROOT/manifests/coredns.yaml" | grep '^  clusterIP: ')"
+  "$(coredns_vips "10.97.0.0/16" 0 | cut -d'|' -f1)"
 check "a mid-address zero run is compressed canonically (kubectl reports fd00:97:0:1::a, not an expanded form)" \
   "fd00:97:0:1::a" "$(rig_cidr_tenth_host "fd00:97:0:1::/64")"
 check "an unaligned address is masked to its network before adding 10" \
@@ -167,8 +183,26 @@ check "run-all.sh forwards --dual-stack to KCM" \
   "1" "$(grep -c '04-start-kcm.sh.*_DUAL_STACK_ARG' "$DIR/run-all.sh")"
 check "run-all.sh defaults a dual-stack apiserver to the dual Service range" \
   "1" "$(grep -cF 'SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"' "$DIR/run-all.sh")"
-check "lima-start.sh renders kube-proxy and flannel via the dual-stack-aware helpers" \
-  "2" "$(grep -cE 'rig_kube_proxy_cluster_cidr "\$DUAL_STACK"|rig_render_flannel .*"\$DUAL_STACK"' "$START")"
+check "lima-start.sh stages the shipped manifests through the dual-stack-aware helper" \
+  "1" "$(grep -cE 'rig_stage_manifests .*"\$DUAL_STACK"' "$START")"
+
+# The rig must run what install.sh ships: the staged set is exactly manifests/*.yaml, so a
+# manifest added tomorrow (or beep today) reaches the rig with no edit to any rig script, and
+# one removed from manifests/ stops being applied instead of lingering in the staging folder.
+shipped=$(cd "$ROOT/manifests" && printf '%s\n' *.yaml | sort | paste -sd' ' -)
+check "rig stages exactly manifests/*.yaml (a manifest the rig skips is never exercised by conformance)" \
+  "$shipped" "$(cd "$single_dir" && printf '%s\n' *.yaml | sort | paste -sd' ' -)"
+check "beep is among the staged manifests, with its uplink iface rendered" \
+  "1" "$(grep -cF -- '--uplink-iface=eth0' "$single_dir/beep.yaml")"
+check "dual-stack beep gets one --pod-cidr per family (install.sh's renderer, not a rig copy)" \
+  "2" "$(grep -cE -- '--pod-cidr=' "$dual_dir/beep.yaml")"
+check "no manifest keeps an install-time placeholder after staging (an unrendered one reaches the apiserver verbatim)" \
+  "0" "$(cat "$single_dir"/*.yaml "$dual_dir"/*.yaml | grep -vE '^ *#' | grep -cE '__[A-Z_]+__' || true)"
+stale_dir=$(mktemp -d)
+echo 'kind: Stale' > "$stale_dir/removed-upstream.yaml"
+rig_stage_manifests "$stale_dir" eth0 1500 0 1.37.1 6443
+check "a manifest dropped from manifests/ disappears from the staging folder on the next run" \
+  "0" "$([ -e "$stale_dir/removed-upstream.yaml" ] && echo 1 || echo 0)"
 
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
