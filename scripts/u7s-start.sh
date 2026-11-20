@@ -9,14 +9,11 @@
 # $WORKDIR/manifests, not its production default of /etc/u7s/manifests -- that
 # path is root-owned on the host Mac and would be shared (and collided on)
 # across every worktree's dev-loop, since the apiserver runs natively on the
-# host here, not inside the VM. Unlike production's scripts/install.sh (which
-# stages every manifests/*.yaml from the release tarball into that folder),
-# this script stages only manifests/coredns.yaml -- flannel.yaml/kube-proxy.yaml
-# carry install-time placeholders scripts/install.sh substitutes and are
-# irrelevant here (Lima's kubelet runs its own kube-proxy systemd service and
-# needs no CNI on a single-node dev-loop). CoreDNS itself moved off its
-# compiled-in `include_bytes!` bundle onto this well-known-folder mechanism
-# -- without staging it, CoreDNS silently stops being applied.
+# host here, not inside the VM. This script leaves the folder empty: the
+# manifests' install-time placeholders (NIC name, MTU, kubelet version) are the
+# VM's, so scripts/conformance/lima-start.sh stages every manifests/*.yaml
+# through install.sh's renderer once the VM is up and SIGHUPs the apiserver to
+# apply them.
 #
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
@@ -189,12 +186,6 @@ fi
 # (bootstrap_apply.rs) and every --reset silently drops the well-known-folder
 # feature entirely.
 mkdir -p "$WORKDIR" "$MANIFEST_DIR"
-
-# Stage the vendored CoreDNS manifest on every start (not just --reset), so a
-# `git pull` picking up a newer vendored coredns.yaml is applied without an
-# explicit --reset -- see this file's header comment for why only CoreDNS,
-# not flannel/kube-proxy, is copied here.
-rig_render_coredns "$SERVICE_CIDR" < "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml" || exit 1
 
 if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
   KONNECTIVITY_PROXY_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"

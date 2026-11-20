@@ -45,8 +45,10 @@ assert "manifests/coredns.yaml exists in the repo (the file every harness below 
 # scripts/u7s-start.sh: structural check that it copies the real vendored file
 # into its own $MANIFEST_DIR before the apiserver launches.
 # ---------------------------------------------------------------------------
-assert "u7s-start.sh copies manifests/coredns.yaml into \$MANIFEST_DIR before launch" \
-  "$(grep -qF '< "$REPO/manifests/coredns.yaml" > "$MANIFEST_DIR/coredns.yaml"' "$U7S_START" && echo 1 || echo 0)"
+assert "lima-start.sh stages the shipped manifests (CoreDNS included) into <workdir>/manifests, where u7s-start.sh points the apiserver's --manifest-dir" \
+  "$(grep -qF 'rig_stage_manifests "$ABS_WORKDIR/manifests"' "$REPO/scripts/conformance/lima-start.sh" \
+    && grep -qF 'MANIFEST_DIR="$WORKDIR/manifests"' "$U7S_START" \
+    && grep -qF -- '--manifest-dir "$MANIFEST_DIR"' "$U7S_START" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Simulation: mirrors u7s-start.sh's actual mkdir+cp sequence against a scratch

@@ -550,40 +550,35 @@ rig_kcm_cidr_flags() {
   fi
 }
 
-# kube-proxy clusterCIDR value. Arg: 1 for dual-stack.
-rig_kube_proxy_cluster_cidr() {
-  if [ "$1" -eq 1 ]; then echo "${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6}"; else echo "${RIG_POD_CIDR_V4}"; fi
-}
-
-# Renders manifests/flannel.yaml (stdin to stdout) with install.sh's own
-# render, deriving the pod MTU from the node's NIC. Args: <iface> <1 if
-# dual-stack> <the iface's MTU>.
-rig_render_flannel() {
-  local v6=""
+# Stages every shipped manifests/*.yaml into <dst> through install.sh's own
+# renderer. The rig's apiserver runs on the host, so in-cluster clients
+# (kube-proxy) reach it as host.lima.internal:<port>, which the apiserver's
+# serving cert carries as a SAN. Args: <dst> <iface> <the iface's MTU> <1 if
+# dual-stack> <kube version> <apiserver port>.
+# shellcheck disable=SC2034 # the locals are the globals install.sh's renderers read
+rig_stage_manifests() {
+  local dst="$1" IFACE="$2" nic_mtu="$3" dual="$4" KUBE_VERSION="$5" port="$6"
+  local IFACE_IP=host.lima.internal POD_MTU CLUSTER_DNS SERVICE_CIDR part root
+  local POD_CLUSTER_CIDR="$RIG_POD_CIDR_V4" POD_CLUSTER_CIDR_IPV4="$RIG_POD_CIDR_V4" POD_CLUSTER_CIDR_IPV6=""
+  local SERVICE_CIDR_IPV4="" SERVICE_CIDR_IPV6=""
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
   # shellcheck source=scripts/lib/flannel-render.sh
-  . "$(dirname "${BASH_SOURCE[0]}")/../lib/flannel-render.sh"
-  [ "$2" -eq 1 ] && v6="$RIG_POD_CIDR_V6"
-  render_flannel_for_nic "$1" "$3" "$RIG_POD_CIDR_V4" "$v6"
-}
-
-# Renders manifests/coredns.yaml (stdin to stdout): the Service's clusterIP is
-# the first family's kube-dns VIP, and a dual-stack Service lists one VIP per
-# family with PreferDualStack, as install.sh does. Arg: <service-cidr-list>.
-rig_render_coredns() {
-  local -a ips
-  local lines vip
-  lines=$(rig_kube_dns_ips "$1") || return 1
-  while IFS= read -r vip; do ips+=("$vip"); done <<< "$lines"
-  local repl="  clusterIP: ${ips[0]}"
-  if [ "${#ips[@]}" -gt 1 ]; then
-    repl+="\\
-  clusterIPs:"
-    for vip in "${ips[@]}"; do repl+="\\
-  - ${vip}"; done
-    repl+="\\
-  ipFamilyPolicy: PreferDualStack"
+  . "$root/scripts/lib/flannel-render.sh"
+  if [ "$dual" -eq 1 ]; then
+    POD_CLUSTER_CIDR="${RIG_POD_CIDR_V4},${RIG_POD_CIDR_V6}"
+    POD_CLUSTER_CIDR_IPV6="$RIG_POD_CIDR_V6"
   fi
-  sed -e "s#^  clusterIP: 10.96.0.10\$#${repl}#"
+  SERVICE_CIDR="$(rig_effective_service_cidr "$dual")"
+  for part in ${SERVICE_CIDR//,/ }; do
+    case "$part" in *:*) SERVICE_CIDR_IPV6="$part" ;; *) SERVICE_CIDR_IPV4="$part" ;; esac
+  done
+  CLUSTER_DNS="$(rig_kube_dns_ips "$SERVICE_CIDR" | sed -n 1p)" || return 1
+  POD_MTU="$(derive_pod_mtu "$nic_mtu" "$dual")" || return 1
+  stage_vendored_manifests "$root/manifests" "$dst" || return 1
+  if [ -f "$dst/kube-proxy.yaml" ]; then
+    sed -e "s#https://${IFACE_IP}:6443#https://${IFACE_IP}:${port}#g" "$dst/kube-proxy.yaml" > "$dst/kube-proxy.yaml.tmp" || return 1
+    mv "$dst/kube-proxy.yaml.tmp" "$dst/kube-proxy.yaml"
+  fi
 }
 
 # Add-ons applied after install.sh purely so specs that need them can run; u7s does not
