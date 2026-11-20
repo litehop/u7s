@@ -1060,8 +1060,18 @@ render_flannel() {
   out="$(sed -e "s/__IFACE__/$iface/g" ${drop_v6[@]+"${drop_v6[@]}"} \
     -e "s#__POD_CLUSTER_CIDR_IPV4__#$v4#g" -e "s#__POD_CLUSTER_CIDR_IPV6__#$v6#g" \
     -e "s#__POD_MTU__#$mtu#g" ${1+"$@"})" || return 1
-  local conf_hash
-  conf_hash="$(sed -n '/^data:$/,/^kind: ConfigMap$/p' <<<"$out" | cksum | tr ' ' -)" || return 1
+  # Hash the two ConfigMap values the CNI reads, picked by key so a reordered
+  # manifest cannot drop one; a missing or empty key fails the render.
+  local conf_hash conf_key block conf_all=""
+  for conf_key in cni-conf.json net-conf.json; do
+    block="$(awk -v k="$conf_key" '
+      index($0, "  " k ": ") == 1 { on = 1; next }
+      on && /^    / { print; next }
+      { on = 0 }' <<<"$out")" || return 1
+    [ -n "$block" ] || { echo "error: flannel manifest has no $conf_key data" >&2; return 1; }
+    conf_all+="$block"$'\n'
+  done
+  conf_hash="$(printf '%s' "$conf_all" | cksum | tr ' ' -)" || return 1
   out="${out//__FLANNEL_CONF_HASH__/$conf_hash}"
   if grep -qE '__[A-Z_]+__' <<<"$out"; then
     echo "error: rendered flannel manifest still has placeholder(s): $(printf '%s\n' "$out" | grep -oE '__[A-Z_]+__' | sort -u | paste -sd' ' -)" >&2
