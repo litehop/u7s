@@ -12,6 +12,7 @@ use u7s_store::Store;
 use crate::{
     admission::{admit_write, AdmissionTarget},
     auth::UserInfo,
+    guaranteed_update::GuaranteedUpdate,
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -19,7 +20,7 @@ use crate::{
     util::{content_type, extract_body_quiet},
 };
 
-use super::generic::{store_err, validate_path_segment};
+use super::generic::validate_path_segment;
 
 use super::json_patch::is_dry_run_header;
 
@@ -560,76 +561,77 @@ async fn scale_put_impl<S: Store>(
         .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?;
 
     let key = group_object_key(group, resource, Some(ns), name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(group, resource, name))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Capture actual pod count and selector before changing spec so the response
-    // reflects reality.
-    let status_replicas = extract_status_replicas(&obj.body);
-    let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
-    let before_write = obj.body.clone();
-
-    let new_replicas = admit_scale_write(
-        &state,
-        &AdmissionTarget {
-            group,
-            version: "v1",
-            resource: &format!("{resource}/scale"),
-            name,
-            namespace: Some(ns),
-            user,
-            dry_run: is_dry_run_header(headers),
-        },
-        &build_scale(
-            name,
-            ns,
-            extract_replicas(&obj.body),
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        ),
-        build_scale(
-            name,
-            ns,
-            new_replicas as i64,
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        ),
-    )
-    .await? as i32;
-    let old_replicas = extract_replicas(&obj.body);
-    write_scale_replicas(&mut obj, old_replicas, new_replicas)?;
-
-    // Dry-run: spec.replicas was computed above; return the would-be Scale object
-    // without persisting — this is the shared impl behind both apps/v1 and
-    // ReplicationController scale PUT routes, so guarding here covers both.
-    record_scale_write(headers, None, &before_write, &mut obj.body, group);
-    if is_dry_run_header(headers) {
-        return Ok(Json(build_scale(
-            name,
-            ns,
-            new_replicas as i64,
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        )));
-    }
-
     let expected_rv =
         crate::util::parse_resource_version(scale.metadata.resource_version.as_deref())?;
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, group, resource, name, resource))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (group, resource, name, resource),
+    );
+    let (new_replicas, status_replicas, selector, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        // Capture actual pod count and selector before changing spec so the response
+        // reflects reality.
+        let status_replicas = extract_status_replicas(&obj.body);
+        let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
+        let before_write = obj.body.clone();
+
+        let new_replicas = admit_scale_write(
+            &state,
+            &AdmissionTarget {
+                group,
+                version: "v1",
+                resource: &format!("{resource}/scale"),
+                name,
+                namespace: Some(ns),
+                user,
+                dry_run: is_dry_run_header(headers),
+            },
+            &build_scale(
+                name,
+                ns,
+                extract_replicas(&obj.body),
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            ),
+            build_scale(
+                name,
+                ns,
+                new_replicas as i64,
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            ),
+        )
+        .await? as i32;
+        let old_replicas = extract_replicas(&obj.body);
+        write_scale_replicas(&mut obj, old_replicas, new_replicas)?;
+
+        // Dry-run: spec.replicas was computed above; return the would-be Scale object
+        // without persisting — this is the shared impl behind both apps/v1 and
+        // ReplicationController scale PUT routes, so guarding here covers both.
+        record_scale_write(headers, None, &before_write, &mut obj.body, group);
+        if is_dry_run_header(headers) {
+            return Ok(Json(build_scale(
+                name,
+                ns,
+                new_replicas as i64,
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            )));
+        }
+
+        if let Some(rv) = gu.commit(obj.to_bytes()).await? {
+            break (new_replicas, status_replicas, selector, rv);
+        }
+    };
 
     Ok(Json(build_scale(
         name,
@@ -675,104 +677,105 @@ async fn scale_patch_impl<S: Store>(
         ScaleSpec::deserialize(&patch_body["spec"]).unwrap_or_default();
 
     let key = group_object_key(group, resource, Some(ns), name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(group, resource, name))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Capture actual pod count and selector before changing spec so the response
-    // reflects reality.
-    let status_replicas = extract_status_replicas(&obj.body);
-    let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
-    let before_write = obj.body.clone();
-    let ssa_plan = is_ssa
-        .then(|| {
-            plan_scale_apply(
-                headers,
-                &before_write,
-                patch_scale_spec.replicas.map(i64::from),
-                "spec.replicas",
-                &scale_api_version(group),
-                None,
-            )
-        })
-        .transpose()?;
-
-    // Extract replicas from patch if present; otherwise keep current value (no write).
-    let old_replicas = extract_replicas(&obj.body);
-    let sent_replicas = scale_apply_replicas(
-        ssa_plan.as_ref(),
-        patch_scale_spec.replicas.map(i64::from),
-        "spec.replicas",
-    );
-    let new_replicas = admit_scale_write(
-        &state,
-        &AdmissionTarget {
-            group,
-            version: "v1",
-            resource: &format!("{resource}/scale"),
-            name,
-            namespace: Some(ns),
-            user,
-            dry_run: is_dry_run_header(headers),
-        },
-        &build_scale(
-            name,
-            ns,
-            old_replicas,
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        ),
-        build_scale(
-            name,
-            ns,
-            sent_replicas.unwrap_or(old_replicas),
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        ),
-    )
-    .await?;
-    if let Some(plan) = &ssa_plan {
-        plan.remove_dropped_fields(&mut obj.body);
-    }
-    if sent_replicas.is_some() || new_replicas != old_replicas {
-        write_scale_replicas(&mut obj, old_replicas, new_replicas as i32)?;
-    }
-
-    // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
-    // apps/v1 and ReplicationController scale PATCH routes.
-    record_scale_write(
-        headers,
-        ssa_plan.as_ref(),
-        &before_write,
-        &mut obj.body,
-        group,
-    );
-    if is_dry_run_header(headers) {
-        return Ok(Json(build_scale(
-            name,
-            ns,
-            new_replicas,
-            status_replicas,
-            obj.resource_version().unwrap_or(""),
-            &selector,
-        )));
-    }
-
     let expected_rv =
         crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?;
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, group, resource, name, resource))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (group, resource, name, resource),
+    );
+    let (new_replicas, status_replicas, selector, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        // Capture actual pod count and selector before changing spec so the response
+        // reflects reality.
+        let status_replicas = extract_status_replicas(&obj.body);
+        let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
+        let before_write = obj.body.clone();
+        let ssa_plan = is_ssa
+            .then(|| {
+                plan_scale_apply(
+                    headers,
+                    &before_write,
+                    patch_scale_spec.replicas.map(i64::from),
+                    "spec.replicas",
+                    &scale_api_version(group),
+                    None,
+                )
+            })
+            .transpose()?;
+
+        // Extract replicas from patch if present; otherwise keep current value (no write).
+        let old_replicas = extract_replicas(&obj.body);
+        let sent_replicas = scale_apply_replicas(
+            ssa_plan.as_ref(),
+            patch_scale_spec.replicas.map(i64::from),
+            "spec.replicas",
+        );
+        let new_replicas = admit_scale_write(
+            &state,
+            &AdmissionTarget {
+                group,
+                version: "v1",
+                resource: &format!("{resource}/scale"),
+                name,
+                namespace: Some(ns),
+                user,
+                dry_run: is_dry_run_header(headers),
+            },
+            &build_scale(
+                name,
+                ns,
+                old_replicas,
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            ),
+            build_scale(
+                name,
+                ns,
+                sent_replicas.unwrap_or(old_replicas),
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            ),
+        )
+        .await?;
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut obj.body);
+        }
+        if sent_replicas.is_some() || new_replicas != old_replicas {
+            write_scale_replicas(&mut obj, old_replicas, new_replicas as i32)?;
+        }
+
+        // Dry-run: same shared-impl reasoning as scale_put_impl above — covers both
+        // apps/v1 and ReplicationController scale PATCH routes.
+        record_scale_write(
+            headers,
+            ssa_plan.as_ref(),
+            &before_write,
+            &mut obj.body,
+            group,
+        );
+        if is_dry_run_header(headers) {
+            return Ok(Json(build_scale(
+                name,
+                ns,
+                new_replicas,
+                status_replicas,
+                obj.resource_version().unwrap_or(""),
+                &selector,
+            )));
+        }
+
+        if let Some(rv) = gu.commit(obj.to_bytes()).await? {
+            break (new_replicas, status_replicas, selector, rv);
+        }
+    };
 
     Ok(Json(build_scale(
         name,

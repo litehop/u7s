@@ -14,6 +14,7 @@ use crate::{
         DEFAULT_WEBHOOK_TIMEOUT_SECS,
     },
     auth::UserInfo,
+    guaranteed_update::GuaranteedUpdate,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
     handlers::field_selector::FieldSelector,
     handlers::generic::validate_path_segment,
@@ -5827,117 +5828,123 @@ pub async fn put_cr_status<S: Store>(
         )
     };
 
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
-
-    let mut current: serde_json::Value =
-        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-    if let Some(ctx) = &cr_ctx {
-        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
-    }
-
-    let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
-    let before_write = current.clone();
-
-    // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
-    // Typed dispatch first: a registry-hit built-in kind with a registered status codec
-    // (Namespace/CertificateSigningRequest/APIService today) fails a scalar status at
-    // typed decode (400) — this closes the KNOWN EDGE where CSR's real /status route
-    // returned 422 (the CR-shaped code) for a built-in with no typed decode to fail. A
-    // dispatch miss (every other kind, and every genuine CR/CRD) falls through to
-    // `replace_status_field_dynamic` UNCHANGED: a scalar status there is caught by
-    // structural-schema validation (422), not a typed decode failure — see that
-    // function's doc comment.
-    let incoming_status = &incoming["status"];
-    if incoming_status.is_null() {
-        current.as_object_mut().map(|m| m.remove("status"));
-    } else {
-        let api_version = if group.is_empty() {
-            version.clone()
-        } else {
-            format!("{group}/{version}")
-        };
-        match crate::status_dispatch::decode_status_put(&api_version, &kind, incoming_status) {
-            Some(result) => current["status"] = result?,
-            None => {
-                crate::handlers::status::replace_status_field_dynamic(
-                    &mut current,
-                    incoming_status,
-                )?;
-            }
-        }
-    }
-
-    crate::handlers::status::merge_incoming_metadata(
-        &mut current,
-        &incoming,
-        cr_ctx.is_none().then_some(kind.as_str()),
-    );
-
-    if let Some(old) = &csr_before {
-        crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
-    }
-
-    current = crate::handlers::status::admit_status_write(
-        &state,
-        &AdmissionTarget {
-            group: &group,
-            version: &version,
-            resource: &format!("{plural}/status"),
-            name: &name,
-            namespace: None,
-            user: Some(&user),
-            dry_run: is_dry_run_header(&headers),
-        },
-        &before_write,
-        current,
-        &kind,
-    )
-    .await?;
-
-    // Dry-run: return the would-be status object without persisting — mirrors
-    // put_resource_status's dry-run early-return.
-    crate::handlers::status::record_status_write(
-        &headers,
-        None,
-        &before_write,
-        &mut current,
-        &group,
-        &version,
-    );
     let incoming_meta: crate::types::ObjectMeta =
         <crate::types::ObjectMeta as serde::Deserialize>::deserialize(&incoming["metadata"])
             .unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    if cr_ctx.is_some() {
-        super::resource::require_cr_resourceversion_on_update(&group, &plural, expected_rv, &name)?;
-    } else {
-        super::resource::require_builtin_resourceversion_on_update(
-            &group,
-            &plural,
-            expected_rv,
-            &name,
-        )?;
-    }
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current));
-    }
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (&group, &plural, &name, &kind),
+    );
+    let (mut current, csr_before, new_rv) = loop {
+        let stored = gu.read_existing().await?;
 
-    let converted = match &cr_ctx {
-        Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
-        None => None,
+        let mut current: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(ctx) = &cr_ctx {
+            current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
+        }
+
+        let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+        let before_write = current.clone();
+
+        // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
+        // Typed dispatch first: a registry-hit built-in kind with a registered status codec
+        // (Namespace/CertificateSigningRequest/APIService today) fails a scalar status at
+        // typed decode (400) — this closes the KNOWN EDGE where CSR's real /status route
+        // returned 422 (the CR-shaped code) for a built-in with no typed decode to fail. A
+        // dispatch miss (every other kind, and every genuine CR/CRD) falls through to
+        // `replace_status_field_dynamic` UNCHANGED: a scalar status there is caught by
+        // structural-schema validation (422), not a typed decode failure — see that
+        // function's doc comment.
+        let incoming_status = &incoming["status"];
+        if incoming_status.is_null() {
+            current.as_object_mut().map(|m| m.remove("status"));
+        } else {
+            let api_version = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{group}/{version}")
+            };
+            match crate::status_dispatch::decode_status_put(&api_version, &kind, incoming_status) {
+                Some(result) => current["status"] = result?,
+                None => {
+                    crate::handlers::status::replace_status_field_dynamic(
+                        &mut current,
+                        incoming_status,
+                    )?;
+                }
+            }
+        }
+
+        crate::handlers::status::merge_incoming_metadata(
+            &mut current,
+            &incoming,
+            cr_ctx.is_none().then_some(kind.as_str()),
+        );
+
+        if let Some(old) = &csr_before {
+            crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
+        }
+
+        current = crate::handlers::status::admit_status_write(
+            &state,
+            &AdmissionTarget {
+                group: &group,
+                version: &version,
+                resource: &format!("{plural}/status"),
+                name: &name,
+                namespace: None,
+                user: Some(&user),
+                dry_run: is_dry_run_header(&headers),
+            },
+            &before_write,
+            current,
+            &kind,
+        )
+        .await?;
+
+        // Dry-run: return the would-be status object without persisting — mirrors
+        // put_resource_status's dry-run early-return.
+        crate::handlers::status::record_status_write(
+            &headers,
+            None,
+            &before_write,
+            &mut current,
+            &group,
+            &version,
+        );
+        if cr_ctx.is_some() {
+            super::resource::require_cr_resourceversion_on_update(
+                &group,
+                &plural,
+                expected_rv,
+                &name,
+            )?;
+        } else {
+            super::resource::require_builtin_resourceversion_on_update(
+                &group,
+                &plural,
+                expected_rv,
+                &name,
+            )?;
+        }
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current));
+        }
+
+        let converted = match &cr_ctx {
+            Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
+            None => None,
+        };
+        let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(rv) = gu.commit(Bytes::from(bytes)).await? {
+            break (current, csr_before, rv);
+        }
     };
-    let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let new_rv = state
-        .store
-        .put(&key, Bytes::from(bytes), expected_rv)
-        .await
-        .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
     if let Some(old) = &csr_before {
         crate::handlers::csr::consume_join_token(state.store.as_ref(), old, &current).await;
     }
@@ -6063,22 +6070,6 @@ pub async fn patch_cr_status<S: Store>(
         )
     };
 
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
-
-    let mut current: serde_json::Value =
-        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-    if let Some(ctx) = &cr_ctx {
-        current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
-    }
-
-    let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
-    let before_write = current.clone();
-
     // apply-patch+yaml bodies are genuine YAML; every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
         ssa_body_to_json(&body)?
@@ -6087,122 +6078,143 @@ pub async fn patch_cr_status<S: Store>(
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
     crate::handlers::status::reject_patch_identity_mismatch(&patch, &name, None)?;
-    let ssa_plan = crate::handlers::status::plan_status_apply(
-        &headers,
-        is_ssa,
-        &current,
-        &patch,
-        &group,
-        &version,
-        cr_ctx.is_none().then_some(kind.as_str()),
-    )?;
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (&group, &plural, &name, &kind),
+    );
+    let (mut current, csr_before, new_rv) = loop {
+        let stored = gu.read_existing().await?;
 
-    match patch_type {
-        PatchType::Json => {
-            crate::handlers::status::validate_status_json_patch_paths(&patch)?;
-            apply_json_patch(&mut current, &patch)?;
+        let mut current: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(ctx) = &cr_ctx {
+            current = convert_cr_to_request_version(&state, ctx, &group, &version, current).await?;
         }
-        _ => {
-            // Merge and strategic merge: apply status and metadata from the patch body.
-            if let Some(status_patch) = patch.get("status") {
-                let entry = current.as_object_mut().map(|m| {
-                    m.entry("status")
-                        .or_insert(serde_json::Value::Object(Default::default()))
-                });
-                if let Some(entry) = entry {
-                    match patch_type {
-                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
-                        PatchType::StrategicMerge => {
-                            crate::patch::strategic_merge_patch(entry, status_patch)
-                                .map_err(Status::patch_error)?;
+
+        let csr_before = crate::handlers::csr::is_csr(&group, &plural).then(|| current.clone());
+        let before_write = current.clone();
+
+        let ssa_plan = crate::handlers::status::plan_status_apply(
+            &headers,
+            is_ssa,
+            &current,
+            &patch,
+            &group,
+            &version,
+            cr_ctx.is_none().then_some(kind.as_str()),
+        )?;
+
+        match patch_type {
+            PatchType::Json => {
+                crate::handlers::status::validate_status_json_patch_paths(&patch)?;
+                apply_json_patch(&mut current, &patch)?;
+            }
+            _ => {
+                // Merge and strategic merge: apply status and metadata from the patch body.
+                if let Some(status_patch) = patch.get("status") {
+                    let entry = current.as_object_mut().map(|m| {
+                        m.entry("status")
+                            .or_insert(serde_json::Value::Object(Default::default()))
+                    });
+                    if let Some(entry) = entry {
+                        match patch_type {
+                            PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
+                            PatchType::StrategicMerge => {
+                                crate::patch::strategic_merge_patch(entry, status_patch)
+                                    .map_err(Status::patch_error)?;
+                            }
+                            PatchType::Json => unreachable!(),
                         }
-                        PatchType::Json => unreachable!(),
                     }
                 }
+                crate::handlers::status::merge_incoming_metadata(
+                    &mut current,
+                    &patch,
+                    cr_ctx.is_none().then_some(kind.as_str()),
+                );
             }
-            crate::handlers::status::merge_incoming_metadata(
-                &mut current,
-                &patch,
-                cr_ctx.is_none().then_some(kind.as_str()),
-            );
         }
-    }
-    if let Some(plan) = &ssa_plan {
-        plan.remove_dropped_fields(&mut current);
-    }
-    // Convergence point for every patch content-type above (JSON Patch, merge, strategic
-    // merge): guard once here, right before the store write, instead of per-branch. A
-    // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
-    // `validate_status_json_patch_paths` permits a whole-`/status` replace and
-    // `apply_json_patch` happily turns that into a scalar. `null` bypasses both guards below
-    // (RFC 7396 field deletion is legal regardless of typed shape).
-    //
-    // Typed dispatch first: every built-in kind with a status subresource is registered in
-    // status_dispatch (see its table), so this is the only guard that ever actually runs for
-    // a registry-hit built-in — it also fails on a wrong-typed enumerated field, which
-    // `reject_non_object_status` alone can't see. A dispatch miss (every genuine CR/CRD)
-    // falls through to `reject_non_object_status` UNCHANGED.
-    if !current["status"].is_null() {
-        let api_version = if group.is_empty() {
-            version.clone()
-        } else {
-            format!("{group}/{version}")
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current);
+        }
+        // Convergence point for every patch content-type above (JSON Patch, merge, strategic
+        // merge): guard once here, right before the store write, instead of per-branch. A
+        // per-branch guard covered merge/strategic-merge but missed PatchType::Json, since
+        // `validate_status_json_patch_paths` permits a whole-`/status` replace and
+        // `apply_json_patch` happily turns that into a scalar. `null` bypasses both guards below
+        // (RFC 7396 field deletion is legal regardless of typed shape).
+        //
+        // Typed dispatch first: every built-in kind with a status subresource is registered in
+        // status_dispatch (see its table), so this is the only guard that ever actually runs for
+        // a registry-hit built-in — it also fails on a wrong-typed enumerated field, which
+        // `reject_non_object_status` alone can't see. A dispatch miss (every genuine CR/CRD)
+        // falls through to `reject_non_object_status` UNCHANGED.
+        if !current["status"].is_null() {
+            let api_version = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{group}/{version}")
+            };
+            match crate::status_dispatch::decode_status_patch(
+                &api_version,
+                &kind,
+                &current["status"],
+            ) {
+                Some(result) => {
+                    result?;
+                }
+                None => crate::handlers::status::reject_non_object_status(&current["status"])?,
+            }
+        }
+
+        if let Some(old) = &csr_before {
+            crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
+        }
+
+        current = crate::handlers::status::admit_status_write(
+            &state,
+            &AdmissionTarget {
+                group: &group,
+                version: &version,
+                resource: &format!("{plural}/status"),
+                name: &name,
+                namespace: None,
+                user: Some(&user),
+                dry_run: is_dry_run_header(&headers),
+            },
+            &before_write,
+            current,
+            &kind,
+        )
+        .await?;
+
+        // Dry-run: same convergence point as reject_non_object_status above — return the
+        // would-be patched status object without persisting.
+        crate::handlers::status::record_status_write(
+            &headers,
+            ssa_plan.as_ref(),
+            &before_write,
+            &mut current,
+            &group,
+            &version,
+        );
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current));
+        }
+
+        let converted = match &cr_ctx {
+            Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
+            None => None,
         };
-        match crate::status_dispatch::decode_status_patch(&api_version, &kind, &current["status"]) {
-            Some(result) => {
-                result?;
-            }
-            None => crate::handlers::status::reject_non_object_status(&current["status"])?,
+        let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(rv) = gu.commit(Bytes::from(bytes)).await? {
+            break (current, csr_before, rv);
         }
-    }
-
-    if let Some(old) = &csr_before {
-        crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
-    }
-
-    current = crate::handlers::status::admit_status_write(
-        &state,
-        &AdmissionTarget {
-            group: &group,
-            version: &version,
-            resource: &format!("{plural}/status"),
-            name: &name,
-            namespace: None,
-            user: Some(&user),
-            dry_run: is_dry_run_header(&headers),
-        },
-        &before_write,
-        current,
-        &kind,
-    )
-    .await?;
-
-    // Dry-run: same convergence point as reject_non_object_status above — return the
-    // would-be patched status object without persisting.
-    crate::handlers::status::record_status_write(
-        &headers,
-        ssa_plan.as_ref(),
-        &before_write,
-        &mut current,
-        &group,
-        &version,
-    );
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current));
-    }
-
-    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let converted = match &cr_ctx {
-        Some(ctx) => Some(convert_cr_for_storage(&state, ctx, &group, current.clone()).await?),
-        None => None,
     };
-    let bytes = serde_json::to_vec(converted.as_ref().unwrap_or(&current))
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let new_rv = state
-        .store
-        .put(&key, Bytes::from(bytes), expected_rv)
-        .await
-        .map_err(|e| store_err_cr(e, &group, &plural, &name, &kind))?;
     if let Some(old) = &csr_before {
         crate::handlers::csr::consume_join_token(state.store.as_ref(), old, &current).await;
     }
@@ -6379,80 +6391,82 @@ async fn cr_scale_put_impl<S: Store>(
         .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?;
 
     let key = cr_store_key(target.group, target.plural, target.ns, target.name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(target.group, target.plural, target.name))?;
-    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    let mut obj =
-        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
-
-    // Capture actual pod count and selector before changing spec so the response reflects
-    // reality — same ordering apps/v1's scale_put_impl uses, for the same reason.
-    let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
-    let selector = scale_cfg
-        .label_selector_path
-        .as_deref()
-        .map(|p| scale_path_get_str(&obj, p).to_string())
-        .unwrap_or_default();
-
-    let before = obj.clone();
-    let new_replicas = admit_cr_scale(
-        state,
-        &target,
-        user,
-        is_dry_run_header(headers),
-        (
-            scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
-            new_replicas as i64,
-            status_replicas,
-        ),
-        (
-            &selector,
-            obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
-        ),
-    )
-    .await?;
-    scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
-    apply_cr_generation_on_update(&before, &mut obj);
-    record_cr_scale_write(
-        headers,
-        None,
-        &before,
-        &mut obj,
-        target.group,
-        target.version,
-        ctx,
-    );
-
-    let old_rv = obj["metadata"]["resourceVersion"]
-        .as_str()
-        .map(str::to_string);
-
-    // Dry-run: spec.replicas was computed above; return the would-be Scale object without
-    // persisting — mirrors apps/v1's scale_put_impl in scale.rs.
-    if is_dry_run_header(headers) {
-        return Ok(Json(super::scale::build_scale(
-            target.name,
-            target.ns.unwrap_or(""),
-            new_replicas,
-            status_replicas,
-            old_rv.as_deref().unwrap_or(""),
-            &selector,
-        )));
-    }
-
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
-    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
-    let new_rv = state
-        .store
-        .put(&key, Bytes::from(bytes), expected_rv)
-        .await
-        .map_err(|e| store_err_cr(e, target.group, target.plural, target.name, &ctx.kind))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (target.group, target.plural, target.name, &ctx.kind),
+    );
+    let (new_replicas, status_replicas, selector, old_rv, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let mut obj =
+            convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
+
+        // Capture actual pod count and selector before changing spec so the response reflects
+        // reality — same ordering apps/v1's scale_put_impl uses, for the same reason.
+        let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
+        let selector = scale_cfg
+            .label_selector_path
+            .as_deref()
+            .map(|p| scale_path_get_str(&obj, p).to_string())
+            .unwrap_or_default();
+
+        let before = obj.clone();
+        let new_replicas = admit_cr_scale(
+            state,
+            &target,
+            user,
+            is_dry_run_header(headers),
+            (
+                scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
+                new_replicas as i64,
+                status_replicas,
+            ),
+            (
+                &selector,
+                obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
+            ),
+        )
+        .await?;
+        scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
+        apply_cr_generation_on_update(&before, &mut obj);
+        record_cr_scale_write(
+            headers,
+            None,
+            &before,
+            &mut obj,
+            target.group,
+            target.version,
+            ctx,
+        );
+
+        let old_rv = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+
+        // Dry-run: spec.replicas was computed above; return the would-be Scale object without
+        // persisting — mirrors apps/v1's scale_put_impl in scale.rs.
+        if is_dry_run_header(headers) {
+            return Ok(Json(super::scale::build_scale(
+                target.name,
+                target.ns.unwrap_or(""),
+                new_replicas,
+                status_replicas,
+                old_rv.as_deref().unwrap_or(""),
+                &selector,
+            )));
+        }
+
+        let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(rv) = gu.commit(Bytes::from(bytes)).await? {
+            break (new_replicas, status_replicas, selector, old_rv, rv);
+        }
+    };
     evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
@@ -6478,105 +6492,107 @@ async fn cr_scale_patch_impl<S: Store>(
     let scale_body = super::scale::decode_scale_body(body, headers)?;
 
     let key = cr_store_key(target.group, target.plural, target.ns, target.name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(target.group, target.plural, target.name))?;
-    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    let mut obj =
-        convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
-
-    let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
-    let selector = scale_cfg
-        .label_selector_path
-        .as_deref()
-        .map(|p| scale_path_get_str(&obj, p).to_string())
-        .unwrap_or_default();
-
-    // Mirrors apps/v1's scale_patch_impl: extract replicas from the patch body if present,
-    // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
-    // is a no-op write, not an error).
-    let before = obj.clone();
-    let ssa_plan = content_type(headers)
-        .contains("apply-patch+yaml")
-        .then(|| {
-            super::scale::plan_scale_apply(
-                headers,
-                &before,
-                scale_body.spec.replicas.map(i64::from),
-                &scale_cfg.spec_replicas_path,
-                &format!("{}/{}", target.group, target.version),
-                ctx.schema.as_deref(),
-            )
-        })
-        .transpose()?;
-    let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
-    let sent_replicas = super::scale::scale_apply_replicas(
-        ssa_plan.as_ref(),
-        scale_body.spec.replicas.map(i64::from),
-        &scale_cfg.spec_replicas_path,
-    );
-    let new_replicas = admit_cr_scale(
-        state,
-        &target,
-        user,
-        is_dry_run_header(headers),
-        (
-            old_replicas,
-            sent_replicas.unwrap_or(old_replicas),
-            status_replicas,
-        ),
-        (
-            &selector,
-            obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
-        ),
-    )
-    .await?;
-    if let Some(plan) = &ssa_plan {
-        plan.remove_dropped_fields(&mut obj);
-    }
-    if sent_replicas.is_some() || new_replicas != old_replicas {
-        scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
-    }
-    apply_cr_generation_on_update(&before, &mut obj);
-    record_cr_scale_write(
-        headers,
-        ssa_plan.as_ref(),
-        &before,
-        &mut obj,
-        target.group,
-        target.version,
-        ctx,
-    );
-
-    let old_rv = obj["metadata"]["resourceVersion"]
-        .as_str()
-        .map(str::to_string);
-
-    // Dry-run: spec.replicas was computed above; return the would-be Scale object without
-    // persisting — mirrors apps/v1's scale_patch_impl in scale.rs.
-    if is_dry_run_header(headers) {
-        return Ok(Json(super::scale::build_scale(
-            target.name,
-            target.ns.unwrap_or(""),
-            new_replicas,
-            status_replicas,
-            old_rv.as_deref().unwrap_or(""),
-            &selector,
-        )));
-    }
-
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
-    let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
-    let bytes = serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
-    let new_rv = state
-        .store
-        .put(&key, Bytes::from(bytes), expected_rv)
-        .await
-        .map_err(|e| store_err_cr(e, target.group, target.plural, target.name, &ctx.kind))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (target.group, target.plural, target.name, &ctx.kind),
+    );
+    let (new_replicas, status_replicas, selector, old_rv, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        let mut obj =
+            convert_cr_to_request_version(state, ctx, target.group, target.version, obj).await?;
+
+        let status_replicas = scale_path_get_i64(&obj, &scale_cfg.status_replicas_path);
+        let selector = scale_cfg
+            .label_selector_path
+            .as_deref()
+            .map(|p| scale_path_get_str(&obj, p).to_string())
+            .unwrap_or_default();
+
+        // Mirrors apps/v1's scale_patch_impl: extract replicas from the patch body if present,
+        // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
+        // is a no-op write, not an error).
+        let before = obj.clone();
+        let ssa_plan = content_type(headers)
+            .contains("apply-patch+yaml")
+            .then(|| {
+                super::scale::plan_scale_apply(
+                    headers,
+                    &before,
+                    scale_body.spec.replicas.map(i64::from),
+                    &scale_cfg.spec_replicas_path,
+                    &format!("{}/{}", target.group, target.version),
+                    ctx.schema.as_deref(),
+                )
+            })
+            .transpose()?;
+        let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
+        let sent_replicas = super::scale::scale_apply_replicas(
+            ssa_plan.as_ref(),
+            scale_body.spec.replicas.map(i64::from),
+            &scale_cfg.spec_replicas_path,
+        );
+        let new_replicas = admit_cr_scale(
+            state,
+            &target,
+            user,
+            is_dry_run_header(headers),
+            (
+                old_replicas,
+                sent_replicas.unwrap_or(old_replicas),
+                status_replicas,
+            ),
+            (
+                &selector,
+                obj["metadata"]["resourceVersion"].as_str().unwrap_or(""),
+            ),
+        )
+        .await?;
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut obj);
+        }
+        if sent_replicas.is_some() || new_replicas != old_replicas {
+            scale_path_set_i64(&mut obj, &scale_cfg.spec_replicas_path, new_replicas);
+        }
+        apply_cr_generation_on_update(&before, &mut obj);
+        record_cr_scale_write(
+            headers,
+            ssa_plan.as_ref(),
+            &before,
+            &mut obj,
+            target.group,
+            target.version,
+            ctx,
+        );
+
+        let old_rv = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .map(str::to_string);
+
+        // Dry-run: spec.replicas was computed above; return the would-be Scale object without
+        // persisting — mirrors apps/v1's scale_patch_impl in scale.rs.
+        if is_dry_run_header(headers) {
+            return Ok(Json(super::scale::build_scale(
+                target.name,
+                target.ns.unwrap_or(""),
+                new_replicas,
+                status_replicas,
+                old_rv.as_deref().unwrap_or(""),
+                &selector,
+            )));
+        }
+
+        let storage_obj = convert_cr_for_storage(state, ctx, target.group, obj).await?;
+        let bytes =
+            serde_json::to_vec(&storage_obj).map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(rv) = gu.commit(Bytes::from(bytes)).await? {
+            break (new_replicas, status_replicas, selector, old_rv, rv);
+        }
+    };
     evict_cr_conversion_cache(state, old_rv.as_deref());
 
     Ok(Json(super::scale::build_scale(
