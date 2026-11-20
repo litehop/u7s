@@ -1230,6 +1230,28 @@ async fn disconnect_during_apply_that_lost_a_create_race_keeps_the_services_rese
     assert_persisted_service_keeps_its_reservations(&st, "svc", 30101).await;
 }
 
+/// A panic inside a Service write must reach the client as a 500, not take the request task
+/// down with it and leave the connection hanging.
+#[tokio::test]
+async fn panicking_service_write_answers_500_instead_of_panicking_the_handler() {
+    let store = std::sync::Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+    let txn = super::ServiceAllocTxn::new(store);
+    let write = async {
+        if true {
+            panic!("store write blew up");
+        }
+        Ok::<u64, u7s_store::StoreError>(0)
+    };
+    let (code, message) = reply(super::commit_on_task(Some(txn), write).await.map(|_| ()))
+        .await
+        .expect_err("a panicking write cannot succeed");
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        message.contains("did not complete"),
+        "the 500 must say the write task died: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dual-stack: one allocator per family behind the shared create/PUT/PATCH path.
 // ---------------------------------------------------------------------------
