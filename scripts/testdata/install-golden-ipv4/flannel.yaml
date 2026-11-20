@@ -154,7 +154,7 @@ spec:
   template:
     metadata:
       annotations:
-        u7s.io/flannel-conf-hash: "1693492816-581"
+        u7s.io/flannel-conf-hash: "2839541114-521"
       labels:
         app: flannel
         k8s-app: flannel
