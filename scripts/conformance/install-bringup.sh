@@ -133,5 +133,8 @@ for addon in ${INSTALL_RIG_ONLY_ADDONS//,/ }; do
 done
 kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system rollout status ds/kube-network-policies --timeout=180s
 
+banner "RIG-ONLY host setup (NOT shipped by install.sh): $RIG_ONLY_HOST_SETUP"
+rig_apply_host_apparmor "$VM_NAME"
+
 echo ""
 echo "Install-mode stack up: kubectl --kubeconfig $KUBECONFIG_PATH get pods -A"
