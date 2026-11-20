@@ -103,30 +103,71 @@ impl<S: Store> AutoClusterIp<S> {
     }
 }
 
-/// Write the Service object while holding its reservations. The write and the commit run on
-/// a spawned task so a client disconnect cannot drop the transaction after the write has
-/// landed. On failure the transaction comes back to the caller (it may retry the write).
-pub(crate) async fn create_committing<S: Store>(
-    store: Arc<S>,
-    ns_key: String,
-    key: String,
-    value: bytes::Bytes,
-    txn: ServiceAllocTxn<S>,
-) -> Result<u64, (CreateNamespacedError, ServiceAllocTxn<S>)> {
-    let joined = tokio::spawn(async move {
-        match store
-            .create_if_namespace_active(Some(&ns_key), &key, value)
-            .await
-        {
-            Ok(rv) => {
+/// Run `write` while holding a Service's reservations. With a transaction, the write and the
+/// commit run on a spawned task so a client disconnect cannot drop the transaction after the
+/// write has landed. Without one (not a Service) the write runs inline.
+///
+/// Returns the write's outcome plus the transaction when the write failed, so the caller can
+/// retry or roll it back. A task that did not finish (runtime shutdown) is a 500.
+pub(crate) async fn commit_on_task<S, T, E>(
+    txn: Option<ServiceAllocTxn<S>>,
+    write: impl std::future::Future<Output = Result<T, E>> + Send + 'static,
+) -> Result<(Result<T, E>, Option<ServiceAllocTxn<S>>), StatusError>
+where
+    S: Store,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let Some(txn) = txn else {
+        return Ok((write.await, None));
+    };
+    tokio::spawn(async move {
+        match write.await {
+            Ok(v) => {
                 txn.commit().await;
-                Ok(rv)
+                (Ok(v), None)
             }
-            Err(e) => Err((e, txn)),
+            Err(e) => (Err(e), Some(txn)),
         }
     })
-    .await;
-    joined.expect("service create task panicked")
+    .await
+    .map_err(|e| Status::internal(format!("service write task did not complete: {e}")))
+}
+
+/// `create_if_namespace_active` under `commit_on_task`.
+pub(crate) async fn create_committing<S: Store>(
+    store: Arc<S>,
+    ns_key: Option<String>,
+    key: String,
+    value: bytes::Bytes,
+    txn: Option<ServiceAllocTxn<S>>,
+) -> Result<
+    (
+        Result<u64, CreateNamespacedError>,
+        Option<ServiceAllocTxn<S>>,
+    ),
+    StatusError,
+> {
+    commit_on_task(txn, async move {
+        store
+            .create_if_namespace_active(ns_key.as_deref(), &key, value)
+            .await
+    })
+    .await
+}
+
+/// `put` under `commit_on_task`.
+pub(crate) async fn put_committing<S: Store>(
+    store: Arc<S>,
+    key: String,
+    value: bytes::Bytes,
+    expected_revision: Option<u64>,
+    txn: Option<ServiceAllocTxn<S>>,
+) -> Result<(Result<u64, StoreError>, Option<ServiceAllocTxn<S>>), StatusError> {
+    commit_on_task(txn, async move {
+        store.put(&key, value, expected_revision).await
+    })
+    .await
 }
 
 async fn delete_sentinel<S: Store>(store: &S, key: &str) {
