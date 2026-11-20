@@ -19,6 +19,10 @@
 #                           drop the EnableIPv6/IPv6Network line.
 #   __POD_MTU__            install.sh's pod MTU: the NIC's MTU minus beep's Geneve overhead
 #                           (74 bytes, 94 on an IPv6 underlay or dual-stack), or --pod-mtu.
+#   __FLANNEL_CONF_HASH__  checksum of the rendered kube-flannel-cfg ConfigMap data, set by
+#                           render_flannel. The install-cni init container copies cni-conf.json
+#                           once per pod start, so the pod template must change whenever the
+#                           ConfigMap does or a new --pod-mtu never reaches the node.
 #
 # Departures from upstream:
 #   - flanneld gets both --iface and --iface-regex, matching install.sh's own $IFACE
@@ -150,6 +154,8 @@ spec:
       k8s-app: flannel
   template:
     metadata:
+      annotations:
+        u7s.io/flannel-conf-hash: "__FLANNEL_CONF_HASH__"
       labels:
         app: flannel
         k8s-app: flannel

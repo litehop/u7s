@@ -1050,7 +1050,8 @@ derive_pod_mtu() {
 # v4> <pod cidr v6, empty for single-stack> <pod mtu> [extra sed args]. The
 # IPv6Network line survives only with both CIDRs. Every render path (install.sh,
 # the dev rig, CI) goes through here; a placeholder left in the output fails
-# the render rather than reaching the CNI config.
+# the render rather than reaching the CNI config. The pod template carries a
+# checksum of the ConfigMap data, so a changed MTU or CIDR rolls the DaemonSet.
 render_flannel() {
   local iface="$1" v4="$2" v6="$3" mtu="$4" out
   shift 4
@@ -1059,6 +1060,9 @@ render_flannel() {
   out="$(sed -e "s/__IFACE__/$iface/g" ${drop_v6[@]+"${drop_v6[@]}"} \
     -e "s#__POD_CLUSTER_CIDR_IPV4__#$v4#g" -e "s#__POD_CLUSTER_CIDR_IPV6__#$v6#g" \
     -e "s#__POD_MTU__#$mtu#g" ${1+"$@"})" || return 1
+  local conf_hash
+  conf_hash="$(sed -n '/^data:$/,/^kind: ConfigMap$/p' <<<"$out" | cksum | tr ' ' -)" || return 1
+  out="${out//__FLANNEL_CONF_HASH__/$conf_hash}"
   if grep -qE '__[A-Z_]+__' <<<"$out"; then
     echo "error: rendered flannel manifest still has placeholder(s): $(printf '%s\n' "$out" | grep -oE '__[A-Z_]+__' | sort -u | paste -sd' ' -)" >&2
     return 1
