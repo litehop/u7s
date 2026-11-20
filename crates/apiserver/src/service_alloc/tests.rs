@@ -91,7 +91,7 @@ fn svc(name: &str, spec: Value) -> Value {
     })
 }
 
-async fn create(st: &AppState<SqliteStore>, name: &str, spec: Value, dry: bool) -> Reply {
+async fn create<S: Store>(st: &AppState<S>, name: &str, spec: Value, dry: bool) -> Reply {
     let q = CreateQuery {
         dry_run: dry.then(|| "All".to_string()),
         ..Default::default()
@@ -110,14 +110,14 @@ async fn create(st: &AppState<SqliteStore>, name: &str, spec: Value, dry: bool) 
     .await
 }
 
-async fn get(st: &AppState<SqliteStore>, name: &str) -> Value {
+async fn get<S: Store>(st: &AppState<S>, name: &str) -> Value {
     reply(get_namespaced_resource(State(st.clone()), path(name), HeaderMap::new()).await)
         .await
         .expect("GET must succeed")
         .1
 }
 
-async fn put(st: &AppState<SqliteStore>, body: Value, dry: bool) -> Reply {
+async fn put<S: Store>(st: &AppState<S>, body: Value, dry: bool) -> Reply {
     let name = body["metadata"]["name"].as_str().unwrap().to_string();
     let q = ReplaceQuery {
         dry_run: dry.then(|| "All".to_string()),
@@ -137,8 +137,8 @@ async fn put(st: &AppState<SqliteStore>, body: Value, dry: bool) -> Reply {
     .await
 }
 
-async fn patch(
-    st: &AppState<SqliteStore>,
+async fn patch<S: Store>(
+    st: &AppState<S>,
     name: &str,
     content_type: &'static str,
     body: Value,
@@ -172,7 +172,7 @@ async fn delete(st: &AppState<SqliteStore>, name: &str) {
     .unwrap_or_else(|e| panic!("DELETE must succeed: {e:?}"));
 }
 
-async fn held(st: &AppState<SqliteStore>, key: &str) -> bool {
+async fn held<S: Store>(st: &AppState<S>, key: &str) -> bool {
     st.store.get(key).await.unwrap().is_some()
 }
 
@@ -186,11 +186,11 @@ fn port_key(p: i64) -> String {
 
 /// A dropped transaction rolls back on a spawned task.
 async fn eventually_free(st: &AppState<SqliteStore>, key: &str) {
-    for _ in 0..400 {
+    for _ in 0..100_000 {
         if !held(st, key).await {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
     panic!("{key} is still reserved: a failed write leaked its reservation");
 }
@@ -838,11 +838,11 @@ async fn quota_rejected_create_does_not_leak_its_auto_allocated_cluster_ip() {
 
     let r = create(&st, "denied", json!({"ports": [{"port": 80}]}), false).await;
     assert!(matches!(r, Err((StatusCode::FORBIDDEN, _))), "{r:?}");
-    for _ in 0..400 {
+    for _ in 0..100_000 {
         if held_ips(&st).await == before {
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
     panic!(
         "a create rejected by quota leaked its auto-allocated clusterIP: {:?}",
@@ -850,61 +850,384 @@ async fn quota_rejected_create_does_not_leak_its_auto_allocated_cluster_ip() {
     );
 }
 
-/// A client that disconnects while its Service is being written cancels the handler future,
-/// but the store write still lands. The persisted Service must keep its VIP and node port:
-/// freeing them would let the next Service be handed the same address.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn client_disconnect_during_create_keeps_reservations_of_the_persisted_service() {
-    use std::future::Future;
-    use std::task::{Context, Waker};
+/// Store double that parks a Service write right after it has landed, so a test can cancel
+/// the handler future at exactly the moment a client disconnect would: object persisted,
+/// reservations not yet committed.
+struct GateStore {
+    inner: std::sync::Arc<SqliteStore>,
+    armed: std::sync::atomic::AtomicBool,
+    landed: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Persisted by a "concurrent writer" just before the next Service create, which then
+    /// reports AlreadyExists.
+    race_winner: std::sync::Mutex<Option<bytes::Bytes>>,
+}
 
-    let mut cancelled_after_persist = 0;
-    for _ in 0..50 {
-        let st = state();
-        let body = svc("svc", np_spec(80, 0));
-        let mut fut = Box::pin(create_namespaced_resource(
-            State(st.clone()),
-            coll_path(),
-            Query(CreateQuery::default()),
-            user(),
-            headers("application/json"),
-            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
-        ));
-        let mut cx = Context::from_waker(Waker::noop());
-        loop {
-            if fut.as_mut().poll(&mut cx).is_ready() {
-                break;
-            }
-            if st
-                .store
-                .get("/registry/services/default/svc")
-                .await
-                .unwrap()
-                .is_some()
-            {
-                drop(fut);
-                cancelled_after_persist += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                let stored = get(&st, "svc").await;
-                let ip = stored["spec"]["clusterIP"].as_str().unwrap();
-                let np = stored["spec"]["ports"][0]["nodePort"].as_i64().unwrap();
-                assert!(
-                    held(&st, &ip_key(ip)).await,
-                    "persisted Service lost its clusterIP reservation on client disconnect"
-                );
-                assert!(
-                    held(&st, &port_key(np)).await,
-                    "persisted Service lost its nodePort reservation on client disconnect"
-                );
-                break;
-            }
-            tokio::task::yield_now().await;
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> InFlight<'a> {
+    fn new(n: &'a std::sync::atomic::AtomicUsize) -> Self {
+        n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+const SERVICE_OBJECT_PREFIX: &str = "/registry/services/";
+
+impl GateStore {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(SqliteStore::new(":memory:").expect("in-memory store")),
+            armed: false.into(),
+            landed: false.into(),
+            release: tokio::sync::Notify::new(),
+            in_flight: 0.into(),
+            race_winner: std::sync::Mutex::new(None),
         }
     }
+
+    async fn park_after_write(&self, key: &str) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if key.starts_with(SERVICE_OBJECT_PREFIX) && self.armed.load(SeqCst) {
+            self.landed.store(true, SeqCst);
+            self.release.notified().await;
+        }
+    }
+}
+
+impl Store for GateStore {
+    fn get(
+        &self,
+        key: impl Into<String> + Send,
+    ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+    {
+        let key: String = key.into();
+        async move {
+            let _g = InFlight::new(&self.in_flight);
+            self.inner.get(&key).await
+        }
+    }
+
+    fn list(
+        &self,
+        prefix: impl Into<String> + Send,
+        opts: u7s_store::ListOptions,
+    ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send {
+        let prefix: String = prefix.into();
+        async move {
+            let _g = InFlight::new(&self.in_flight);
+            self.inner.list(&prefix, opts).await
+        }
+    }
+
+    fn put(
+        &self,
+        key: impl Into<String> + Send,
+        value: bytes::Bytes,
+        expected_revision: Option<u64>,
+    ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+        let key: String = key.into();
+        async move {
+            let _g = InFlight::new(&self.in_flight);
+            let rv = self.inner.put(&key, value, expected_revision).await?;
+            self.park_after_write(&key).await;
+            Ok(rv)
+        }
+    }
+
+    fn create_if_namespace_active(
+        &self,
+        ns_key: Option<&str>,
+        key: impl Into<String> + Send,
+        value: bytes::Bytes,
+    ) -> impl std::future::Future<Output = Result<u64, u7s_store::CreateNamespacedError>> + Send
+    {
+        let key: String = key.into();
+        let ns_key = ns_key.map(str::to_string);
+        async move {
+            let _g = InFlight::new(&self.in_flight);
+            let winner = self.race_winner.lock().unwrap().take();
+            if let Some(winner) = winner {
+                self.inner.put(&key, winner, Some(0)).await?;
+                return Err(u7s_store::CreateNamespacedError::Store(
+                    u7s_store::StoreError::AlreadyExists { key },
+                ));
+            }
+            let rv = self
+                .inner
+                .create_if_namespace_active(ns_key.as_deref(), &key, value)
+                .await?;
+            self.park_after_write(&key).await;
+            Ok(rv)
+        }
+    }
+
+    fn delete(
+        &self,
+        key: impl Into<String> + Send,
+        expected_revision: Option<u64>,
+    ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send {
+        let key: String = key.into();
+        async move {
+            let _g = InFlight::new(&self.in_flight);
+            self.inner.delete(&key, expected_revision).await
+        }
+    }
+
+    fn list_namespace_objects(
+        &self,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+    {
+        let ns = namespace.to_string();
+        async move { self.inner.list_namespace_objects(&ns).await }
+    }
+
+    fn delete_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+        let ns = namespace.to_string();
+        async move { self.inner.delete_namespace_resources(&ns).await }
+    }
+
+    fn watch(
+        &self,
+        _prefix: &str,
+        _from_revision: u64,
+    ) -> impl std::future::Future<
+        Output = u7s_store::Result<
+            impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+        >,
+    > + Send {
+        std::future::ready(Ok(futures_util::stream::empty()))
+    }
+
+    fn compaction_horizon(&self) -> u64 {
+        self.inner.compaction_horizon()
+    }
+
+    fn current_revision(&self) -> u64 {
+        self.inner.current_revision()
+    }
+
+    fn watch_receiver_count(&self) -> usize {
+        self.inner.watch_receiver_count()
+    }
+}
+
+fn gated_state() -> AppState<GateStore> {
+    let (primary, _) = crate::state::parse_service_cluster_ip_ranges(RANGE).unwrap();
+    let st = AppState::new_with_config(AppStateConfig {
+        store: std::sync::Arc::new(GateStore::new()),
+        sa_keys: None,
+        token_map: std::collections::HashMap::new(),
+        server_address: "https://localhost:6443".into(),
+        cluster_ca_ders: None,
+        service_ip_allocator: Some(primary),
+        kubelet_client_identity_pem: None,
+        kubelet_preferred_address: None,
+        kubelet_port: 10250,
+        continue_token_key: None,
+        konnectivity_proxy_addr: None,
+    });
+    crate::handlers::test_support::grant_create_everywhere(&st.rbac_index);
+    st
+}
+
+/// Drive `write` until its Service object has landed in the store, drop it (the client
+/// disconnect), then let the parked store call finish and everything it spawned drain.
+async fn disconnect_after_write_lands(
+    st: &AppState<GateStore>,
+    write: impl std::future::Future<Output = Reply>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::task::{Context, Poll, Waker};
+
+    let mut write = Box::pin(write);
+    let mut cx = Context::from_waker(Waker::noop());
+    st.store.armed.store(true, SeqCst);
+    for _ in 0..100_000 {
+        if st.store.landed.load(SeqCst) {
+            break;
+        }
+        assert!(
+            matches!(write.as_mut().poll(&mut cx), Poll::Pending),
+            "the write finished before it could be cancelled"
+        );
+        tokio::task::yield_now().await;
+    }
     assert!(
-        cancelled_after_persist > 0,
-        "never cancelled a create after its write landed; the test did not exercise the window"
+        st.store.landed.load(SeqCst),
+        "the Service write never reached the store"
     );
+    drop(write);
+    st.store.armed.store(false, SeqCst);
+    st.store.release.notify_one();
+    while st.store.in_flight.load(SeqCst) > 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The persisted Service must hold its clusterIP and nodePort. Freeing them would let the
+/// next Service be handed the same address or port.
+async fn assert_persisted_service_keeps_its_reservations(
+    st: &AppState<GateStore>,
+    name: &str,
+    node_port: i64,
+) {
+    let stored = get(st, name).await;
+    assert_eq!(
+        stored["spec"]["ports"][0]["nodePort"], node_port,
+        "the write must have landed"
+    );
+    assert!(
+        held(st, &port_key(node_port)).await,
+        "persisted Service lost its nodePort reservation on client disconnect"
+    );
+    if let Some(ip) = stored["spec"]["clusterIP"].as_str() {
+        assert!(
+            held(st, &ip_key(ip)).await,
+            "persisted Service lost its clusterIP reservation on client disconnect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn disconnect_during_create_keeps_the_new_services_reservations() {
+    let st = gated_state();
+    disconnect_after_write_lands(&st, create(&st, "svc", np_spec(80, 30100), false)).await;
+    assert_persisted_service_keeps_its_reservations(&st, "svc", 30100).await;
+    assert!(
+        get(&st, "svc").await["spec"]["clusterIP"].is_string(),
+        "an auto-allocated clusterIP is what a create must keep"
+    );
+}
+
+/// Seeds `svc` on nodePort 30100, then cancels `write` (which moves it to 30101) after the
+/// write landed. The new port must stay reserved and the old one must be freed.
+async fn disconnect_during_port_change(
+    write: impl FnOnce(
+        &AppState<GateStore>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Reply> + '_>>,
+) {
+    let st = gated_state();
+    create(&st, "svc", np_spec(80, 30100), false).await.unwrap();
+    disconnect_after_write_lands(&st, write(&st)).await;
+    assert_persisted_service_keeps_its_reservations(&st, "svc", 30101).await;
+    assert!(
+        !held(&st, &port_key(30100)).await,
+        "the replaced nodePort stayed reserved forever after a client disconnect"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_during_put_keeps_the_updated_services_reservations() {
+    disconnect_during_port_change(|st| Box::pin(put(st, svc("svc", np_spec(80, 30101)), false)))
+        .await;
+}
+
+#[tokio::test]
+async fn disconnect_during_put_create_keeps_the_new_services_reservations() {
+    let st = gated_state();
+    disconnect_after_write_lands(&st, put(&st, svc("svc", np_spec(80, 30101)), false)).await;
+    assert_persisted_service_keeps_its_reservations(&st, "svc", 30101).await;
+}
+
+#[tokio::test]
+async fn disconnect_during_merge_patch_keeps_the_updated_services_reservations() {
+    disconnect_during_port_change(|st| {
+        Box::pin(patch(
+            st,
+            "svc",
+            "application/merge-patch+json",
+            json!({"spec": {"ports": [{"port": 80, "nodePort": 30101, "protocol": "TCP", "targetPort": 80}]}}),
+        ))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disconnect_during_json_patch_keeps_the_updated_services_reservations() {
+    disconnect_during_port_change(|st| {
+        Box::pin(patch(
+            st,
+            "svc",
+            "application/json-patch+json",
+            json!([{"op": "replace", "path": "/spec/ports/0/nodePort", "value": 30101}]),
+        ))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disconnect_during_strategic_patch_keeps_the_updated_services_reservations() {
+    disconnect_during_port_change(|st| {
+        Box::pin(patch(
+            st,
+            "svc",
+            "application/strategic-merge-patch+json",
+            json!({"spec": {"ports": [{"port": 80, "nodePort": 30101}]}}),
+        ))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disconnect_during_apply_keeps_the_updated_services_reservations() {
+    disconnect_during_port_change(|st| {
+        Box::pin(patch(
+            st,
+            "svc",
+            "application/apply-patch+yaml",
+            svc("svc", np_spec(80, 30101)),
+        ))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn disconnect_during_apply_create_keeps_the_new_services_reservations() {
+    let st = gated_state();
+    disconnect_after_write_lands(
+        &st,
+        patch(
+            &st,
+            "svc",
+            "application/apply-patch+yaml",
+            svc("svc", np_spec(80, 30101)),
+        ),
+    )
+    .await;
+    assert_persisted_service_keeps_its_reservations(&st, "svc", 30101).await;
+}
+
+/// The apply-create loses a create race and falls back to merging onto the winner's object;
+/// that fallback write has the same disconnect window as every other Service write.
+#[tokio::test]
+async fn disconnect_during_apply_that_lost_a_create_race_keeps_the_services_reservations() {
+    let st = gated_state();
+    *st.store.race_winner.lock().unwrap() = Some(bytes::Bytes::from(
+        serde_json::to_vec(&svc("svc", json!({"ports": [{"port": 80}]}))).unwrap(),
+    ));
+    disconnect_after_write_lands(
+        &st,
+        patch(
+            &st,
+            "svc",
+            "application/apply-patch+yaml",
+            svc("svc", np_spec(80, 30101)),
+        ),
+    )
+    .await;
+    assert_persisted_service_keeps_its_reservations(&st, "svc", 30101).await;
 }
 
 // ---------------------------------------------------------------------------

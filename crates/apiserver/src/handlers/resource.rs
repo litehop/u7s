@@ -806,15 +806,14 @@ fn qualified_resource(group: &str, plural: &str) -> String {
 /// update rules apply: see `require_resourceversion_on_update`; a stated resourceVersion is
 /// compared by the store and conflicts (409) on mismatch.
 async fn update_after_lost_create_race<S: Store>(
-    state: &AppState<S>,
+    store: &S,
     key: &str,
     body: Bytes,
     expected_revision: Option<u64>,
     (group, plural, name, kind): (&str, &str, &str, &str),
 ) -> Result<u64, crate::status::StatusError> {
     require_builtin_resourceversion_on_update(group, plural, expected_revision, name)?;
-    state
-        .store
+    store
         .put(key, body, expected_revision)
         .await
         .map_err(|e| store_err(e, group, plural, name, kind))
@@ -1258,7 +1257,7 @@ pub(crate) async fn replace_resource<S: Store>(
     let new_rv = match put_result {
         Err(StoreError::AlreadyExists { .. }) if create_only => {
             update_after_lost_create_race(
-                &state,
+                &*state.store,
                 &key,
                 obj.to_bytes(),
                 expected_revision,
@@ -1875,11 +1874,15 @@ pub(crate) async fn do_patch<S: Store>(
         // Without this, `kubectl apply --server-side` could create new content in a namespace
         // mid-deletion by going through PATCH+apply instead of POST+create.
         let ns_key = ns.map(|namespace| cluster_object_key("namespaces", namespace));
-        let new_rv = match state
-            .store
-            .create_if_namespace_active(ns_key.as_deref(), key, obj.to_bytes())
-            .await
-        {
+        let (created, svc_alloc) = crate::service_alloc::create_committing(
+            state.store.clone(),
+            ns_key,
+            key.to_string(),
+            obj.to_bytes(),
+            svc_alloc,
+        )
+        .await?;
+        let new_rv = match created {
             Ok(rv) => rv,
             Err(
                 e @ (CreateNamespacedError::NamespaceTerminating
@@ -2052,15 +2055,16 @@ pub(crate) async fn do_patch<S: Store>(
                     None
                 };
                 let expected_rv = parse_resource_version(current.resource_version())?;
-                let rv = state
-                    .store
-                    .put(key, current.to_bytes(), expected_rv)
-                    .await
-                    .map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
+                let (put, _) = crate::service_alloc::put_committing(
+                    state.store.clone(),
+                    key.to_string(),
+                    current.to_bytes(),
+                    expected_rv,
+                    race_svc_alloc,
+                )
+                .await?;
+                let rv = put.map_err(|e| store_err(e, group, plural, name, &meta.kind))?;
                 current.set_resource_version(rv);
-                if let Some(txn) = race_svc_alloc {
-                    txn.commit().await;
-                }
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
                         None => rbac_cluster_key(group, version, plural, name),
@@ -2077,9 +2081,6 @@ pub(crate) async fn do_patch<S: Store>(
             }
         };
         obj.set_resource_version(new_rv);
-        if let Some(txn) = svc_alloc {
-            txn.commit().await;
-        }
         // SSA upsert-create: this is the same "object now exists" event create_resource's
         // RBAC_GROUP hook handles for a plain POST — without it, a ClusterRole/ClusterRoleBinding
         // created via `kubectl apply --server-side` (or this apiserver's own bootstrap-installer,
@@ -2618,12 +2619,17 @@ pub(crate) async fn do_patch<S: Store>(
         }
 
         let expected_rv = parse_resource_version(current.resource_version())?;
-        match state.store.put(key, current.to_bytes(), expected_rv).await {
+        let (put, svc_alloc) = crate::service_alloc::put_committing(
+            state.store.clone(),
+            key.to_string(),
+            current.to_bytes(),
+            expected_rv,
+            svc_alloc,
+        )
+        .await?;
+        match put {
             Ok(new_rv) => {
                 current.set_resource_version(new_rv);
-                if let Some(txn) = svc_alloc {
-                    txn.commit().await;
-                }
                 if group == RBAC_GROUP {
                     let rbac_key = match ns {
                         None => rbac_cluster_key(group, version, plural, name),
@@ -3712,31 +3718,17 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
         // a separate earlier check + this write used to leave open (a create could observe
         // Active, then a concurrent delete_namespace flips the phase, and this write would
         // blindly succeed regardless).
-        let result = match svc_alloc.take() {
-            // A Service's reservations are committed on the write's own task: if the client
-            // disconnects mid-write the object still lands, and must keep its VIP/ports.
-            Some(txn) => match crate::service_alloc::create_committing(
-                state.store.clone(),
-                ns_key.clone(),
-                key.clone(),
-                obj.to_bytes(),
-                txn,
-            )
-            .await
-            {
-                Ok(rv) => Ok(rv),
-                Err((e, txn)) => {
-                    svc_alloc = Some(txn);
-                    Err(e)
-                }
-            },
-            None => {
-                state
-                    .store
-                    .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
-                    .await
-            }
-        };
+        // A Service's reservations are committed on the write's own task: if the client
+        // disconnects mid-write the object still lands, and must keep its VIP/ports.
+        let (result, failed_txn) = crate::service_alloc::create_committing(
+            state.store.clone(),
+            Some(ns_key.clone()),
+            key.clone(),
+            obj.to_bytes(),
+            svc_alloc.take(),
+        )
+        .await?;
+        svc_alloc = failed_txn;
         tracing::debug!(
             key = %key,
             elapsed_ms = put_start.elapsed().as_millis() as u64,
@@ -3801,9 +3793,6 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
     };
 
     obj.set_resource_version(new_rv);
-    if let Some(txn) = svc_alloc {
-        txn.commit().await;
-    }
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
@@ -4510,42 +4499,53 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     // use (create_if_namespace_active) instead of a plain unconditional store.put — without
     // this, `kubectl replace` (or any PUT resolving to a create) could create new content in
     // a namespace mid-deletion, a bypass POST already closes via this same store method.
-    let new_rv = if !object_existed {
-        let ns_key = cluster_object_key("namespaces", &ns);
-        match state
-            .store
-            .create_if_namespace_active(Some(&ns_key), &key, obj.to_bytes())
+    let store = state.store.clone();
+    let write_key = key.clone();
+    let write_body = obj.to_bytes();
+    let ns_key = cluster_object_key("namespaces", &ns);
+    let (group_w, plural_w, name_w, kind_w, ns_w) = (
+        group.clone(),
+        plural.clone(),
+        name.clone(),
+        meta.kind.clone(),
+        ns.clone(),
+    );
+    // The write (and its commit, for a Service) runs on its own task so a client disconnect
+    // cannot drop the reservations of an object that has landed.
+    let (written, _) = crate::service_alloc::commit_on_task(svc_alloc, async move {
+        if object_existed {
+            return store
+                .put(&write_key, write_body, expected_revision)
+                .await
+                .map_err(|e| store_err(e, &group_w, &plural_w, &name_w, &kind_w));
+        }
+        match store
+            .create_if_namespace_active(Some(&ns_key), &write_key, write_body.clone())
             .await
         {
-            Ok(rv) => rv,
+            Ok(rv) => Ok(rv),
             Err(
                 e @ (CreateNamespacedError::NamespaceTerminating
                 | CreateNamespacedError::NamespaceNotFound),
-            ) => {
-                return Err(Status::namespace_create_rejected(&ns, &e));
-            }
+            ) => Err(Status::namespace_create_rejected(&ns_w, &e)),
             // Lost a create race: continue as the update upstream retries into.
             Err(CreateNamespacedError::Store(StoreError::AlreadyExists { .. })) => {
                 update_after_lost_create_race(
-                    &state,
-                    &key,
-                    obj.to_bytes(),
+                    &*store,
+                    &write_key,
+                    write_body,
                     expected_revision,
-                    (&group, &plural, &name, &meta.kind),
+                    (&group_w, &plural_w, &name_w, &kind_w),
                 )
-                .await?
+                .await
             }
             Err(CreateNamespacedError::Store(e)) => {
-                return Err(store_err(e, &group, &plural, &name, &meta.kind))
+                Err(store_err(e, &group_w, &plural_w, &name_w, &kind_w))
             }
         }
-    } else {
-        let put_result = state
-            .store
-            .put(&key, obj.to_bytes(), expected_revision)
-            .await;
-        put_result.map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?
-    };
+    })
+    .await?;
+    let new_rv = written?;
     tracing::debug!(
         key = %key,
         elapsed_ms = put_start.elapsed().as_millis() as u64,
@@ -4553,9 +4553,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
     );
 
     obj.set_resource_version(new_rv);
-    if let Some(txn) = svc_alloc {
-        txn.commit().await;
-    }
     if group == RBAC_GROUP {
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
@@ -8388,16 +8385,10 @@ mod tests {
             .put(key, bytes::Bytes::from_static(b"{\"winner\":true}"), None)
             .await
             .unwrap();
-        let state = crate::state::AppState::new(
-            store.clone(),
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
         let ident = ("coordination.k8s.io", "leases", "race-lease", "Lease");
 
         let err = update_after_lost_create_race(
-            &state,
+            &*store,
             key,
             bytes::Bytes::from_static(b"{\"loser\":true}"),
             Some(winner + 100),
@@ -8414,7 +8405,7 @@ mod tests {
         );
 
         update_after_lost_create_race(
-            &state,
+            &*store,
             key,
             bytes::Bytes::from_static(b"{\"loser\":true}"),
             Some(winner),
