@@ -2948,6 +2948,8 @@ mod tests {
         "check_and_persist_availability",
         // Test fixture seeding Namespaces; not reachable from any request.
         "seed_namespace_in",
+        // Test fixture seeding a stored object past admission; not reachable from any request.
+        "seed_stored_object",
     ];
 
     #[test]

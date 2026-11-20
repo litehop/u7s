@@ -55,7 +55,12 @@ fn pod_template_location(
     group: &str,
     resource: &str,
 ) -> Option<(&'static [&'static str], &'static str)> {
-    let resource = resource.split('/').next().unwrap_or(resource);
+    // Upstream's status and scale strategies reset the spec to the stored one and never
+    // validate the template, so a stored object with a bad template must stay writable there.
+    let (resource, sub) = resource.split_once('/').unwrap_or((resource, ""));
+    if matches!(sub, "status" | "scale") {
+        return None;
+    }
     match (group, resource) {
         ("apps", "deployments" | "replicasets" | "statefulsets" | "daemonsets")
         | ("batch", "jobs")

@@ -374,12 +374,20 @@ fn template_kinds() -> Vec<Kind> {
             "ReplicationController",
             json!({"spec": {"selector": {"a": "b"}, "template": t}}),
         ),
+        simple(
+            "PodTemplate",
+            "/api/v1/namespaces/default/podtemplates",
+            "v1",
+            "PodTemplate",
+            json!({"template": t}),
+        ),
     ]
 }
 
 fn template_path(k: &Kind) -> Vec<&'static str> {
     match k.kind {
         "CronJob" => vec!["spec", "jobTemplate", "spec", "template"],
+        "PodTemplate" => vec!["template"],
         _ => vec!["spec", "template"],
     }
 }
@@ -458,5 +466,102 @@ async fn overlong_pod_template_label_is_rejected_on_every_workload_kind_and_writ
         }
         sites += 2;
     }
-    assert_eq!(sites, 7 * 6, "every kind x path cell must have run");
+    assert_eq!(sites, 8 * 6, "every kind x path cell must have run");
+}
+
+/// A pod template annotation key that is not a qualified name would make every pod the
+/// controller stamps out fail admission; upstream rejects the workload at
+/// `<template path>.annotations`.
+#[tokio::test]
+async fn invalid_pod_template_annotation_key_is_rejected_on_every_workload_kind() {
+    let c = cluster().await;
+    for k in &template_kinds() {
+        let path = template_path(k);
+        let mut bad = body(k, "bad", None);
+        let mut cur = &mut bad;
+        for p in &path {
+            cur = &mut cur[*p];
+        }
+        cur["metadata"]["annotations"] = json!({"bad key": "v"});
+        let (st, resp) = c.call("POST", k.collection, "application/json", bad).await;
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}: a bad template annotation key must be a 422: {resp}",
+            k.label
+        );
+        let want = format!("{}.annotations: Invalid value: \"bad key\"", path.join("."));
+        let msg = resp["message"].as_str().unwrap_or_default();
+        assert!(msg.contains(&want), "{}: wrong message: {msg}", k.label);
+    }
+}
+
+/// Writes `obj` straight to the store, bypassing admission, to model an object stored before
+/// validation tightened.
+async fn seed_stored_object(c: &Cluster, k: &Kind, obj: &Value) {
+    use u7s_store::Store;
+    let group = k.api_version.split_once('/').map_or("", |(g, _)| g);
+    let resource = k.collection.rsplit('/').next().unwrap();
+    let prefix = if group.is_empty() {
+        "/registry".to_string()
+    } else {
+        format!("/registry/{group}")
+    };
+    c.store
+        .put(
+            &format!("{prefix}/{resource}/default/t"),
+            bytes::Bytes::from(obj.to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+/// Upstream's status and scale strategies reset the spec to the stored one and never validate
+/// the pod template, so a workload that already holds a bad template label must keep
+/// accepting status writes; rejecting them would freeze the controllers' status updates.
+#[tokio::test]
+async fn status_and_scale_writes_succeed_on_a_stored_workload_with_an_invalid_template_label() {
+    let c = cluster().await;
+    let long = "x".repeat(64);
+    let mut writes = 0;
+    for k in template_kinds() {
+        if k.kind == "PodTemplate" {
+            continue;
+        }
+        let mut obj = body(&k, "t", None);
+        set_template_label(&mut obj, &template_path(&k), json!({"a": "b", "k": long}));
+        seed_stored_object(&c, &k, &obj).await;
+        let item = format!("{}/t", k.collection);
+        let mut subs = vec![("status", json!({"status": {"observedGeneration": 1}}))];
+        if k.kind == "Deployment" {
+            subs.push(("scale", json!({"spec": {"replicas": 2}})));
+        }
+        for (sub, patch) in subs {
+            let (st, resp) = c
+                .call("PATCH", &format!("{item}/{sub}"), MERGE, patch)
+                .await;
+            assert_eq!(
+                st,
+                StatusCode::OK,
+                "{} {sub}: a stored bad template must not block the write: {resp}",
+                k.label
+            );
+            writes += 1;
+        }
+        let (_, after) = c.call("GET", &item, "application/json", Value::Null).await;
+        let mut cur = &after;
+        for p in template_path(&k) {
+            cur = &cur[p];
+        }
+        assert_eq!(
+            cur["metadata"]["labels"]["k"], long,
+            "{}: the stored template is untouched by status writes",
+            k.label
+        );
+    }
+    assert_eq!(
+        writes, 8,
+        "7 workload kinds with status plus Deployment scale"
+    );
 }
