@@ -22,7 +22,7 @@ kubectl wait crd/"$CRD_NAME" --for=condition=Established --timeout=30s
 # --all-namespaces forces the cluster-wide path: /apis/<group>/<version>/<plural>
 output="$(kubectl get widgets.apps.example.com --all-namespaces --v=6 2>&1 || true)"
 
-if echo "$output" | grep -q 'Response Status: 200 OK'; then
+if grep -q 'Response Status: 200 OK' <<<"$output"; then
   echo "ASSERT OK: cluster-wide list returned 200 OK"
   exit 0
 else

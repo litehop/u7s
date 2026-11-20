@@ -96,7 +96,7 @@ spec:
 EOF
 kubectl --kubeconfig "$KCFG" -n default rollout status deployment/ug-dep --timeout=300s >> "$OUT/run.log" 2>&1 || abort "ug-dep never rolled out"
 kubectl --kubeconfig "$KCFG" -n default rollout status daemonset/ug-ds --timeout=300s >> "$OUT/run.log" 2>&1 || abort "ug-ds never rolled out"
-marker_read | grep -q "cm=$MARKER pod=$MARKER" || abort "marker not readable before the upgrade"
+grep -q "cm=$MARKER pod=$MARKER" < <(marker_read) || abort "marker not readable before the upgrade"
 
 VER_PRE="$(server_version)"
 state_hashes > "$OUT/hashes-pre.txt"

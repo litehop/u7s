@@ -103,7 +103,7 @@ is_restricted_symbol_candidate() {
   # CamelCase/mixedCase: a lowercase letter immediately followed by an
   # uppercase one, e.g. `NetworkPolicyPort`. Plain grep -E (not a GNU-only
   # extension) since macOS ships BSD grep as /bin/grep.
-  printf '%s' "$s" | grep -qE '[a-z][A-Z]'
+  grep -qE '[a-z][A-Z]' <<<"$s"
 }
 
 # Bare-symbol candidates passing is_restricted_symbol_candidate, in order

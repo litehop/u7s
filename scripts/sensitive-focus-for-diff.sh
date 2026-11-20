@@ -69,7 +69,7 @@ while IFS=$'\t' read -r pattern focus specs; do
   # A registry `file:` is a path (or path substring) matched against the
   # changed-file list (grep -F substring match).
   grep -Fq -- "$pattern" "$CHANGED" || continue
-  if ! printf '%s' "$specs" | grep -qE '^[0-9]+$'; then
+  if ! grep -qE '^[0-9]+$' <<<"$specs"; then
     echo "sensitive-focus-for-diff: registry entry for '$pattern' has no valid 'specs:' count (got '$specs')" >&2
     exit 1
   fi

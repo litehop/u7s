@@ -202,7 +202,7 @@ resolve_konnectivity_pid() {
 # scheduler/konnectivity-server all run as the operator's own user here.
 footprint_kb() {
   local pid="$1" line val unit
-  line="$(footprint -p "$pid" 2>/dev/null | grep -m1 '^[[:space:]]*phys_footprint:')" || return 1
+  line="$(footprint -p "$pid" 2>/dev/null | awk '/^[[:space:]]*phys_footprint:/ && !seen {print; seen=1}')" || return 1
   [ -z "$line" ] && return 1
   val="$(echo "$line" | awk '{print $2}')"
   unit="$(echo "$line" | awk '{print $3}')"

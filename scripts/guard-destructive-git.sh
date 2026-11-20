@@ -113,7 +113,7 @@ is_destructive_git_args() {
   esac
   case "$first" in
     reset)
-      printf '%s' "$args" | grep -qE '(^|[[:space:]])--hard([[:space:]]|$)'
+      grep -qE '(^|[[:space:]])--hard([[:space:]]|$)' <<<"$args"
       ;;
     checkout)
       # `checkout -- <path>` / `checkout <ref> -- <path>` and bare
@@ -144,8 +144,8 @@ is_destructive_git_args() {
       return 1
       ;;
     restore)
-      if printf '%s' "$args" | grep -qE '(^|[[:space:]])--staged([[:space:]]|$)'; then
-        printf '%s' "$args" | grep -qE '(^|[[:space:]])--worktree([[:space:]]|$)'
+      if grep -qE '(^|[[:space:]])--staged([[:space:]]|$)' <<<"$args"; then
+        grep -qE '(^|[[:space:]])--worktree([[:space:]]|$)' <<<"$args"
       else
         return 0
       fi
@@ -164,10 +164,10 @@ is_destructive_git_args() {
       esac
       ;;
     clean)
-      printf '%s' "$args" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|(^|[[:space:]])--force([[:space:]]|$)'
+      grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|(^|[[:space:]])--force([[:space:]]|$)' <<<"$args"
       ;;
     switch)
-      printf '%s' "$args" | grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|(^|[[:space:]])--discard-changes([[:space:]]|$)'
+      grep -qE -- '(^|[[:space:]])-[a-zA-Z]*f[a-zA-Z]*([[:space:]]|$)|(^|[[:space:]])--discard-changes([[:space:]]|$)' <<<"$args"
       ;;
     *)
       return 1
@@ -197,7 +197,7 @@ is_head_moving_args() {
   case "$first" in
     reset|rebase|cherry-pick|revert|am) return 0 ;;
     merge|pull)
-      printf '%s' "$args" | grep -qE '(^|[[:space:]])--ff-only([[:space:]]|$)' && return 1
+      grep -qE '(^|[[:space:]])--ff-only([[:space:]]|$)' <<<"$args" && return 1
       return 0
       ;;
     checkout|switch)

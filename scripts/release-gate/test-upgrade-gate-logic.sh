@@ -129,7 +129,7 @@ assert "all checks passing is PASS (exit 0)" "$(yes_if ug_run_status "$good")"
 bad="$TMP/bad.env"; sed 's/^ca=1/ca=0/' "$good" > "$bad"
 rc=0; ug_run_status "$bad" || rc=$?
 assert "a lost CA fails the run (exit 1): every node identity would be invalid" "$(yes_if [ "$rc" = 1 ])"
-assert "the verdict table names the failed check" "$(yes_if grep -q '^FAIL  CA' <(ug_verdict "$bad"))"
+assert "the verdict table names the failed check" "$(yes_if grep -q '^FAIL  CA' <<<"$(ug_verdict "$bad")")"
 short="$TMP/short.env"; grep -v '^downtime=' "$good" > "$short"
 rc=0; ug_run_status "$short" || rc=$?
 assert "a check that never ran is a FAIL, not a silent pass" "$(yes_if [ "$rc" = 1 ])"
@@ -146,7 +146,7 @@ assert "an out-of-bound outage fails the run" "$(yes_if [ "$rc" = 1 ])"
 nrbad="$TMP/nr.env"; sed 's/^node_ready=1/node_ready=0/' "$good" > "$nrbad"
 rc=0; ug_run_status "$nrbad" || rc=$?
 assert "a node that never returns Ready fails the run" "$(yes_if [ "$rc" = 1 ])"
-assert "the verdict table names the node check" "$(yes_if grep -q '^FAIL  node Ready' <(ug_verdict "$nrbad"))"
+assert "the verdict table names the node check" "$(yes_if grep -q '^FAIL  node Ready' <<<"$(ug_verdict "$nrbad")")"
 
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]

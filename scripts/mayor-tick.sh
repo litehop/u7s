@@ -796,7 +796,7 @@ close_merged_pr_beads() {
     if [ -z "$notes" ]; then
       echo "mayor-tick: bead $id not closed: no 'PR #$num opened' note"; hold_cursor "$merged_at"; continue
     fi
-    if printf '%s' "$notes" | grep -q '(partial'; then
+    if grep -q '(partial' <<<"$notes"; then
       echo "mayor-tick: bead $id not closed: marked partial by PR #$num"; continue
     fi
     if run_cmd bd close "$id" --reason "merged in #$num ($sha)" >/dev/null 2>&1; then

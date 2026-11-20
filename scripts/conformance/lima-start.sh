@@ -1056,7 +1056,7 @@ echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:${PORT}"
 echo "Waiting for ${VM_NAME} to register (up to 60s)..."
 FOUND=0
 for i in $(seq 1 60); do
-  if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o name 2>/dev/null | grep -Fxq "node/${VM_NAME}"; then
+  if grep -Fxq "node/${VM_NAME}" < <(kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes -o name 2>/dev/null); then
     FOUND=1
     break
   fi

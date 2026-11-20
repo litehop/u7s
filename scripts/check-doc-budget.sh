@@ -64,7 +64,7 @@ while IFS= read -r f; do
   if [ -f "$f" ]; then
     new=$(count_words < "$f")
     # Exempt incident writeups; they are dated records, not maintained docs.
-    if head -20 "$f" | grep -qE '^kind: postmortem[[:space:]]*$'; then
+    if grep -qE '^kind: postmortem[[:space:]]*$' < <(head -20 "$f"); then
       continue
     fi
   else
