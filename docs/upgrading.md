@@ -7,7 +7,7 @@ workers.
 ## Supported paths
 
 u7s is pre-production. The only supported upgrade is from release N-1 to
-release N (operator decision 2026-11-18).
+release N.
 
 - To skip releases, step through each one in order.
 - Downgrades are unsupported. The API server refuses to start on a store
@@ -15,16 +15,16 @@ release N (operator decision 2026-11-18).
   format is SQLite's `PRAGMA user_version` (today 1), independent of the
   release version.
 - u7s sends no update notification. Watch
-  [GitHub Releases](https://github.com/litehop/u7s/releases) and read
-  `CHANGELOG.md` before each step.
+  [GitHub Releases](https://github.com/litehop/u7s/releases).
 
 ## Before you upgrade
 
 1. Print the installed release (see
    [Pinning a release tag](install.md#pinning-a-release-tag)). It must be
    the release just before your target.
-2. Back up the control plane (see [Back up and restore](#back-up-and-restore)).
-3. Expect a short API outage on the control plane.
+2. Read the target release's `CHANGELOG.md`.
+3. Back up the control plane (see [Back up and restore](#back-up-and-restore)).
+4. Expect a short API outage.
 
 ## Upgrade a control plane
 
@@ -32,7 +32,9 @@ Download the target release's `install.sh` and re-run it with no flags. Set
 `TAG` to the target release tag:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
+TAG=vX.Y.Z  # replace with the target release tag
+[ "$TAG" != vX.Y.Z ] &&
+curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh" &&
 sudo bash install.sh
 ```
 
@@ -41,11 +43,15 @@ when `ca.key` or `kubeconfig` exists under `/var/lib/u7s`. It replaces the
 binaries and unit files, then restarts the API server, controller manager,
 and kubelet. The CA, the cluster state, and the pods keep their identity. The
 script fails if the CA changed; recover as in
-[Back up and restore](#back-up-and-restore). A changed `sa.key` is expected.
+[Back up and restore](#back-up-and-restore). A changed `sa.key` is expected:
+the API server rotates it on its own schedule and keeps the previous key
+verifying until its tokens expire.
 
 The script reads `/var/lib/u7s/config`, so `--iface` and `--node-name` need
-no repeat, and a different value is refused. A re-run keeps a single-stack
-cluster single-stack.
+no repeat, and a different value is refused. The one exception is a
+single-stack cluster gaining exactly one range of the other IP family in
+`--cluster-cidr` or `--service-cidr`; every other range change is refused. A
+re-run keeps a single-stack cluster single-stack.
 
 ## Upgrade a worker
 
@@ -61,7 +67,7 @@ A worker offline past its client certificate lifetime fails with an error that
 tells you what to clear (`systemctl stop kubelet; rm -rf /var/lib/u7s`). Re-join
 it with a token from `install.sh --mint-join-token`; see
 [Add a worker](install.md#add-a-worker). A joiner cannot claim the
-control-plane node's name (the API server answers 403).
+control-plane node's name (403).
 
 ## Expected outage
 
@@ -90,20 +96,26 @@ v0.4.6 after an upgrade to v0.4.7.
    sudo systemctl start u7s-apiserver u7s-kcm kubelet
    ```
 
-   Never copy a running store: 8 of 12 live copies changed mid-copy.
+   Never copy a running store: 8 of 12 live copies changed mid-copy. Move the
+   archive off the node (it holds the CA private key) and keep it until the
+   upgrade is confirmed good.
 
 2. Upgrade.
 
-3. To restore, replace the state directory, then re-run the previous
-   release's `install.sh` with no flags, as in
-   [Upgrade a control plane](#upgrade-a-control-plane). It restores the
-   binaries and prints `Control-plane identity preserved` (tested with a
-   local `--tarball` install, not the mirror URL):
+3. To restore, copy the archive back to the node's working directory, replace
+   the state directory, then re-run the previous release's `install.sh` with
+   no flags (tag: [how](install.md#pinning-a-release-tag)). It prints
+   `Control-plane identity preserved`. The live test used a local
+   `--tarball` install, not this download:
 
    ```bash
-   sudo systemctl stop kubelet u7s-kcm u7s-apiserver
-   sudo rm -rf /var/lib/u7s
-   sudo tar -C /var/lib -xzpf u7s-state-backup.tar.gz
+   TAG=vX.Y.Z  # replace with the previous release tag
+   [ "$TAG" != vX.Y.Z ] &&
+   curl --proto '=https' --tlsv1.2 -fsSL -o "install-${TAG}.sh" "https://u7s.dekiru.tech/${TAG}/install.sh" &&
+   sudo systemctl stop kubelet u7s-kcm u7s-apiserver &&
+   sudo rm -rf /var/lib/u7s &&
+   sudo tar -C /var/lib -xzpf u7s-state-backup.tar.gz &&
+   sudo bash "install-${TAG}.sh"
    ```
 
 4. Check that `sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get --raw /readyz`
@@ -124,8 +136,7 @@ upgrade. Releases before v0.4.4-snapshot.1 refuse it and need a reinstall.
 Existing Nodes keep their single-stack `spec.podCIDRs`, because upstream does
 not let a Node gain a pod range in place; re-create each Node. Existing
 Services keep their single ClusterIP; new ones can request
-`ipFamilyPolicy: PreferDualStack` or `RequireDualStack`. Any range change
-other than adding one range of the other family is refused.
+`ipFamilyPolicy: PreferDualStack` or `RequireDualStack`.
 
 1. Give each node an address of each family (see
    [Dual-stack install](install.md#dual-stack-install)).
@@ -137,16 +148,13 @@ other than adding one range of the other family is refused.
    ```
 
 3. On the control plane, re-run `install.sh` of the same release with each
-   existing range followed by a range of the other family. This example
-   upgrades a default install:
+   existing range followed by a range of the other family. Example:
 
    ```bash
    sudo bash install.sh \
      --service-cidr 10.96.0.0/12,fd00:96::/108 \
      --cluster-cidr 10.244.0.0/16,fd00:244::/56
    ```
-
-   The script prints `upgraded to dual-stack` and the commands in steps 4-6.
 
 4. For each Node, drain it, delete the Node object, and restart kubelet on
    that node so it re-registers. Pass `--force` to `drain` if bare pods run
