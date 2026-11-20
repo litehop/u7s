@@ -418,6 +418,17 @@ pub async fn put_resource_status<S: Store>(
     Ok(Json(current.body))
 }
 
+/// Bound on re-reads when a status PATCH loses a write race; mirrors the main-resource
+/// PATCH retry loop.
+const MAX_STATUS_PATCH_CONFLICT_RETRIES: u32 = 5;
+
+/// `Conflict`: the object changed between the read and the write, and the client did not pin
+/// a resourceVersion, so the patch is re-applied to the fresh object.
+pub(crate) enum StatusPatchOutcome<T> {
+    Done(T),
+    Conflict,
+}
+
 pub async fn patch_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
@@ -425,18 +436,44 @@ pub async fn patch_resource_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_path_segment("name", &name)?;
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let patch_type = detect_patch_type(&headers)?;
-    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    for _ in 0..MAX_STATUS_PATCH_CONFLICT_RETRIES {
+        if let StatusPatchOutcome::Done(resp) = patch_resource_status_attempt(
+            &state, &group, &version, &plural, &name, &user, &headers, &body,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
+    }
+    Err(Status::conflict(format!(
+        "Operation cannot be fulfilled on {plural} \"{name}\": the object has been modified; \
+         please apply your changes to the latest version and try again"
+    )))
+}
 
-    let key = group_object_key(&group, &plural, None, &name);
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn patch_resource_status_attempt<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+    plural: &str,
+    name: &str,
+    user: &UserInfo,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<StatusPatchOutcome<Json<serde_json::Value>>, crate::status::StatusError> {
+    validate_path_segment("name", name)?;
+    let meta = lookup(state, group, version, plural)?.clone();
+    let patch_type = detect_patch_type(headers)?;
+    let is_ssa = content_type(headers).contains("apply-patch+yaml");
+
+    let key = group_object_key(group, plural, None, name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&group, &plural, &name))?;
+        .ok_or_else(|| Status::not_found(group, plural, name))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -447,25 +484,25 @@ pub async fn patch_resource_status<S: Store>(
     } else {
         None
     };
-    let svm_before = is_storage_version_migration(&group, &plural).then(|| current.body.clone());
-    let csr_before = super::csr::is_csr(&group, &plural).then(|| current.body.clone());
+    let svm_before = is_storage_version_migration(group, plural).then(|| current.body.clone());
+    let csr_before = super::csr::is_csr(group, plural).then(|| current.body.clone());
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side status);
     // every other patch type here is JSON.
     let patch: serde_json::Value = if is_ssa {
-        ssa_body_to_json(&body)?
+        ssa_body_to_json(body)?
     } else {
-        serde_json::from_slice(&body)
+        serde_json::from_slice(body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
-    reject_patch_identity_mismatch(&patch, &name, None)?;
+    reject_patch_identity_mismatch(&patch, name, None)?;
     let ssa_plan = plan_status_apply(
-        &headers,
+        headers,
         is_ssa,
         &current.body,
         &patch,
-        &group,
-        &version,
+        group,
+        version,
         Some(meta.kind.as_str()),
     )?;
 
@@ -512,7 +549,7 @@ pub async fn patch_resource_status<S: Store>(
     // this call site) falls through to `reject_non_object_status` UNCHANGED.
     if !current.body["status"].is_null() {
         let api_version = if group.is_empty() {
-            version.clone()
+            version.to_string()
         } else {
             format!("{group}/{version}")
         };
@@ -532,14 +569,14 @@ pub async fn patch_resource_status<S: Store>(
         crate::node_authz::restrict_node_self_write(
             &user.username,
             &user.groups,
-            &name,
+            name,
             Some(old_node),
             &current.body,
         )
         .map_err(Status::forbidden)?;
     }
     if let Some(ref old) = csr_before {
-        super::csr::guard_csr_status_write(&state, &user, old, &mut current.body)?;
+        super::csr::guard_csr_status_write(state, user, old, &mut current.body)?;
     }
     if let Some(ref old) = svm_before {
         super::storagemigration::validate_status_update(old, &current.body)
@@ -547,15 +584,15 @@ pub async fn patch_resource_status<S: Store>(
     }
 
     current.body = admit_status_write(
-        &state,
+        state,
         &AdmissionTarget {
-            group: &group,
-            version: &version,
+            group,
+            version,
             resource: &format!("{plural}/status"),
-            name: &name,
+            name,
             namespace: None,
-            user: Some(&user),
-            dry_run: is_dry_run_header(&headers),
+            user: Some(user),
+            dry_run: is_dry_run_header(headers),
         },
         &before_write,
         current.body,
@@ -566,28 +603,40 @@ pub async fn patch_resource_status<S: Store>(
     // Dry-run: same convergence point as reject_non_object_status above — return the
     // would-be patched status object without persisting.
     record_status_write(
-        &headers,
+        headers,
         ssa_plan.as_ref(),
         &before_write,
         &mut current.body,
-        &group,
-        &version,
+        group,
+        version,
     );
-    if is_dry_run_header(&headers) {
-        inject_type_meta(&mut current.body, &group, &version, &meta.kind);
-        return Ok(Json(current.body));
+    if is_dry_run_header(headers) {
+        inject_type_meta(&mut current.body, group, version, &meta.kind);
+        return Ok(StatusPatchOutcome::Done(Json(current.body)));
     }
 
-    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let new_rv = state
+    // An unpinned patch is still a read-modify-write: without a CAS on the revision it read,
+    // a concurrent delete is undone by this write recreating the object.
+    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let new_rv = match state
         .store
-        .put(&key, current.to_bytes(), expected_rv)
+        .put(
+            &key,
+            current.to_bytes(),
+            client_rv.or(Some(stored.revision)),
+        )
         .await
-        .map_err(|e| store_err(e, &group, &plural, &name, &meta.kind))?;
+    {
+        Ok(rv) => rv,
+        Err(u7s_store::StoreError::RevisionMismatch { .. }) if client_rv.is_none() => {
+            return Ok(StatusPatchOutcome::Conflict)
+        }
+        Err(e) => return Err(store_err(e, group, plural, name, &meta.kind)),
+    };
 
     current.set_resource_version(new_rv);
-    inject_type_meta(&mut current.body, &group, &version, &meta.kind);
-    Ok(Json(current.body))
+    inject_type_meta(&mut current.body, group, version, &meta.kind);
+    Ok(StatusPatchOutcome::Done(Json(current.body)))
 }
 
 /// Typed view of just the `kind` field, used by the CR-fallback /status handlers
@@ -821,12 +870,41 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 
 pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
     State(state): State<AppState<S>>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Path(path): Path<(String, String, String, String, String)>,
     user: Option<&UserInfo>,
     headers: HeaderMap,
     body: Bytes,
     guard: Option<&StatusWriteGuard<'_>>,
 ) -> Result<Response, crate::status::StatusError> {
+    for _ in 0..MAX_STATUS_PATCH_CONFLICT_RETRIES {
+        if let StatusPatchOutcome::Done(resp) = patch_namespaced_resource_status_attempt(
+            State(state.clone()),
+            Path(path.clone()),
+            user,
+            headers.clone(),
+            body.clone(),
+            guard,
+        )
+        .await?
+        {
+            return Ok(resp);
+        }
+    }
+    let (_, _, ns, plural, name) = path;
+    Err(Status::conflict(format!(
+        "Operation cannot be fulfilled on {plural} \"{ns}/{name}\": the object has been \
+         modified; please apply your changes to the latest version and try again"
+    )))
+}
+
+pub(crate) async fn patch_namespaced_resource_status_attempt<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    user: Option<&UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+    guard: Option<&StatusWriteGuard<'_>>,
+) -> Result<StatusPatchOutcome<Response>, crate::status::StatusError> {
     validate_path_segment("namespace", &ns)?;
     validate_path_segment("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
@@ -987,20 +1065,31 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
     );
     if is_dry_run_header(&headers) {
         inject_type_meta(&mut current.body, &group, &version, &kind);
-        return Ok(Json(current.body).into_response());
+        return Ok(StatusPatchOutcome::Done(Json(current.body).into_response()));
     }
 
-    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    // See patch_resource_status_attempt: the write must be pinned to the revision read.
+    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let storage_obj = to_storage_object(&state, cr_ctx.as_ref(), &group, &current).await?;
-    let new_rv = state
+    let new_rv = match state
         .store
-        .put(&key, storage_obj.to_bytes(), expected_rv)
+        .put(
+            &key,
+            storage_obj.to_bytes(),
+            client_rv.or(Some(stored.revision)),
+        )
         .await
-        .map_err(|e| store_err(e, &group, &plural, &name, &kind))?;
+    {
+        Ok(rv) => rv,
+        Err(u7s_store::StoreError::RevisionMismatch { .. }) if client_rv.is_none() => {
+            return Ok(StatusPatchOutcome::Conflict)
+        }
+        Err(e) => return Err(store_err(e, &group, &plural, &name, &kind)),
+    };
 
     current.set_resource_version(new_rv);
     inject_type_meta(&mut current.body, &group, &version, &kind);
-    Ok(Json(current.body).into_response())
+    Ok(StatusPatchOutcome::Done(Json(current.body).into_response()))
 }
 
 /// A resource's `status` is always a message/object type in the Kubernetes API — never a
@@ -4550,6 +4639,7 @@ mod tests {
     struct MockStore {
         inner: Arc<SqliteStore>,
         inject_next: std::sync::atomic::AtomicBool,
+        delete_before_next_put: std::sync::Mutex<Option<String>>,
     }
 
     impl MockStore {
@@ -4557,7 +4647,13 @@ mod tests {
             Self {
                 inner: Arc::new(SqliteStore::new(":memory:").unwrap()),
                 inject_next: std::sync::atomic::AtomicBool::new(false),
+                delete_before_next_put: std::sync::Mutex::new(None),
             }
+        }
+
+        /// Deletes `key` right before the next put, i.e. after the handler's read.
+        fn arm_delete_before_put(&self, key: &str) {
+            *self.delete_before_next_put.lock().unwrap() = Some(key.to_string());
         }
 
         fn arm(&self) {
@@ -4597,9 +4693,13 @@ mod tests {
             let inject = self
                 .inject_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let delete_first = self.delete_before_next_put.lock().unwrap().take();
             let inner = self.inner.clone();
             let key: String = key.into();
             async move {
+                if let Some(k) = delete_first {
+                    inner.delete(&k, None).await.unwrap();
+                }
                 if inject {
                     Err(u7s_store::StoreError::RevisionMismatch {
                         expected: 1,
@@ -4735,6 +4835,114 @@ mod tests {
             err.0,
             axum::http::StatusCode::CONFLICT,
             "RevisionMismatch must produce 409 Conflict so controllers can retry"
+        );
+    }
+
+    /// A controller's status apply that read the object just before a client deleted it must
+    /// not write it back: the resurrected object has no deletionTimestamp, so the client's
+    /// delete appears to have been ignored (a DeviceTaintRule whose delete "never completes"
+    /// while the eviction controller applies its status).
+    #[tokio::test]
+    async fn status_patch_racing_a_delete_does_not_resurrect_cluster_scoped_object() {
+        let mock = Arc::new(MockStore::new());
+        let key = "/registry/storage.k8s.io/csinodes/node-race";
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "node-race" },
+            "spec": { "drivers": [] }
+        });
+        mock.inner
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            Arc::clone(&mock),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        mock.arm_delete_before_put(key);
+
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "node-race".into(),
+            )),
+            axum::Extension(test_user()),
+            merge_patch_headers(),
+            bytes::Bytes::from(r#"{"status":{"ready":true}}"#),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("patching a deleted object must fail, not succeed"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            mock.inner.get(key).await.unwrap().is_none(),
+            "a status patch must not recreate an object deleted after it was read"
+        );
+    }
+
+    /// Namespaced sibling of the cluster-scoped resurrection test above.
+    #[tokio::test]
+    async fn status_patch_racing_a_delete_does_not_resurrect_namespaced_object() {
+        let mock = Arc::new(MockStore::new());
+        let key = "/registry/apps/deployments/default/race";
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "race", "namespace": "default" },
+            "spec": { "replicas": 1, "selector": {"matchLabels": {"app": "race"}}, "template": {} }
+        });
+        mock.inner
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            Arc::clone(&mock),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        mock.arm_delete_before_put(key);
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "race".into(),
+            )),
+            Some(axum::Extension(test_user())),
+            merge_patch_headers(),
+            bytes::Bytes::from(r#"{"status":{"readyReplicas":1}}"#),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("patching a deleted object must fail, not succeed"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            mock.inner.get(key).await.unwrap().is_none(),
+            "a status patch must not recreate an object deleted after it was read"
         );
     }
 
