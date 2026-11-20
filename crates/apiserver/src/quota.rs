@@ -27,7 +27,10 @@
 use serde_json::Value;
 use u7s_store::{ListOptions, Store};
 
-use crate::{keys::group_list_prefix, state::AppState, status::Status, status::StatusError};
+use crate::{
+    guaranteed_update::GuaranteedUpdate, keys::group_list_prefix, state::AppState, status::Status,
+    status::StatusError,
+};
 
 // ---------------------------------------------------------------------------
 // Supported quota resource names → (group, plural) pairs
@@ -878,40 +881,55 @@ pub async fn update_quota_status<S: Store>(state: &AppState<S>, namespace: &str)
 
         let key = crate::keys::group_object_key("", "resourcequotas", Some(namespace), &quota_name);
 
-        let stored = match state.store.get(&key).await {
-            Ok(Some(s)) => s,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!("quota status: failed to fetch {quota_name}: {e}");
-                continue;
+        // The quota may be edited or deleted while its usage is being counted; the status is
+        // written onto the quota as it is at write time.
+        let mut gu = GuaranteedUpdate::new(
+            state.store.clone(),
+            &key,
+            None,
+            ("", "resourcequotas", &quota_name, "ResourceQuota"),
+        );
+        loop {
+            let stored = match gu.read().await {
+                Ok(Some(s)) => s,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("quota status: failed to fetch {quota_name}: {e:?}");
+                    break;
+                }
+            };
+
+            let mut obj: Value = match serde_json::from_slice(&stored.value) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
+                    break;
+                }
+            };
+
+            // status.hard mirrors spec.hard.
+            let hard = obj["spec"]["hard"].clone();
+
+            let used_map: serde_json::Map<String, Value> = used
+                .iter()
+                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                .collect();
+
+            obj["status"] = serde_json::json!({
+                "hard": hard,
+                "used": Value::Object(used_map),
+            });
+
+            let bytes =
+                bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
+            match gu.commit(bytes).await {
+                Ok(None) => continue,
+                Ok(Some(_)) => break,
+                Err(e) => {
+                    tracing::warn!("quota status: failed to write status for {quota_name}: {e:?}");
+                    break;
+                }
             }
-        };
-
-        let mut obj: Value = match serde_json::from_slice(&stored.value) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
-                continue;
-            }
-        };
-
-        // status.hard mirrors spec.hard.
-        let hard = obj["spec"]["hard"].clone();
-
-        let used_map: serde_json::Map<String, Value> = used
-            .into_iter()
-            .map(|(k, v)| (k, Value::String(v)))
-            .collect();
-
-        obj["status"] = serde_json::json!({
-            "hard": hard,
-            "used": Value::Object(used_map),
-        });
-
-        let bytes =
-            bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
-        if let Err(e) = state.store.put(&key, bytes, None).await {
-            tracing::warn!("quota status: failed to write status for {quota_name}: {e}");
         }
     }
 }
@@ -928,41 +946,57 @@ async fn write_quota_used_updates<S: Store>(
     updates: Vec<(String, String)>,
 ) {
     let key = crate::keys::group_object_key("", "resourcequotas", Some(namespace), quota_name);
-    let stored = match state.store.get(&key).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return, // quota deleted concurrently with this pod mutation
-        Err(e) => {
-            tracing::warn!(
-                "quota status: failed to fetch {quota_name} for incremental update: {e}"
-            );
-            return;
-        }
-    };
-    let mut obj: Value = match serde_json::from_slice(&stored.value) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
-            return;
-        }
-    };
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        None,
+        ("", "resourcequotas", quota_name, "ResourceQuota"),
+    );
+    loop {
+        let stored = match gu.read().await {
+            Ok(Some(s)) => s,
+            Ok(None) => return, // quota deleted concurrently with this pod mutation
+            Err(e) => {
+                tracing::warn!(
+                    "quota status: failed to fetch {quota_name} for incremental update: {e:?}"
+                );
+                return;
+            }
+        };
+        let mut obj: Value = match serde_json::from_slice(&stored.value) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
+                return;
+            }
+        };
 
-    // Auto-vivify status/status.used defensively rather than relying on serde_json's Index
-    // cascading through Null: a quota created before status was ever written could have
-    // "status" absent entirely.
-    if !obj["status"].is_object() {
-        obj["status"] = serde_json::json!({});
-    }
-    if !obj["status"]["used"].is_object() {
-        obj["status"]["used"] = serde_json::json!({});
-    }
-    for (resource_name, value) in updates {
-        obj["status"]["used"][resource_name] = Value::String(value);
-    }
-    obj["status"]["hard"] = obj["spec"]["hard"].clone();
+        // Auto-vivify status/status.used defensively rather than relying on serde_json's Index
+        // cascading through Null: a quota created before status was ever written could have
+        // "status" absent entirely.
+        if !obj["status"].is_object() {
+            obj["status"] = serde_json::json!({});
+        }
+        if !obj["status"]["used"].is_object() {
+            obj["status"]["used"] = serde_json::json!({});
+        }
+        for (resource_name, value) in &updates {
+            obj["status"]["used"][resource_name] = Value::String(value.clone());
+        }
+        obj["status"]["hard"] = obj["spec"]["hard"].clone();
 
-    let bytes = bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
-    if let Err(e) = state.store.put(&key, bytes, None).await {
-        tracing::warn!("quota status: failed to write incremental status for {quota_name}: {e}");
+        let bytes =
+            bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
+        match gu.commit(bytes).await {
+            Ok(None) => continue,
+            Ok(Some(_)) => return,
+            Err(e) => {
+                tracing::warn!(
+                    "quota status: failed to write incremental status for {quota_name}: {e:?}"
+                );
+                return;
+            }
+        }
     }
 }
 

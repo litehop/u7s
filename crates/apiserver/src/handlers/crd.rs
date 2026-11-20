@@ -17,6 +17,7 @@ use crate::{
         run_mutating_webhooks, run_validating_webhooks, AdmissionContext, AdmissionTarget,
     },
     auth::UserInfo,
+    guaranteed_update::GuaranteedUpdate,
     state::AppState,
     status::Status,
     types::{DeleteOptions, Object},
@@ -1663,78 +1664,6 @@ pub async fn patch_crd<S: Store>(
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = store_key(&name);
-    let stored_opt = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    // SSA create-on-missing: `kubectl apply --server-side -f my-crd.yaml` against a CRD name
-    // that doesn't exist yet sends exactly this PATCH (Content-Type: application/apply-patch+yaml)
-    // and relies on the apiserver to create it — this is core SSA semantics, not an edge case
-    // (see do_patch's identical `is_ssa && stored_opt.is_none()` branch for the generic resource
-    // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
-    // matching upstream: those patch types have no create-on-missing semantics.
-    if is_ssa && stored_opt.is_none() {
-        super::resource::authorize_create_on_write(
-            &state.rbac_index,
-            &state.node_graph,
-            &user,
-            "apiextensions.k8s.io",
-            "customresourcedefinitions",
-            None,
-            &name,
-        )?;
-        let mut body_json = ssa_body_to_json(&body)?;
-        crate::handlers::json_patch::strip_managed_fields(&mut body_json);
-        // The URL name is authoritative for what gets created, regardless of what (if anything)
-        // the apply body's metadata.name says — mirrors do_patch's obj_meta.name override.
-        body_json["metadata"]["name"] = serde_json::Value::String(name.clone());
-        let crd: CustomResourceDefinition = serde_json::from_value(body_json).map_err(|e| {
-            Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
-        })?;
-        let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
-
-        // Dry-run: validation and admission passed; return the would-be created CRD without
-        // persisting — mirrors create_crd's dry-run early-return.
-        if is_dry_run_header(&headers) {
-            return Ok((StatusCode::CREATED, Json(crd)).into_response());
-        }
-
-        let rv = state
-            .store
-            .put(&key, to_bytes(&crd)?, Some(0))
-            .await
-            .map_err(|e| store_err_crd(e, &name))?;
-
-        state.cr_context_cache.invalidate_absent();
-        let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
-        let _ = state.store.delete(&tombstone_key, None).await;
-        crate::handlers::discovery::refresh_discovery_cache(&state).await;
-
-        crd.metadata.resource_version = rv.to_string();
-        return Ok((StatusCode::CREATED, Json(crd)).into_response());
-    }
-
-    let stored = stored_opt.ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
-
-    let mut current: serde_json::Value =
-        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-    // Captured before the patch mutates `current` in place, so this reflects the CRD
-    // generation the pre-patch cr_schema_cache entries were cached under.
-    let (old_group, old_versions, old_plural, old_rv) = crd_cache_identity(&current);
-    // Snapshot the pre-patch value for reject_structural_field_change below — `current` is
-    // mutated in place by the patch application, so the stored spec.group/scope/names.* would
-    // otherwise be lost by the time we can compare against them.
-    let existing = current.clone();
-
-    // Snapshot .status before applying the patch: the CRD's own status
-    // (Established/NamesAccepted/StoredVersions conditions) is a dedicated subresource
-    // (.../status) — a main-endpoint patch must never change it, including via JSON Patch,
-    // whose array shape slips past an object-key "status" strip. Restored below before
-    // `current` is deserialized into `CustomResourceDefinition`, whose status field is a
-    // bare `Option<serde_json::Value>` (not a typed shape that would reject a scalar).
-    let stored_status = existing["status"].clone();
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -1747,96 +1676,172 @@ pub async fn patch_crd<S: Store>(
     if is_ssa {
         crate::handlers::json_patch::strip_managed_fields(&mut patch);
     }
+    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        client_rv,
+        (GROUP, PLURAL, &name, KIND),
+    );
+    let (mut crd, rv, old_group, old_versions, old_plural, old_rv) = loop {
+        let stored_opt = gu.read().await?;
 
-    match patch_type {
-        PatchType::Merge | PatchType::StrategicMerge => {
-            crate::patch::merge_patch(&mut current, &patch);
+        // SSA create-on-missing: `kubectl apply --server-side -f my-crd.yaml` against a CRD name
+        // that doesn't exist yet sends exactly this PATCH (Content-Type: application/apply-patch+yaml)
+        // and relies on the apiserver to create it — this is core SSA semantics, not an edge case
+        // (see do_patch's identical `is_ssa && stored_opt.is_none()` branch for the generic resource
+        // path). A non-SSA patch type (merge/strategic-merge/JSON Patch) on a missing CRD still 404s,
+        // matching upstream: those patch types have no create-on-missing semantics.
+        if is_ssa && stored_opt.is_none() {
+            super::resource::authorize_create_on_write(
+                &state.rbac_index,
+                &state.node_graph,
+                &user,
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                None,
+                &name,
+            )?;
+            let mut body_json = ssa_body_to_json(&body)?;
+            crate::handlers::json_patch::strip_managed_fields(&mut body_json);
+            // The URL name is authoritative for what gets created, regardless of what (if anything)
+            // the apply body's metadata.name says — mirrors do_patch's obj_meta.name override.
+            body_json["metadata"]["name"] = serde_json::Value::String(name.clone());
+            let crd: CustomResourceDefinition = serde_json::from_value(body_json).map_err(|e| {
+                Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
+            })?;
+            let mut crd = build_new_crd(&state, &user, &name, crd, &headers).await?;
+
+            // Dry-run: validation and admission passed; return the would-be created CRD without
+            // persisting — mirrors create_crd's dry-run early-return.
+            if is_dry_run_header(&headers) {
+                return Ok((StatusCode::CREATED, Json(crd)).into_response());
+            }
+
+            let rv = state
+                .store
+                .put(&key, to_bytes(&crd)?, Some(0))
+                .await
+                .map_err(|e| store_err_crd(e, &name))?;
+
+            state.cr_context_cache.invalidate_absent();
+            let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
+            let _ = state.store.delete(&tombstone_key, None).await;
+            crate::handlers::discovery::refresh_discovery_cache(&state).await;
+
+            crd.metadata.resource_version = rv.to_string();
+            return Ok((StatusCode::CREATED, Json(crd)).into_response());
         }
-        PatchType::Json => {
-            apply_json_patch(&mut current, &patch)?;
+
+        let stored = stored_opt.ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
+
+        let mut current: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        // Captured before the patch mutates `current` in place, so this reflects the CRD
+        // generation the pre-patch cr_schema_cache entries were cached under.
+        let (old_group, old_versions, old_plural, old_rv) = crd_cache_identity(&current);
+        // Snapshot the pre-patch value for reject_structural_field_change below — `current` is
+        // mutated in place by the patch application, so the stored spec.group/scope/names.* would
+        // otherwise be lost by the time we can compare against them.
+        let existing = current.clone();
+
+        // Snapshot .status before applying the patch: the CRD's own status
+        // (Established/NamesAccepted/StoredVersions conditions) is a dedicated subresource
+        // (.../status) — a main-endpoint patch must never change it, including via JSON Patch,
+        // whose array shape slips past an object-key "status" strip. Restored below before
+        // `current` is deserialized into `CustomResourceDefinition`, whose status field is a
+        // bare `Option<serde_json::Value>` (not a typed shape that would reject a scalar).
+        let stored_status = existing["status"].clone();
+
+        match patch_type {
+            PatchType::Merge | PatchType::StrategicMerge => {
+                crate::patch::merge_patch(&mut current, &patch);
+            }
+            PatchType::Json => {
+                apply_json_patch(&mut current, &patch)?;
+            }
         }
-    }
 
-    crate::handlers::json_patch::enforce_patch_identity(&mut current, &name, None)?;
+        crate::handlers::json_patch::enforce_patch_identity(&mut current, &name, None)?;
 
-    if stored_status.is_null() {
-        current.as_object_mut().map(|m| m.remove("status"));
-    } else {
-        current["status"] = stored_status;
-    }
+        if stored_status.is_null() {
+            current.as_object_mut().map(|m| m.remove("status"));
+        } else {
+            current["status"] = stored_status;
+        }
 
-    // Validate that the patched value is still a valid CRD shape.
-    let mut crd: CustomResourceDefinition = serde_json::from_value(current).map_err(|e| {
-        Status::unprocessable_entity(format!(
-            "patched object is not a valid CustomResourceDefinition: {e}"
-        ))
-    })?;
-
-    // Preserve server-assigned type meta.
-    crd.api_version = API_VERSION.to_string();
-    crd.kind = KIND.to_string();
-
-    // Reject rather than silently drop: a patch that changes a structural identity field
-    // is a client error the caller must correct, not something to merge-and-ignore.
-    reject_structural_field_change(&existing, &crd.spec, &name)?;
-
-    // metadata.uid is immutable identity, restored unconditionally after every patch type
-    // above — mirrors do_patch (resource.rs) and patch_cr's restore, since
-    // CustomResourceDefinition routes around the generic PATCH path entirely and previously
-    // had no uid handling at all. Without this, a caller holding only ordinary CRD `patch`
-    // rights could forge uid to match a stale/foreign ownerReference and corrupt
-    // the garbage collector's cascade-GC decision.
-    crd.metadata.uid = existing["metadata"]["uid"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-    crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
-        .as_str()
-        .map(str::to_string);
-
-    validate_crd_schema(&crd.spec, Some(&existing))?;
-
-    // Admission webhook pipeline (mutating then validating).
-    {
-        let admission_ctx = AdmissionContext {
-            group: "apiextensions.k8s.io",
-            version: "v1",
-            resource: "customresourcedefinitions",
-            name: &name,
-            namespace: None,
-            operation: "UPDATE",
-            user_info: Some(serde_json::json!({
-                "username": user.username,
-                "uid": user.uid,
-                "groups": user.groups,
-                "extra": user.extra,
-            })),
-            dry_run: is_dry_run_header(&headers),
-        };
-        let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
-        let mutated =
-            run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
-        run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
-        crd = serde_json::from_value(mutated).map_err(|e| {
-            Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+        // Validate that the patched value is still a valid CRD shape.
+        let mut crd: CustomResourceDefinition = serde_json::from_value(current).map_err(|e| {
+            Status::unprocessable_entity(format!(
+                "patched object is not a valid CustomResourceDefinition: {e}"
+            ))
         })?;
-    }
-    prepare_crd_generation_for_update(&existing, &mut crd);
-    if !is_ssa {
-        record_crd_write(&headers, &existing, &mut crd)?;
-    }
 
-    // Dry-run: validation and admission passed; return the would-be patched CRD without
-    // persisting — mirrors do_patch's dry-run early-return in resource.rs.
-    if is_dry_run_header(&headers) {
-        return Ok(Json(crd).into_response());
-    }
+        // Preserve server-assigned type meta.
+        crd.api_version = API_VERSION.to_string();
+        crd.kind = KIND.to_string();
 
-    let rv = state
-        .store
-        .put(&key, to_bytes(&crd)?, None)
-        .await
-        .map_err(|e| store_err_crd(e, &name))?;
+        // Reject rather than silently drop: a patch that changes a structural identity field
+        // is a client error the caller must correct, not something to merge-and-ignore.
+        reject_structural_field_change(&existing, &crd.spec, &name)?;
+
+        // metadata.uid is immutable identity, restored unconditionally after every patch type
+        // above — mirrors do_patch (resource.rs) and patch_cr's restore, since
+        // CustomResourceDefinition routes around the generic PATCH path entirely and previously
+        // had no uid handling at all. Without this, a caller holding only ordinary CRD `patch`
+        // rights could forge uid to match a stale/foreign ownerReference and corrupt
+        // the garbage collector's cascade-GC decision.
+        crd.metadata.uid = existing["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
+            .as_str()
+            .map(str::to_string);
+
+        validate_crd_schema(&crd.spec, Some(&existing))?;
+
+        // Admission webhook pipeline (mutating then validating).
+        {
+            let admission_ctx = AdmissionContext {
+                group: "apiextensions.k8s.io",
+                version: "v1",
+                resource: "customresourcedefinitions",
+                name: &name,
+                namespace: None,
+                operation: "UPDATE",
+                user_info: Some(serde_json::json!({
+                    "username": user.username,
+                    "uid": user.uid,
+                    "groups": user.groups,
+                    "extra": user.extra,
+                })),
+                dry_run: is_dry_run_header(&headers),
+            };
+            let obj_val =
+                serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
+            let mutated =
+                run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
+            run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
+            crd = serde_json::from_value(mutated).map_err(|e| {
+                Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
+            })?;
+        }
+        prepare_crd_generation_for_update(&existing, &mut crd);
+        if !is_ssa {
+            record_crd_write(&headers, &existing, &mut crd)?;
+        }
+
+        // Dry-run: validation and admission passed; return the would-be patched CRD without
+        // persisting — mirrors do_patch's dry-run early-return in resource.rs.
+        if is_dry_run_header(&headers) {
+            return Ok(Json(crd).into_response());
+        }
+
+        if let Some(rv) = gu.commit(to_bytes(&crd)?).await? {
+            break (crd, rv, old_group, old_versions, old_plural, old_rv);
+        }
+    };
     if crd.metadata.deletion_timestamp.is_some() {
         state.crd_finalizer_wake.notify_one();
     }
