@@ -3968,13 +3968,13 @@ pub async fn delete_collection_cr<S: Store>(
                 continue;
             }
 
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if crate::handlers::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }
@@ -5000,13 +5000,13 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                 continue;
             }
 
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if crate::handlers::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }

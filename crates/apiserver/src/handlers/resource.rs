@@ -5034,13 +5034,13 @@ pub(crate) async fn delete_collection_resource<S: Store>(
             // or PersistentVolume with a legitimate finalizer) must be soft-deleted
             // (deletionTimestamp stamped, kept alive), not removed outright — mirrors
             // delete_collection_namespaced_resource below.
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if super::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }
@@ -5206,13 +5206,13 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
             // type) — without this, it would silently bypass every object's finalizers,
             // breaking OrderedNamespaceDeletion (e.g. a finalizer'd pod must survive with
             // deletionTimestamp set while later resource types are still being processed).
-            let mut typed = Object { body: parsed };
-            if let Some(soft) = apply_delete_policy(&mut typed) {
-                state
-                    .store
-                    .put(&obj.key, Object { body: soft }.to_bytes(), None)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+            if super::generic::soft_delete_collection_item(
+                state.store.clone(),
+                &obj.key,
+                (&group, &plural, &name, &plural),
+            )
+            .await?
+            {
                 continue;
             }
         }
