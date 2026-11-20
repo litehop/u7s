@@ -12,11 +12,9 @@ release N.
 - To skip releases, step through each one in order.
 - Downgrades are unsupported. The API server refuses to start on a store
   whose format is newer than it supports and names both formats. The store
-  format is SQLite's `PRAGMA user_version` (today 1), independent of the
-  release version.
-- Watch
-  [GitHub Releases](https://github.com/litehop/u7s/releases) and read
-  `CHANGELOG.md` before each step.
+  format is SQLite's `PRAGMA user_version` (today 1).
+- u7s sends no update notification. Watch
+  [GitHub Releases](https://github.com/litehop/u7s/releases).
 
 ## Before you upgrade
 
@@ -25,7 +23,7 @@ release N.
    the release just before your target.
 2. Read the target release's `CHANGELOG.md`.
 3. Back up the control plane (see [Back up and restore](#back-up-and-restore)).
-4. Expect a short API outage on the control plane.
+4. Expect a short API outage.
 
 ## Upgrade a control plane
 
@@ -42,12 +40,12 @@ when `ca.key` or `kubeconfig` exists under `/var/lib/u7s`. It replaces the
 binaries and unit files, then restarts the API server, controller manager,
 and kubelet. The CA, the cluster state, and the pods keep their identity. The
 script fails if the CA changed; recover as in
-[Back up and restore](#back-up-and-restore).
+[Back up and restore](#back-up-and-restore). A changed `sa.key` is expected:
+the API server rotates it on its own schedule and keeps the previous key
+verifying until its tokens expire.
 
 The script reads `/var/lib/u7s/config`, so `--iface` and `--node-name` need
-no repeat, and a different value is refused. A re-run keeps a single-stack
-cluster single-stack.
-
+no repeat, and a different value is refused.
 ## Upgrade a worker
 
 After the control plane is done, re-run `install.sh` on each worker with no
@@ -62,7 +60,7 @@ A worker offline past its client certificate lifetime fails with an error that
 tells you what to clear (`systemctl stop kubelet; rm -rf /var/lib/u7s`). Re-join
 it with a token from `install.sh --mint-join-token`; see
 [Add a worker](install.md#add-a-worker). A joiner cannot claim the
-control-plane node's name (the API server answers 403).
+control-plane node's name (403).
 
 ## Expected outage
 
@@ -71,16 +69,15 @@ single-node GCP VM from v0.4.5 to v0.4.6: the script ran 99 s, and one of 132
 `/readyz` polls at 2 s failed. CoreDNS, kube-proxy, and the `servicelb` pods
 kept their UIDs with 0 restarts, and the flannel pod was recreated by design.
 The release gate asserts at most 60 s
-([dev-setup.md](dev-setup.md#upgrade-check)). Multi-node is not probed, and the outage was not timed beyond that.
-
+([dev-setup.md](dev-setup.md#upgrade-check)).
 ## Back up and restore
 
 This is disaster recovery, not a supported downgrade. It discards every
 change made since the backup. On a single-node control plane it restored
 v0.4.6 after an upgrade to v0.4.7.
 
-1. Before upgrading, stop the services and copy the whole state directory.
-   Committed writes can stay in
+1. Before upgrading, stop the services and copy the whole state directory
+   (the API is down meanwhile). Committed writes can stay in
    `state.db-wal`, so a copy of `state.db` alone may lose data. The archive
    contains the CA private key and service-account keys, so `umask` makes it
    mode 0600:
@@ -97,18 +94,19 @@ v0.4.6 after an upgrade to v0.4.7.
 
 2. Upgrade.
 
-3. To restore, replace the state directory, then re-run the previous release's
-   `install.sh` with no flags. Set `TAG` to the previous release tag
-   ([how](install.md#pinning-a-release-tag)). It prints
-   `Control-plane identity preserved`. The live test used
-   a local `--tarball` install, not this download:
+3. To restore, copy the archive back to the node's working directory, replace
+   the state directory, then re-run the previous release's `install.sh` with
+   no flags (tag: [how](install.md#pinning-a-release-tag)). It prints
+   `Control-plane identity preserved`. The live test used a local
+   `--tarball` install, not this download:
 
    ```bash
-   sudo systemctl stop kubelet u7s-kcm u7s-apiserver
-   sudo rm -rf /var/lib/u7s
-   sudo tar -C /var/lib -xzpf u7s-state-backup.tar.gz
-   curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
-   sudo bash install.sh
+   TAG=<previous-release-tag>
+   curl --proto '=https' --tlsv1.2 -fsSL -o "install-${TAG}.sh" "https://u7s.dekiru.tech/${TAG}/install.sh" &&
+   sudo systemctl stop kubelet u7s-kcm u7s-apiserver &&
+   sudo rm -rf /var/lib/u7s &&
+   sudo tar -C /var/lib -xzpf u7s-state-backup.tar.gz &&
+   sudo bash "install-${TAG}.sh"
    ```
 
 4. Check that `sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig get --raw /readyz`
