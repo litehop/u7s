@@ -69,6 +69,25 @@ To run the Kubernetes conformance suite against u7s locally:
    scripts/conformance/06-run-sonobuoy.sh --focus "ConfigMap"
    ```
 
+### Rig-only add-ons and alpha gates
+
+The local conformance rig applies three upstream add-ons and enables three alpha kubelet gates (in `lima/kubelet.yaml`) that u7s does not ship. Specs that depend on them pass only when they're present.
+
+- **Add-ons:** `kube-network-policies`, `metrics-server` and `external-snapshotter`. `run-all.sh --install` labels each `u7s.io/conformance-rig-only=true`; `install.sh` installs none of them and `manifests/` doesn't carry them. Install the upstream components yourself if you need NetworkPolicy enforcement, resource metrics (`metrics.k8s.io`, HPA) or volume snapshots.
+- **Kubelet gates:** `ClusterTrustBundle`, `ClusterTrustBundleProjection` and `PodCertificateRequest`. They're off by default in the kubelet, and `install.sh` leaves them off.
+
+Dependent spec groups, from the upstream `release-1.37` e2e sources:
+
+| Dependency | Spec group | Basis |
+| --- | --- | --- |
+| kube-network-policies | `[sig-network] Netpol` | `test/e2e/network/netpol/network_policy.go` tests traffic reachability; `Netpol API` is not verified |
+| metrics-server | `[sig-autoscaling]` `[Feature:HPA]` "Horizontal pod autoscaling (scale resource: CPU)" and "(scale resource: Memory)" | `test/e2e/autoscaling/horizontal_pod_autoscaling.go`; the KCM HPA controller needs `metrics.k8s.io` |
+| external-snapshotter | `[sig-storage]` `[Feature:VolumeSnapshotDataSource]` snapshottable suite | `test/e2e/storage/testsuites/snapshottable.go` |
+| ClusterTrustBundle gates | `[sig-auth]` ClusterTrustBundle projection | `test/e2e/auth/projected_clustertrustbundle.go` |
+| All three gates | `[sig-auth]` "Projected PodCertificate" | `test/e2e/auth/projected_podcertificate.go` |
+
+Not verified: whether `[sig-instrumentation]` `MetricsGrabber` and `PodCertificateRequest API` specs depend on any of these. Neither names a gate or add-on in its source.
+
 **Architecture:** u7s runs on the Mac host for a fast `cargo build` → restart loop. kubelet and sonobuoy run inside the lima VM (Linux, cri-o+crun) for reproducibility. sonobuoy reaches u7s via `host.lima.internal:6443`.
 
 ## Release gate: 1 GiB burst survival
