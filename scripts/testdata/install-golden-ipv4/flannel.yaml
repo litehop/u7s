@@ -19,7 +19,7 @@
 #                           drop the EnableIPv6/IPv6Network line.
 #   1426            install.sh's pod MTU: the NIC's MTU minus beep's Geneve overhead
 #                           (74 bytes, 94 on an IPv6 underlay or dual-stack), or --pod-mtu.
-#   1693492816-581  checksum of the rendered kube-flannel-cfg ConfigMap data, set by
+#   2839541114-521  checksum of the rendered kube-flannel-cfg ConfigMap data, set by
 #                           render_flannel. The install-cni init container copies cni-conf.json
 #                           once per pod start, so the pod template must change whenever the
 #                           ConfigMap does or a new --pod-mtu never reaches the node.
