@@ -38,6 +38,7 @@ mod net_disc_cert_policy_events_gen;
 mod net_disc_cert_policy_events_gen_adapter;
 mod node_authz;
 pub mod node_csr;
+mod object_meta;
 mod patch;
 mod pki;
 mod pod_security;

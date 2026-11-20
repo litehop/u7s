@@ -2,7 +2,7 @@
 //! a webhook or ValidatingAdmissionPolicy registered for `<resource>/<subresource>` must see
 //! (and be able to veto or mutate) the write, with upstream's `subResource`/`kind`/`operation`.
 
-mod cases {
+pub(crate) mod cases {
     use std::sync::{Arc, Mutex};
 
     use axum::{body::Body, http::Request, http::StatusCode, Router};

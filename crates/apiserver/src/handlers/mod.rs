@@ -20,6 +20,8 @@ pub mod json_patch;
 pub(crate) mod jsonpath;
 pub mod metrics;
 pub mod namespaces;
+#[cfg(test)]
+mod object_meta_write_tests;
 pub mod oidc;
 pub mod pods;
 pub mod proxy;

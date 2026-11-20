@@ -3301,6 +3301,7 @@ pub async fn run_validating_webhooks<S: Store>(
     ctx: &AdmissionContext<'_>,
 ) -> Result<(), StatusError> {
     crate::int32_range::validate_write(state, ctx, object)?;
+    crate::object_meta::validate_write(ctx, object)?;
 
     // Skip the webhook pipeline for webhook configuration resources themselves
     // to prevent a bootstrap deadlock (see is_webhook_configuration_resource).
