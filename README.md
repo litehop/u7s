@@ -30,8 +30,9 @@ between releases. Do not run production workloads against it yet.
 installs CRI-O, stages the u7s binaries and the vendored kubelet and
 kube-controller-manager, and writes a systemd unit for each. Every step
 below uses the downloaded script; the join step needs it, because the token
-is read from stdin. For flags, signature verification, upgrades and
-reinstalling, see [docs/install.md](docs/install.md).
+is read from stdin. For flags, signature verification and reinstalling, see
+[docs/install.md](docs/install.md). For upgrades, see
+[docs/upgrading.md](docs/upgrading.md).
 
 1. Install the control plane as root. The script verifies the release
    tarball against the signing key embedded in it and refuses to install if
@@ -61,7 +62,7 @@ reinstalling, see [docs/install.md](docs/install.md).
    Install the control plane's release (the default), because a worker must
    never be newer than the control plane. An older worker is fine during a
    rolling upgrade, within upstream's kubelet skew policy (up to 3 minor
-   versions older); see [Upgrading](docs/install.md#upgrading). Print the
+   versions older); see [Upgrading](docs/upgrading.md). Print the
    installed release tag:
 
    ```bash
@@ -90,8 +91,6 @@ More in [docs/install.md](docs/install.md):
 - [Dual-stack install](docs/install.md#dual-stack-install)
 - [Add a worker](docs/install.md#add-a-worker): token details and failures.
 - [Files, logs and reinstalling](docs/install.md#files-logs-and-reinstalling)
-- [Upgrading](docs/install.md#upgrading), including
-  [to dual-stack](docs/install.md#upgrading-to-dual-stack)
 - [Running on a 1 GiB host](docs/install.md#running-on-a-1-gib-host): zram,
   swapfile, services to disable.
 
