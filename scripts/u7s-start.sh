@@ -20,8 +20,9 @@
 #                        [--node-kubelet-port <name>=<N>]
 #                        [--konnectivity-server-port <N>]
 #                        [--embedded-scheduler <true|false>]
-#                        [--service-cidr <cidr>[,<cidr>]]
+#                        [--service-cidr <cidr>[,<cidr>]] [--dual-stack]
 #
+#   --dual-stack  Publish the dual-stack pod CIDR (--cluster-cidr) the rig's KCM uses.
 #   --service-cidr  Passthrough to --service-cluster-ip-range (default 10.96.0.0/12);
 #                 two comma-separated CIDRs of different families make a dual-stack range.
 #   --reset      Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
@@ -92,6 +93,7 @@ _NODE_KUBELET_PORT_OVERRIDE=""
 _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _EMBEDDED_SCHEDULER_OVERRIDE=""
 _SERVICE_CIDR_OVERRIDE=""
+DUAL_STACK=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
@@ -106,6 +108,7 @@ while [[ $# -gt 0 ]]; do
     --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --embedded-scheduler) _EMBEDDED_SCHEDULER_OVERRIDE="$2"; shift 2 ;;
     --service-cidr) _SERVICE_CIDR_OVERRIDE="$2"; shift 2 ;;
+    --dual-stack) DUAL_STACK=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -114,6 +117,16 @@ PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 NODE_KUBELET_PORT_ARG=""
 [ -n "$_NODE_KUBELET_PORT_OVERRIDE" ] && NODE_KUBELET_PORT_ARG="--node-kubelet-port $_NODE_KUBELET_PORT_OVERRIDE"
+
+# The flags install.sh's u7s-apiserver.service passes, so the rig's apiserver behaves as
+# delivered: externalIPs denied, the local-node CSR exemption, and the published cluster
+# config (pod CIDR and the first kube-dns VIP).
+_POD_CIDR="$RIG_POD_CIDR_V4"
+[ "$DUAL_STACK" -eq 0 ] || _POD_CIDR="$RIG_POD_CIDR_V4,$RIG_POD_CIDR_V6"
+_KUBE_DNS_IP="$(rig_kube_dns_ips "$SERVICE_CIDR" | sed -n 1p)"
+[ -n "$_KUBE_DNS_IP" ] || { echo "cannot derive the kube-dns VIP from --service-cidr '$SERVICE_CIDR'" >&2; exit 1; }
+INSTALL_PARITY_ARGS="--deny-service-external-ips --local-node-name ${U7S_VM_NAME:-lima-node} --cluster-cidr $_POD_CIDR --kube-dns-cluster-ip $_KUBE_DNS_IP"
+
 EMBEDDED_SCHEDULER_ARG=""
 [ -n "$_EMBEDDED_SCHEDULER_OVERRIDE" ] && EMBEDDED_SCHEDULER_ARG="--embedded-scheduler $_EMBEDDED_SCHEDULER_OVERRIDE"
 
@@ -334,6 +347,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
+    $INSTALL_PARITY_ARGS \
     $EMBEDDED_SCHEDULER_ARG \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
@@ -357,6 +371,7 @@ else
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
+    $INSTALL_PARITY_ARGS \
     $EMBEDDED_SCHEDULER_ARG \
     &
   SERVER_PID=$!
@@ -487,6 +502,7 @@ EXTEOF
       --manifest-dir "$MANIFEST_DIR" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \
+      $INSTALL_PARITY_ARGS \
       $EMBEDDED_SCHEDULER_ARG \
       > "$LOG" 2>&1 &
     SERVER_PID=$!

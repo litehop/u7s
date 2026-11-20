@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 PORT="${_PORT_OVERRIDE:-6443}"
 KCM_CIDR_FLAGS="$(rig_kcm_cidr_flags "$DUAL_STACK")"
+KCM_SERVICE_CIDR_FLAG="--service-cluster-ip-range=$(rig_effective_service_cidr "$DUAL_STACK")"
 
 _VM="${U7S_VM_NAME:-lima-node}"
 VM_NAME="$_VM"
@@ -179,8 +180,8 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
   --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\
   $KCM_CIDR_FLAGS \\
+  $KCM_SERVICE_CIDR_FLAG \\
   --allocate-node-cidrs=true \\
-  --concurrent-gc-syncs=5 \\
   --use-service-account-credentials=true \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
