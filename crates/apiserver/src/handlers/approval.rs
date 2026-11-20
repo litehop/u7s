@@ -26,7 +26,8 @@ use serde::Deserialize;
 use crate::{
     admission::{admit_write, AdmissionTarget},
     auth::UserInfo,
-    handlers::generic::{store_err, validate_path_segment},
+    guaranteed_update::GuaranteedUpdate,
+    handlers::generic::validate_path_segment,
     handlers::json_patch::{
         apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
     },
@@ -144,45 +145,46 @@ pub async fn put_approval<S: Store>(
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let key = group_object_key(GROUP, PLURAL, None, &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    super::csr::authorize_csr_approval(&state, &user, &current.body)?;
-
     // OCC: if incoming has a resourceVersion, it must match the stored one.
     let expected_rv = parse_resource_version(incoming.resource_version())?;
-
-    // Merge status.conditions and metadata (labels/annotations) — never touch spec or
-    // status.certificate. kubectl certificate approve/deny sends the whole object back,
-    // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
-    let old_body = current.body.clone();
-    merge_approval_conditions(&mut current, &incoming);
-    super::csr::populate_condition_timestamps(
-        &mut current.body,
-        &old_body,
-        &crate::util::utc_now_rfc3339(),
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (GROUP, PLURAL, &name, KIND),
     );
-    merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
-    current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
-    record_approval_write(&headers, &old_body, &mut current.body, None);
+    let (mut current, new_rv) = loop {
+        let stored = gu.read_existing().await?;
 
-    // Dry-run: return the would-be approval object without persisting — mirrors
-    // put_resource_status's dry-run early-return.
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current.body));
-    }
+        let mut current = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        super::csr::authorize_csr_approval(&state, &user, &current.body)?;
 
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, GROUP, PLURAL, &name, KIND))?;
+        // Merge status.conditions and metadata (labels/annotations) — never touch spec or
+        // status.certificate. kubectl certificate approve/deny sends the whole object back,
+        // and clients (e.g. this conformance test) also PATCH/PUT annotations via /approval.
+        let old_body = current.body.clone();
+        merge_approval_conditions(&mut current, &incoming);
+        super::csr::populate_condition_timestamps(
+            &mut current.body,
+            &old_body,
+            &crate::util::utc_now_rfc3339(),
+        );
+        merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
+        current.body =
+            admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
+        record_approval_write(&headers, &old_body, &mut current.body, None);
+
+        // Dry-run: return the would-be approval object without persisting — mirrors
+        // put_resource_status's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current.body));
+        }
+
+        if let Some(rv) = gu.commit(current.to_bytes()).await? {
+            break (current, rv);
+        }
+    };
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
@@ -206,16 +208,6 @@ pub async fn patch_approval<S: Store>(
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let key = group_object_key(GROUP, PLURAL, None, &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-    super::csr::authorize_csr_approval(&state, &user, &current.body)?;
 
     // apply-patch+yaml bodies are genuine YAML (e.g. kubectl apply --server-side); every
     // other patch type here is JSON.
@@ -225,102 +217,114 @@ pub async fn patch_approval<S: Store>(
         serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?
     };
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        (GROUP, PLURAL, &name, KIND),
+    );
+    let (mut current, new_rv) = loop {
+        let stored = gu.read_existing().await?;
 
-    // Snapshot fields /approval must never change, before applying any patch type.
-    // `spec_before` is restored unconditionally below regardless of patch type —
-    // defense in depth alongside the PatchType::Json path check just below, so a
-    // bug in (or future change to) that check can never let a JSON Patch smuggle a
-    // different spec.request/spec.signerName past approval.
-    let old_body = current.body.clone();
-    let spec_before = current.body["spec"].clone();
-    let status_before: CertificateSigningRequestStatus =
-        CertificateSigningRequestStatus::deserialize(&current.body["status"]).unwrap_or_else(
-            |_| CertificateSigningRequestStatus {
-                certificate: None,
-                conditions: None,
-                rest: serde_json::Value::Object(Default::default()),
-            },
-        );
-    let ssa_plan = is_ssa
-        .then(|| plan_approval_apply(&headers, &old_body, &patch))
-        .transpose()?;
+        let mut current = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        super::csr::authorize_csr_approval(&state, &user, &current.body)?;
 
-    match patch_type {
-        PatchType::Json => {
-            // Unlike a merge patch, JSON Patch addresses the full document with no
-            // structural isolation — an op can name /spec or any metadata field.
-            // Reject the whole patch up front if it targets anything outside the
-            // fields /approval may change, instead of applying it and relying
-            // solely on restoring the damage afterward.
-            validate_approval_json_patch_paths(&patch)?;
-            apply_json_patch(&mut current.body, &patch)?;
+        // Snapshot fields /approval must never change, before applying any patch type.
+        // `spec_before` is restored unconditionally below regardless of patch type —
+        // defense in depth alongside the PatchType::Json path check just below, so a
+        // bug in (or future change to) that check can never let a JSON Patch smuggle a
+        // different spec.request/spec.signerName past approval.
+        let old_body = current.body.clone();
+        let spec_before = current.body["spec"].clone();
+        let status_before: CertificateSigningRequestStatus =
+            CertificateSigningRequestStatus::deserialize(&current.body["status"]).unwrap_or_else(
+                |_| CertificateSigningRequestStatus {
+                    certificate: None,
+                    conditions: None,
+                    rest: serde_json::Value::Object(Default::default()),
+                },
+            );
+        let ssa_plan = is_ssa
+            .then(|| plan_approval_apply(&headers, &old_body, &patch))
+            .transpose()?;
+
+        match patch_type {
+            PatchType::Json => {
+                // Unlike a merge patch, JSON Patch addresses the full document with no
+                // structural isolation — an op can name /spec or any metadata field.
+                // Reject the whole patch up front if it targets anything outside the
+                // fields /approval may change, instead of applying it and relying
+                // solely on restoring the damage afterward.
+                validate_approval_json_patch_paths(&patch)?;
+                apply_json_patch(&mut current.body, &patch)?;
+            }
+            PatchType::Merge | PatchType::StrategicMerge => {
+                // Deserialize the patch status to get typed conditions.
+                let patch_status: Option<CertificateSigningRequestStatus> = patch
+                    .get("status")
+                    .and_then(|s| CertificateSigningRequestStatus::deserialize(s).ok());
+                if let Some(ps) = patch_status {
+                    if let Some(conditions) = ps.conditions {
+                        current.body["status"]["conditions"] =
+                            serde_json::to_value(conditions).unwrap_or(serde_json::Value::Null);
+                    }
+                }
+                // Merge metadata (labels/annotations) from the patch — kubectl certificate
+                // approve/deny and this conformance test also patch annotations via /approval.
+                merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
+            }
         }
-        PatchType::Merge | PatchType::StrategicMerge => {
-            // Deserialize the patch status to get typed conditions.
-            let patch_status: Option<CertificateSigningRequestStatus> = patch
-                .get("status")
-                .and_then(|s| CertificateSigningRequestStatus::deserialize(s).ok());
-            if let Some(ps) = patch_status {
-                if let Some(conditions) = ps.conditions {
-                    current.body["status"]["conditions"] =
-                        serde_json::to_value(conditions).unwrap_or(serde_json::Value::Null);
+
+        if let Some(plan) = &ssa_plan {
+            plan.remove_dropped_fields(&mut current.body);
+        }
+
+        super::csr::populate_condition_timestamps(
+            &mut current.body,
+            &old_body,
+            &crate::util::utc_now_rfc3339(),
+        );
+
+        // Restore protected fields — spec and status.certificate must never change via
+        // /approval, for every patch type (not just PatchType::Json).
+        match spec_before {
+            serde_json::Value::Null => {
+                // Make sure spec wasn't introduced by the patch (a CSR always has one,
+                // but a stored object shouldn't gain a spec it didn't have).
+                if let Some(m) = current.body.as_object_mut() {
+                    m.remove("spec");
                 }
             }
-            // Merge metadata (labels/annotations) from the patch — kubectl certificate
-            // approve/deny and this conformance test also patch annotations via /approval.
-            merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
+            v => current.body["spec"] = v,
         }
-    }
-
-    if let Some(plan) = &ssa_plan {
-        plan.remove_dropped_fields(&mut current.body);
-    }
-
-    super::csr::populate_condition_timestamps(
-        &mut current.body,
-        &old_body,
-        &crate::util::utc_now_rfc3339(),
-    );
-
-    // Restore protected fields — spec and status.certificate must never change via
-    // /approval, for every patch type (not just PatchType::Json).
-    match spec_before {
-        serde_json::Value::Null => {
-            // Make sure spec wasn't introduced by the patch (a CSR always has one,
-            // but a stored object shouldn't gain a spec it didn't have).
-            if let Some(m) = current.body.as_object_mut() {
-                m.remove("spec");
+        match &status_before.certificate {
+            Some(cert) => {
+                current.body["status"]["certificate"] = serde_json::Value::String(cert.clone());
+            }
+            None => {
+                // Make sure it wasn't introduced by the patch.
+                if let Some(s) = current.body["status"].as_object_mut() {
+                    s.remove("certificate");
+                }
             }
         }
-        v => current.body["spec"] = v,
-    }
-    match &status_before.certificate {
-        Some(cert) => {
-            current.body["status"]["certificate"] = serde_json::Value::String(cert.clone());
+
+        current.body =
+            admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
+        record_approval_write(&headers, &old_body, &mut current.body, ssa_plan.as_ref());
+
+        // Dry-run: return the would-be patched approval object without persisting —
+        // mirrors put_approval's dry-run early-return above.
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current.body));
         }
-        None => {
-            // Make sure it wasn't introduced by the patch.
-            if let Some(s) = current.body["status"].as_object_mut() {
-                s.remove("certificate");
-            }
+
+        if let Some(rv) = gu.commit(current.to_bytes()).await? {
+            break (current, rv);
         }
-    }
-
-    current.body = admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
-    record_approval_write(&headers, &old_body, &mut current.body, ssa_plan.as_ref());
-
-    // Dry-run: return the would-be patched approval object without persisting —
-    // mirrors put_approval's dry-run early-return above.
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current.body));
-    }
-
-    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, GROUP, PLURAL, &name, KIND))?;
+    };
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))

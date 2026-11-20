@@ -14,6 +14,7 @@ use crate::{
         AdmissionTarget,
     },
     auth::UserInfo,
+    guaranteed_update::GuaranteedUpdate,
     handlers::{
         generic::apply_delete_policy,
         json_patch::{
@@ -302,17 +303,6 @@ pub(crate) async fn get_namespace<S: Store>(
         .into_response())
 }
 
-/// Bound on re-read-and-retry attempts when an unconditional PUT (no client resourceVersion)
-/// loses a write race, as upstream GuaranteedUpdate does.
-const MAX_REPLACE_CONFLICT_RETRIES: u32 = 5;
-
-/// A PUT without a resourceVersion must still be conditioned on the revision just read, or a
-/// DELETE landing between that read and the write would be undone by an unconditional put
-/// recreating the namespace without its finalizers.
-fn replace_put_precondition(client_rv: Option<u64>, stored_rv: Option<u64>) -> Option<u64> {
-    client_rv.or(stored_rv)
-}
-
 pub(crate) async fn replace_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -345,20 +335,18 @@ pub(crate) async fn replace_namespace<S: Store>(
     // /status. Mirrors replace_pod's stored_status handling and the generic
     // replace_namespaced_resource in resource.rs.
     let original_body = obj.body.clone();
-    let mut attempt = 0u32;
+    // Upstream disallows create-on-update for Namespace; creating here would skip the create
+    // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_revision,
+        ("", "namespaces", &name, "Namespace"),
+    );
     let new_rv = loop {
-        attempt += 1;
         obj.body = original_body.clone();
-        let stored_entry = state
-            .store
-            .get(&key)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let stored_revision = stored_entry.as_ref().map(|s| s.revision);
-        let stored_obj = stored_entry
-            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
-        // Upstream disallows create-on-update for Namespace; creating here would skip the create
-        // preparation (spec.finalizers), so a later delete would orphan the namespace's content.
+        let stored_obj =
+            serde_json::from_slice::<serde_json::Value>(&gu.read_existing().await?.value).ok();
         if stored_obj.is_none() {
             return Err(Status::not_found("", "namespaces", &name));
         }
@@ -460,20 +448,8 @@ pub(crate) async fn replace_namespace<S: Store>(
             return Ok(Json(obj.body).into_response());
         }
 
-        match state
-            .store
-            .put(
-                &key,
-                obj.to_bytes(),
-                replace_put_precondition(expected_revision, stored_revision),
-            )
-            .await
-        {
-            Ok(rv) => break rv,
-            // Upstream GuaranteedUpdate re-reads and retries an unconditional update on conflict.
-            Err(StoreError::RevisionMismatch { .. })
-                if expected_revision.is_none() && attempt < MAX_REPLACE_CONFLICT_RETRIES => {}
-            Err(e) => return Err(store_err_to_status(e, &name)),
+        if let Some(rv) = gu.commit(obj.to_bytes()).await? {
+            break rv;
         }
     };
 
@@ -711,89 +687,90 @@ pub(crate) async fn finalize_namespace<S: Store>(
 
     // Fetch the current namespace from the store.
     let key = cluster_object_key("namespaces", &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Namespace finalizers live in spec.finalizers (not metadata.finalizers).
-    let mut spec: NamespaceSpec =
-        NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
-    spec.finalizers = new_finalizers;
-    let before_write = current.body.clone();
-    current.body["spec"] = serde_json::to_value(&spec)
-        .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
-    current.body = admit_write(
-        &state,
-        &AdmissionTarget {
-            group: "",
-            version: "v1",
-            resource: "namespaces/finalize",
-            name: &name,
-            namespace: None,
-            user: user.as_ref().map(|u| &u.0),
-            dry_run: is_dry_run_header(&headers),
-        },
-        "UPDATE",
-        Some(&before_write),
-        current.body,
-        // Upstream's finalize strategy keeps only spec.finalizers.
-        |mutated| {
-            let mut admitted = before_write.clone();
-            match mutated["spec"].get("finalizers").filter(|f| !f.is_null()) {
-                Some(f) => admitted["spec"]["finalizers"] = f.clone(),
-                None => {
-                    admitted["spec"]
-                        .as_object_mut()
-                        .map(|s| s.remove("finalizers"));
-                }
-            }
-            Ok(admitted)
-        },
-    )
-    .await?;
-    crate::field_manager::WriteIdentity::new(None, &headers).record(
-        &before_write,
-        &mut current.body,
-        "v1",
-        Some("finalize"),
-        None,
-    );
-
-    // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
-    let current_meta: ObjectMeta =
-        ObjectMeta::deserialize(&current.body["metadata"]).unwrap_or_default();
-    let deletion_ts_set = current_meta.deletion_timestamp.is_some();
-    let current_spec: NamespaceSpec =
-        NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
-    let finalizers_empty = current_spec
-        .finalizers
-        .as_deref()
-        .map(|f| f.is_empty())
-        .unwrap_or(true);
-
-    // Dry-run: return the would-be finalized namespace without persisting — mirrors
-    // replace_namespace's dry-run early-return above.
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current.body).into_response());
-    }
-
-    // Persist the updated object first.
     // CAS on the INCOMING request's resourceVersion, not the stored object's: /finalize is
     // a replace subresource, so a client holding a stale snapshot must get 409 and retry
-    // rather than clobber a concurrent write. Absent rv stays unconditional (returns None).
+    // rather than clobber a concurrent write.
     let incoming_meta: ObjectMeta = ObjectMeta::deserialize(&req["metadata"]).unwrap_or_default();
     let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        ("", "namespaces", &name, "Namespace"),
+    );
+    let (mut current, new_rv, deletion_ts_set, finalizers_empty) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut current = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        // Namespace finalizers live in spec.finalizers (not metadata.finalizers).
+        let mut spec: NamespaceSpec =
+            NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
+        spec.finalizers = new_finalizers.clone();
+        let before_write = current.body.clone();
+        current.body["spec"] = serde_json::to_value(&spec)
+            .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
+        current.body = admit_write(
+            &state,
+            &AdmissionTarget {
+                group: "",
+                version: "v1",
+                resource: "namespaces/finalize",
+                name: &name,
+                namespace: None,
+                user: user.as_ref().map(|u| &u.0),
+                dry_run: is_dry_run_header(&headers),
+            },
+            "UPDATE",
+            Some(&before_write),
+            current.body,
+            // Upstream's finalize strategy keeps only spec.finalizers.
+            |mutated| {
+                let mut admitted = before_write.clone();
+                match mutated["spec"].get("finalizers").filter(|f| !f.is_null()) {
+                    Some(f) => admitted["spec"]["finalizers"] = f.clone(),
+                    None => {
+                        admitted["spec"]
+                            .as_object_mut()
+                            .map(|s| s.remove("finalizers"));
+                    }
+                }
+                Ok(admitted)
+            },
+        )
+        .await?;
+        crate::field_manager::WriteIdentity::new(None, &headers).record(
+            &before_write,
+            &mut current.body,
+            "v1",
+            Some("finalize"),
+            None,
+        );
+
+        // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
+        let current_meta: ObjectMeta =
+            ObjectMeta::deserialize(&current.body["metadata"]).unwrap_or_default();
+        let deletion_ts_set = current_meta.deletion_timestamp.is_some();
+        let current_spec: NamespaceSpec =
+            NamespaceSpec::deserialize(&current.body["spec"]).unwrap_or_default();
+        let finalizers_empty = current_spec
+            .finalizers
+            .as_deref()
+            .map(|f| f.is_empty())
+            .unwrap_or(true);
+
+        // Dry-run: return the would-be finalized namespace without persisting — mirrors
+        // replace_namespace's dry-run early-return above.
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current.body).into_response());
+        }
+
+        // Persist the updated object first.
+        if let Some(rv) = gu.commit(current.to_bytes()).await? {
+            break (current, rv, deletion_ts_set, finalizers_empty);
+        }
+    };
 
     current.set_resource_version(new_rv);
 
@@ -860,57 +837,65 @@ pub(crate) async fn put_namespace_status<S: Store>(
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let key = cluster_object_key("namespaces", &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let before_write = current.body.clone();
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] =
-                crate::status_dispatch::decode_status_put("v1", "Namespace", v)
-                    .expect("Namespace is always registered in status_dispatch")?;
-        }
-    }
-
-    crate::handlers::status::merge_incoming_metadata(
-        &mut current.body,
-        &incoming.body,
-        Some("Namespace"),
-    );
-
-    current.body = admit_namespace_status(
-        &state,
-        &name,
-        user.as_ref().map(|u| &u.0),
-        &headers,
-        &before_write,
-        current.body,
-    )
-    .await?;
-    super::status::record_status_write(&headers, None, &before_write, &mut current.body, "", "v1");
-
-    // Dry-run: return the would-be status object without persisting — mirrors
-    // put_resource_status's dry-run early-return.
-    if is_dry_run_header(&headers) {
-        return Ok(Json(current.body));
-    }
-
     let expected_rv = parse_resource_version(incoming.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        &key,
+        expected_rv,
+        ("", "namespaces", &name, "Namespace"),
+    );
+    let (mut current, new_rv) = loop {
+        let stored = gu.read_existing().await?;
+
+        let mut current = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        let before_write = current.body.clone();
+        match &incoming.body["status"] {
+            serde_json::Value::Null => {
+                current.body.as_object_mut().map(|m| m.remove("status"));
+            }
+            v => {
+                current.body["status"] =
+                    crate::status_dispatch::decode_status_put("v1", "Namespace", v)
+                        .expect("Namespace is always registered in status_dispatch")?;
+            }
+        }
+
+        crate::handlers::status::merge_incoming_metadata(
+            &mut current.body,
+            &incoming.body,
+            Some("Namespace"),
+        );
+
+        current.body = admit_namespace_status(
+            &state,
+            &name,
+            user.as_ref().map(|u| &u.0),
+            &headers,
+            &before_write,
+            current.body,
+        )
+        .await?;
+        super::status::record_status_write(
+            &headers,
+            None,
+            &before_write,
+            &mut current.body,
+            "",
+            "v1",
+        );
+
+        // Dry-run: return the would-be status object without persisting — mirrors
+        // put_resource_status's dry-run early-return.
+        if is_dry_run_header(&headers) {
+            return Ok(Json(current.body));
+        }
+
+        if let Some(rv) = gu.commit(current.to_bytes()).await? {
+            break (current, rv);
+        }
+    };
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
@@ -3734,20 +3719,6 @@ mod tests {
             state.store.get(cm_key).await.unwrap().is_some(),
             "namespace DELETE must not purge content in-process; that is the namespace \
              controller's job, via per-object DELETEs that run admission"
-        );
-    }
-
-    #[test]
-    fn replace_put_precondition_falls_back_to_read_revision_only_without_client_resource_version() {
-        assert_eq!(
-            replace_put_precondition(None, Some(7)),
-            Some(7),
-            "an unconditional put would recreate a namespace deleted after the existence check"
-        );
-        assert_eq!(
-            replace_put_precondition(Some(3), Some(7)),
-            Some(3),
-            "a client-supplied resourceVersion keeps its own optimistic-concurrency check"
         );
     }
 
