@@ -261,8 +261,8 @@ main() {
   # --install mode's only host process: the ssh tunnel to the VM's apiserver. Pidfile only,
   # and only if the pid is still an ssh -L, so a recycled pid is never signalled.
   if [ -f "$WORKDIR/install-tunnel.pid" ]; then
-    pid="$(cat "$WORKDIR/install-tunnel.pid")"
-    if is_install_tunnel_pid "$pid"; then
+    read -r pid port < "$WORKDIR/install-tunnel.pid" || true
+    if is_install_tunnel_pid "$pid" "$port"; then
       echo "[reset]   killing install-mode apiserver tunnel (PID $pid)"
       kill "$pid" 2>/dev/null || true
     fi

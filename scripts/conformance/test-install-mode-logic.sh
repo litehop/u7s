@@ -75,7 +75,7 @@ bash -c "exec -a 'ssh -F cfg -N -L 127.0.0.1:6444:10.0.0.5:6443 lima-x' sleep 60
 TUNNEL_PID=$!
 LEFTOVER_PIDS+=("$TUNNEL_PID")
 sleep 0.3
-echo "$TUNNEL_PID" > "$WD/install-tunnel.pid"
+echo "$TUNNEL_PID 6444" > "$WD/install-tunnel.pid"
 bash "$REPO/scripts/conformance/reset.sh" --host-only --workdir "$WD" >/dev/null 2>&1 && rc=0 || rc=$?
 assert_eq "reset.sh --host-only succeeds in an install-mode workdir (no host apiserver exists)" "$rc" "0"
 sleep 0.3
@@ -85,16 +85,69 @@ kill -0 "$TUNNEL_PID" 2>/dev/null && bad "tunnel survived reset.sh --host-only" 
 sleep 60 &
 INNOCENT_PID=$!
 LEFTOVER_PIDS+=("$INNOCENT_PID")
-echo "$INNOCENT_PID" > "$WD/install-tunnel.pid"
+echo "$INNOCENT_PID 6444" > "$WD/install-tunnel.pid"
 bash "$REPO/scripts/conformance/reset.sh" --host-only --workdir "$WD" >/dev/null 2>&1 || true
 kill -0 "$INNOCENT_PID" 2>/dev/null && ok "a stale pidfile pointing at an unrelated process does not kill it" \
   || bad "reset.sh killed an unrelated process via a stale tunnel pidfile"
 
+# A recycled pid that is now ANOTHER slot's tunnel (different forwarded port) must survive:
+# killing it would drop a concurrent slot's apiserver connection.
+bash -c "exec -a 'ssh -F cfg -N -L 127.0.0.1:6555:10.0.0.9:6443 lima-y' sleep 60" >/dev/null 2>&1 &
+OTHER_SLOT_PID=$!
+LEFTOVER_PIDS+=("$OTHER_SLOT_PID")
+sleep 0.3
+echo "$OTHER_SLOT_PID 6444" > "$WD/install-tunnel.pid"
+bash "$REPO/scripts/conformance/reset.sh" --host-only --workdir "$WD" >/dev/null 2>&1 || true
+kill -0 "$OTHER_SLOT_PID" 2>/dev/null && ok "reset.sh --host-only leaves another slot's ssh -L tunnel alone" \
+  || bad "reset.sh killed another slot's tunnel (forwarding 6555) via this slot's pidfile (port 6444)"
+is_install_tunnel_pid "$OTHER_SLOT_PID" 6555 && ok "the same process is recognised as the tunnel of its own port" \
+  || bad "is_install_tunnel_pid rejects a tunnel for its own port"
+if is_install_tunnel_pid "$OTHER_SLOT_PID" ""; then bad "a pidfile without a port must never authorise a kill"; else ok "a pidfile without a port authorises no kill"; fi
+
 # 5. Keep-VM teardown must cover every unit install.sh enables, or the leftover units
 # (u7s-kcm-restart.path was the one that survived) break the next host-rig bring-up.
-for unit in $(grep -o 'systemctl enable u7s-[a-z-]*\.[a-z]*' "$REPO/scripts/install.sh" | awk '{print $3}'); do
-  grep -q "$unit" "$REPO/scripts/conformance/install-teardown.sh" \
-    && ok "install-teardown.sh removes $unit" || bad "install-teardown.sh does not remove $unit, which install.sh enables"
+# The real teardown runs against a stubbed limactl (which executes the remote script locally)
+# with stubbed systemctl/rm, so the assertions see the calls the unit list actually produces.
+STUBS="$TMP/stubs"
+CALLS="$TMP/calls"
+mkdir -p "$STUBS" "$TMP/tw"
+: > "$CALLS"
+cat > "$STUBS/limactl" <<'EOF'
+#!/usr/bin/env bash
+shift 2
+[ "$1" = sudo ] && shift
+exec "$@"
+EOF
+cat > "$STUBS/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$STUB_CALLS"
+EOF
+cat > "$STUBS/rm" <<'EOF'
+#!/usr/bin/env bash
+echo "rm $*" >> "$STUB_CALLS"
+EOF
+for s in findmnt ip; do printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/$s"; done
+chmod +x "$STUBS"/*
+STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/install-teardown.sh" --vm stub --workdir "$TMP/tw" >/dev/null 2>&1 && rc=0 || rc=$?
+assert_eq "install-teardown.sh completes against a stubbed VM" "$rc" "0"
+enabled=$(grep -oE 'systemctl enable (u7s-[a-z-]+\.[a-z]+|kubelet\.service)' "$REPO/scripts/install.sh" | awk '{print $3}' | sort -u)
+[ -n "$enabled" ] && ok "install.sh enables u7s units to cover ($(echo "$enabled" | paste -sd' ' -))" || bad "found no units enabled by install.sh"
+for unit in $enabled; do
+  grep -qxF "systemctl disable --now $unit" "$CALLS" \
+    && ok "teardown stops and disables $unit" || bad "teardown never runs 'systemctl disable --now $unit', so it keeps running on the kept VM"
+  grep -qxF "rm -f /etc/systemd/system/$unit" "$CALLS" \
+    && ok "teardown removes the $unit file" || bad "teardown never removes /etc/systemd/system/$unit, so it returns on reboot"
+done
+grep -qxF "systemctl daemon-reload" "$CALLS" && ok "teardown reloads systemd after removing units" || bad "teardown skips daemon-reload"
+
+# One network-default table, shared by lima-start.sh and install-bringup.sh.
+assert_eq "lima-node defaults to its own network" "$(default_network_for_vm lima-node)" "user-v2-mayor"
+assert_eq "lima-node-3 defaults to worker network a" "$(default_network_for_vm lima-node-3)" "user-v2-workers-a"
+assert_eq "lima-node-smoke defaults to worker network b" "$(default_network_for_vm lima-node-smoke)" "user-v2-workers-b"
+assert_eq "an unknown VM falls back to user-v2" "$(default_network_for_vm scratch)" "user-v2"
+for f in lima-start.sh install-bringup.sh; do
+  if grep -q 'lima-node-2|' "$REPO/scripts/conformance/$f"; then bad "$f carries its own copy of the network table"; else ok "$f reads the shared network table"; fi
+  grep -q 'default_network_for_vm' "$REPO/scripts/conformance/$f" || bad "$f does not call default_network_for_vm"
 done
 
 echo ""

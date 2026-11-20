@@ -92,13 +92,7 @@ VM_NAME="${U7S_VM_NAME:-lima-node}"
 # Network column in the mayor-dispatch-template.md doc's Lima VM protocol
 # table -- keep both in sync. Any VM name outside this known set (a one-off
 # scratch VM) falls back to the original flat "user-v2" default.
-case "$VM_NAME" in
-  lima-node) _DEFAULT_NETWORK="user-v2-mayor" ;;
-  lima-node-2|lima-node-3|lima-node-4) _DEFAULT_NETWORK="user-v2-workers-a" ;;
-  lima-node-5|lima-node-smoke) _DEFAULT_NETWORK="user-v2-workers-b" ;;
-  *) _DEFAULT_NETWORK="user-v2" ;;
-esac
-NETWORK="${_NETWORK_OVERRIDE:-$_DEFAULT_NETWORK}"
+NETWORK="${_NETWORK_OVERRIDE:-$(default_network_for_vm "$VM_NAME")}"
 
 # Suffixes the per-node resource names below (konnectivity-agent Pod/Secret, kubelet
 # serving cert) so a 2nd node can join the same cluster without colliding with — or,
