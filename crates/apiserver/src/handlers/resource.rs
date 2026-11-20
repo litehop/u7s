@@ -2087,25 +2087,27 @@ pub(crate) async fn do_patch<S: Store>(
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let mut stored = stored_opt.ok_or_else(|| Status::not_found(group, plural, name))?;
+    if stored_opt.is_none() {
+        return Err(Status::not_found(group, plural, name));
+    }
 
     // A plain PATCH (merge / strategic-merge / JSON Patch) carries no resourceVersion
     // precondition unless the client's own patch body sets metadata.resourceVersion.
     // Real kube-apiserver's PATCH handler therefore read-modify-writes against the
-    // LIVE object and retries (bounded) on a conflicting concurrent write instead of
+    // LIVE object and retries on a conflicting concurrent write instead of
     // surfacing a 409 for a race the client never asked to guard against — e.g. a
     // controller reacting to the just-created object (writing a status condition)
     // bumps the resourceVersion between the client's create response and its very
-    // next PATCH. Without this retry, that PATCH fails with a spurious conflict even
-    // though it never read or depended on the resourceVersion it happened to race
-    // against. If the client's patch DOES pin metadata.resourceVersion to a stale
-    // value, reapplying it against the freshly re-fetched object still yields that
-    // same stale value, so the mismatch reproduces every attempt and correctly
-    // surfaces as 409 once retries are exhausted.
-    const MAX_PATCH_CONFLICT_RETRIES: u32 = 5;
-    let mut attempt = 0u32;
+    // next PATCH. If the client's patch DOES pin metadata.resourceVersion to a value other
+    // than the one just read, that is a 409 without retrying.
+    let mut gu = GuaranteedUpdate::new(
+        state.store.clone(),
+        key,
+        None,
+        (group, plural, name, &meta.kind),
+    );
     loop {
-        attempt += 1;
+        let stored = gu.read_existing().await?;
         let mut current = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
         // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
@@ -2580,15 +2582,22 @@ pub(crate) async fn do_patch<S: Store>(
             return Ok(Json(current.body).into_response());
         }
 
-        let expected_rv = parse_resource_version(current.resource_version())?;
-        let (put, svc_alloc) = crate::service_alloc::put_committing(
-            state.store.clone(),
-            key.to_string(),
-            current.to_bytes(),
-            expected_rv,
-            svc_alloc,
-        )
-        .await?;
+        if let Some(pinned) = parse_resource_version(current.resource_version())? {
+            if pinned != stored.revision {
+                return Err(store_err(
+                    StoreError::RevisionMismatch {
+                        expected: pinned,
+                        current: stored.revision,
+                    },
+                    group,
+                    plural,
+                    name,
+                    &meta.kind,
+                ));
+            }
+        }
+        let (put, svc_alloc) =
+            crate::service_alloc::commit_on_task(svc_alloc, gu.pending(current.to_bytes())).await?;
         match put {
             Ok(new_rv) => {
                 current.set_resource_version(new_rv);
@@ -2610,19 +2619,13 @@ pub(crate) async fn do_patch<S: Store>(
                 inject_type_meta(&mut current.body, group, version, &meta.kind);
                 return Ok(Json(current.body).into_response());
             }
-            Err(StoreError::RevisionMismatch { .. }) if attempt < MAX_PATCH_CONFLICT_RETRIES => {
+            Err(WriteFailure::Retry) => {
                 // Await the rollback so the retry can re-reserve the same values.
                 if let Some(txn) = svc_alloc {
                     txn.rollback().await;
                 }
-                stored = state
-                    .store
-                    .get(key)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(group, plural, name))?;
             }
-            Err(e) => return Err(store_err(e, group, plural, name, &meta.kind)),
+            Err(WriteFailure::Fail(e)) => return Err(e),
         }
     }
 }
