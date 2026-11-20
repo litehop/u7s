@@ -69,19 +69,13 @@ To run the Kubernetes conformance suite against u7s locally:
    scripts/conformance/06-run-sonobuoy.sh --focus "ConfigMap"
    ```
 
-### Rig-only add-ons and kubelet gates
+### Rig-only add-ons
 
-The local conformance rig applies three upstream add-ons and sets three kubelet feature gates (in `lima/kubelet.yaml`) that u7s does not ship. Specs that depend on them pass only when they're present.
+The local conformance rig applies three upstream add-ons that u7s does not ship: `kube-network-policies`, `metrics-server` and `external-snapshotter`. `run-all.sh --install` labels each `u7s.io/conformance-rig-only=true`. Specs that depend on them pass only when they're present.
 
-- **Add-ons:** `kube-network-policies`, `metrics-server` and `external-snapshotter`. `run-all.sh --install` labels each `u7s.io/conformance-rig-only=true`.
-- **Kubelet gates:** `ClusterTrustBundle`, `ClusterTrustBundleProjection` and `PodCertificateRequest`.
+`install.sh` installs no add-on, and `manifests/` doesn't carry them. Install the upstream components yourself if you need NetworkPolicy enforcement, resource metrics (`metrics.k8s.io`, HPA) or volume snapshots.
 
-`install.sh` installs no add-on and sets no gate, and `manifests/` doesn't carry the add-ons. Install the upstream components yourself if you need NetworkPolicy enforcement, resource metrics (`metrics.k8s.io`, HPA) or volume snapshots.
-
-Gate stages disagree between sources:
-
-- `pkg/features/kube_features.go` at `release-1.37` (lines 1417-1427, 1945-1949) shows all three as GA and default-on.
-- The comment at `lima/kubelet.yaml:286-288` calls them beta and default-off, so the rig sets them explicitly. Reconcile that comment with the 1.37 source.
+The `ClusterTrustBundle`, `ClusterTrustBundleProjection` and `PodCertificateRequest` kubelet gates are GA and on by default in Kubernetes 1.37, so u7s installs have them too.
 
 Dependent spec groups, from the upstream `release-1.37` e2e sources:
 
@@ -90,10 +84,6 @@ Dependent spec groups, from the upstream `release-1.37` e2e sources:
 | kube-network-policies | `[sig-network] Netpol` | `test/e2e/network/netpol/network_policy.go` tests traffic reachability; `Netpol API` is not verified |
 | metrics-server | `[sig-autoscaling]` `[Feature:HPA]` "Horizontal pod autoscaling (scale resource: CPU)" and "(scale resource: Memory)" | Spec names from `test/e2e/autoscaling/horizontal_pod_autoscaling.go`; the metrics-server link comes from the `run-all.sh:567-573` comments, not the spec source |
 | external-snapshotter | `[sig-storage]` `[Feature:VolumeSnapshotDataSource]` snapshottable suite | Spec names from `test/e2e/storage/testsuites/snapshottable.go`; the external-snapshotter link comes from the `run-all.sh:578-586` comments, not the spec source |
-| ClusterTrustBundle gates | `[sig-auth]` ClusterTrustBundle (API CRUD at line 80, plus projection specs) | `test/e2e/auth/projected_clustertrustbundle.go:62` gates the whole Describe on both CTB gates |
-| All three gates | `[sig-auth]` "Projected PodCertificate" | `test/e2e/auth/projected_podcertificate.go:48-51` |
-
-Not verified: whether `[sig-instrumentation]` `MetricsGrabber` and `PodCertificateRequest API` specs depend on any of these. Their sources aren't among the files checked.
 
 **Architecture:** u7s runs on the Mac host for a fast `cargo build` → restart loop. kubelet and sonobuoy run inside the lima VM (Linux, cri-o+crun) for reproducibility. sonobuoy reaches u7s via `host.lima.internal:6443`.
 
