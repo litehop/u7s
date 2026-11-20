@@ -40,6 +40,73 @@ pub(crate) enum WriteFailure {
     Fail(StatusError),
 }
 
+pub(crate) enum Deleted {
+    Removed,
+    /// Absent, or recreated under a new uid: nothing of the object that was read is left.
+    Gone,
+    /// A concurrent write changed the object and `keep` says it must now stay.
+    Kept,
+}
+
+fn uid_of(value: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(value).ok()?;
+    Some(
+        v["metadata"]["uid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Hard-deletes `read`, conditional on the uid and revision it was read at, as upstream's
+/// delete preconditions. A write that lands in between is not discarded: the object is re-read
+/// and, unless it is gone, `keep` says it must stay (e.g. a finalizer was re-added), or it is
+/// a different object, the delete is retried at the new revision.
+pub(crate) async fn delete_read<S: Store>(
+    store: &S,
+    key: &str,
+    read: &StoreObject,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Deleted, StoreError> {
+    let uid = uid_of(&read.value);
+    let mut revision = read.revision;
+    loop {
+        match store.delete(key, Some(revision)).await {
+            Ok(_) => return Ok(Deleted::Removed),
+            Err(StoreError::NotFound { .. }) => return Ok(Deleted::Gone),
+            Err(StoreError::RevisionMismatch { .. }) => {
+                let Some(fresh) = store.get(key).await? else {
+                    return Ok(Deleted::Gone);
+                };
+                if uid_of(&fresh.value) != uid {
+                    return Ok(Deleted::Gone);
+                }
+                match serde_json::from_slice::<serde_json::Value>(&fresh.value) {
+                    Ok(body) if !keep(&body) => revision = fresh.revision,
+                    _ => return Ok(Deleted::Kept),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// True when `body` holds a finalizer.
+pub(crate) fn has_finalizers(body: &serde_json::Value) -> bool {
+    body["metadata"]["finalizers"]
+        .as_array()
+        .is_some_and(|f| !f.is_empty())
+}
+
+/// What happened to a [`GuaranteedUpdate::delete`].
+pub(crate) enum Drain {
+    Removed,
+    /// Already gone, or recreated under a new uid.
+    Gone,
+    /// A concurrent writer won and the client did not pin a revision: re-read and redo.
+    Lost,
+}
+
 pub(crate) struct GuaranteedUpdate<S> {
     store: Arc<S>,
     key: String,
@@ -53,6 +120,7 @@ pub(crate) struct GuaranteedUpdate<S> {
     ns: Option<(String, String)>,
     deadline: tokio::time::Instant,
     expected: Option<u64>,
+    read_object: Option<StoreObject>,
 }
 
 impl<S: Store> GuaranteedUpdate<S> {
@@ -78,6 +146,7 @@ impl<S: Store> GuaranteedUpdate<S> {
             ns: None,
             deadline: tokio::time::Instant::now() + CONFLICT_RETRY_DEADLINE,
             expected: None,
+            read_object: None,
         }
     }
 
@@ -103,6 +172,7 @@ impl<S: Store> GuaranteedUpdate<S> {
             (Some(c), None) => c.revision,
             (None, None) => 0,
         });
+        self.read_object = current.clone();
         Ok(current)
     }
 
@@ -145,6 +215,47 @@ impl<S: Store> GuaranteedUpdate<S> {
             &self.name,
             &self.kind,
         ))
+    }
+
+    /// Hard-deletes the object `read` returned instead of writing it (an update that drained
+    /// the last finalizer), conditional on the revision it was read at. A client-pinned
+    /// revision that is not the stored one, or a write that lands first under a pinned one, is
+    /// a 409 as for [`Self::commit`]; otherwise `Lost` sends the caller back to re-read.
+    pub(crate) async fn delete(&mut self) -> Result<Drain, StatusError> {
+        let expected = self
+            .expected
+            .take()
+            .expect("delete without a preceding read");
+        let read = self
+            .read_object
+            .take()
+            .ok_or_else(|| Status::not_found(&self.group, &self.resource, &self.name))?;
+        let read = &read;
+        let conflict = |current| {
+            crate::handlers::generic::store_err(
+                StoreError::RevisionMismatch { expected, current },
+                &self.group,
+                &self.resource,
+                &self.name,
+                &self.kind,
+            )
+        };
+        if expected != read.revision {
+            return Err(conflict(read.revision));
+        }
+        match delete_read(&*self.store, &self.key, read, |_| true).await {
+            Ok(Deleted::Removed) => Ok(Drain::Removed),
+            Ok(Deleted::Gone) => Ok(Drain::Gone),
+            Ok(Deleted::Kept) if self.client_rv.is_none() => Ok(Drain::Lost),
+            Ok(Deleted::Kept) => Err(conflict(0)),
+            Err(e) => Err(crate::handlers::generic::store_err(
+                e,
+                &self.group,
+                &self.resource,
+                &self.name,
+                &self.kind,
+            )),
+        }
     }
 
     /// Writes `bytes` iff the key is still at the revision `read` returned. `Ok(None)` means a
@@ -416,7 +527,7 @@ mod tests {
     ];
 
     /// The text of the third top-level argument of the call whose `(` is at `open`.
-    fn third_arg(text: &str, open: usize) -> Option<String> {
+    fn nth_arg(text: &str, open: usize, n: usize) -> Option<String> {
         let (mut depth, mut in_str, mut esc) = (0usize, false, false);
         let mut args = vec![String::new()];
         for c in text[open..].chars() {
@@ -452,7 +563,7 @@ mod tests {
                 _ => args.last_mut().unwrap().push(c),
             }
         }
-        args.get(2)
+        args.get(n)
             .map(|a| a.split_whitespace().collect::<String>())
     }
 
@@ -465,7 +576,10 @@ mod tests {
     }
 
     /// `(file, fn, class) -> count` of every store `.put(` outside test code under `src/`.
-    fn production_put_sites() -> std::collections::BTreeMap<(String, String, Put), usize> {
+    fn production_sites(
+        call: &str,
+        arg: usize,
+    ) -> std::collections::BTreeMap<(String, String, Put), usize> {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap().flatten() {
                 let p = e.path();
@@ -524,11 +638,11 @@ mod tests {
                     continue;
                 }
                 let mut from = 0;
-                while let Some(i) = line[from..].find(".put(") {
-                    let open = line_start + from + i + ".put".len();
-                    from += i + ".put(".len();
-                    // A router's `.put(handler)` has one argument; a store put has three.
-                    if let Some(arg) = third_arg(&text, open) {
+                while let Some(i) = line[from..].find(call) {
+                    let open = line_start + from + i + call.len() - 1;
+                    from += i + call.len();
+                    // A router's `.put(handler)` has too few arguments to be a store call.
+                    if let Some(arg) = nth_arg(&text, open, arg) {
                         *sites
                             .entry((rel.clone(), current_fn.clone(), classify(&arg)))
                             .or_insert(0) += 1;
@@ -544,7 +658,7 @@ mod tests {
     /// Fails when a call site appears, disappears or changes its argument class unaudited.
     #[test]
     fn every_direct_store_put_is_audited() {
-        let found = production_put_sites();
+        let found = production_sites(".put(", 2);
         let audited: std::collections::BTreeMap<_, _> = AUDITED
             .iter()
             .map(|(f, n, c, k)| ((f.to_string(), n.to_string(), *c), *k))
@@ -561,6 +675,50 @@ mod tests {
             diff.is_empty(),
             "direct `.put(` sites differ from the audit:\n{}\nfound:\n{}",
             diff.join("\n"),
+            found
+                .iter()
+                .map(|((f, n, c), k)| format!("        (\"{f}\", \"{n}\", Put::{c:?}, {k}),"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Every production `.delete(` call site by the class of its revision argument. Blind
+    /// (`None`) deletes only server-owned marker records that nothing updates (allocation
+    /// sentinels, tombstones, Events) or a single-use join token; a delete of a user-visible
+    /// object goes through [`delete_read`] or [`GuaranteedUpdate::delete`], conditional on the
+    /// revision and uid it read, so a write landing after the read is never discarded.
+    const AUDITED_DELETES: &[(&str, &str, Put, usize)] = &[
+        ("bootstrap_rbac.rs", "reconcile_object", Put::Conditional, 1),
+        (
+            "bootstrap_rbac.rs",
+            "remove_legacy_cluster_roles",
+            Put::Conditional,
+            1,
+        ),
+        ("bootstrap_token.rs", "delete_token_secret", Put::Blind, 1),
+        ("cert_expiry.rs", "clear_warnings", Put::Blind, 1),
+        ("guaranteed_update.rs", "delete_read", Put::Conditional, 1),
+        ("handlers/crd.rs", "create_crd", Put::Blind, 1),
+        ("handlers/crd.rs", "delete_instances", Put::Conditional, 1),
+        ("handlers/crd.rs", "patch_crd", Put::Blind, 1),
+        ("handlers/crd.rs", "purge_crd", Put::Conditional, 1),
+        ("handlers/crd.rs", "replace_crd", Put::Blind, 1),
+        ("service_alloc.rs", "delete_sentinel", Put::Blind, 1),
+        ("state.rs", "release_service_ip", Put::Blind, 1),
+    ];
+
+    #[test]
+    fn every_direct_store_delete_is_audited() {
+        let found = production_sites(".delete(", 1);
+        let audited: std::collections::BTreeMap<_, _> = AUDITED_DELETES
+            .iter()
+            .map(|(f, n, c, k)| ((f.to_string(), n.to_string(), *c), *k))
+            .collect();
+        assert_eq!(
+            found,
+            audited,
+            "direct `.delete(` sites differ from the audit; found:\n{}",
             found
                 .iter()
                 .map(|((f, n, c), k)| format!("        (\"{f}\", \"{n}\", Put::{c:?}, {k}),"))
@@ -647,6 +805,63 @@ mod tests {
         let err = gu.commit(with_n(2)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(s.get(KEY).await.unwrap().is_none());
+    }
+
+    fn with_uid(uid: &str, finalizers: &[&str]) -> Bytes {
+        Bytes::from(
+            serde_json::json!({"metadata": {"name": "c", "uid": uid, "finalizers": finalizers}})
+                .to_string(),
+        )
+    }
+
+    /// A write that lands after the read and leaves the object deletable is not an
+    /// obstacle: the delete is retried at the new revision instead of failing.
+    #[tokio::test]
+    async fn delete_read_retries_over_a_write_that_does_not_stop_the_delete() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.put(KEY, with_n(9), None).await.unwrap();
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Removed));
+        assert!(s.get(KEY).await.unwrap().is_none());
+    }
+
+    /// A finalizer added after the read must keep the object, or the finalizer's owner
+    /// never gets to run.
+    #[tokio::test]
+    async fn delete_read_keeps_an_object_that_gained_a_finalizer() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.put(KEY, with_uid("u", &["f"]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Kept));
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    /// A different object under the same name (recreated) is not the object that was read.
+    #[tokio::test]
+    async fn delete_read_never_deletes_an_object_recreated_under_a_new_uid() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("old", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.delete(KEY, None).await.unwrap();
+        s.put(KEY, with_uid("new", &[]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Gone));
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    /// An object already deleted by someone else is done, not an error.
+    #[tokio::test]
+    async fn delete_read_of_an_already_deleted_object_is_gone() {
+        let s = seeded().await;
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.delete(KEY, None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, |_| false).await.unwrap();
+        assert!(matches!(out, Deleted::Gone));
     }
 
     /// Kinds with AllowCreateOnUpdate must still create on PUT to a missing key.

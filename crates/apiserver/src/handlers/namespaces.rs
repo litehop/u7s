@@ -466,7 +466,7 @@ pub(crate) async fn replace_namespace<S: Store>(
         .map(|f| f.is_empty())
         .unwrap_or(true);
     if deletion_ts_set && finalizers_empty {
-        delete_finalized_namespace(&state, &name).await;
+        delete_finalized_namespace(&state, &name, &obj, new_rv).await;
     }
 
     Ok(Json(obj.body).into_response())
@@ -644,7 +644,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     current.set_resource_version(new_rv);
 
     if deletion_ts_set && finalizers_empty {
-        delete_finalized_namespace(&state, &name).await;
+        delete_finalized_namespace(&state, &name, &current, new_rv).await;
     }
 
     Ok(Json(current.body).into_response())
@@ -775,7 +775,7 @@ pub(crate) async fn finalize_namespace<S: Store>(
     current.set_resource_version(new_rv);
 
     if deletion_ts_set && finalizers_empty {
-        delete_finalized_namespace(&state, &name).await;
+        delete_finalized_namespace(&state, &name, &current, new_rv).await;
     }
 
     Ok(Json(current.body).into_response())
@@ -1044,10 +1044,32 @@ pub(crate) async fn patch_namespace_status<S: Store>(
 /// namespace REST does in the same write. Content is never touched: the namespace controller
 /// only empties `spec.finalizers` after its own drain, and every deletion it issued went
 /// through the object's own DELETE path.
-async fn delete_finalized_namespace<S: Store>(state: &AppState<S>, name: &str) {
+///
+/// The delete is conditional on `written`, the object at revision `rv` that emptied the
+/// finalizers: a write that landed since (a re-added finalizer) is not discarded.
+async fn delete_finalized_namespace<S: Store>(
+    state: &AppState<S>,
+    name: &str,
+    written: &Object,
+    rv: u64,
+) {
     let key = cluster_object_key("namespaces", name);
-    let _ = state.store.delete(&key, None).await;
-    state.quota_admission_locks.evict(name);
+    let read = u7s_store::StoreObject {
+        key: key.clone(),
+        value: written.to_bytes(),
+        revision: rv,
+    };
+    let kept = |body: &serde_json::Value| {
+        body["spec"]["finalizers"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty())
+    };
+    if !matches!(
+        crate::guaranteed_update::delete_read(&*state.store, &key, &read, kept).await,
+        Ok(crate::guaranteed_update::Deleted::Kept)
+    ) {
+        state.quota_admission_locks.evict(name);
+    }
 }
 
 pub(crate) async fn delete_namespace<S: Store>(
@@ -1169,11 +1191,19 @@ pub(crate) async fn delete_namespace<S: Store>(
     // No spec.finalizers — remove the namespace at once, like upstream's namespace REST
     // Delete. Content is never cascaded here: API-created namespaces always carry
     // "kubernetes", so this is the namespace controller's final DELETE after its own drain.
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+    if let crate::guaranteed_update::Deleted::Kept =
+        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?
+    {
+        return Err(store_err_to_status(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: stored.revision,
+                current: 0,
+            },
+            &name,
+        ));
+    }
     state.quota_admission_locks.evict(&name);
 
     Ok(Json(serde_json::json!({

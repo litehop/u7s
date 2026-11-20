@@ -3613,8 +3613,10 @@ pub async fn replace_cr<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
-                .await?;
+            complete_cr_finalizer_drain(
+                &state, &key, &stored, &group, &plural, &name, &ctx.kind, None,
+            )
+            .await?;
         }
         return Ok(Json(obj));
     }
@@ -3696,20 +3698,33 @@ pub async fn replace_cr<S: Store>(
 /// removes the finalizer via PATCH; `patch_cr`/`patch_cr_namespaced` detect that the patch
 /// itself completed the drain and call this instead of storing the update — without it, the
 /// owner CR would sit stuck Terminating forever once the finalizer is cleared.
+#[allow(clippy::too_many_arguments)]
 async fn complete_cr_finalizer_drain<S: Store>(
     state: &AppState<S>,
     key: &str,
+    stored: &u7s_store::StoreObject,
     group: &str,
     plural: &str,
     name: &str,
     kind: &str,
     ns: Option<&str>,
 ) -> Result<(), crate::status::StatusError> {
-    state
-        .store
-        .delete(key, None)
-        .await
-        .map_err(|e| store_err_cr(e, group, plural, name, kind))?;
+    if let crate::guaranteed_update::Deleted::Kept =
+        crate::guaranteed_update::delete_read(&*state.store, key, stored, |_| true)
+            .await
+            .map_err(|e| store_err_cr(e, group, plural, name, kind))?
+    {
+        return Err(store_err_cr(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: stored.revision,
+                current: 0,
+            },
+            group,
+            plural,
+            name,
+            kind,
+        ));
+    }
     // The drained CR may be the last instance holding a Terminating CRD.
     state.crd_finalizer_wake.notify_one();
     if let Some(namespace) = ns {
@@ -3832,11 +3847,22 @@ pub async fn delete_cr<S: Store>(
         .into_response());
     }
 
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+    if let crate::guaranteed_update::Deleted::Kept =
+        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
+            .await
+            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?
+    {
+        return Err(store_err_cr(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: stored.revision,
+                current: 0,
+            },
+            &group,
+            &plural,
+            &name,
+            &ctx.kind,
+        ));
+    }
     state.crd_finalizer_wake.notify_one();
 
     evict_cr_conversion_cache(&state, obj.resource_version());
@@ -3968,20 +3994,24 @@ pub async fn delete_collection_cr<S: Store>(
                 continue;
             }
 
-            if crate::handlers::generic::soft_delete_collection_item(
-                state.store.clone(),
-                &obj.key,
-                (&group, &plural, &name, &plural),
-            )
-            .await?
+            if let crate::handlers::generic::CollectedItem::Removed =
+                crate::handlers::generic::delete_collection_item(
+                    state.store.clone(),
+                    &obj.key,
+                    (&group, &plural, &name, &plural),
+                )
+                .await?
             {
-                continue;
+                state.crd_finalizer_wake.notify_one();
             }
+            continue;
         }
-        match state.store.delete(&obj.key, None).await {
-            Ok(_) => state.crd_finalizer_wake.notify_one(),
-            Err(u7s_store::StoreError::NotFound { .. }) => {}
-            Err(e) => return Err(Status::internal(e.to_string())),
+        if let crate::guaranteed_update::Deleted::Removed =
+            crate::guaranteed_update::delete_read(&*state.store, &obj.key, &obj, |_| true)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        {
+            state.crd_finalizer_wake.notify_one();
         }
     }
 
@@ -4670,8 +4700,17 @@ pub async fn replace_cr_namespaced<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&existing)).await?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
-                .await?;
+            complete_cr_finalizer_drain(
+                &state,
+                &key,
+                &stored,
+                &group,
+                &plural,
+                &name,
+                &ctx.kind,
+                Some(&ns),
+            )
+            .await?;
         }
         return Ok(Json(obj));
     }
@@ -4848,11 +4887,22 @@ pub async fn delete_cr_namespaced<S: Store>(
         .into_response());
     }
 
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?;
+    if let crate::guaranteed_update::Deleted::Kept =
+        crate::guaranteed_update::delete_read(&*state.store, &key, &stored, |_| true)
+            .await
+            .map_err(|e| store_err_cr(e, &group, &plural, &name, &ctx.kind))?
+    {
+        return Err(store_err_cr(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: stored.revision,
+                current: 0,
+            },
+            &group,
+            &plural,
+            &name,
+            &ctx.kind,
+        ));
+    }
     state.crd_finalizer_wake.notify_one();
 
     evict_cr_conversion_cache(&state, obj.resource_version());
@@ -5000,20 +5050,24 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                 continue;
             }
 
-            if crate::handlers::generic::soft_delete_collection_item(
-                state.store.clone(),
-                &obj.key,
-                (&group, &plural, &name, &plural),
-            )
-            .await?
+            if let crate::handlers::generic::CollectedItem::Removed =
+                crate::handlers::generic::delete_collection_item(
+                    state.store.clone(),
+                    &obj.key,
+                    (&group, &plural, &name, &plural),
+                )
+                .await?
             {
-                continue;
+                state.crd_finalizer_wake.notify_one();
             }
+            continue;
         }
-        match state.store.delete(&obj.key, None).await {
-            Ok(_) => state.crd_finalizer_wake.notify_one(),
-            Err(u7s_store::StoreError::NotFound { .. }) => {}
-            Err(e) => return Err(Status::internal(e.to_string())),
+        if let crate::guaranteed_update::Deleted::Removed =
+            crate::guaranteed_update::delete_read(&*state.store, &obj.key, &obj, |_| true)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        {
+            state.crd_finalizer_wake.notify_one();
         }
     }
 
@@ -5336,8 +5390,10 @@ pub async fn patch_cr<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, None)
-                .await?;
+            complete_cr_finalizer_drain(
+                &state, &key, &stored, &group, &plural, &name, &ctx.kind, None,
+            )
+            .await?;
         }
         return Ok(Json(obj).into_response());
     }
@@ -5689,8 +5745,17 @@ pub async fn patch_cr_namespaced<S: Store>(
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
-            complete_cr_finalizer_drain(&state, &key, &group, &plural, &name, &ctx.kind, Some(&ns))
-                .await?;
+            complete_cr_finalizer_drain(
+                &state,
+                &key,
+                &stored,
+                &group,
+                &plural,
+                &name,
+                &ctx.kind,
+                Some(&ns),
+            )
+            .await?;
         }
         return Ok(Json(obj).into_response());
     }

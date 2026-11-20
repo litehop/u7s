@@ -2928,7 +2928,7 @@ mod tests {
         "complete_finalizer_drain",
         "complete_cr_finalizer_drain",
         // Every DeleteCollection caller `continue`s on dry-run before reaching it.
-        "soft_delete_collection_item",
+        "delete_collection_item",
         // CRD finalization (finalize_crd and its helpers): reached from delete_crd only after
         // its dry-run early-return, and from the background terminating-CRD sweep.
         "finalize_crd",
