@@ -1339,9 +1339,9 @@ assert "both CSR sites (join and control-plane self-join) go through generate_no
   "$([ "$(grep -c '^  generate_node_csr "\$STATE_DIR/kubelet-client.key" "\$STATE_DIR/kubelet-client.csr"$' "$INSTALL")" = 2 ] && grep -qF '"$tool" node-csr --node-name "$NODE_NAME"' "$INSTALL" && echo 1 || echo 0)"
 
 # Case 6a: a GCP FQDN hostname (<name>.c.<project>.internal) can push the
-# identity CN past X.509's 64 chars. Upstream accepts names up to 253 chars, so
-# install.sh must not refuse any of them -- via --node-name, via the hostname
-# default, or when persisted by an earlier install.
+# identity CN past X.509's 64 chars. Names up to 63 chars (the hostname label
+# limit) must be accepted and longer ones refused -- via --node-name, via the
+# hostname default, or when persisted by an earlier install.
 long_runner="$PERSIST_WORK/long-name.sh"
 {
   echo '#!/usr/bin/env bash'
@@ -1358,24 +1358,21 @@ for len in 52 53 63 64 253; do
   long_name="$(printf 'a%.0s' $(seq 1 "$len"))"
   rc=0
   out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long" "$long_name" 2>&1)" || rc=$?
-  assert "a $len-char --node-name is accepted (upstream joins nodes up to 253 chars)" \
-    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+  want=$([ "$len" -le 63 ] && echo 0 || echo 1)
+  assert "a $len-char --node-name is $([ "$want" -eq 0 ] && echo accepted || echo refused) (kubernetes.io/hostname label value limit is 63)" \
+    "$([ "$rc" -eq "$want" ] && { [ "$want" -eq 1 ] || printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name"; } && echo 1 || echo 0)"
   rc=0
   out="$(LONG_HOST="$(printf '%s' "$long_name" | tr a A)" bash "$long_runner" "$PERSIST_WORK/long" "" 2>&1)" || rc=$?
-  assert "a $len-char hostname becomes the (lowercased) node name via the real derivation path" \
-    "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name" && echo 1 || echo 0)"
+  assert "a $len-char hostname is $([ "$want" -eq 0 ] && echo 'becomes the (lowercased) node name' || echo refused) via the real derivation path" \
+    "$([ "$rc" -eq "$want" ] && { [ "$want" -eq 1 ] || printf '%s' "$out" | drain_grep -qx "NODE_NAME=$long_name"; } && echo 1 || echo 0)"
 done
 persisted_long="$(printf 'b%.0s' $(seq 1 100))"
 mkdir -p "$PERSIST_WORK/long-persisted"
 printf 'NODE_NAME="%s"\nIFACE="eth0"\n' "$persisted_long" > "$PERSIST_WORK/long-persisted/config"
 rc=0
 out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "" 1 2>&1)" || rc=$?
-assert "a persisted long node name is reused on re-run with no flag (a host from a failed earlier install must not dead-end)" \
-  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
-rc=0
-out="$(LONG_HOST=x bash "$long_runner" "$PERSIST_WORK/long-persisted" "$persisted_long" 1 2>&1)" || rc=$?
-assert "re-running with the persisted long name as --node-name is not refused" \
-  "$([ "$rc" -eq 0 ] && printf '%s' "$out" | drain_grep -qx "NODE_NAME=$persisted_long" && echo 1 || echo 0)"
+assert "a persisted node name over 63 chars is refused on re-run: it could never register as a Node" \
+  "$([ "$rc" -eq 1 ] && printf '%s' "$out" | drain_grep -qF 'limit is 63' && echo 1 || echo 0)"
 
 # Case 6b: the control-plane Node must carry node-role.kubernetes.io/control-plane
 # (empty value) like kubeadm's mark-control-plane. The kubelet cannot label
@@ -3373,6 +3370,59 @@ assert_true "install.sh carries the rig-mirror comment -- without it a profile e
   grep -q 'Lima conformance rig mirror: scripts/conformance/lima-start.sh' "$INSTALL"
 assert_true "lima-start.sh carries the rig-only-rule comment -- without it the rule's absence from install.sh looks like an omission and gets 'fixed' on one side only, drifting the rig from what users run" \
   grep -q 'This rig-only u7s-default rule is intentionally NOT in install.sh' "$LIMA_START"
+
+# ---------------------------------------------------------------------------
+# Node name validation: the kubelet stamps the name into the
+# kubernetes.io/hostname label (value <= 63 chars), which the apiserver
+# enforces. A longer name (explicit, or a long cloud hostname) must be refused
+# before install.sh changes the host, not fail at kubelet registration.
+# ---------------------------------------------------------------------------
+NN_WORK="$(mktemp -d)"
+trap 'rm -rf "$DETECT_WORK" "$MANIFEST_WORK" "$NET_WORK" "$NN_WORK"' EXIT
+{
+  echo 'set -uo pipefail'
+  grep -F 'normalize_node_name() {' "$INSTALL"
+  awk '$0 == "validate_node_name() {" {p=1} p {print} p && /^}$/ {exit}' "$INSTALL"
+  echo 'hostname() { printf "%s" "$FAKE_HOSTNAME"; }'
+  awk '/^# --- Defaults: node name/ {p=1; next} /^if \[ -z "\$IFACE" \]; then$/ {p=0} p' "$INSTALL"
+  echo 'echo "resolved=$NODE_NAME"'
+} > "$NN_WORK/run.sh"
+assert "node-name validation was extracted from install.sh (if this fails the cases below test nothing)" \
+  "$(grep -qF 'validate_node_name "$NODE_NAME" || exit 1' "$NN_WORK/run.sh" && grep -qx 'validate_node_name() {' "$NN_WORK/run.sh" && echo 1 || echo 0)"
+
+# nn_run <explicit --node-name or ""> <hostname>: sets NN_STATUS/NN_OUT.
+nn_run() {
+  NN_STATUS=0
+  NN_OUT="$(NODE_NAME="$1" FAKE_HOSTNAME="$2" bash "$NN_WORK/run.sh" 2>&1)" || NN_STATUS=$?
+}
+n63="$(printf 'a%.0s' $(seq 63))"
+n64="${n63}a"
+nn_run "$n63" host
+assert "a 63-char --node-name is accepted: it is exactly the label-value limit, refusing it would reject valid hosts" \
+  "$([ "$NN_STATUS" -eq 0 ] && echo 1 || echo 0)"
+nn_run "$n64" host
+assert "a 64-char --node-name is refused, or kubelet registration fails late once the apiserver validates the hostname label" \
+  "$([ "$NN_STATUS" -ne 0 ] && echo 1 || echo 0)"
+assert "the refusal names the 63-char limit and --node-name so the operator knows the fix" \
+  "$([[ "$NN_OUT" == *"limit is 63"* && "$NN_OUT" == *"--node-name"* ]] && echo 1 || echo 0)"
+nn_run "" "$n64"
+assert "a derived hostname over 63 chars (long cloud instance name) is refused, not just an explicit flag" \
+  "$([ "$NN_STATUS" -ne 0 ] && echo 1 || echo 0)"
+nn_run "" "Host-A"
+assert "an uppercase hostname is lowercased then accepted: validating before normalizing would refuse valid hosts" \
+  "$([ "$NN_STATUS" -eq 0 ] && [[ "$NN_OUT" == *"resolved=host-a"* ]] && echo 1 || echo 0)"
+nn_run "bad_name" host
+assert "a name with an invalid character ('_') is refused: it is not a DNS-1123 name and the Node would be rejected" \
+  "$([ "$NN_STATUS" -ne 0 ] && echo 1 || echo 0)"
+nn_run "-lead" host
+assert "a name starting with '-' is refused as not DNS-1123" \
+  "$([ "$NN_STATUS" -ne 0 ] && echo 1 || echo 0)"
+nn_run "a..b" host
+assert "a name with an empty DNS label ('..') is refused" \
+  "$([ "$NN_STATUS" -ne 0 ] && echo 1 || echo 0)"
+nn_run "node-1.example.com" host
+assert "a dotted DNS-1123 subdomain is accepted (FQDN hostnames are common)" \
+  "$([ "$NN_STATUS" -eq 0 ] && echo 1 || echo 0)"
 
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"

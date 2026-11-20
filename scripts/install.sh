@@ -1426,8 +1426,8 @@ read_join_token() {
 }
 
 # Writes the node identity key (0600) and CSR (CN=system:node:<name>,
-# O=system:nodes) via the tarball's u7s-apiserver. The openssl CSR tool caps
-# CN at 64 bytes, so node names over 52 chars would not fit.
+# O=system:nodes) via the tarball's u7s-apiserver, which (unlike openssl req's
+# 64-byte CN cap, i.e. 52-char names) fits any name install.sh accepts.
 generate_node_csr() {
   local tool
   tool="$(find "$STAGE_DIR" -type f -name u7s-apiserver | head -n1)"
@@ -2010,6 +2010,20 @@ PERSISTED_CLUSTER_FAMILIES=""
 PERSISTED_POD_MTU=""
 normalize_node_name() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
 NODE_NAME="$(normalize_node_name "$NODE_NAME")"
+# The kubelet stamps the node name into the kubernetes.io/hostname label, whose
+# value is capped at 63 chars; the apiserver rejects the Node otherwise and
+# registration would fail only after the install has changed the host.
+validate_node_name() {
+  local name="$1"
+  if [ "${#name}" -gt 63 ]; then
+    echo "error: node name '$name' is ${#name} characters; the limit is 63 (it becomes the kubernetes.io/hostname label value). Pass a shorter name with --node-name <name> (or U7S_NODE_NAME)." >&2
+    return 1
+  fi
+  if [[ ! "$name" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ ]] || [[ "$name" == *..* ]]; then
+    echo "error: node name '$name' is not a valid DNS-1123 name (lowercase letters, digits, '-' and '.', starting and ending with a letter or digit). Pass a valid name with --node-name <name> (or U7S_NODE_NAME)." >&2
+    return 1
+  fi
+}
 if [ -f "$CONFIG_FILE" ]; then
   # Sourced inside a subshell, not the main shell, so this cannot clobber the
   # NODE_NAME/IFACE already resolved from flags/env above.
@@ -2108,6 +2122,7 @@ if [ -z "$NODE_NAME" ]; then
   echo "error: refusing to continue: empty node name (hostname is empty; pass --node-name)" >&2
   exit 1
 fi
+validate_node_name "$NODE_NAME" || exit 1
 
 if [ -z "$IFACE" ]; then
   # Whitelist physical-NIC name patterns rather than blacklisting virtual
