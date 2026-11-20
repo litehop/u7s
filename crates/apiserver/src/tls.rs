@@ -603,9 +603,23 @@ pub(crate) fn pq_provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// Makes the PQ provider the process default for third-party clients (reqwest, tungstenite)
-/// that pick up `CryptoProvider::get_default()`. Idempotent.
-pub(crate) fn install_pq_provider() {
+/// that pick up `CryptoProvider::get_default()`. Fails if a different default was already
+/// installed: those clients would silently handshake without the hybrid group.
+pub(crate) fn install_pq_provider() -> anyhow::Result<()> {
     rustls_post_quantum::provider().install_default().ok();
+    let default = rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| anyhow::anyhow!("no process-default rustls CryptoProvider is installed"))?;
+    ensure_pq_first(default)
+}
+
+fn ensure_pq_first(provider: &rustls::crypto::CryptoProvider) -> anyhow::Result<()> {
+    match provider.kx_groups.first().map(|g| g.name()) {
+        Some(rustls::NamedGroup::X25519MLKEM768) => Ok(()),
+        first => anyhow::bail!(
+            "process-default rustls CryptoProvider prefers {first:?}, not X25519MLKEM768: \
+             outbound clients would negotiate classical-only key exchange"
+        ),
+    }
 }
 
 /// Serving config presenting the leaf and its signing intermediate (never the root: the root
@@ -695,7 +709,7 @@ fn generate_tls_with(
     let test_lifetime = crate::pki::test_lifetime();
     let serving_lifetime = test_lifetime.unwrap_or(serving_lifetime);
     let test_client_lifetime = test_lifetime.unwrap_or(CLIENT_CERT_LIFETIME);
-    install_pq_provider();
+    install_pq_provider()?;
 
     // --- CAs: load-or-generate ---
     // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
@@ -3222,6 +3236,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
+    #[test]
+    fn pq_first_provider_passes_the_default_check() {
+        ensure_pq_first(&pq_provider()).expect("hybrid-first provider must be accepted");
+    }
+
+    /// A classical-first process default (installed by something else before startup) would make
+    /// reqwest and bootstrap_apply handshake without the hybrid, so startup must refuse it.
+    #[test]
+    fn non_pq_default_provider_is_rejected() {
+        let mut provider = (*pq_provider()).clone();
+        provider
+            .kx_groups
+            .retain(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
+        let err = ensure_pq_first(&provider).unwrap_err().to_string();
+        assert!(err.contains("X25519MLKEM768"), "{err}");
+
+        provider.kx_groups.clear();
+        assert!(ensure_pq_first(&provider).is_err());
+    }
+
     /// Harvest-now-decrypt-later: every control-plane session the apiserver terminates or
     /// originates must use hybrid X25519MLKEM768, not a classical-only group. The hybrid must
     /// also be the preferred first group, because rustls only sends a key share for the first
@@ -3284,7 +3318,7 @@ mod tests {
     async fn reqwest_clients_complete_a_pq_only_handshake_after_install() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        install_pq_provider();
+        install_pq_provider().unwrap();
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = key.cert.der().clone();
         let mut provider = (*pq_provider()).clone();
