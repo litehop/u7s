@@ -1491,6 +1491,14 @@ fn webhook_url_errors(path: &str, url: &str) -> Vec<String> {
     };
     let parsed = match reqwest::Url::parse(url) {
         Ok(u) => u,
+        // Go's url.Parse accepts a scheme-less reference (including ""), so upstream reports
+        // the empty scheme and host rather than a parse failure.
+        Err(e) if e.to_string() == "relative URL without a base" => {
+            return vec![
+                invalid("", &format!("'https' is the only allowed URL scheme{FORM}")),
+                invalid("", &format!("host must be specified{FORM}")),
+            ]
+        }
         Err(e) => {
             return vec![format!(
                 "{path}: Required value: url must be a valid URL: {e}{FORM}"
@@ -10376,6 +10384,19 @@ mod tests {
             ]
         );
         assert!(validate_webhook_client_config("p", &cc("https://host:8443/hook")).is_empty());
+    }
+
+    /// `url: ""` is a scheme-less reference to Go, so upstream answers Invalid (not Required)
+    /// for scheme and host; clients that match on the message must see the same text.
+    #[test]
+    fn webhook_client_config_empty_url_reports_invalid_scheme_and_host_like_upstream() {
+        assert_eq!(
+            validate_webhook_client_config("p", &json!({"url": ""})),
+            vec![
+                "p.url: Invalid value: \"\": 'https' is the only allowed URL scheme; desired format: https://host[/path]",
+                "p.url: Invalid value: \"\": host must be specified; desired format: https://host[/path]",
+            ]
+        );
     }
 
     #[test]
