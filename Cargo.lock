@@ -3450,6 +3450,7 @@ dependencies = [
  "u7s-sentinel",
  "u7s-store",
  "u7s-version",
+ "url",
  "uuid",
  "x509-cert",
  "yaml-rust2",

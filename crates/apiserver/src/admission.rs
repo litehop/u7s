@@ -1493,11 +1493,24 @@ fn webhook_url_errors(path: &str, url: &str) -> Vec<String> {
         Ok(u) => u,
         // Go's url.Parse accepts a scheme-less reference (including ""), so upstream reports
         // the empty scheme and host rather than a parse failure.
-        Err(e) if e.to_string() == "relative URL without a base" => {
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
             return vec![
                 invalid("", &format!("'https' is the only allowed URL scheme{FORM}")),
                 invalid("", &format!("host must be specified{FORM}")),
             ]
+        }
+        // Go parses `https://` into an empty host rather than failing.
+        Err(url::ParseError::EmptyHost) => {
+            let mut errs = Vec::new();
+            let scheme = url.split(':').next().unwrap_or_default();
+            if scheme != "https" {
+                errs.push(invalid(
+                    scheme,
+                    &format!("'https' is the only allowed URL scheme{FORM}"),
+                ));
+            }
+            errs.push(invalid("", &format!("host must be specified{FORM}")));
+            return errs;
         }
         Err(e) => {
             return vec![format!(
@@ -10384,6 +10397,22 @@ mod tests {
             ]
         );
         assert!(validate_webhook_client_config("p", &cc("https://host:8443/hook")).is_empty());
+    }
+
+    /// Go parses `https://` into an empty host, so upstream answers Invalid "host must be
+    /// specified" rather than Required "must be a valid URL".
+    #[test]
+    fn webhook_client_config_empty_host_is_invalid_host_not_unparseable_like_upstream() {
+        assert_eq!(
+            validate_webhook_client_config("p", &json!({"url": "https://"})),
+            vec![
+                "p.url: Invalid value: \"\": host must be specified; desired format: https://host[/path]"
+            ]
+        );
+        assert_eq!(
+            validate_webhook_client_config("p", &json!({"url": "http://"})).len(),
+            2
+        );
     }
 
     /// `url: ""` is a scheme-less reference to Go, so upstream answers Invalid (not Required)
