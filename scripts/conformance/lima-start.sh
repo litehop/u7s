@@ -271,6 +271,10 @@ fi
 # different Lima networks.
 assert_same_lima_network "$VM_NAME" "$KUBECONFIG_PATH" || exit 1
 
+# A prior install.sh run on this slot leaves u7s-apiserver/u7s-kcm enabled; they collide with
+# the host rig's KCM on :10257 and race it for podCIDRs. Idempotent.
+limactl shell "$VM_NAME" sudo bash -s < "$(dirname "$0")/clear-native-units.sh"
+
 # CRI-O ships a default 10-crio-bridge.conf(list) that gives every node its own
 # independent, uncoordinated subnet with no cross-node routing at all. Flannel
 # supplies the real CNI config instead (10-flannel.conflist, installed by its

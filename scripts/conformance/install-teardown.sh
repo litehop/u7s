@@ -34,13 +34,13 @@ fi
 rm -f "$WORKDIR/kubeconfig" "$WORKDIR/install-tunnel.log"
 
 echo "[install-teardown] stopping and removing u7s units on $VM_NAME"
+limactl shell "$VM_NAME" sudo bash -s < "$DIR/clear-native-units.sh"
 limactl shell "$VM_NAME" sudo bash -c '
   set -u
-  units="u7s-kcm-restart.path u7s-kcm-restart.service u7s-kcm.service u7s-apiserver.service u7s-scheduler.service kubelet.service"
-  for u in $units; do systemctl disable --now "$u" 2>/dev/null || true; done
+  systemctl disable --now kubelet.service 2>/dev/null || true
   if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
-  for u in $units; do rm -f "/etc/systemd/system/$u"; done
-  rm -rf /etc/systemd/system/u7s-apiserver.service.d /etc/systemd/system/kubelet.service.d
+  rm -f /etc/systemd/system/kubelet.service
+  rm -rf /etc/systemd/system/kubelet.service.d
   systemctl daemon-reload
   systemctl reset-failed 2>/dev/null || true
   findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
