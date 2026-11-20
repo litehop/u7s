@@ -226,6 +226,7 @@ fn backlog_clamp_warning(requested: i32, ceiling: Option<i32>) -> Option<String>
 }
 
 pub async fn run(args: Args) -> anyhow::Result<()> {
+    tls::install_pq_provider()?;
     // 2. Init tracing. try_init() rather than init(): idempotent if a global subscriber is
     // already installed (e.g. this crate's own test_utils::tracing_capture, shared by several
     // tests in this binary) instead of panicking — the shipped main.rs binary only ever calls

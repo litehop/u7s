@@ -7,7 +7,7 @@ pub(crate) fn handshake_completes(
     client: Arc<rustls::ClientConfig>,
     server: Arc<rustls::ServerConfig>,
 ) -> bool {
-    server_chain(client, server).is_some()
+    handshake(client, server).is_some()
 }
 
 /// The certificate chain the server presented, when the handshake completes.
@@ -15,6 +15,35 @@ pub(crate) fn server_chain(
     client: Arc<rustls::ClientConfig>,
     server: Arc<rustls::ServerConfig>,
 ) -> Option<Vec<Vec<u8>>> {
+    let [client, _] = handshake(client, server)?;
+    Some(
+        client
+            .peer_certificates()
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.as_ref().to_vec())
+            .collect(),
+    )
+}
+
+/// The key-exchange group the two sides agreed on, when the handshake completes.
+pub(crate) fn negotiated_group(
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+) -> Option<rustls::NamedGroup> {
+    let [client, server] = handshake(client, server)?;
+    let (c, s) = (
+        client.negotiated_key_exchange_group()?.name(),
+        server.negotiated_key_exchange_group()?.name(),
+    );
+    assert_eq!(c, s, "both ends must report the same group");
+    Some(c)
+}
+
+fn handshake(
+    client: Arc<rustls::ClientConfig>,
+    server: Arc<rustls::ServerConfig>,
+) -> Option<[rustls::Connection; 2]> {
     let mut conns = [
         rustls::Connection::Client(
             rustls::ClientConnection::new(client, "localhost".try_into().unwrap()).unwrap(),
@@ -37,14 +66,7 @@ pub(crate) fn server_chain(
             }
         }
         if conns.iter().all(|c| !c.is_handshaking()) {
-            return Some(
-                conns[0]
-                    .peer_certificates()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|c| c.as_ref().to_vec())
-                    .collect(),
-            );
+            return Some(conns);
         }
     }
     None

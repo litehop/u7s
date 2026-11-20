@@ -596,6 +596,32 @@ fn host_san(host: &str) -> anyhow::Result<SanType> {
     })
 }
 
+/// The hybrid X25519MLKEM768 provider (preferred first) every u7s-owned rustls config is built
+/// from, so a captured handshake cannot be decrypted later by a quantum adversary.
+pub(crate) fn pq_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls_post_quantum::provider())
+}
+
+/// Makes the PQ provider the process default for third-party clients (reqwest, tungstenite)
+/// that pick up `CryptoProvider::get_default()`. Fails if a different default was already
+/// installed: those clients would silently handshake without the hybrid group.
+pub(crate) fn install_pq_provider() -> anyhow::Result<()> {
+    rustls_post_quantum::provider().install_default().ok();
+    let default = rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| anyhow::anyhow!("no process-default rustls CryptoProvider is installed"))?;
+    ensure_pq_first(default)
+}
+
+fn ensure_pq_first(provider: &rustls::crypto::CryptoProvider) -> anyhow::Result<()> {
+    match provider.kx_groups.first().map(|g| g.name()) {
+        Some(rustls::NamedGroup::X25519MLKEM768) => Ok(()),
+        first => anyhow::bail!(
+            "process-default rustls CryptoProvider prefers {first:?}, not X25519MLKEM768: \
+             outbound clients would negotiate classical-only key exchange"
+        ),
+    }
+}
+
 /// Serving config presenting the leaf and its signing intermediate (never the root: the root
 /// is already in every client's trust store) and verifying optional client certs against
 /// `client_ca_ders`. Rebuilt and swapped, never mutated, so a connection keeps the config
@@ -638,7 +664,8 @@ pub(crate) fn build_server_config(
         .allow_unauthenticated()
         .build()
         .map_err(|e| anyhow::anyhow!("client verifier: {e}"))?;
-    let mut server_config = ServerConfig::builder()
+    let mut server_config = ServerConfig::builder_with_provider(pq_provider())
+        .with_safe_default_protocol_versions()?
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_cert_chain, server_key_der)?;
     // h2 first so clients that support both (kubelet, kubectl, controllers) prefer
@@ -682,9 +709,7 @@ fn generate_tls_with(
     let test_lifetime = crate::pki::test_lifetime();
     let serving_lifetime = test_lifetime.unwrap_or(serving_lifetime);
     let test_client_lifetime = test_lifetime.unwrap_or(CLIENT_CERT_LIFETIME);
-    // Install the ML-KEM-768 hybrid post-quantum crypto provider.
-    // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
-    rustls_post_quantum::provider().install_default().ok();
+    install_pq_provider()?;
 
     // --- CAs: load-or-generate ---
     // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
@@ -3209,6 +3234,130 @@ mod tests {
             "the root must not be presented: it is already in every client's trust store"
         );
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    #[test]
+    fn pq_first_provider_passes_the_default_check() {
+        ensure_pq_first(&pq_provider()).expect("hybrid-first provider must be accepted");
+    }
+
+    /// A classical-first process default (installed by something else before startup) would make
+    /// reqwest and bootstrap_apply handshake without the hybrid, so startup must refuse it.
+    #[test]
+    fn non_pq_default_provider_is_rejected() {
+        let mut provider = (*pq_provider()).clone();
+        provider
+            .kx_groups
+            .retain(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
+        let err = ensure_pq_first(&provider).unwrap_err().to_string();
+        assert!(err.contains("X25519MLKEM768"), "{err}");
+
+        provider.kx_groups.clear();
+        assert!(ensure_pq_first(&provider).is_err());
+    }
+
+    /// Harvest-now-decrypt-later: every control-plane session the apiserver terminates or
+    /// originates must use hybrid X25519MLKEM768, not a classical-only group. The hybrid must
+    /// also be the preferred first group, because rustls only sends a key share for the first
+    /// group; a provider that merely lists it would still start with X25519 and let a
+    /// classical-preferring peer settle there.
+    #[test]
+    fn every_owned_tls_config_negotiates_x25519mlkem768() {
+        use crate::handlers::proxy::{build_insecure_tls_config, build_kubelet_tls_config_for};
+
+        let dir = test_temp_dir("pq-kx");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let server = tls.server_config.get();
+        let pq = rustls::NamedGroup::X25519MLKEM768;
+
+        assert_eq!(
+            server.crypto_provider().kx_groups[0].name(),
+            pq,
+            "serving config (kubectl/kubelet/KCM/scheduler -> apiserver) must prefer the hybrid"
+        );
+
+        let kubelet =
+            build_kubelet_tls_config_for(Some(std::slice::from_ref(&tls.ca_cert_der)), None, None)
+                .unwrap();
+        let kubelet_named = build_kubelet_tls_config_for(
+            Some(std::slice::from_ref(&tls.ca_cert_der)),
+            None,
+            Some("localhost"),
+        )
+        .unwrap();
+        let insecure = build_insecure_tls_config().unwrap();
+        for (link, client) in [
+            ("apiserver -> kubelet", kubelet),
+            ("apiserver -> kubelet (redirected dial)", kubelet_named),
+            ("apiserver -> pod proxy", insecure),
+        ] {
+            assert_eq!(
+                client.crypto_provider().kx_groups[0].name(),
+                pq,
+                "{link}: client must offer the hybrid key share first"
+            );
+            assert_eq!(
+                crate::test_tls::negotiated_group(client, server.clone()),
+                Some(pq),
+                "{link}: handshake against the apiserver's serving config must negotiate the hybrid"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Webhook, aggregated-API and service-resolver calls go through reqwest, which keys its
+    /// TLS from the process-default provider. Against a server that accepts only the hybrid
+    /// group, the call can only complete if that default is PQ-capable; a classical-only
+    /// default would silently expose those links to harvest-now-decrypt-later.
+    #[tokio::test]
+    async fn reqwest_clients_complete_a_pq_only_handshake_after_install() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        install_pq_provider().unwrap();
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = key.cert.der().clone();
+        let mut provider = (*pq_provider()).clone();
+        provider
+            .kx_groups
+            .retain(|g| g.name() == rustls::NamedGroup::X25519MLKEM768);
+        let server = ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                PrivateKeyDer::try_from(key.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf).await;
+            let _ = tls
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = tls.shutdown().await;
+        });
+
+        let client = reqwest::Client::builder()
+            .tls_certs_only([reqwest::Certificate::from_der(cert.as_ref()).unwrap()])
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .expect("reqwest must offer X25519MLKEM768 to a hybrid-only server");
+        assert_eq!(resp.status(), 200);
     }
 
     /// The root's key may be online, but it must sign nothing except the intermediate: a leaf
