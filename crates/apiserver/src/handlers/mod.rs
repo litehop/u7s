@@ -38,3 +38,5 @@ pub mod table;
 pub(crate) mod test_support;
 pub mod tokens;
 pub mod watch;
+#[cfg(test)]
+mod webhook_client_config_tests;

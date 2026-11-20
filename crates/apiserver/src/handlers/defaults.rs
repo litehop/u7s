@@ -1093,6 +1093,7 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
             || plural == "mutatingwebhookconfigurations")
     {
         crate::admission::validate_webhook_timeouts(obj)?;
+        crate::admission::validate_webhook_client_configs(obj)?;
         crate::admission::validate_webhook_match_conditions_cel(obj)?;
     }
     if group == "admissionregistration.k8s.io" && plural == "validatingadmissionpolicies" {
@@ -4649,6 +4650,7 @@ mod tests {
             "metadata": {"name": "test"},
             "webhooks": [{
                 "name": "test.example.com",
+                "clientConfig": {"url": "https://h.example.com/x"},
                 "matchConditions": [{"name": "check", "expression": "object.metadata.name == \"test\""}]
             }]
         });
@@ -4697,6 +4699,7 @@ mod tests {
             "metadata": {"name": "test"},
             "webhooks": [{
                 "name": "test.example.com",
+                "clientConfig": {"url": "https://h.example.com/x"},
                 "matchConditions": [{"name": "check", "expression": "object.metadata.name == \"test\""}]
             }]
         });

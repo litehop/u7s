@@ -413,6 +413,45 @@ fn validate_additional_printer_columns(
     Ok(())
 }
 
+/// Static validation of `spec.conversion.webhook.clientConfig` as upstream's
+/// `validateCustomResourceConversion` does (field paths use the internal
+/// `webhookClientConfig` name, as upstream's messages do).
+fn validate_conversion_webhook(
+    spec: &CustomResourceDefinitionSpec,
+) -> Result<(), crate::status::StatusError> {
+    let Some(conversion) = spec.conversion.as_ref() else {
+        return Ok(());
+    };
+    if conversion["strategy"].as_str() != Some("Webhook") {
+        return Ok(());
+    }
+    let path = "spec.conversion.webhookClientConfig";
+    let cc = &conversion["webhook"]["clientConfig"];
+    if cc.is_null() {
+        return Err(Status::unprocessable_entity(format!(
+            "{path}: Required value: required when strategy is set to Webhook"
+        )));
+    }
+    let mut errs = crate::admission::validate_webhook_client_config(path, cc);
+    if let Some(b64) = cc["caBundle"].as_str().filter(|s| !s.is_empty()) {
+        let pem = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|e| Status::bad_request(format!("invalid caBundle: {e}")))?;
+        if !reqwest::Certificate::from_pem_bundle(&pem).is_ok_and(|c| !c.is_empty()) {
+            errs.push(format!(
+                "{path}.caBundle: Invalid value: \"<redacted>\": unable to load root certificates: unable to parse bytes as PEM block"
+            ));
+        }
+    }
+    match errs.as_slice() {
+        [] => Ok(()),
+        [only] => Err(Status::unprocessable_entity(only.clone())),
+        _ => Err(Status::unprocessable_entity(format!(
+            "[{}]",
+            errs.join(", ")
+        ))),
+    }
+}
+
 /// Validate a CRD's `openAPIV3Schema` (across all versions) against the boon-ReDoS
 /// class of bugs before persisting the CRD. `stored` is the previous CRD on update: its
 /// expressions and unchanged version schemas are ratcheted so an unrelated write cannot
@@ -421,6 +460,7 @@ fn validate_crd_schema(
     spec: &CustomResourceDefinitionSpec,
     stored: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {
+    validate_conversion_webhook(spec)?;
     validate_additional_printer_columns(spec)?;
     let mut preexisting = std::collections::HashSet::new();
     if let Some(stored) = stored {

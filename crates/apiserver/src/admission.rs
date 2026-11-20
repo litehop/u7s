@@ -1463,6 +1463,145 @@ pub(crate) fn validate_webhook_timeouts(obj: &serde_json::Value) -> Result<(), S
     Ok(())
 }
 
+/// Static validation of a webhook `clientConfig` as upstream runs it when the configuration is
+/// written (`ValidateWebhookURL` with forceHttps, `ValidateWebhookService`). `path` is the
+/// clientConfig's field path. Offending userinfo and query values are redacted rather than
+/// echoed, since they routinely carry credentials that would end up in logs and audit events.
+pub(crate) fn validate_webhook_client_config(path: &str, cc: &serde_json::Value) -> Vec<String> {
+    let url = cc.get("url").filter(|v| !v.is_null());
+    let service = cc.get("service").filter(|v| !v.is_null());
+    match (url, service) {
+        (None, None) | (Some(_), Some(_)) => {
+            vec![format!(
+                "{path}: Required value: exactly one of url or service is required"
+            )]
+        }
+        (Some(url), None) => webhook_url_errors(&format!("{path}.url"), url.as_str().unwrap_or("")),
+        (None, Some(service)) => webhook_service_errors(&format!("{path}.service"), service),
+    }
+}
+
+fn webhook_url_errors(path: &str, url: &str) -> Vec<String> {
+    const FORM: &str = "; desired format: https://host[/path]";
+    let invalid = |value: &str, msg: &str| {
+        format!(
+            "{path}: Invalid value: {}: {msg}",
+            serde_json::Value::from(value)
+        )
+    };
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return vec![format!(
+                "{path}: Required value: url must be a valid URL: {e}{FORM}"
+            )]
+        }
+    };
+    let mut errs = Vec::new();
+    // Plain http to an IPv4 loopback literal is the one scheme exception, matching the
+    // call-time check in `validate_webhook_url`; in-process webhook servers have no TLS.
+    let loopback_http = parsed.scheme() == "http"
+        && parsed
+            .host_str()
+            .and_then(|h| h.parse::<std::net::Ipv4Addr>().ok())
+            .is_some_and(|a| a.octets()[0] == 127);
+    if parsed.scheme() != "https" && !loopback_http {
+        errs.push(invalid(
+            parsed.scheme(),
+            &format!("'https' is the only allowed URL scheme{FORM}"),
+        ));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        errs.push(invalid("", &format!("host must be specified{FORM}")));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        errs.push(invalid(
+            "<redacted>",
+            "user information is not permitted in the URL",
+        ));
+    }
+    if parsed.fragment().is_some_and(|f| !f.is_empty()) {
+        errs.push(invalid(
+            parsed.fragment().unwrap_or_default(),
+            "fragments are not permitted in the URL",
+        ));
+    }
+    if parsed.query().is_some_and(|q| !q.is_empty()) {
+        errs.push(invalid(
+            "<redacted>",
+            "query parameters are not permitted in the URL",
+        ));
+    }
+    errs
+}
+
+fn webhook_service_errors(path: &str, service: &serde_json::Value) -> Vec<String> {
+    use crate::cel_runtime::format::Format;
+    let mut errs = Vec::new();
+    // Upstream's call site passes (name, namespace) into ValidateWebhookService's
+    // (namespace, name) parameters, so an empty service name is reported at `.namespace` and
+    // an empty service namespace at `.name`. Kept so the field path matches kubectl output.
+    if service["namespace"].as_str().unwrap_or("").is_empty() {
+        errs.push(format!("{path}.name: Required value"));
+    }
+    if service["name"].as_str().unwrap_or("").is_empty() {
+        errs.push(format!("{path}.namespace: Required value"));
+    }
+    let port = service["port"].as_i64().unwrap_or(443);
+    if !(1..=65535).contains(&port) {
+        errs.push(format!(
+            "{path}.port: Invalid value: {port}: port is not valid: must be between 1 and 65535, inclusive"
+        ));
+    }
+    let Some(url_path) = service["path"].as_str() else {
+        return errs;
+    };
+    let invalid = |msg: String| {
+        format!(
+            "{path}.path: Invalid value: {}: {msg}",
+            serde_json::Value::from(url_path)
+        )
+    };
+    if url_path == "/" || url_path.is_empty() {
+        return errs;
+    }
+    if url_path == "//" {
+        errs.push(invalid("segment[0] may not be empty".into()));
+        return errs;
+    }
+    if !url_path.starts_with('/') {
+        errs.push(invalid("must start with a '/'".into()));
+    }
+    let rest = url_path.get(1..).unwrap_or("");
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    for (i, step) in rest.split('/').enumerate() {
+        if step.is_empty() {
+            errs.push(invalid(format!("segment[{i}] may not be empty")));
+            continue;
+        }
+        for failure in Format::Dns1123Subdomain.validate(step) {
+            errs.push(invalid(format!("segment[{i}]: {failure}")));
+        }
+    }
+    errs
+}
+
+/// Reject `webhooks[*].clientConfig` values upstream validation refuses at create/update.
+pub(crate) fn validate_webhook_client_configs(obj: &serde_json::Value) -> Result<(), String> {
+    let mut errs = Vec::new();
+    for (i, webhook) in obj["webhooks"].as_array().into_iter().flatten().enumerate() {
+        errs.extend(validate_webhook_client_config(
+            &format!("webhooks[{i}].clientConfig"),
+            &webhook["clientConfig"],
+        ));
+    }
+    match errs.as_slice() {
+        [] => Ok(()),
+        [only] => Err(only.clone()),
+        _ => Err(format!("[{}]", errs.join(", "))),
+    }
+}
+
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
@@ -10216,6 +10355,65 @@ mod tests {
             );
         }
         assert!(validate_webhook_timeouts(&json!({"webhooks": [{}]})).is_ok());
+    }
+
+    /// A config with credentials in its URL must be refused when written, not accepted and then
+    /// failed on every admitted request; the credentials must not be echoed back.
+    #[test]
+    fn webhook_client_config_url_rejects_what_upstream_rejects_without_echoing_secrets() {
+        let cc = |url: &str| json!({"url": url});
+        let errs = validate_webhook_client_config("p", &cc("https://user:pass@host/?token=x#frag"));
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        let all = errs.join("|");
+        assert!(all.contains("user information is not permitted in the URL"));
+        assert!(all.contains("fragments are not permitted in the URL"));
+        assert!(all.contains("query parameters are not permitted in the URL"));
+        assert!(!all.contains("pass") && !all.contains("token"), "{all}");
+        assert_eq!(
+            validate_webhook_client_config("p", &cc("http://host/x")),
+            vec![
+                "p.url: Invalid value: \"http\": 'https' is the only allowed URL scheme; desired format: https://host[/path]"
+            ]
+        );
+        assert!(validate_webhook_client_config("p", &cc("https://host:8443/hook")).is_empty());
+    }
+
+    #[test]
+    fn webhook_client_config_requires_exactly_one_of_url_or_service() {
+        let want = vec!["p: Required value: exactly one of url or service is required"];
+        assert_eq!(validate_webhook_client_config("p", &json!({})), want);
+        assert_eq!(
+            validate_webhook_client_config(
+                "p",
+                &json!({"url": "https://h", "service": {"name": "s", "namespace": "n"}})
+            ),
+            want
+        );
+    }
+
+    #[test]
+    fn webhook_client_config_service_rules_follow_upstream() {
+        let svc =
+            |s: serde_json::Value| validate_webhook_client_config("p", &json!({"service": s}));
+        assert!(
+            svc(json!({"name": "s", "namespace": "n", "path": "/a/b/", "port": 8443})).is_empty()
+        );
+        assert_eq!(
+            svc(json!({"name": "s", "namespace": "n", "port": 70000})),
+            vec!["p.service.port: Invalid value: 70000: port is not valid: must be between 1 and 65535, inclusive"]
+        );
+        let errs = svc(json!({"name": "s", "namespace": "n", "path": "a//B"}));
+        let all = errs.join("|");
+        assert!(all.contains("must start with a '/'"), "{all}");
+        assert!(all.contains("segment[1] may not be empty"), "{all}");
+        assert_eq!(
+            svc(json!({"namespace": "n", "path": "//"})),
+            vec![
+                "p.service.namespace: Required value".to_string(),
+                "p.service.path: Invalid value: \"//\": segment[0] may not be empty".to_string()
+            ],
+            "upstream reports an empty service name at .namespace"
+        );
     }
 
     /// A webhook matchCondition containing a lone & must be rejected at creation time.
