@@ -6,7 +6,7 @@
 //! budget and exhaustion aborts the expression (never absorbed by `&&`/`||`).
 
 mod authzlib;
-mod format;
+pub(crate) mod format;
 mod interp;
 mod k8slib;
 mod listlib;
