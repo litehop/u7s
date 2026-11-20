@@ -24,7 +24,7 @@ release N (operator decision 2026-11-18).
 2. Print the installed release (see
    [Pinning a release tag](install.md#pinning-a-release-tag)). It must be
    the release just before your target.
-3. Back up the control plane (see [Backup and rollback](#backup-and-rollback)).
+3. Back up the control plane (see [Back up and restore](#back-up-and-restore)).
 4. Expect a short API outage on the control plane.
 
 ## Upgrade a control plane
@@ -41,7 +41,8 @@ The script prints `existing u7s install detected -- upgrading in place`
 when `ca.key` or `kubeconfig` exists under `/var/lib/u7s`. It replaces the
 binaries and unit files, then enables and restarts the API server,
 controller manager, and kubelet. The CA, the cluster state, and the pods keep
-their identity. The script fails if the CA changed. The service-account
+their identity. The script fails if the CA changed; recover as in
+[Back up and restore](#back-up-and-restore). The service-account
 keyring rotates on its own, so `sa.key` changing is expected.
 
 The script reads `/var/lib/u7s/config`, so `--iface` and `--node-name` need
@@ -76,14 +77,47 @@ CoreDNS, kube-proxy, and the `servicelb` pods kept their UIDs with 0
 restarts, a `hostPath` marker kept its content, and the flannel DaemonSet pod
 was recreated by design. The release gate asserts an outage of at most 60 s
 ([dev-setup.md](dev-setup.md#upgrade-check)). A multi-node control plane is
-not probed. A backup taken with the services stopped adds downtime of its own.
+not probed.
 
-## Backup and rollback
+## Back up and restore
 
-Before upgrading, back up `/var/lib/u7s`: it holds the CA, keys, and the
-store. Keep the copy private. Rollback and downgrade are unsupported before
-production. The tested restore procedure is added once it has been
-verified live.
+This is disaster recovery, not a supported downgrade. It discards every
+change made since the backup. On a single-node control plane it restored
+v0.4.6 after an upgrade to v0.4.7, with the same CA, UIDs, and pods.
+
+1. Before upgrading, stop the services and copy the whole state directory.
+   The API is down until they start again. Committed writes stay in
+   `state.db-wal` even after a clean stop, so a copy of `state.db` alone
+   loses data:
+
+   ```bash
+   sudo systemctl stop kubelet u7s-kcm u7s-apiserver
+   sudo tar -C /var/lib -czpf u7s-state-backup.tar.gz u7s
+   sudo systemctl start u7s-apiserver u7s-kcm kubelet
+   ```
+
+   The archive holds the CA and keys. Keep it private. Never copy a running
+   store: of 12 such copies under write load, 8 changed mid-copy and 1 failed
+   `PRAGMA integrity_check`.
+
+2. Upgrade.
+
+3. To restore, stop the services and replace the state directory:
+
+   ```bash
+   sudo systemctl stop kubelet u7s-kcm u7s-apiserver
+   sudo rm -rf /var/lib/u7s
+   sudo tar -C /var/lib -xzpf u7s-state-backup.tar.gz
+   ```
+
+4. Re-run the previous release's `install.sh` with no flags, as in
+   [Upgrade a control plane](#upgrade-a-control-plane). It restores the
+   binaries and prints `Control-plane identity preserved`.
+
+5. Check that `get --raw /readyz` prints `ok` and the Node is Ready.
+
+If `install.sh` reports that the CA changed, stop the services, extract
+`u7s/ca.key` and `u7s/ca.crt` from the archive, and start the services.
 
 ## Upgrading to dual-stack
 
