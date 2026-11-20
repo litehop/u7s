@@ -267,6 +267,43 @@ scripts/conformance/lima-install-test.sh --vm <VM> -- --tarball <path under ~> [
 It unrigs, aborts if the drop-in is still present, then runs this checkout's install.sh as
 root. Afterwards `run-all.sh --stack-only` re-rigs the VM.
 
+---
+
+## Release sign-off — `run-all.sh --install`
+
+The host rig (everything above) is the dev loop; its PASS is not a delivered-behaviour PASS
+(apiserver on the Mac, systemd kube-proxy, no beep, rig-only add-ons). `--install` runs what
+a user gets: it builds an arm64 tarball from the worktree (`scripts/release-gate/build-arm64-tarball.sh`),
+provisions the VM (golden clone), runs the real `scripts/install.sh --tarball` on it,
+tunnels the VM's apiserver to `127.0.0.1:<PORT>` over ssh, applies the rig-only add-ons
+(kube-network-policies, metrics-server, external-snapshotter — labelled
+`u7s.io/conformance-rig-only=true`, never in `manifests/`), then runs sonobuoy.
+
+```bash
+scripts/conformance/run-all.sh --install --reset --stack-only --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT>
+scripts/conformance/run-all.sh --install --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> --focus "<FOCUS>"
+```
+
+- Use `--reset` for sign-off: without it an existing VM is unrigged and install.sh is re-run
+  on it (an in-place upgrade, not a first install).
+- `--focus`, `--stack-only`, `--all-e2e`, `--procs`, `--k8s-version`, `--network` work as
+  on the rig; a bare run is the full suite. Host-rig-only options (`--binary`, `--profile`,
+  `--pki-test-*`, `--extra-node`, `--dual-stack`, `--embedded-scheduler`, ...) are rejected.
+- `-v` puts the (tiered) `RUST_LOG` into a harness-written systemd drop-in on
+  `u7s-apiserver`; install.sh has no debug hook.
+- Archives: every `temp/e2e/<run>/` has `run-meta` (`topology=install` or `topology=host-rig`;
+  install archives also list the rig-only add-ons). `host-logs/` has `u7s-apiserver.log`,
+  `u7s-kcm.log`, `kubelet.log`, `crio.log` from the VM journal.
+- Kubeconfig is `<workdir>/kubeconfig` as usual. The only host process is the ssh tunnel
+  (`<workdir>/install-tunnel.pid`).
+- Teardown, before the slot goes back to the host rig (install.sh leaves `u7s-apiserver`,
+  `u7s-kcm` and `u7s-kcm-restart.path` enabled; a host-rig run on top of them fails with
+  "node has no IPv4 podCIDR"). Either delete the VM:
+  `scripts/conformance/reset.sh --vm <VM> --workdir ./temp/u7s`, or keep it:
+  `scripts/conformance/install-teardown.sh --vm <VM> --workdir ./temp/u7s` (stops, disables
+  and removes every u7s unit, wipes install state and pods, kills the tunnel). Then
+  `limactl stop <VM>`. `reset.sh --host-only` alone only reaps the tunnel, never the VM's units.
+
 ## Step 1 — Build (individual, for partial restarts only)
 
 Build from the worktree's `Cargo.toml` into the worktree's own `target/`:
