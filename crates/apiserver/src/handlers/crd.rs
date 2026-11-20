@@ -1115,6 +1115,13 @@ pub async fn delete_crd<S: Store>(
     };
     let dry_run = delete_opts.is_dry_run() || is_dry_run_header(&headers);
 
+    crate::guaranteed_update::check_preconditions(
+        delete_opts.preconditions.as_ref(),
+        &key,
+        &stored.value,
+    )
+    .map_err(|e| e.into_status(GROUP, PLURAL, &name, KIND))?;
+
     // Parsed once as the admission review object.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);

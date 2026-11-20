@@ -862,9 +862,11 @@ pub(crate) async fn delete_collection_item<S: Store>(
     store: std::sync::Arc<S>,
     key: &str,
     ctx: (&str, &str, &str, &str),
+    pre: Option<crate::types::Preconditions>,
 ) -> Result<CollectedItem, crate::status::StatusError> {
     use crate::guaranteed_update::Drain;
-    let mut gu = crate::guaranteed_update::GuaranteedUpdate::new(store, key, None, ctx);
+    let mut gu = crate::guaranteed_update::GuaranteedUpdate::new(store, key, None, ctx)
+        .with_preconditions(pre);
     loop {
         let Some(stored) = gu.read().await? else {
             return Ok(CollectedItem::Kept);
