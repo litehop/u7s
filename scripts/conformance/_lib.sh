@@ -587,27 +587,55 @@ INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-polici
 # shellcheck disable=SC2034 # used by install-bringup.sh
 INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 
-# Host setup the rig provides because u7s ships nothing for it: Ubuntu's host dig/nslookup
-# AppArmor profiles attach by path inside containers, and their signal rules lack the
-# stacked-peer form, so BIND's self-signal is DENIED (rc 139) under AppArmor 5 stacking.
-# Adds only that rule via each profile's local override and reloads it. Idempotent; a
-# failed reload leaves no override behind. Also undoes an earlier disable of the profiles.
-RIG_ONLY_HOST_SETUP="apparmor-dig-nslookup"
-# Args: <vm>. No-op on a VM without AppArmor.
-rig_apply_host_apparmor() {
-  local vm="$1"
-  limactl shell "$vm" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null' || return 0
-  limactl shell "$vm" sudo bash -c 'set -euo pipefail
+# Rig-only AppArmor rule u7s does not ship: a container process stacked under a host
+# dig/nslookup profile is labelled "dig//&u7s-default", which u7s-default's own
+# peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
+# Both topologies add this one rule to u7s-default; install.sh's profile is untouched.
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup"
+RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
+RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
+
+# Filter: u7s-default profile text on stdin -> same text with RIG_AA_RULE after the
+# anchor line. An already-present rule passes through unchanged (idempotent); a missing
+# or duplicated anchor fails so a profile restructure cannot silently drop the rule.
+rig_aa_with_rule() {
+  awk -v a="$RIG_AA_ANCHOR" -v r="$RIG_AA_RULE" '
+    {buf[NR] = $0; if ($0 == r) have = 1; if ($0 == a) n++}
+    END {
+      if (!have && n != 1) exit 1
+      for (i = 1; i <= NR; i++) { print buf[i]; if (!have && buf[i] == a) print r }
+    }'
+}
+
+# Removes the dig/nslookup local overrides an earlier rig revision wrote (they never
+# fixed the denial) and reloads the profile so the kernel drops the rule. Args: <vm>.
+rig_remove_stale_host_aa_overrides() {
+  limactl shell "$1" sudo bash -c 'set -euo pipefail
 for p in dig nslookup; do
-  [ -f /etc/apparmor.d/$p ] || continue
-  rm -f /etc/apparmor.d/disable/$p
-  want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
-  if [ "$(cat /etc/apparmor.d/local/$p 2>/dev/null || true)" != "$want" ] \
-    || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
-    printf "%s\n" "$want" > /etc/apparmor.d/local/$p
-    apparmor_parser -r /etc/apparmor.d/$p || { rm -f /etc/apparmor.d/local/$p; exit 1; }
+  f=/etc/apparmor.d/local/$p
+  if [ -f $f ] && grep -qx "signal (send,receive) peer=@{profile_name}//&u7s-default," $f; then
+    rm -f $f
+    [ ! -f /etc/apparmor.d/$p ] || apparmor_parser -r /etc/apparmor.d/$p
   fi
 done'
+}
+
+# --install mode: the host rig injects the rule into the profile text before loading it
+# (lima-start.sh); here the profile install.sh already loaded is edited in place and
+# reloaded. Idempotent; fails loud if the anchor line is gone. No-op without AppArmor.
+# Args: <vm>.
+rig_apply_apparmor_rig_rule() {
+  local vm="$1" cur new
+  limactl shell "$vm" sh -c '[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && command -v apparmor_parser >/dev/null' || return 0
+  rig_remove_stale_host_aa_overrides "$vm"
+  cur="$(limactl shell "$vm" sudo cat /etc/apparmor.d/u7s-default)" \
+    || { echo "FATAL: cannot read installed /etc/apparmor.d/u7s-default on $vm" >&2; return 1; }
+  new="$(printf '%s\n' "$cur" | rig_aa_with_rule)" \
+    || { echo "FATAL: u7s-default anchor line '$RIG_AA_ANCHOR' not found exactly once in installed profile" >&2; return 1; }
+  if [ "$new" != "$cur" ]; then
+    printf '%s\n' "$new" | limactl shell "$vm" sudo tee /etc/apparmor.d/u7s-default >/dev/null
+    limactl shell "$vm" sudo apparmor_parser -r -W /etc/apparmor.d/u7s-default
+  fi
 }
 
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only
@@ -625,7 +653,7 @@ write_run_meta() {
   {
     echo "topology=$topology"
     if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
-    echo "rig_only_host_setup=$RIG_ONLY_HOST_SETUP"
+    echo "rig_only_setup=$RIG_ONLY_SETUP"
   } > "$run_dir/run-meta"
 }
 

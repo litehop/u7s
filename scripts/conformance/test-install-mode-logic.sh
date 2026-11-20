@@ -37,18 +37,18 @@ assert_eq() {
 write_run_meta "$TMP/rig" host-rig
 assert_eq "host-rig archive is stamped topology=host-rig so it is never read as a sign-off run" \
   "$(sed -n 1p "$TMP/rig/run-meta")" "topology=host-rig"
-assert_eq "host-rig archive records the rig-only host setup -- DNS specs pass only with it, so an archive must say it was applied" \
-  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_host_setup=apparmor-dig-nslookup"
+assert_eq "host-rig archive records the rig-only setup -- DNS specs pass only with it, so an archive must say it was applied" \
+  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup"
 write_run_meta "$TMP/inst" install
 assert_eq "install archive is stamped topology=install" "$(sed -n 1p "$TMP/inst/run-meta")" "topology=install"
 assert_eq "install archive lists the rig-only add-ons that are not shipped by install.sh" \
   "$(sed -n 2p "$TMP/inst/run-meta")" "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"
-assert_eq "install archive records the same rig-only host setup as the host rig" \
-  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_host_setup=apparmor-dig-nslookup"
-for s in lima-start.sh install-bringup.sh; do
-  grep -qx 'rig_apply_host_apparmor "\$VM_NAME"' "$REPO/scripts/conformance/$s" \
-    && ok "$s applies the shared rig host AppArmor setup -- without it dig/nslookup in pods segfault (rc 139) and 7 DNS/Service specs fail in that mode" \
-    || bad "$s does not call rig_apply_host_apparmor -- DNS specs fail in that mode"
+assert_eq "install archive records the same rig-only setup as the host rig" \
+  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup"
+for pair in lima-start.sh:rig_aa_with_rule install-bringup.sh:rig_apply_apparmor_rig_rule; do
+  grep -q "${pair#*:}" "$REPO/scripts/conformance/${pair%%:*}" \
+    && ok "${pair%%:*} applies the rig-only u7s-default rule via ${pair#*:} -- without it dig/nslookup in pods segfault (rc 139) and 7 DNS/Service specs fail in that mode" \
+    || bad "${pair%%:*} does not use ${pair#*:} -- DNS specs fail in that mode"
 done
 if write_run_meta "$TMP/bogus" hostrig 2>/dev/null; then bad "unknown topology must be refused"; else ok "unknown topology is refused instead of writing a mislabelled archive"; fi
 [ ! -e "$TMP/bogus/run-meta" ] && ok "refused topology leaves no run-meta behind" || bad "refused topology wrote run-meta"
