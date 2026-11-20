@@ -137,8 +137,8 @@ Prerequisites:
 
    The output lists both ranges.
 
-The ranges are fixed at first install: a re-run with a different value is
-refused. The only supported change is the
+The ranges are fixed at first install: `install.sh` refuses a re-run with a
+different value. The only supported change is the
 [single-stack to dual-stack upgrade](upgrading.md#upgrading-to-dual-stack).
 A dual-stack install enables IPv6 forwarding in
 `/etc/sysctl.d/u7s-ipv6-forwarding.conf`. A joining worker reads the ranges
@@ -168,7 +168,8 @@ script reads the token from stdin, which is the script itself in the one-liner.
    [Pinning a release tag](#pinning-a-release-tag)), then download `install.sh`:
 
    ```bash
-   TAG=<tag>
+   TAG=vX.Y.Z  # replace with the control plane's release tag
+   [ "$TAG" != vX.Y.Z ] &&
    curl --proto '=https' --tlsv1.2 -fsSLO "https://u7s.dekiru.tech/${TAG}/install.sh"
    ```
 

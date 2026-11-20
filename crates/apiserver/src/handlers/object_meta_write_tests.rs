@@ -205,65 +205,258 @@ async fn invalid_label_key_is_rejected_on_create_and_patch() {
     }
 }
 
-/// Status and scale writes run strategy before validation, so they may neither store a bad
-/// label nor reject an object whose labels they were never allowed to change.
+/// Upstream's pods/status and nodes/status strategies keep the submitted labels, so an
+/// over-long value reaches `ValidateObjectMetaUpdate` and is a 422 (a kubelet patching a bad
+/// label must be told, not silently ignored). deployments/status resets labels to the stored
+/// ones and deployments/scale only copies `spec.replicas`, so there the write succeeds and the
+/// label is dropped.
 #[tokio::test]
-async fn status_and_scale_writes_never_store_an_invalid_label() {
+async fn status_and_scale_writes_follow_each_upstream_strategy_for_an_overlong_label() {
     let c = cluster().await;
     let long = "x".repeat(64);
-    let dep = &kinds()[4];
-    let (st, resp) = c
-        .call(
-            "POST",
-            dep.collection,
-            "application/json",
-            body(dep, "t", None),
-        )
-        .await;
-    assert_eq!(st, StatusCode::CREATED, "{resp}");
+    let ks = kinds();
+    let (node, pod, dep) = (&ks[1], &ks[2], &ks[4]);
+    for k in [node, pod, dep] {
+        let (st, resp) = c
+            .call("POST", k.collection, "application/json", body(k, "t", None))
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{}: {resp}", k.label);
+    }
+    let lbl = json!({"metadata": {"labels": {"k": long}}});
+    let rejected = [(node, "status", lbl.clone()), (pod, "status", lbl.clone())];
+    for (k, sub, b) in rejected {
+        let item = format!("{}/t", k.collection);
+        let (st, resp) = c.call("PATCH", &format!("{item}/{sub}"), MERGE, b).await;
+        assert_label_rejected(
+            k.label,
+            &format!("{sub} merge-PATCH"),
+            st,
+            &resp,
+            "must be no more than 63 characters",
+        );
+        let (_, after) = c.call("GET", &item, "application/json", Value::Null).await;
+        assert!(
+            after["metadata"]["labels"]["k"].is_null(),
+            "{}: invalid label reached storage via {sub}: {after}",
+            k.label
+        );
+    }
     let item = format!("{}/t", dep.collection);
-    for (path, ct, sub, b) in [
+    for (sub, b) in [
         (
-            "status merge-PATCH",
-            MERGE,
             "status",
             json!({"metadata": {"labels": {"k": long}}, "status": {"replicas": 1}}),
         ),
         (
-            "scale merge-PATCH",
-            MERGE,
             "scale",
             json!({"metadata": {"labels": {"k": long}}, "spec": {"replicas": 2}}),
         ),
     ] {
-        let (st, resp) = c.call("PATCH", &format!("{item}/{sub}"), ct, b).await;
-        assert!(
-            st == StatusCode::UNPROCESSABLE_ENTITY || st == StatusCode::OK,
-            "{path}: {st} {resp}"
+        let (st, resp) = c.call("PATCH", &format!("{item}/{sub}"), MERGE, b).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "deployments/{sub} ignores submitted labels upstream, so the write succeeds: {resp}"
         );
         let (_, after) = c.call("GET", &item, "application/json", Value::Null).await;
-        assert_ne!(
-            after["metadata"]["labels"]["k"].as_str(),
-            Some(long.as_str()),
-            "{path}: invalid label reached storage"
+        assert!(
+            after["metadata"]["labels"]["k"].is_null(),
+            "deployments/{sub}: the submitted label must be dropped, not stored: {after}"
         );
     }
 }
 
-/// Upstream caps total annotation size at 256 KiB; without it one object can bloat storage.
+/// Upstream caps total annotation size at 256 KiB; without it one object can bloat storage,
+/// and a PATCH must not be a way around the cap that POST enforces.
 #[tokio::test]
 async fn annotations_over_256kib_are_rejected_on_create_and_patch() {
     let c = cluster().await;
     let k = &kinds()[0];
+    let needle = "metadata.annotations: Too long: may not be more than 262144 bytes";
+    let big = json!({"a": "x".repeat(262_145)});
     let mut b = body(k, "big", None);
-    b["metadata"]["annotations"] = json!({"a": "x".repeat(262_145)});
+    b["metadata"]["annotations"] = big.clone();
     let (st, resp) = c.call("POST", k.collection, "application/json", b).await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    assert!(resp["message"].as_str().unwrap().contains(needle), "{resp}");
+
+    let (st, resp) = c
+        .call(
+            "POST",
+            k.collection,
+            "application/json",
+            body(k, "small", None),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{resp}");
+    let item = format!("{}/small", k.collection);
+    let (st, resp) = c
+        .call(
+            "PATCH",
+            &item,
+            MERGE,
+            json!({"metadata": {"annotations": big}}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "PATCH: {resp}");
+    assert!(resp["message"].as_str().unwrap().contains(needle), "{resp}");
+    let (_, after) = c.call("GET", &item, "application/json", Value::Null).await;
     assert!(
-        resp["message"]
-            .as_str()
-            .unwrap()
-            .contains("metadata.annotations: Too long: may not be more than 262144 bytes"),
-        "{resp}"
+        after["metadata"]["annotations"].is_null(),
+        "an oversized PATCH must leave the object untouched: {after}"
     );
+}
+
+fn template_kinds() -> Vec<Kind> {
+    let pod_spec = json!({"containers": [{"name": "app", "image": "nginx"}]});
+    let simple = |label: &'static str,
+                  c: &'static str,
+                  av: &'static str,
+                  kind: &'static str,
+                  extra: Value| Kind {
+        label,
+        collection: c,
+        api_version: av,
+        kind,
+        extra,
+    };
+    let sel = json!({"matchLabels": {"a": "b"}});
+    let t = json!({"metadata": {"labels": {"a": "b"}}, "spec": pod_spec});
+    let job = json!({"template": {"metadata": {"labels": {"a": "b"}},
+        "spec": {"restartPolicy": "Never", "containers": [{"name": "app", "image": "nginx"}]}}});
+    vec![
+        simple(
+            "Deployment",
+            "/apis/apps/v1/namespaces/default/deployments",
+            "apps/v1",
+            "Deployment",
+            json!({"spec": {"selector": sel, "template": t}}),
+        ),
+        simple(
+            "ReplicaSet",
+            "/apis/apps/v1/namespaces/default/replicasets",
+            "apps/v1",
+            "ReplicaSet",
+            json!({"spec": {"selector": sel, "template": t}}),
+        ),
+        simple(
+            "StatefulSet",
+            "/apis/apps/v1/namespaces/default/statefulsets",
+            "apps/v1",
+            "StatefulSet",
+            json!({"spec": {"selector": sel, "serviceName": "s", "template": t}}),
+        ),
+        simple(
+            "DaemonSet",
+            "/apis/apps/v1/namespaces/default/daemonsets",
+            "apps/v1",
+            "DaemonSet",
+            json!({"spec": {"selector": sel, "template": t}}),
+        ),
+        simple(
+            "Job",
+            "/apis/batch/v1/namespaces/default/jobs",
+            "batch/v1",
+            "Job",
+            json!({"spec": {"selector": null, "manualSelector": false, "template": job["template"]}}),
+        ),
+        simple(
+            "CronJob",
+            "/apis/batch/v1/namespaces/default/cronjobs",
+            "batch/v1",
+            "CronJob",
+            json!({"spec": {"schedule": "* * * * *", "jobTemplate": {"spec": job}}}),
+        ),
+        simple(
+            "ReplicationController",
+            "/api/v1/namespaces/default/replicationcontrollers",
+            "v1",
+            "ReplicationController",
+            json!({"spec": {"selector": {"a": "b"}, "template": t}}),
+        ),
+    ]
+}
+
+fn template_path(k: &Kind) -> Vec<&'static str> {
+    match k.kind {
+        "CronJob" => vec!["spec", "jobTemplate", "spec", "template"],
+        _ => vec!["spec", "template"],
+    }
+}
+
+fn set_template_label(v: &mut Value, path: &[&str], value: Value) {
+    let mut cur = v;
+    for p in path {
+        cur = &mut cur[*p];
+    }
+    cur["metadata"]["labels"] = value;
+}
+
+fn nested(path: &[&str], leaf: Value) -> Value {
+    path.iter().rev().fold(leaf, |acc, p| json!({ *p: acc }))
+}
+
+/// A workload whose pod template carries a label the kubelet or a selector can never
+/// round-trip would be stored, and then every pod its controller creates would be rejected
+/// by the apiserver in a hot loop. Upstream rejects the workload itself, at
+/// `<template path>.labels`, on every kind and write verb.
+#[tokio::test]
+async fn overlong_pod_template_label_is_rejected_on_every_workload_kind_and_write_path() {
+    let c = cluster().await;
+    let long = "x".repeat(64);
+    let mut sites = 0;
+    let ks = template_kinds();
+    for k in &ks {
+        let path = template_path(k);
+        let want = format!("{}.labels: Invalid value:", path.join("."));
+        let check = |path_name: &str, st: StatusCode, resp: &Value| {
+            assert_eq!(
+                st,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{} via {path_name}: bad template label must be a 422: {resp}",
+                k.label
+            );
+            let msg = resp["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains(&want) && msg.contains("must be no more than 63 characters"),
+                "{} via {path_name}: wrong message: {msg}",
+                k.label
+            );
+        };
+        let item = format!("{}/t", k.collection);
+        let (st, resp) = c
+            .call("POST", k.collection, "application/json", body(k, "t", None))
+            .await;
+        assert_eq!(st, StatusCode::CREATED, "{}: seed {resp}", k.label);
+
+        let mut bad = body(k, "bad", None);
+        set_template_label(&mut bad, &path, json!({"a": "b", "k": long}));
+        let (st, resp) = c.call("POST", k.collection, "application/json", bad).await;
+        check("POST", st, &resp);
+
+        let (_, cur) = c.call("GET", &item, "application/json", Value::Null).await;
+        let mut put = cur.clone();
+        set_template_label(&mut put, &path, json!({"a": "b", "k": long}));
+        let (st, resp) = c.call("PUT", &item, "application/json", put).await;
+        check("PUT", st, &resp);
+
+        let leaf = json!({"metadata": {"labels": {"k": long}}});
+        let patch = nested(&path, leaf);
+        let mut apply = body(k, "t", None);
+        set_template_label(&mut apply, &path, json!({"a": "b", "k": long}));
+        let json_patch = json!([{"op": "add",
+            "path": format!("/{}/metadata/labels/k", path.join("/")), "value": long}]);
+        for (name, ct, b) in [
+            ("merge-PATCH", MERGE, patch.clone()),
+            ("strategic-PATCH", STRATEGIC, patch.clone()),
+            ("json-PATCH", JSON_PATCH, json_patch),
+            ("apply-PATCH", APPLY, apply),
+        ] {
+            let (st, resp) = c.call("PATCH", &item, ct, b).await;
+            check(name, st, &resp);
+            sites += 1;
+        }
+        sites += 2;
+    }
+    assert_eq!(sites, 7 * 6, "every kind x path cell must have run");
 }

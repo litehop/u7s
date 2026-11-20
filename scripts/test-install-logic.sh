@@ -2679,6 +2679,20 @@ net_run 'printf "a: __NEW_THING__\n" | render_flannel eth0 10.244.0.0/16 "" 1426
 assert "render_flannel fails loud on an unknown placeholder instead of shipping it into the CNI config" \
   "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF '__NEW_THING__' && echo 1 || echo 0)"
 
+# The install-cni init container copies cni-conf.json once per pod start, so a
+# changed --pod-mtu only reaches the node if the DaemonSet pod template changes.
+flannel_conf_hash() {
+  net_run 'render_flannel eth0 10.244.0.0/16 "" '"$1"' < "'"$ROOT_DIR"'/manifests/flannel.yaml"'
+  printf '%s\n' "$NET_OUT" | sed -n 's/^ *u7s.io\/flannel-conf-hash: //p'
+}
+hash_1426="$(flannel_conf_hash 1426)"
+assert "flannel pod template carries a conf-hash annotation (got '$hash_1426')" \
+  "$([ -n "$hash_1426" ] && echo 1 || echo 0)"
+assert "a different --pod-mtu changes the pod-template hash, so the DaemonSet rolls and the new MTU reaches /etc/cni/net.d" \
+  "$([ "$hash_1426" != "$(flannel_conf_hash 1400)" ] && echo 1 || echo 0)"
+assert "the same --pod-mtu renders the same hash, so a no-op re-run does not restart flannel" \
+  "$([ "$hash_1426" = "$(flannel_conf_hash 1426)" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # Node address list: --iface yields every global-scope family, --node-ip
 # overrides, the list reaches kubelet/apiserver/SANs, mismatches with the

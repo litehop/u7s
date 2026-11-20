@@ -14,34 +14,68 @@ fn invalid(path: &str, value: &str, msg: &str) -> String {
     format!("{path}: Invalid value: {quoted}: {msg}")
 }
 
-/// Violations in upstream's wording, labels before annotations; empty when the object conforms.
-pub(crate) fn metadata_violations(object: &Value) -> Vec<String> {
+/// Violations of `meta`'s labels and annotations, reported under `prefix` + `labels` /
+/// `annotations` (`metadata.` for an object, `spec.template.` for a pod template).
+fn meta_violations(meta: &Value, prefix: &str) -> Vec<String> {
     let mut errs = Vec::new();
-    if let Some(labels) = object["metadata"]["labels"].as_object() {
+    if let Some(labels) = meta["labels"].as_object() {
+        let path = format!("{prefix}labels");
         for (k, v) in labels {
             for m in Format::QualifiedName.validate(k) {
-                errs.push(invalid("metadata.labels", k, &m));
+                errs.push(invalid(&path, k, &m));
             }
             if let Some(v) = v.as_str() {
                 for m in Format::LabelValue.validate(v) {
-                    errs.push(invalid("metadata.labels", v, &m));
+                    errs.push(invalid(&path, v, &m));
                 }
             }
         }
     }
-    if let Some(annotations) = object["metadata"]["annotations"].as_object() {
+    if let Some(annotations) = meta["annotations"].as_object() {
+        let path = format!("{prefix}annotations");
         let mut total = 0usize;
         for (k, v) in annotations {
             total += k.len() + v.as_str().map_or(0, str::len);
             for m in Format::QualifiedName.validate(&k.to_lowercase()) {
-                errs.push(invalid("metadata.annotations", k, &m));
+                errs.push(invalid(&path, k, &m));
             }
         }
         if total > TOTAL_ANNOTATION_SIZE_LIMIT_B {
             errs.push(format!(
-                "metadata.annotations: Too long: may not be more than {TOTAL_ANNOTATION_SIZE_LIMIT_B} bytes"
+                "{path}: Too long: may not be more than {TOTAL_ANNOTATION_SIZE_LIMIT_B} bytes"
             ));
         }
+    }
+    errs
+}
+
+/// Where a workload kind embeds its pod template, as the JSON path from the object root and
+/// upstream's field-path prefix (`ValidatePodTemplateSpec` reports `<path>.labels`).
+fn pod_template_location(
+    group: &str,
+    resource: &str,
+) -> Option<(&'static [&'static str], &'static str)> {
+    let resource = resource.split('/').next().unwrap_or(resource);
+    match (group, resource) {
+        ("apps", "deployments" | "replicasets" | "statefulsets" | "daemonsets")
+        | ("batch", "jobs")
+        | ("", "replicationcontrollers") => Some((&["spec", "template"], "spec.template.")),
+        ("batch", "cronjobs") => Some((
+            &["spec", "jobTemplate", "spec", "template"],
+            "spec.jobTemplate.spec.template.",
+        )),
+        ("", "podtemplates") => Some((&["template"], "template.")),
+        _ => None,
+    }
+}
+
+/// Violations in upstream's wording, labels before annotations; empty when the object conforms.
+/// Workload kinds also have their pod template's labels and annotations checked.
+pub(crate) fn metadata_violations(object: &Value, group: &str, resource: &str) -> Vec<String> {
+    let mut errs = meta_violations(&object["metadata"], "metadata.");
+    if let Some((path, prefix)) = pod_template_location(group, resource) {
+        let template = path.iter().fold(object, |v, key| &v[*key]);
+        errs.extend(meta_violations(&template["metadata"], prefix));
     }
     errs
 }
@@ -57,7 +91,7 @@ pub(crate) fn validate_write(
     if ctx.operation != "CREATE" && ctx.operation != "UPDATE" {
         return Ok(());
     }
-    let errs = metadata_violations(object);
+    let errs = metadata_violations(object, ctx.group, ctx.resource);
     if errs.is_empty() {
         return Ok(());
     }
@@ -85,7 +119,8 @@ mod tests {
     #[test]
     fn label_value_over_63_chars_is_rejected_like_upstream() {
         let v = "a".repeat(64);
-        let errs = metadata_violations(&json!({"metadata": {"labels": {"k": v}}}));
+        let errs =
+            metadata_violations(&json!({"metadata": {"labels": {"k": v}}}), "", "configmaps");
         assert_eq!(
             errs,
             vec![format!(
@@ -96,7 +131,11 @@ mod tests {
 
     #[test]
     fn label_key_must_be_a_qualified_name() {
-        let errs = metadata_violations(&json!({"metadata": {"labels": {"bad key": "v"}}}));
+        let errs = metadata_violations(
+            &json!({"metadata": {"labels": {"bad key": "v"}}}),
+            "",
+            "configmaps",
+        );
         assert_eq!(errs.len(), 1);
         assert!(
             errs[0].starts_with("metadata.labels: Invalid value: \"bad key\": name part must"),
@@ -110,7 +149,7 @@ mod tests {
             "labels": {"app.kubernetes.io/name": "x-1", "empty": ""},
             "annotations": {"Example.COM/Mixed": "anything at all"},
         }});
-        assert!(metadata_violations(&obj).is_empty());
+        assert!(metadata_violations(&obj, "", "configmaps").is_empty());
     }
 
     #[test]
@@ -118,14 +157,18 @@ mod tests {
         let obj =
             json!({"metadata": {"annotations": {"a": "x".repeat(TOTAL_ANNOTATION_SIZE_LIMIT_B)}}});
         assert_eq!(
-            metadata_violations(&obj),
+            metadata_violations(&obj, "", "configmaps"),
             vec!["metadata.annotations: Too long: may not be more than 262144 bytes".to_string()]
         );
     }
 
     #[test]
     fn annotation_key_with_invalid_chars_is_rejected() {
-        let errs = metadata_violations(&json!({"metadata": {"annotations": {"a b": "v"}}}));
+        let errs = metadata_violations(
+            &json!({"metadata": {"annotations": {"a b": "v"}}}),
+            "",
+            "configmaps",
+        );
         assert_eq!(errs.len(), 1, "{errs:?}");
     }
 }
