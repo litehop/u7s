@@ -12,6 +12,8 @@ pub mod csr;
 pub mod defaults;
 pub mod device_taint_rule;
 pub mod discovery;
+#[cfg(test)]
+mod exclude_resource_rules_tests;
 pub mod field_selector;
 #[cfg(test)]
 mod field_selector_tests;
@@ -20,6 +22,8 @@ pub mod json_patch;
 pub(crate) mod jsonpath;
 pub mod metrics;
 pub mod namespaces;
+#[cfg(test)]
+mod object_meta_write_tests;
 pub mod oidc;
 pub mod pods;
 pub mod proxy;
@@ -36,3 +40,5 @@ pub mod table;
 pub(crate) mod test_support;
 pub mod tokens;
 pub mod watch;
+#[cfg(test)]
+mod webhook_client_config_tests;
