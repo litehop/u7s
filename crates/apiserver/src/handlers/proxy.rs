@@ -856,12 +856,14 @@ pub(crate) fn build_kubelet_tls_config_for(
     let verifier = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
         .build()
         .map_err(|e| anyhow::anyhow!("build kubelet server verifier: {e}"))?;
+    let versions = rustls::ClientConfig::builder_with_provider(crate::tls::pq_provider())
+        .with_safe_default_protocol_versions()?;
     let builder = match verify_name {
-        None => rustls::ClientConfig::builder().with_webpki_verifier(verifier),
+        None => versions.with_webpki_verifier(verifier),
         Some(name) => {
             let name = ServerName::try_from(name.to_owned())
                 .map_err(|e| anyhow::anyhow!("invalid kubelet verify name '{name}': {e}"))?;
-            rustls::ClientConfig::builder()
+            versions
                 .dangerous()
                 .with_custom_certificate_verifier(std::sync::Arc::new(FixedNameVerifier {
                     inner: verifier,
@@ -948,15 +950,11 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
 /// dialing a pod/service TLS listener over an already-established konnectivity tunnel (see
 /// `pod_proxy_via_connect_tunnel`). Unlike `build_kubelet_tls_config`, this takes no CA:
 /// there is no cluster-wide trust anchor to check an arbitrary workload's TLS cert against.
-fn build_insecure_tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
-    // Idempotent: a second install (the server's startup path already did this once) is a
-    // no-op, so this function works standalone in tests too.
-    rustls_post_quantum::provider().install_default().ok();
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .ok_or_else(|| anyhow::anyhow!("no default rustls crypto provider installed"))?
-        .clone();
+pub(crate) fn build_insecure_tls_config() -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+    let provider = crate::tls::pq_provider();
 
-    let mut config = rustls::ClientConfig::builder()
+    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
     config

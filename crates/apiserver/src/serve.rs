@@ -275,6 +275,18 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
                 }
             };
 
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(
+                    peer = %peer_addr,
+                    kx_group = ?tls_stream
+                        .get_ref()
+                        .1
+                        .negotiated_key_exchange_group()
+                        .map(|g| g.name()),
+                    "TLS handshake complete"
+                );
+            }
+
             // Extract the peer certificate once per connection, then share it
             // across all requests on this connection via an Arc.
             let peer_cert: Arc<Option<PeerCertificate>> = Arc::new(
