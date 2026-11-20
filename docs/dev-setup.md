@@ -71,9 +71,21 @@ To run the Kubernetes conformance suite against u7s locally:
 
 ### Rig-only add-ons
 
-The local conformance rig applies three upstream add-ons that u7s does not ship: `kube-network-policies`, `metrics-server` and `external-snapshotter`. `run-all.sh --install` labels each `u7s.io/conformance-rig-only=true`. Specs that depend on them pass only when they're present.
+The local conformance rig applies three upstream add-ons that u7s does not ship:
 
-`install.sh` installs no add-on, and `manifests/` doesn't carry them. Install the upstream components yourself if you need NetworkPolicy enforcement, resource metrics (`metrics.k8s.io`, HPA) or volume snapshots.
+- `kube-network-policies`
+- `metrics-server`
+- `external-snapshotter`
+
+The rig labels each add-on with this label:
+
+```text
+u7s.io/conformance-rig-only=true
+```
+
+Specs that depend on the add-ons pass only when the add-ons are present.
+
+`install.sh` installs no add-on. `manifests/` doesn't carry them. If you need NetworkPolicy enforcement, resource metrics (`metrics.k8s.io`, HPA) or volume snapshots, install the upstream components yourself.
 
 The `ClusterTrustBundle`, `ClusterTrustBundleProjection` and `PodCertificateRequest` kubelet gates are GA and on by default in Kubernetes 1.37, so u7s installs have them too.
 
@@ -82,8 +94,8 @@ Dependent spec groups, from the upstream `release-1.37` e2e sources:
 | Dependency | Spec group | Basis |
 | --- | --- | --- |
 | kube-network-policies | `[sig-network] Netpol` | `test/e2e/network/netpol/network_policy.go` tests traffic reachability; `Netpol API` is not verified |
-| metrics-server | `[sig-autoscaling]` `[Feature:HPA]` "Horizontal pod autoscaling (scale resource: CPU)" and "(scale resource: Memory)" | Spec names from `test/e2e/autoscaling/horizontal_pod_autoscaling.go`; the metrics-server link comes from the `run-all.sh:567-573` comments, not the spec source |
-| external-snapshotter | `[sig-storage]` `[Feature:VolumeSnapshotDataSource]` snapshottable suite | Spec names from `test/e2e/storage/testsuites/snapshottable.go`; the external-snapshotter link comes from the `run-all.sh:578-586` comments, not the spec source |
+| metrics-server | `[sig-autoscaling]` `[Feature:HPA]` "Horizontal pod autoscaling (scale resource: CPU)" and "(scale resource: Memory)" | Spec names from `test/e2e/autoscaling/horizontal_pod_autoscaling.go`; the metrics-server link comes from the `run-all.sh:571-580` comments, not the spec source |
+| external-snapshotter | `[sig-storage]` `[Feature:VolumeSnapshotDataSource]` snapshottable suite | Spec names from `test/e2e/storage/testsuites/snapshottable.go`; the external-snapshotter link comes from the `run-all.sh:582-592` comments, not the spec source |
 
 **Architecture:** u7s runs on the Mac host for a fast `cargo build` → restart loop. kubelet and sonobuoy run inside the lima VM (Linux, cri-o+crun) for reproducibility. sonobuoy reaches u7s via `host.lima.internal:6443`.
 
