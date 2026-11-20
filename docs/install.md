@@ -139,9 +139,10 @@ Prerequisites:
 
 The ranges are fixed at first install: a re-run that passes a different
 value is refused. The only supported change is the single-stack to
-dual-stack upgrade below. The script enables IPv6 forwarding for a
-dual-stack install by writing `/etc/sysctl.d/u7s-ipv6-forwarding.conf`.
-A joining worker reads the ranges from the cluster, so it needs no CIDR
+dual-stack upgrade in
+[Upgrading](upgrading.md#upgrading-to-dual-stack). The script enables IPv6
+forwarding for a dual-stack install by writing
+`/etc/sysctl.d/u7s-ipv6-forwarding.conf`. A joining worker reads the ranges from the cluster, so it needs no CIDR
 flags, only an address of each family.
 
 ## Add a worker
@@ -163,7 +164,7 @@ script reads the token from stdin, which is the script itself in the one-liner.
 2. On the worker, install the control plane's release (the default), because a
    worker must never be newer than the control plane. An older worker is fine
    during a rolling upgrade, within upstream's kubelet skew policy (up to 3
-   minor versions older); see [Upgrading](#upgrading). Set `TAG` to the
+   minor versions older); see [Upgrading](upgrading.md). Set `TAG` to the
    control plane's release tag (read it as in
    [Pinning a release tag](#pinning-a-release-tag)), then download `install.sh`:
 
@@ -239,104 +240,7 @@ if you need a clean host.
 
 ## Upgrading
 
-Upgrade in place by re-running the install script of the newer release on each
-node. It needs no token and mints nothing. Upgrade the control plane first,
-then the workers.
-
-- **Control plane**: re-run with no flags. A re-run with no flags keeps a
-  single-stack cluster single-stack; see "Upgrading to dual-stack" below
-  to add IPv6. The binaries and unit files are
-  replaced and the services restarted; the CA (`/var/lib/u7s/ca.key`,
-  `ca.crt`), the service-account keyring (`sa.key`, `sa.pub`) and the cluster
-  state are kept, and the script fails if the CA changed. The keyring rotates
-  on its own, so `sa.key` changing between runs is expected.
-- **Joined worker**: re-run with no flags (no `--join`, no token). The script
-  recognises the node's identity (`/var/lib/u7s/kubeconfig`, `ca.pem`,
-  `kubelet-client.crt` and `.key`, plus the kubelet's rotated client cert in
-  `/var/lib/u7s/kubelet/pki/`), swaps the kubelet binary and config,
-  restarts kubelet, and waits for the Node to report Ready again. The
-  kubelet keeps its own rotating client and serving certificates. The
-  upgrade needs a reachable API server: it reads the Node's Ready heartbeat
-  first and aborts before touching kubelet if it cannot.
-- **Expired or missing worker identity**: a worker offline past its client
-  certificate lifetime fails with an error naming the state to clear
-  (`systemctl stop kubelet; rm -rf /var/lib/u7s`); re-join it with a fresh
-  `install.sh --mint-join-token` token. A worker whose identity files are
-  missing needs a join too.
-- **Node name on join**: a joiner cannot claim the control-plane node's name
-  (the apiserver answers 403 "it is the control-plane node"); pick a
-  different `--node-name`. Other names, including an existing worker's, are
-  accepted so a worker can re-join.
-
-Downgrades are not supported: the API server refuses to start on a store
-written by a newer u7s, and the error names the store's format and the
-format this release supports.
-
-### Upgrading to dual-stack
-
-Releases before v0.4.4-snapshot.1 refuse it and require a reinstall. Existing
-Nodes keep their single-stack `spec.podCIDRs`, because upstream does not allow
-a Node to gain a pod range in place. Each Node must be re-created before its
-pods get an IPv6 address. Existing Services keep their single ClusterIP; new
-Services can request `ipFamilyPolicy: PreferDualStack` or `RequireDualStack`.
-Any change to the ranges other than adding one range of the other family is
-refused.
-
-1. Make sure each node has an address of each family (see "Dual-stack
-   install").
-
-2. Read the existing ranges:
-
-   ```bash
-   sudo grep -E '^(SERVICE_CIDR|POD_CLUSTER_CIDR)=' /var/lib/u7s/config
-   ```
-
-3. On the control plane, re-run `install.sh` of the same release with each
-   existing range followed by a range of the other family. This example
-   upgrades a default install:
-
-   ```bash
-   sudo bash install.sh \
-     --service-cidr 10.96.0.0/12,fd00:96::/108 \
-     --cluster-cidr 10.244.0.0/16,fd00:244::/56
-   ```
-
-   The script prints `upgraded to dual-stack` and the commands in steps 4-7.
-
-4. For each Node, drain it and delete the Node object. Pass `--force` to
-   `drain` if bare pods (not managed by a controller) run on the Node:
-
-   ```bash
-   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig drain <node> --ignore-daemonsets --delete-emptydir-data
-   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig delete node <node>
-   ```
-
-5. On that node, restart kubelet so the Node re-registers with both
-   podCIDRs:
-
-   ```bash
-   sudo systemctl restart kubelet
-   ```
-
-6. Restart flannel so it reads the new podCIDRs. Pods created before this
-   step get an IPv4 address only:
-
-   ```bash
-   sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig -n kube-flannel delete pod -l app=flannel
-   ```
-
-7. Deleting the control-plane Node removed its
-   `node-role.kubernetes.io/control-plane` label. After it re-registers,
-   re-run the command from step 3 to restore the label.
-
-8. Re-join each worker: its address families are learned at join. On the
-   worker, stop kubelet and clear its state, then follow "Add a worker"
-   with a new token:
-
-   ```bash
-   sudo systemctl stop kubelet
-   sudo rm -rf /var/lib/u7s
-   ```
+Upgrades are covered in [Upgrading](upgrading.md).
 
 ## Running on a 1 GiB host
 
