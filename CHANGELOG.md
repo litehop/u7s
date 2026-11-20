@@ -5,6 +5,14 @@ individually; their changes land in the next release's section.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** node names longer than 63 characters, accepted by
+  v0.4.5 through v0.4.7, are no longer supported, matching upstream's
+  hostname-label limit. `install.sh` refuses them and such Nodes fail
+  apiserver label validation. Re-join affected nodes with a `--node-name` of
+  63 characters or fewer before upgrading.
+
 ## [0.4.7] - 2026-11-18
 
 ### Changed
