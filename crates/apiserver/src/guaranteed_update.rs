@@ -40,6 +40,73 @@ pub(crate) enum WriteFailure {
     Fail(StatusError),
 }
 
+pub(crate) enum Deleted {
+    Removed,
+    /// Absent, or recreated under a new uid: nothing of the object that was read is left.
+    Gone,
+    /// A concurrent write changed the object and `keep` says it must now stay.
+    Kept,
+}
+
+fn uid_of(value: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(value).ok()?;
+    Some(
+        v["metadata"]["uid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Hard-deletes `read`, conditional on the uid and revision it was read at, as upstream's
+/// delete preconditions. A write that lands in between is not discarded: the object is re-read
+/// and, unless it is gone, `keep` says it must stay (e.g. a finalizer was re-added), or it is
+/// a different object, the delete is retried at the new revision.
+pub(crate) async fn delete_read<S: Store>(
+    store: &S,
+    key: &str,
+    read: &StoreObject,
+    keep: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Deleted, StoreError> {
+    let uid = uid_of(&read.value);
+    let mut revision = read.revision;
+    loop {
+        match store.delete(key, Some(revision)).await {
+            Ok(_) => return Ok(Deleted::Removed),
+            Err(StoreError::NotFound { .. }) => return Ok(Deleted::Gone),
+            Err(StoreError::RevisionMismatch { .. }) => {
+                let Some(fresh) = store.get(key).await? else {
+                    return Ok(Deleted::Gone);
+                };
+                if uid_of(&fresh.value) != uid {
+                    return Ok(Deleted::Gone);
+                }
+                match serde_json::from_slice::<serde_json::Value>(&fresh.value) {
+                    Ok(body) if !keep(&body) => revision = fresh.revision,
+                    _ => return Ok(Deleted::Kept),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// True when `body` holds a finalizer.
+pub(crate) fn has_finalizers(body: &serde_json::Value) -> bool {
+    body["metadata"]["finalizers"]
+        .as_array()
+        .is_some_and(|f| !f.is_empty())
+}
+
+/// What happened to a [`GuaranteedUpdate::delete`].
+pub(crate) enum Drain {
+    Removed,
+    /// Already gone, or recreated under a new uid.
+    Gone,
+    /// A concurrent writer won and the client did not pin a revision: re-read and redo.
+    Lost,
+}
+
 pub(crate) struct GuaranteedUpdate<S> {
     store: Arc<S>,
     key: String,
@@ -53,6 +120,7 @@ pub(crate) struct GuaranteedUpdate<S> {
     ns: Option<(String, String)>,
     deadline: tokio::time::Instant,
     expected: Option<u64>,
+    read_object: Option<StoreObject>,
 }
 
 impl<S: Store> GuaranteedUpdate<S> {
@@ -78,6 +146,7 @@ impl<S: Store> GuaranteedUpdate<S> {
             ns: None,
             deadline: tokio::time::Instant::now() + CONFLICT_RETRY_DEADLINE,
             expected: None,
+            read_object: None,
         }
     }
 
@@ -103,6 +172,7 @@ impl<S: Store> GuaranteedUpdate<S> {
             (Some(c), None) => c.revision,
             (None, None) => 0,
         });
+        self.read_object = current.clone();
         Ok(current)
     }
 
@@ -111,6 +181,81 @@ impl<S: Store> GuaranteedUpdate<S> {
         self.read()
             .await?
             .ok_or_else(|| Status::not_found(&self.group, &self.resource, &self.name))
+    }
+
+    /// A `metadata.resourceVersion` that a patch set on the object is a precondition on the
+    /// revision `read` returned, as upstream checks it on the patched object, so every patch
+    /// type (a JSON Patch op included) pins alike. `rv_before_patch` is the stored body's own
+    /// value, which is not a client pin. A stale pin is a 409 without retrying.
+    pub(crate) fn check_patched_pin(
+        &self,
+        rv_before_patch: Option<&str>,
+        patched: &serde_json::Value,
+    ) -> Result<(), StatusError> {
+        let patched_rv = patched["metadata"]["resourceVersion"].as_str();
+        if patched_rv == rv_before_patch {
+            return Ok(());
+        }
+        let (Some(pinned), Some(read)) = (
+            crate::util::parse_resource_version(patched_rv)?,
+            self.expected,
+        ) else {
+            return Ok(());
+        };
+        if pinned == read {
+            return Ok(());
+        }
+        Err(crate::handlers::generic::store_err(
+            StoreError::RevisionMismatch {
+                expected: pinned,
+                current: read,
+            },
+            &self.group,
+            &self.resource,
+            &self.name,
+            &self.kind,
+        ))
+    }
+
+    /// Hard-deletes the object `read` returned instead of writing it (an update that drained
+    /// the last finalizer), conditional on the revision it was read at. A client-pinned
+    /// revision that is not the stored one, or a write that lands first under a pinned one, is
+    /// a 409 as for [`Self::commit`]; otherwise `Lost` sends the caller back to re-read.
+    pub(crate) async fn delete(&mut self) -> Result<Drain, StatusError> {
+        let expected = self
+            .expected
+            .take()
+            .expect("delete without a preceding read");
+        let read = self
+            .read_object
+            .take()
+            .ok_or_else(|| Status::not_found(&self.group, &self.resource, &self.name))?;
+        let read = &read;
+        let conflict = |current| {
+            crate::handlers::generic::store_err(
+                StoreError::RevisionMismatch { expected, current },
+                &self.group,
+                &self.resource,
+                &self.name,
+                &self.kind,
+            )
+        };
+        if expected != read.revision {
+            return Err(conflict(read.revision));
+        }
+        match delete_read(&*self.store, &self.key, read, |_| true).await {
+            Ok(Deleted::Removed) => Ok(Drain::Removed),
+            Ok(Deleted::Gone) => Ok(Drain::Gone),
+            Ok(Deleted::Kept) if self.client_rv.is_none() => Ok(Drain::Lost),
+            Ok(Deleted::Kept) => Err(conflict(0)),
+            Err(e) => Err(crate::handlers::generic::store_err(
+                e,
+                &self.group,
+                &self.resource,
+                &self.name,
+                &self.kind,
+            )),
+        }
     }
 
     /// Writes `bytes` iff the key is still at the revision `read` returned. `Ok(None)` means a
@@ -196,82 +341,245 @@ mod tests {
     const KEY: &str = "/registry/configmaps/default/c";
     const CTX: (&str, &str, &str, &str) = ("", "configmaps", "c", "ConfigMap");
 
-    /// Every production function that calls `.put(` directly, with why it cannot resurrect a
-    /// deleted object or clobber a write it did not see. A new entry needs the same
-    /// justification; an update-class write belongs on `GuaranteedUpdate` instead.
+    /// How a direct `.put(` constrains the stored revision, read off its third argument.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Put {
+        /// `None`: an unconditional upsert.
+        Blind,
+        /// `Some(0)`: fails if the key exists.
+        CreateOnly,
+        /// `Some(rv)` or a caller-supplied expectation.
+        Conditional,
+    }
+
+    /// Every production `.put(` call site: `(file, fn, argument class)` and how many there are.
+    /// A new site, or a site whose class changes (a pinned write turned into a blind one),
+    /// fails until it is listed here with why it cannot resurrect a deleted object or clobber a
+    /// write it did not see. An update-class write belongs on `GuaranteedUpdate` instead.
     ///
-    /// create-only: `Some(0)`, fails if the key exists.
-    /// pinned: `Some(rv)` of the revision read in the same function (no retry; a lost race
-    /// is a 409, or the caller's own loop re-reads).
-    /// client rv: the handler rejects (422) a write without the client's resourceVersion.
-    /// caller: the expectation is the caller's argument.
-    /// new record: a blind write of a record nothing else updates.
-    const AUDITED: &[(&str, &str)] = &[
-        ("bootstrap_rbac.rs", "reconcile_object"), // create-only / pinned
-        ("cert_expiry.rs", "upsert_event"),        // new record
-        ("csr_approver.rs", "approve_kubelet_serving_csrs"), // pinned
-        ("guaranteed_update.rs", "pending"),       // the shared path
-        ("handlers/aggregation.rs", "check_and_persist_availability"), // pinned
-        ("handlers/cr.rs", "create_cr"),           // create-only
-        ("handlers/cr.rs", "delete_cr"),           // pinned
-        ("handlers/cr.rs", "delete_cr_namespaced"), // pinned
-        ("handlers/cr.rs", "patch_cr"),            // create-only / pinned
-        ("handlers/cr.rs", "patch_cr_namespaced"), // pinned
-        ("handlers/cr.rs", "replace_cr"),          // client rv
-        ("handlers/cr.rs", "replace_cr_namespaced"), // client rv
-        ("handlers/crd.rs", "create_crd"),         // create-only
-        ("handlers/crd.rs", "delete_instances"),   // pinned
-        ("handlers/crd.rs", "finalize_crd"),       // pinned
-        ("handlers/crd.rs", "patch_crd_status"),   // pinned
-        ("handlers/crd.rs", "purge_crd"),          // new record (tombstone)
-        ("handlers/crd.rs", "put_crd_status"),     // client rv
-        ("handlers/crd.rs", "replace_crd"),        // client rv
-        ("handlers/crd.rs", "soft_delete_crd"),    // pinned
-        ("handlers/csr.rs", "create_csr"),         // create-only
-        ("handlers/namespaces.rs", "create_namespace"), // create-only
-        ("handlers/namespaces.rs", "delete_namespace"), // pinned
-        ("handlers/namespaces.rs", "patch_namespace"), // pinned
-        ("handlers/namespaces.rs", "patch_namespace_status"), // pinned
-        ("handlers/namespaces.rs", "seed_root_ca_configmap"), // create-only
-        ("handlers/resource.rs", "create_resource"), // create-only
-        ("handlers/resource.rs", "delete_namespaced_resource"), // pinned
-        ("handlers/resource.rs", "delete_resource"), // pinned
+    /// Blind is only for a record nothing else updates (new record, or a seed of a
+    /// server-owned constant). Conditional is a revision read in the same function (a lost
+    /// race is a 409 or the caller's own loop re-reads), the client's required resourceVersion
+    /// (422 without it), or the caller's argument.
+    const AUDITED: &[(&str, &str, Put, usize)] = &[
+        ("bootstrap_rbac.rs", "reconcile_object", Put::CreateOnly, 2),
+        ("bootstrap_rbac.rs", "reconcile_object", Put::Conditional, 1),
+        ("cert_expiry.rs", "upsert_event", Put::Blind, 1),
+        (
+            "csr_approver.rs",
+            "approve_kubelet_serving_csrs",
+            Put::Conditional,
+            1,
+        ),
+        ("guaranteed_update.rs", "pending", Put::Conditional, 1),
+        (
+            "handlers/aggregation.rs",
+            "check_and_persist_availability",
+            Put::Conditional,
+            1,
+        ),
+        ("handlers/cr.rs", "create_cr", Put::CreateOnly, 1),
+        ("handlers/cr.rs", "delete_cr", Put::Conditional, 1),
+        (
+            "handlers/cr.rs",
+            "delete_cr_namespaced",
+            Put::Conditional,
+            1,
+        ),
+        ("handlers/cr.rs", "patch_cr", Put::CreateOnly, 1),
+        ("handlers/cr.rs", "patch_cr", Put::Conditional, 1),
+        ("handlers/cr.rs", "patch_cr_namespaced", Put::Conditional, 1),
+        ("handlers/cr.rs", "replace_cr", Put::Conditional, 1),
+        (
+            "handlers/cr.rs",
+            "replace_cr_namespaced",
+            Put::Conditional,
+            1,
+        ),
+        ("handlers/crd.rs", "create_crd", Put::CreateOnly, 1),
+        ("handlers/crd.rs", "delete_instances", Put::Conditional, 1),
+        ("handlers/crd.rs", "finalize_crd", Put::Conditional, 4),
+        ("handlers/crd.rs", "patch_crd", Put::CreateOnly, 1),
+        ("handlers/crd.rs", "patch_crd_status", Put::Conditional, 1),
+        ("handlers/crd.rs", "purge_crd", Put::Blind, 1),
+        ("handlers/crd.rs", "put_crd_status", Put::Conditional, 1),
+        ("handlers/crd.rs", "replace_crd", Put::Conditional, 1),
+        ("handlers/crd.rs", "soft_delete_crd", Put::Conditional, 1),
+        ("handlers/csr.rs", "create_csr", Put::CreateOnly, 1),
+        (
+            "handlers/namespaces.rs",
+            "create_namespace",
+            Put::CreateOnly,
+            1,
+        ),
+        (
+            "handlers/namespaces.rs",
+            "delete_namespace",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/namespaces.rs",
+            "patch_namespace",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/namespaces.rs",
+            "patch_namespace_status",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/namespaces.rs",
+            "seed_root_ca_configmap",
+            Put::CreateOnly,
+            1,
+        ),
+        ("handlers/pods.rs", "bind_pod", Put::Conditional, 1),
+        (
+            "handlers/pods.rs",
+            "check_pdb_allows_eviction",
+            Put::Conditional,
+            1,
+        ),
+        ("handlers/pods.rs", "delete_pod", Put::Conditional, 1),
+        ("handlers/pods.rs", "evict_pod", Put::Conditional, 1),
+        (
+            "handlers/resource.rs",
+            "create_resource",
+            Put::CreateOnly,
+            1,
+        ),
+        (
+            "handlers/resource.rs",
+            "delete_namespaced_resource",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/resource.rs",
+            "delete_resource",
+            Put::Conditional,
+            1,
+        ),
         (
             "handlers/resource.rs",
             "propagate_rs_revision_to_deployment",
-        ), // pinned
-        ("handlers/resource.rs", "write_flowcontrol_status"), // pinned
-        ("handlers/resource.rs", "write_vap_status"), // pinned
-        ("service_alloc.rs", "put_committing"),    // caller
-        ("service_alloc.rs", "repair"),            // sentinel records
-        ("service_alloc.rs", "reserve"),           // create-only
-        ("handlers/crd.rs", "patch_crd"), // create-only (SSA create); updates use GuaranteedUpdate
-        ("handlers/pods.rs", "bind_pod"), // pinned
-        ("handlers/pods.rs", "check_pdb_allows_eviction"), // pinned
-        ("handlers/pods.rs", "delete_pod"), // pinned
-        ("handlers/pods.rs", "evict_pod"), // pinned
-        ("lib.rs", "build_routes"),       // router wiring (`.put(handler)`)
-        ("lib.rs", "reconcile_extension_apiserver_authentication"), // pinned
-        ("lib.rs", "reconcile_kubernetes_endpointslice"), // pinned / create-only
-        ("lib.rs", "reconcile_quota_status"), // pinned
-        ("lib.rs", "reconcile_system_node_binding_subjects"), // pinned
-        ("lib.rs", "seed_cluster_config"), // seed: server-owned constant
-        ("lib.rs", "seed_cluster_info"),  // seed
-        ("lib.rs", "seed_flowcontrol"),   // seed
-        ("lib.rs", "seed_kube_root_ca"),  // seed
-        ("lib.rs", "seed_namespaces"),    // seed
-        ("lib.rs", "seed_priorityclasses"), // seed
-        ("lib.rs", "seed_serviceaccounts"), // seed
-        ("lib.rs", "seed_servicecidrs"),  // seed
-        ("lib.rs", "seed_services"),      // seed
-        ("lib.rs", "upgrade_default_servicecidr_to_dual_stack"), // pinned
-        ("service_resolver.rs", "put_loopback_service"), // seed
-        ("state.rs", "allocate_service_ip"), // create-only
-        ("state.rs", "seed_immortal_namespaces"), // create-only
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/resource.rs",
+            "write_flowcontrol_status",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "handlers/resource.rs",
+            "write_vap_status",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "lib.rs",
+            "reconcile_extension_apiserver_authentication",
+            Put::Conditional,
+            1,
+        ),
+        (
+            "lib.rs",
+            "reconcile_kubernetes_endpointslice",
+            Put::Conditional,
+            1,
+        ),
+        ("lib.rs", "reconcile_quota_status", Put::Conditional, 1),
+        (
+            "lib.rs",
+            "reconcile_system_node_binding_subjects",
+            Put::Conditional,
+            1,
+        ),
+        ("lib.rs", "seed_cluster_config", Put::CreateOnly, 1),
+        ("lib.rs", "seed_cluster_config", Put::Conditional, 1),
+        ("lib.rs", "seed_cluster_info", Put::CreateOnly, 1),
+        ("lib.rs", "seed_cluster_info", Put::Conditional, 1),
+        ("lib.rs", "seed_flowcontrol", Put::Blind, 21),
+        ("lib.rs", "seed_kube_root_ca", Put::CreateOnly, 1),
+        ("lib.rs", "seed_kube_root_ca", Put::Conditional, 1),
+        ("lib.rs", "seed_namespaces", Put::CreateOnly, 1),
+        ("lib.rs", "seed_priorityclasses", Put::CreateOnly, 1),
+        ("lib.rs", "seed_serviceaccounts", Put::CreateOnly, 1),
+        ("lib.rs", "seed_servicecidrs", Put::CreateOnly, 1),
+        ("lib.rs", "seed_services", Put::CreateOnly, 4),
+        (
+            "lib.rs",
+            "upgrade_default_servicecidr_to_dual_stack",
+            Put::Conditional,
+            1,
+        ),
+        ("service_alloc.rs", "put_committing", Put::Conditional, 1),
+        ("service_alloc.rs", "repair", Put::CreateOnly, 1),
+        ("service_alloc.rs", "reserve", Put::CreateOnly, 1),
+        ("service_resolver.rs", "put_loopback_service", Put::Blind, 1),
+        ("state.rs", "allocate_service_ip", Put::CreateOnly, 1),
+        ("state.rs", "seed_immortal_namespaces", Put::CreateOnly, 1),
     ];
 
-    /// `(file, fn)` of every `.put(` outside test code under `src/`.
-    fn production_put_sites() -> std::collections::BTreeSet<(String, String)> {
+    /// The text of the third top-level argument of the call whose `(` is at `open`.
+    fn nth_arg(text: &str, open: usize, n: usize) -> Option<String> {
+        let (mut depth, mut in_str, mut esc) = (0usize, false, false);
+        let mut args = vec![String::new()];
+        for c in text[open..].chars() {
+            if in_str {
+                args.last_mut().unwrap().push(c);
+                match (esc, c) {
+                    (true, _) => esc = false,
+                    (false, '\\') => esc = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_str = true;
+                    args.last_mut().unwrap().push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        args.last_mut().unwrap().push(c);
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    args.last_mut().unwrap().push(c);
+                }
+                ',' if depth == 1 => args.push(String::new()),
+                _ => args.last_mut().unwrap().push(c),
+            }
+        }
+        args.get(n)
+            .map(|a| a.split_whitespace().collect::<String>())
+    }
+
+    fn classify(arg: &str) -> Put {
+        match arg {
+            "None" => Put::Blind,
+            "Some(0)" => Put::CreateOnly,
+            _ => Put::Conditional,
+        }
+    }
+
+    /// `(file, fn, class) -> count` of every store `.put(` outside test code under `src/`.
+    fn production_sites(
+        call: &str,
+        arg: usize,
+    ) -> std::collections::BTreeMap<(String, String, Put), usize> {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap().flatten() {
                 let p = e.path();
@@ -292,14 +600,18 @@ mod tests {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         walk(&src, &mut files);
-        let mut sites = std::collections::BTreeSet::new();
+        let mut sites = std::collections::BTreeMap::new();
         for f in files {
             let rel = f.strip_prefix(&src).unwrap().to_string_lossy().to_string();
             let text = std::fs::read_to_string(&f).unwrap();
             let mut in_test_mod = false;
             let mut prev_cfg_test = false;
             let mut current_fn = String::new();
-            for line in text.lines() {
+            let mut offset = 0;
+            for line in text.split_inclusive('\n') {
+                let line_start = offset;
+                offset += line.len();
+                let line = line.trim_end_matches('\n');
                 if in_test_mod {
                     in_test_mod = line != "}";
                     continue;
@@ -311,20 +623,30 @@ mod tests {
                 let t = line.trim_start();
                 if let Some(i) = t.find("fn ") {
                     let head = &t[..i];
-                    if head.is_empty() || head.ends_with("async ") || head.ends_with("pub ") {
-                        current_fn = t[i + 3..]
-                            .chars()
-                            .take_while(|c| c.is_alphanumeric() || *c == '_')
-                            .collect();
-                    } else if head.ends_with(") ") {
+                    if head.is_empty()
+                        || head.ends_with("async ")
+                        || head.ends_with("pub ")
+                        || head.ends_with(") ")
+                    {
                         current_fn = t[i + 3..]
                             .chars()
                             .take_while(|c| c.is_alphanumeric() || *c == '_')
                             .collect();
                     }
                 }
-                if !t.starts_with("//") && t.contains(".put(") {
-                    sites.insert((rel.clone(), current_fn.clone()));
+                if t.starts_with("//") {
+                    continue;
+                }
+                let mut from = 0;
+                while let Some(i) = line[from..].find(call) {
+                    let open = line_start + from + i + call.len() - 1;
+                    from += i + call.len();
+                    // A router's `.put(handler)` has too few arguments to be a store call.
+                    if let Some(arg) = nth_arg(&text, open, arg) {
+                        *sites
+                            .entry((rel.clone(), current_fn.clone(), classify(&arg)))
+                            .or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -333,20 +655,75 @@ mod tests {
 
     /// An update-class write that calls `store.put` directly is the bug class this module
     /// removes: it either overwrites a write it never saw or resurrects a deleted object.
-    /// Fails when a function starts calling `.put(` without being audited here.
+    /// Fails when a call site appears, disappears or changes its argument class unaudited.
     #[test]
     fn every_direct_store_put_is_audited() {
-        let found = production_put_sites();
-        let audited: std::collections::BTreeSet<(String, String)> = AUDITED
+        let found = production_sites(".put(", 2);
+        let audited: std::collections::BTreeMap<_, _> = AUDITED
             .iter()
-            .map(|(f, n)| (f.to_string(), n.to_string()))
+            .map(|(f, n, c, k)| ((f.to_string(), n.to_string(), *c), *k))
             .collect();
-        let unaudited: Vec<_> = found.difference(&audited).collect();
-        let stale: Vec<_> = audited.difference(&found).collect();
+        let keys: std::collections::BTreeSet<_> = found.keys().chain(audited.keys()).collect();
+        let diff: Vec<String> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let (have, want) = (found.get(key).unwrap_or(&0), audited.get(key).unwrap_or(&0));
+                (have != want).then(|| format!("{key:?}: found {have}, audited {want}"))
+            })
+            .collect();
         assert!(
-            unaudited.is_empty() && stale.is_empty(),
-            "direct `.put(` sites not audited: {unaudited:?}; audited entries that no longer \
-             call `.put(`: {stale:?}"
+            diff.is_empty(),
+            "direct `.put(` sites differ from the audit:\n{}\nfound:\n{}",
+            diff.join("\n"),
+            found
+                .iter()
+                .map(|((f, n, c), k)| format!("        (\"{f}\", \"{n}\", Put::{c:?}, {k}),"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Every production `.delete(` call site by the class of its revision argument. Blind
+    /// (`None`) deletes only server-owned marker records that nothing updates (allocation
+    /// sentinels, tombstones, Events) or a single-use join token; a delete of a user-visible
+    /// object goes through [`delete_read`] or [`GuaranteedUpdate::delete`], conditional on the
+    /// revision and uid it read, so a write landing after the read is never discarded.
+    const AUDITED_DELETES: &[(&str, &str, Put, usize)] = &[
+        ("bootstrap_rbac.rs", "reconcile_object", Put::Conditional, 1),
+        (
+            "bootstrap_rbac.rs",
+            "remove_legacy_cluster_roles",
+            Put::Conditional,
+            1,
+        ),
+        ("bootstrap_token.rs", "delete_token_secret", Put::Blind, 1),
+        ("cert_expiry.rs", "clear_warnings", Put::Blind, 1),
+        ("guaranteed_update.rs", "delete_read", Put::Conditional, 1),
+        ("handlers/crd.rs", "create_crd", Put::Blind, 1),
+        ("handlers/crd.rs", "delete_instances", Put::Conditional, 1),
+        ("handlers/crd.rs", "patch_crd", Put::Blind, 1),
+        ("handlers/crd.rs", "purge_crd", Put::Conditional, 1),
+        ("handlers/crd.rs", "replace_crd", Put::Blind, 1),
+        ("service_alloc.rs", "delete_sentinel", Put::Blind, 1),
+        ("state.rs", "release_service_ip", Put::Blind, 1),
+    ];
+
+    #[test]
+    fn every_direct_store_delete_is_audited() {
+        let found = production_sites(".delete(", 1);
+        let audited: std::collections::BTreeMap<_, _> = AUDITED_DELETES
+            .iter()
+            .map(|(f, n, c, k)| ((f.to_string(), n.to_string(), *c), *k))
+            .collect();
+        assert_eq!(
+            found,
+            audited,
+            "direct `.delete(` sites differ from the audit; found:\n{}",
+            found
+                .iter()
+                .map(|((f, n, c), k)| format!("        (\"{f}\", \"{n}\", Put::{c:?}, {k}),"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
@@ -428,6 +805,63 @@ mod tests {
         let err = gu.commit(with_n(2)).await.unwrap_err();
         assert_eq!(err.0, StatusCode::NOT_FOUND);
         assert!(s.get(KEY).await.unwrap().is_none());
+    }
+
+    fn with_uid(uid: &str, finalizers: &[&str]) -> Bytes {
+        Bytes::from(
+            serde_json::json!({"metadata": {"name": "c", "uid": uid, "finalizers": finalizers}})
+                .to_string(),
+        )
+    }
+
+    /// A write that lands after the read and leaves the object deletable is not an
+    /// obstacle: the delete is retried at the new revision instead of failing.
+    #[tokio::test]
+    async fn delete_read_retries_over_a_write_that_does_not_stop_the_delete() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.put(KEY, with_n(9), None).await.unwrap();
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Removed));
+        assert!(s.get(KEY).await.unwrap().is_none());
+    }
+
+    /// A finalizer added after the read must keep the object, or the finalizer's owner
+    /// never gets to run.
+    #[tokio::test]
+    async fn delete_read_keeps_an_object_that_gained_a_finalizer() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.put(KEY, with_uid("u", &["f"]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Kept));
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    /// A different object under the same name (recreated) is not the object that was read.
+    #[tokio::test]
+    async fn delete_read_never_deletes_an_object_recreated_under_a_new_uid() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("old", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.delete(KEY, None).await.unwrap();
+        s.put(KEY, with_uid("new", &[]), None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        assert!(matches!(out, Deleted::Gone));
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    /// An object already deleted by someone else is done, not an error.
+    #[tokio::test]
+    async fn delete_read_of_an_already_deleted_object_is_gone() {
+        let s = seeded().await;
+        let read = s.get(KEY).await.unwrap().unwrap();
+        s.delete(KEY, None).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, |_| false).await.unwrap();
+        assert!(matches!(out, Deleted::Gone));
     }
 
     /// Kinds with AllowCreateOnUpdate must still create on PUT to a missing key.

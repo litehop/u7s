@@ -14,7 +14,7 @@ use crate::{
         AdmissionContext, AdmissionTarget, LabelSelector,
     },
     auth::UserInfo,
-    guaranteed_update::GuaranteedUpdate,
+    guaranteed_update::{delete_read, Deleted, Drain, GuaranteedUpdate},
     handlers::{field_selector::FieldSelector, generic::validate_path_segment},
     keys::{cluster_object_key, group_list_prefix, group_object_key, list_prefix, object_key},
     limit_range::parse_quantity,
@@ -836,11 +836,11 @@ pub(crate) async fn replace_pod<S: Store>(
         // complete the delete instead of storing an update, or the pod stays stuck Terminating
         // forever.
         if super::resource::finalizer_drain_complete(&obj.body) {
-            state
-                .store
-                .delete(&key, None)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
+            match gu.delete().await? {
+                Drain::Lost => continue,
+                Drain::Gone => return Ok(Json(obj.body)),
+                Drain::Removed => {}
+            }
             state.node_graph.remove_pod(ns.as_str(), &name);
             // Same per-namespace lock the create path holds across its check-then-write —
             // without it here, this decrement can interleave with a concurrent
@@ -1242,7 +1242,20 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         if dry_run {
             continue;
         }
-        let _ = state.store.delete(&obj.key, None).await;
+        // Decided on the list snapshot: a pod that got a finalizer since must survive, and one
+        // deleted since needs no cleanup.
+        if !matches!(
+            delete_read(
+                &*state.store,
+                &obj.key,
+                &obj,
+                crate::guaranteed_update::has_finalizers
+            )
+            .await,
+            Ok(Deleted::Removed)
+        ) {
+            continue;
+        }
         if let Some(pod_name) = obj.key.rsplit('/').next() {
             state.node_graph.remove_pod(ns.as_str(), pod_name);
         }
@@ -1369,13 +1382,23 @@ pub(crate) async fn delete_pod<S: Store>(
                 })));
             }
             // Hard-delete: pod is already Terminating, or the caller forced it, and all
-            // finalizers are gone. No resourceVersion precondition is passed here, so this
-            // path cannot RevisionMismatch.
-            state
-                .store
-                .delete(&key, None)
+            // finalizers are gone. Conditional on the revision read, so a finalizer re-added
+            // since (or any other write) is re-decided instead of discarded.
+            match delete_read(&*state.store, &key, &stored, |_| true)
                 .await
-                .map_err(|e| store_err_to_status(e, &name))?;
+                .map_err(|e| store_err_to_status(e, &name))?
+            {
+                Deleted::Kept => continue,
+                Deleted::Gone => {
+                    return Ok(Json(serde_json::json!({
+                        "kind": "Status",
+                        "apiVersion": "v1",
+                        "status": "Success",
+                        "code": 200
+                    })))
+                }
+                Deleted::Removed => {}
+            }
             state.node_graph.remove_pod(ns.as_str(), &name);
 
             // Same per-namespace lock the create path holds across its check-then-write —
@@ -1508,13 +1531,7 @@ pub(crate) async fn patch_pod<S: Store>(
     // KCM can complete a single round-trip, so every attempt conflicts and the
     // batch.kubernetes.io/job-tracking finalizer is never removed, leaving pods stuck
     // Terminating forever and Job GC never completing.
-    let client_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
-    let mut gu = GuaranteedUpdate::new(
-        state.store.clone(),
-        &key,
-        client_rv,
-        ("", "pods", &name, "Pod"),
-    );
+    let mut gu = GuaranteedUpdate::new(state.store.clone(), &key, None, ("", "pods", &name, "Pod"));
     loop {
         let stored = gu.read().await?;
         let Some(stored) = stored else {
@@ -1587,6 +1604,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
         let stored_deletion = super::generic::snapshot_deletion_fields(&current_obj.body);
+        let rv_before_patch = current_obj.resource_version().map(str::to_owned);
 
         match patch_type {
             super::json_patch::PatchType::StrategicMerge => {
@@ -1604,6 +1622,8 @@ pub(crate) async fn patch_pod<S: Store>(
                 super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
             }
         }
+
+        gu.check_patched_pin(rv_before_patch.as_deref(), &current_obj.body)?;
 
         if let Some(plan) = &ssa_plan {
             plan.remove_dropped_fields(&mut current_obj.body);
@@ -1707,11 +1727,11 @@ pub(crate) async fn patch_pod<S: Store>(
 
         if deletion_ts_set && finalizers_empty {
             tracing::debug!(name = %name, "patch_pod: hard-deleting pod (deletionTimestamp set, finalizers empty)");
-            state
-                .store
-                .delete(&key, None)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
+            match gu.delete().await? {
+                Drain::Lost => continue,
+                Drain::Gone => return Ok(Json(current_obj.body).into_response()),
+                Drain::Removed => {}
+            }
             state.node_graph.remove_pod(ns.as_str(), &name);
             // Same per-namespace lock the create path holds across its check-then-write —
             // without it here, this decrement can interleave with a concurrent
@@ -1809,11 +1829,18 @@ pub(crate) async fn evict_pod<S: Store>(
         // Dry-run: validation passed and this is what a real eviction would hard-delete;
         // return without persisting.
         if !dry_run {
-            state
-                .store
-                .delete(&key, None)
+            match delete_read(&*state.store, &key, &stored, |_| true)
                 .await
-                .map_err(|e| store_err_to_status(e, &name))?;
+                .map_err(|e| store_err_to_status(e, &name))?
+            {
+                Deleted::Kept => {
+                    return Err(Status::conflict(format!(
+                        "pod {name} changed while it was being evicted; retry the eviction"
+                    )))
+                }
+                Deleted::Gone => return Ok((StatusCode::CREATED, Json(eviction))),
+                Deleted::Removed => {}
+            }
             state.node_graph.remove_pod(ns.as_str(), &name);
             // Same per-namespace lock the create path holds across its check-then-write —
             // without it here, this decrement can interleave with a concurrent

@@ -411,6 +411,7 @@ pub(crate) struct MockStore {
     inject_next: std::sync::atomic::AtomicBool,
     delete_before_next_put: std::sync::Mutex<Option<String>>,
     write_before_next_put: std::sync::Mutex<Option<(String, bytes::Bytes)>>,
+    write_before_next_delete: std::sync::Mutex<Option<(String, bytes::Bytes)>>,
 }
 
 impl MockStore {
@@ -420,6 +421,7 @@ impl MockStore {
             inject_next: std::sync::atomic::AtomicBool::new(false),
             delete_before_next_put: std::sync::Mutex::new(None),
             write_before_next_put: std::sync::Mutex::new(None),
+            write_before_next_delete: std::sync::Mutex::new(None),
         }
     }
 
@@ -432,6 +434,12 @@ impl MockStore {
     /// lands after the handler's read.
     pub(crate) fn arm_write_before_put(&self, key: &str, body: bytes::Bytes) {
         *self.write_before_next_put.lock().unwrap() = Some((key.to_string(), body));
+    }
+
+    /// Overwrites `key` with `body` right before the next delete: a concurrent writer that
+    /// lands after the handler's read.
+    pub(crate) fn arm_write_before_delete(&self, key: &str, body: bytes::Bytes) {
+        *self.write_before_next_delete.lock().unwrap() = Some((key.to_string(), body));
     }
 
     pub(crate) fn arm(&self) {
@@ -497,9 +505,15 @@ impl u7s_store::Store for MockStore {
         key: impl Into<String> + Send,
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send {
+        let write_first = self.write_before_next_delete.lock().unwrap().take();
         let inner = self.inner.clone();
         let key: String = key.into();
-        async move { inner.delete(&key, expected_revision).await }
+        async move {
+            if let Some((k, body)) = write_first {
+                inner.put(&k, body, None).await.unwrap();
+            }
+            inner.delete(&key, expected_revision).await
+        }
     }
 
     fn list_namespace_objects(
