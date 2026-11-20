@@ -1059,7 +1059,7 @@ render_flannel() {
   out="$(sed -e "s/__IFACE__/$iface/g" ${drop_v6[@]+"${drop_v6[@]}"} \
     -e "s#__POD_CLUSTER_CIDR_IPV4__#$v4#g" -e "s#__POD_CLUSTER_CIDR_IPV6__#$v6#g" \
     -e "s#__POD_MTU__#$mtu#g" ${1+"$@"})" || return 1
-  if printf '%s\n' "$out" | grep -qE '__[A-Z_]+__'; then
+  if grep -qE '__[A-Z_]+__' <<<"$out"; then
     echo "error: rendered flannel manifest still has placeholder(s): $(printf '%s\n' "$out" | grep -oE '__[A-Z_]+__' | sort -u | paste -sd' ' -)" >&2
     return 1
   fi
@@ -1339,7 +1339,7 @@ discover_cluster_ca() {
   local ca_pem pinned=0 hashes=""
   ca_pem="$(sed -n 's/^ *certificate-authority-data: *//p' "$work/kubeconfig.yaml" | head -n1 | base64 -d)"
   rm -rf "$work"
-  if ! printf '%s\n' "$ca_pem" | grep -q '^-----BEGIN CERTIFICATE-----$'; then
+  if ! grep -q '^-----BEGIN CERTIFICATE-----$' <<<"$ca_pem"; then
     echo "error: cluster-info carries no CA certificate -- refusing to join" >&2
     exit 1
   fi
@@ -1414,7 +1414,7 @@ read_join_token() {
       exit 1
     fi
   fi
-  if ! printf '%s' "$token" | grep -Eq '^[a-z0-9]{6}\.[a-z0-9]{16}$'; then
+  if ! grep -Eq '^[a-z0-9]{6}\.[a-z0-9]{16}$' <<<"$token"; then
     echo "error: join token must look like <6 chars>.<16 chars> (as printed by --mint-join-token)" >&2
     exit 1
   fi
