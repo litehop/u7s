@@ -585,3 +585,48 @@ rig_render_coredns() {
   fi
   sed -e "s#^  clusterIP: 10.96.0.10\$#${repl}#"
 }
+
+# Add-ons applied after install.sh purely so specs that need them can run; u7s does not
+# ship them. Comma-separated, in the order install-bringup.sh applies them.
+INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
+# shellcheck disable=SC2034 # used by install-bringup.sh
+INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
+
+# Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only
+# VM. "install": the real scripts/install.sh on the VM (the release sign-off path).
+# A host-rig PASS is not a delivered-behaviour PASS, so every archive says which it is.
+# Args: <run-dir> <host-rig|install>. Install archives also list the rig-only add-ons
+# applied on top of what install.sh delivers.
+write_run_meta() {
+  local run_dir="$1" topology="$2"
+  case "$topology" in
+    host-rig|install) ;;
+    *) echo "write_run_meta: topology must be host-rig or install, got '$topology'" >&2; return 1 ;;
+  esac
+  mkdir -p "$run_dir"
+  {
+    echo "topology=$topology"
+    if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
+  } > "$run_dir/run-meta"
+}
+
+# Prints, one per line, the names of run-all.sh options that only configure the host
+# rig and so cannot be honoured by --install mode. Args: <name>=<value> pairs; an
+# empty value means "not given".
+install_mode_incompatible_flags() {
+  local pair
+  for pair in "$@"; do
+    if [ -n "${pair#*=}" ]; then echo "${pair%%=*}"; fi
+  done
+}
+
+# True when <pid> is an ssh process forwarding a port (the install-mode apiserver
+# tunnel). Guards pidfile-driven kills against a recycled PID.
+is_install_tunnel_pid() {
+  local cmd
+  cmd=$(ps -p "$1" -o command= 2>/dev/null) || return 1
+  case "$cmd" in
+    *ssh*" -L "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}

@@ -20,6 +20,9 @@ set -euo pipefail
 source "$(dirname "$0")/_lib.sh"
 
 VM_NAME="${U7S_VM_NAME:-lima-node}"
+# "install" (set by install-run.sh): the cluster is a real install.sh install, apiserver and
+# all in the VM. Every run archive records which topology produced it.
+TOPOLOGY="${U7S_TOPOLOGY:-host-rig}"
 FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
 ALL_E2E_TIMEOUT_SECONDS="${SONOBUOY_ALL_E2E_TIMEOUT_SECONDS:-43200}"
@@ -242,7 +245,12 @@ _WATCHDOG_PID=""
 trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true' EXIT
 sed "s|https://127.0.0.1:${PORT}|https://host.lima.internal:${PORT}|g" "$KUBECONFIG" > "$REWRITTEN"
 limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-kubeconfig
-limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
+if [ "$TOPOLOGY" = "install" ]; then
+  # The apiserver lives in the VM: use the kubeconfig install.sh wrote there.
+  limactl shell "$VM_NAME" sudo cp "$U7S_SONOBUOY_VM_KUBECONFIG" /tmp/sonobuoy-kubeconfig
+else
+  limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
+fi
 limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-plugin-e2e.yaml
 limactl copy scripts/conformance/sonobuoy-plugin-e2e.yaml "${VM_NAME}:/tmp/sonobuoy-plugin-e2e.yaml"
 
@@ -572,8 +580,16 @@ echo "Results: $OUTFILE"
 RUN_DIR="${OUTFILE%.tar.gz}"
 mkdir -p "$WORKDIR"
 echo "$RUN_DIR" > "$RESULTS_DIR_FILE"
+write_run_meta "$RUN_DIR" "$TOPOLOGY"
 HOST_LOGS_DIR="$RUN_DIR/host-logs"
 mkdir -p "$HOST_LOGS_DIR"
+if [ "$TOPOLOGY" = "install" ]; then
+  # The control plane runs as systemd units in the VM; its journal is its only log.
+  for UNIT in u7s-apiserver u7s-kcm; do
+    limactl shell "$VM_NAME" sudo journalctl -u "$UNIT" --no-pager --utc \
+      > "$HOST_LOGS_DIR/${UNIT}.log" 2>/dev/null || true
+  done
+fi
 [ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
 [ -f "$WORKDIR/scheduler.log" ]              && cp "$WORKDIR/scheduler.log"   "$HOST_LOGS_DIR/scheduler.log"
 [ -f "$WORKDIR/konnectivity-server.log" ]    && cp "$WORKDIR/konnectivity-server.log" "$HOST_LOGS_DIR/konnectivity-server.log"

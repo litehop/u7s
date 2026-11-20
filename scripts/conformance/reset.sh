@@ -39,6 +39,8 @@ set -euo pipefail
 
 # shellcheck source=scripts/_kill-pattern.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_kill-pattern.sh"
+# shellcheck source=scripts/conformance/_lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 
 # Host processes are killed by full cmdline (binary name + this workdir's
 # path) via workdir_kill_pattern, never by "whatever holds this port": a blanket
@@ -255,6 +257,17 @@ main() {
   # Fallback, scoped by cmdline (see the note above host_process_survivors).
   pkill -f "$(workdir_kill_pattern apiserver "$WORKDIR")" 2>/dev/null || true
   pkill -f "$(workdir_kill_pattern scheduler "$WORKDIR")" 2>/dev/null || true
+
+  # --install mode's only host process: the ssh tunnel to the VM's apiserver. Pidfile only,
+  # and only if the pid is still an ssh -L, so a recycled pid is never signalled.
+  if [ -f "$WORKDIR/install-tunnel.pid" ]; then
+    pid="$(cat "$WORKDIR/install-tunnel.pid")"
+    if is_install_tunnel_pid "$pid"; then
+      echo "[reset]   killing install-mode apiserver tunnel (PID $pid)"
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$WORKDIR/install-tunnel.pid"
+  fi
 
   # The run-metrics sampler (started by run-all.sh alongside the stack, see
   # sample-run-metrics.sh) is a peer of apiserver/scheduler for teardown

@@ -20,6 +20,20 @@
 #                                  [--embedded-scheduler <true|false>]
 #                                  [--service-cidr <cidr>[,<cidr>]]
 #
+#   --install    Release sign-off path: instead of the host rig, build an arm64 tarball
+#                from this checkout, run the real scripts/install.sh on the VM, tunnel
+#                the VM's apiserver to 127.0.0.1:<--port>, apply the rig-only add-ons
+#                (labelled u7s.io/conformance-rig-only=true; install.sh does not ship
+#                them), then run sonobuoy. Delegates to install-run.sh. Works with
+#                --reset, --focus, --all-e2e, --stack-only, --vm, --port, --kubelet-port,
+#                --network, --procs, --k8s-version, -v (RUST_LOG goes to a systemd
+#                drop-in on u7s-apiserver). Host-rig-only options (--binary, --profile,
+#                --pki-test-*, --extra-node, --dual-stack, --embedded-scheduler, ...) are
+#                rejected. Every run archive carries run-meta with topology=install
+#                (host-rig on the default path). Tear down with
+#                scripts/conformance/reset.sh --vm <vm> --workdir <workdir> (deletes the
+#                VM), then nothing else is left on the host.
+#
 #   --embedded-scheduler  Passthrough to u7s-apiserver's own --embedded-scheduler flag:
 #                run u7s-scheduler as a supervised task inside the
 #                apiserver process instead of the standalone binary Step 5 otherwise
@@ -245,6 +259,7 @@ PROCS=""
 K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
 SERVICE_CIDR=""
+INSTALL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -277,6 +292,7 @@ while [[ $# -gt 0 ]]; do
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
+    --install) INSTALL=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -392,6 +408,35 @@ banner() {
   echo " $*"
   echo "============================================================"
 }
+
+# --install: the real install.sh on the VM instead of the host rig. Options that configure
+# the host rig have no install-mode meaning, so reject them rather than ignore them silently.
+if [ "$INSTALL" -eq 1 ]; then
+  source "$DIR/_lib.sh"
+  _INSTALL_BAD=$(install_mode_incompatible_flags "--binary=$BINARY" \
+    "--konnectivity-server-port=$KONNECTIVITY_SERVER_PORT" "--dual-stack=$_DUAL_STACK_ARG" \
+    "--extra-node=$EXTRA_NODE" "--profile=$([ "$PROFILE" -eq 1 ] && echo 1)" \
+    "--dhat-depth=$DHAT_DEPTH" "--pki-test-lifetime=$PKI_TEST_LIFETIME" \
+    "--pki-test-sa-rotation=$PKI_TEST_SA_ROTATION" "--pki-test-intermediate=$PKI_TEST_INTERMEDIATE" \
+    "--embedded-scheduler=$EMBEDDED_SCHEDULER" "--service-cidr=$SERVICE_CIDR" \
+    "--sample-interval=$SAMPLE_INTERVAL" | paste -sd' ' -)
+  if [ -n "$_INSTALL_BAD" ]; then
+    echo "error: --install runs the real install.sh on the VM; host-rig option(s) not supported with it: $_INSTALL_BAD" >&2
+    exit 1
+  fi
+  _INSTALL_ARGS=(--port "${PORT:-6443}" --kubelet-port "${KUBELET_PORT:-10250}" --workdir "$WORKDIR" --argv-json "$(printf '%s\n' "${ORIGINAL_ARGV[@]}" | jq -R . | jq -s -c .)")
+  [ "$RESET" -eq 0 ] || _INSTALL_ARGS+=(--reset)
+  [ "$STACK_ONLY" -eq 0 ] || _INSTALL_ARGS+=(--stack-only)
+  [ -z "$FOCUS" ] || _INSTALL_ARGS+=(--focus "$FOCUS")
+  [ "$ALL_E2E" -eq 0 ] || _INSTALL_ARGS+=(--all-e2e)
+  [ "$UNSAFE_FOCUS" -eq 0 ] || _INSTALL_ARGS+=(--unsafe-focus)
+  [ -z "$PROCS" ] || _INSTALL_ARGS+=(--procs "$PROCS")
+  [ -z "$K8S_VERSION" ] || _INSTALL_ARGS+=(--k8s-version "$K8S_VERSION")
+  [ -z "$NETWORK" ] || _INSTALL_ARGS+=(--network "$NETWORK")
+  [ -z "${U7S_VM_NAME:-}" ] || _INSTALL_ARGS+=(--vm "$U7S_VM_NAME")
+  [ "$VERBOSE" -lt 1 ] || _INSTALL_ARGS+=(--rust-log "$RUST_LOG")
+  exec bash "$DIR/install-run.sh" "${_INSTALL_ARGS[@]}"
+fi
 
 # Propagate binary override via env var (u7s-start.sh reads U7S_BINARY).
 if [ -n "$BINARY" ]; then
