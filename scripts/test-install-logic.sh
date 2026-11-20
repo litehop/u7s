@@ -1009,7 +1009,7 @@ assert "a tarball with no manifests/ dir at all is treated as an empty set, not 
 # fail to find a real --iface or net-conf.json Network.
 stage5="$MANIFEST_WORK/stage5"
 mkdir -p "$stage5/manifests"
-printf '        - --iface=__IFACE__\n      "Network": "__POD_CLUSTER_CIDR__",\n' \
+printf '        - --iface=__IFACE__\n  cni-conf.json: |\n    {}\n  net-conf.json: |\n    "Network": "__POD_CLUSTER_CIDR__",\n' \
   > "$stage5/manifests/flannel.yaml"
 dest5="$MANIFEST_WORK/dest5"
 bash "$MANIFEST_RUNNER" "$stage5" "$dest5" 0 "eth7" "10.99.0.0/16"
@@ -2506,15 +2506,15 @@ assert_true "--service-cidr and --cluster-cidr values are whitespace-stripped be
 # Manifest placeholders: the full lists and each family are available; the
 # legacy __POD_CLUSTER_CIDR__ stays one valid CIDR (the primary).
 mkdir -p "$NET_WORK/ph"
-printf 'a: __POD_CLUSTER_CIDR__\nb: __POD_CLUSTER_CIDRS__\nc: __POD_CLUSTER_CIDR_IPV4__\nd: __POD_CLUSTER_CIDR_IPV6__\ne: __SERVICE_CIDRS__\nf: __SERVICE_CIDR_IPV4__\ng: __SERVICE_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
+printf 'data:\n  cni-conf.json: |\n    {}\n  net-conf.json: |\n    a: __POD_CLUSTER_CIDR__\n    b: __POD_CLUSTER_CIDRS__\n    c: __POD_CLUSTER_CIDR_IPV4__\n    d: __POD_CLUSTER_CIDR_IPV6__\n    e: __SERVICE_CIDRS__\n    f: __SERVICE_CIDR_IPV4__\n    g: __SERVICE_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
 net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/ph"'" && echo rendered'
 assert "rendering a dual-stack install succeeds" "$([ "$NET_STATUS" -eq 0 ] && echo 1 || echo 0)"
 assert "dual-stack placeholders expose the primary CIDR, both full lists and each family; a pre-dual-stack manifest keeps a single valid CIDR" \
-  "$([ "$(paste -sd'|' "$NET_WORK/ph/flannel.yaml")" = 'a: 10.244.0.0/16|b: 10.244.0.0/16,fd00:244::/56|c: 10.244.0.0/16|d: fd00:244::/56|e: 10.96.0.0/12,fd00:96::/108|f: 10.96.0.0/12|g: fd00:96::/108' ] && echo 1 || echo 0)"
-printf 'a: __POD_CLUSTER_CIDR__\nc: __POD_CLUSTER_CIDR_IPV4__\nd: __POD_CLUSTER_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
+  "$([ "$(sed -n 's/^    //p' "$NET_WORK/ph/flannel.yaml" | paste -sd'|' -)" = '{}|a: 10.244.0.0/16|b: 10.244.0.0/16,fd00:244::/56|c: 10.244.0.0/16|d: fd00:244::/56|e: 10.96.0.0/12,fd00:96::/108|f: 10.96.0.0/12|g: fd00:96::/108' ] && echo 1 || echo 0)"
+printf 'data:\n  cni-conf.json: |\n    {}\n  net-conf.json: |\n    a: __POD_CLUSTER_CIDR__\n    c: __POD_CLUSTER_CIDR_IPV4__\n    d: __POD_CLUSTER_CIDR_IPV6__\n' > "$NET_WORK/ph/flannel.yaml"
 net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; IFACE=eth0; validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/ph"'" && echo rendered'
 assert "single-stack leaves the IPv6 placeholders empty rather than inventing a value" \
-  "$([ "$(paste -sd'|' "$NET_WORK/ph/flannel.yaml")" = 'a: 10.244.0.0/16|c: 10.244.0.0/16|d: ' ] && echo 1 || echo 0)"
+  "$([ "$(sed -n 's/^    //p' "$NET_WORK/ph/flannel.yaml" | paste -sd'|' -)" = '{}|a: 10.244.0.0/16|c: 10.244.0.0/16|d: ' ] && echo 1 || echo 0)"
 
 # Dual-stack render of the REAL vendored manifests: each consumer must learn
 # both families, or one family silently breaks (pods unroutable, Service VIPs
@@ -2672,14 +2672,18 @@ for v6 in "" fd00:244::/56; do
   assert "render_flannel (v6='${v6:-none}') exits 0 and leaves no __PLACEHOLDER__ in the output" \
     "$([ "$NET_STATUS" -eq 0 ] && ! printf '%s' "$NET_OUT" | drain_grep -qE '__[A-Z_]+__' && echo 1 || echo 0)"
 done
-net_run 'printf "a: __NEW_THING__\n" | render_flannel eth0 10.244.0.0/16 "" 1426'
+net_run 'printf "data:\n  cni-conf.json: |\n    {}\n  net-conf.json: |\n    a: __NEW_THING__\n" | render_flannel eth0 10.244.0.0/16 "" 1426'
 assert "render_flannel fails loud on an unknown placeholder instead of shipping it into the CNI config" \
   "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF '__NEW_THING__' && echo 1 || echo 0)"
+net_run 'printf "data:\n  cni-conf.json: |\n    {}\n" | render_flannel eth0 10.244.0.0/16 "" 1426'
+assert "render_flannel refuses a manifest with no net-conf.json: hashing nothing would stop CIDR changes from rolling the DaemonSet" \
+  "$([ "$NET_STATUS" -ne 0 ] && printf '%s' "$NET_OUT" | drain_grep -qF 'net-conf.json' && echo 1 || echo 0)"
 
 # The install-cni init container copies cni-conf.json once per pod start, so a
 # changed --pod-mtu only reaches the node if the DaemonSet pod template changes.
+# flannel_conf_hash <mtu> [v6 cidr] [manifest]
 flannel_conf_hash() {
-  net_run 'render_flannel eth0 10.244.0.0/16 "" '"$1"' < "'"$ROOT_DIR"'/manifests/flannel.yaml"'
+  net_run 'render_flannel eth0 10.244.0.0/16 "'"${2:-}"'" '"$1"' < "'"${3:-$ROOT_DIR/manifests/flannel.yaml}"'"'
   printf '%s\n' "$NET_OUT" | sed -n 's/^ *u7s.io\/flannel-conf-hash: //p'
 }
 hash_1426="$(flannel_conf_hash 1426)"
@@ -2689,6 +2693,20 @@ assert "a different --pod-mtu changes the pod-template hash, so the DaemonSet ro
   "$([ "$hash_1426" != "$(flannel_conf_hash 1400)" ] && echo 1 || echo 0)"
 assert "the same --pod-mtu renders the same hash, so a no-op re-run does not restart flannel" \
   "$([ "$hash_1426" = "$(flannel_conf_hash 1426)" ] && echo 1 || echo 0)"
+hash_dual="$(flannel_conf_hash 1426 fd00:244::/56)"
+assert "enabling dual-stack changes the pod-template hash (got '$hash_dual'), so an existing single-stack node rolls flannel to pick up IPv6Network" \
+  "$([ -n "$hash_dual" ] && [ "$hash_dual" != "$hash_1426" ] && echo 1 || echo 0)"
+assert "a different IPv6 pod CIDR changes the dual-stack hash, so the new range reaches net-conf.json on every node" \
+  "$([ "$hash_dual" != "$(flannel_conf_hash 1426 fd00:245::/56)" ] && echo 1 || echo 0)"
+# Swap the two data keys: the hash must still cover both values.
+awk '
+  /^  cni-conf.json: \|$/ { c = 1 } /^  net-conf.json: \|$/ { c = 0; n = 1 } /^kind: ConfigMap$/ { n = 0 }
+  c { cni = cni $0 "\n"; next } n { net = net $0 "\n"; next }
+  { if (net != "" && !done) { printf "%s%s", net, cni; done = 1 } print }' "$ROOT_DIR/manifests/flannel.yaml" > "$NET_WORK/flannel-swapped.yaml"
+assert "the key-swapped manifest really has net-conf.json before cni-conf.json (else the reorder test below proves nothing)" \
+  "$([ "$(grep -n '^  net-conf.json:' "$NET_WORK/flannel-swapped.yaml" | cut -d: -f1)" -lt "$(grep -n '^  cni-conf.json:' "$NET_WORK/flannel-swapped.yaml" | cut -d: -f1)" ] && echo 1 || echo 0)"
+assert "the conf-hash is independent of the order of the ConfigMap data keys, so reordering flannel.yaml cannot silently stop an MTU change from rolling the DaemonSet" \
+  "$([ "$hash_1426" = "$(flannel_conf_hash 1426 '' "$NET_WORK/flannel-swapped.yaml")" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Node address list: --iface yields every global-scope family, --node-ip
