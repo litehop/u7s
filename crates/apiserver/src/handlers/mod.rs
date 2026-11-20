@@ -12,6 +12,8 @@ pub mod csr;
 pub mod defaults;
 pub mod device_taint_rule;
 pub mod discovery;
+#[cfg(test)]
+mod exclude_resource_rules_tests;
 pub mod field_selector;
 #[cfg(test)]
 mod field_selector_tests;

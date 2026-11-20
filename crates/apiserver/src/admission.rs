@@ -2093,17 +2093,33 @@ pub(crate) fn matches_match_constraints(
     if mc.is_null() {
         return true; // absent matchConstraints matches everything
     }
-    let resource_rules = mc["resourceRules"].as_array();
-    let Some(rules) = resource_rules else {
-        return true; // no resourceRules means match all
+    resource_rules_select(mc, group, version, resource, namespace, operation)
+}
+
+/// Whether a `matchConstraints`/`matchResources` object selects the request: any
+/// `resourceRules` entry matches (none declared selects everything) and no
+/// `excludeResourceRules` entry matches.
+pub(crate) fn resource_rules_select(
+    mc: &serde_json::Value,
+    group: &str,
+    version: &str,
+    resource: &str,
+    namespace: Option<&str>,
+    operation: &str,
+) -> bool {
+    let matches = |rule: &serde_json::Value| {
+        matches_rule(rule, group, version, resource, namespace, operation)
     };
-    if rules.is_empty() {
-        return true;
+    if mc["excludeResourceRules"]
+        .as_array()
+        .is_some_and(|rules| rules.iter().any(matches))
+    {
+        return false;
     }
-    // Match if ANY rule matches (OR across rules).
-    rules
-        .iter()
-        .any(|rule| matches_rule(rule, group, version, resource, namespace, operation))
+    match mc["resourceRules"].as_array() {
+        Some(rules) if !rules.is_empty() => rules.iter().any(matches),
+        _ => true,
+    }
 }
 
 /// The roots a ValidatingAdmissionPolicy or `matchConditions` expression is evaluated
@@ -2615,23 +2631,15 @@ pub async fn run_cel_mutating_policies<S: Store>(
         }
 
         // Check binding matchResources resourceRules (same as matchConstraints logic).
-        let binding_rules = binding["spec"]["matchResources"]["resourceRules"].as_array();
-        if let Some(rules) = binding_rules {
-            if !rules.is_empty() {
-                let any_rule = rules.iter().any(|rule| {
-                    matches_rule(
-                        rule,
-                        ctx.group,
-                        ctx.version,
-                        ctx.resource,
-                        ctx.namespace,
-                        ctx.operation,
-                    )
-                });
-                if !any_rule {
-                    continue;
-                }
-            }
+        if !resource_rules_select(
+            &binding["spec"]["matchResources"],
+            ctx.group,
+            ctx.version,
+            ctx.resource,
+            ctx.namespace,
+            ctx.operation,
+        ) {
+            continue;
         }
 
         let request_val = webhook_match_condition_request(ctx, &object);
@@ -3173,23 +3181,15 @@ async fn run_validating_admission_policies<S: Store>(
         }
 
         // Check binding matchResources resourceRules (same as matchConstraints logic).
-        let binding_rules = binding["spec"]["matchResources"]["resourceRules"].as_array();
-        if let Some(rules) = binding_rules {
-            if !rules.is_empty() {
-                let any_rule = rules.iter().any(|rule| {
-                    matches_rule(
-                        rule,
-                        ctx.group,
-                        ctx.version,
-                        ctx.resource,
-                        ctx.namespace,
-                        ctx.operation,
-                    )
-                });
-                if !any_rule {
-                    continue;
-                }
-            }
+        if !resource_rules_select(
+            &binding["spec"]["matchResources"],
+            ctx.group,
+            ctx.version,
+            ctx.resource,
+            ctx.namespace,
+            ctx.operation,
+        ) {
+            continue;
         }
 
         // Build a `request` JSON object from the admission context for CEL evaluation.
