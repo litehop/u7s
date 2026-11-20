@@ -34,6 +34,10 @@
 #                scripts/conformance/reset.sh --vm <vm> --workdir <workdir> (deletes the
 #                VM), then nothing else is left on the host.
 #
+#   Rig-only: the rig applies kube-network-policies, metrics-server and external-snapshotter.
+#   u7s ships none of them; dependent specs pass only with them. See
+#   docs/dev-setup.md "Rig-only add-ons".
+#
 #   --embedded-scheduler  Passthrough to u7s-apiserver's own --embedded-scheduler flag:
 #                run u7s-scheduler as a supervised task inside the
 #                apiserver process instead of the standalone binary Step 5 otherwise
