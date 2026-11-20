@@ -1001,6 +1001,7 @@ fn delete_options_from_query(query: &[(String, String)]) -> DeleteOptions {
         orphan_dependents: first("orphanDependents")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
         grace_period_seconds: None,
+        preconditions: None,
         dry_run: (!dry_run.is_empty()).then(|| dry_run.into_iter().map(String::from).collect()),
     }
 }

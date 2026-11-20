@@ -412,6 +412,9 @@ pub(crate) struct MockStore {
     delete_before_next_put: std::sync::Mutex<Option<String>>,
     write_before_next_put: std::sync::Mutex<Option<(String, bytes::Bytes)>>,
     write_before_next_delete: std::sync::Mutex<Option<(String, bytes::Bytes)>>,
+    churn_before_every_delete: std::sync::Mutex<Option<String>>,
+    churns: std::sync::atomic::AtomicU64,
+    delete_before_next_delete: std::sync::Mutex<Option<String>>,
 }
 
 impl MockStore {
@@ -422,6 +425,9 @@ impl MockStore {
             delete_before_next_put: std::sync::Mutex::new(None),
             write_before_next_put: std::sync::Mutex::new(None),
             write_before_next_delete: std::sync::Mutex::new(None),
+            churn_before_every_delete: std::sync::Mutex::new(None),
+            churns: std::sync::atomic::AtomicU64::new(0),
+            delete_before_next_delete: std::sync::Mutex::new(None),
         }
     }
 
@@ -440,6 +446,17 @@ impl MockStore {
     /// lands after the handler's read.
     pub(crate) fn arm_write_before_delete(&self, key: &str, body: bytes::Bytes) {
         *self.write_before_next_delete.lock().unwrap() = Some((key.to_string(), body));
+    }
+
+    /// Deletes `key` right before the next delete: someone else's delete that lands first.
+    pub(crate) fn arm_delete_before_delete(&self, key: &str) {
+        *self.delete_before_next_delete.lock().unwrap() = Some(key.to_string());
+    }
+
+    /// Rewrites `key` right before every delete: a writer that wins every race. Each lost
+    /// race advances the paused tokio clock by 20s, so only for `start_paused` tests.
+    pub(crate) fn arm_churn_before_every_delete(&self, key: &str) {
+        *self.churn_before_every_delete.lock().unwrap() = Some(key.to_string());
     }
 
     pub(crate) fn arm(&self) {
@@ -506,11 +523,35 @@ impl u7s_store::Store for MockStore {
         expected_revision: Option<u64>,
     ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send {
         let write_first = self.write_before_next_delete.lock().unwrap().take();
+        let delete_first = self.delete_before_next_delete.lock().unwrap().take();
+        let churn = self.churn_before_every_delete.lock().unwrap().clone();
+        let n = self
+            .churns
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let inner = self.inner.clone();
         let key: String = key.into();
         async move {
             if let Some((k, body)) = write_first {
                 inner.put(&k, body, None).await.unwrap();
+            }
+            if let Some(k) = delete_first {
+                inner.delete(&k, None).await.unwrap();
+            }
+            if let Some(k) = churn {
+                // Needs a paused tokio clock: each lost race costs 20s of request time.
+                assert!(
+                    n < 50,
+                    "the delete never gave up on a writer that always wins"
+                );
+                tokio::time::advance(std::time::Duration::from_secs(20)).await;
+                if let Some(cur) = inner.get(&k).await.unwrap() {
+                    let mut body: serde_json::Value = serde_json::from_slice(&cur.value).unwrap();
+                    body["metadata"]["annotations"] = serde_json::json!({"churn": n.to_string()});
+                    inner
+                        .put(&k, bytes::Bytes::from(body.to_string()), None)
+                        .await
+                        .unwrap();
+                }
             }
             inner.delete(&key, expected_revision).await
         }

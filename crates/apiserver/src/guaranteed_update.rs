@@ -28,6 +28,7 @@ use bytes::Bytes;
 use u7s_store::{CreateNamespacedError, Store, StoreError, StoreObject};
 
 use crate::status::{Status, StatusError};
+use crate::types::Preconditions;
 
 /// Upstream's default `--request-timeout`. The handlers have no request deadline of their
 /// own, so the conflict loop gives up with a 409 after this long.
@@ -58,18 +59,90 @@ fn uid_of(value: &[u8]) -> Option<String> {
     )
 }
 
+/// Why a delete did not happen.
+#[derive(Debug)]
+pub(crate) enum DeleteError {
+    Store(StoreError),
+    /// The stored object fails `DeleteOptions.preconditions`: `message` is upstream's
+    /// `Preconditions.Check` text.
+    Precondition {
+        key: String,
+        message: String,
+    },
+}
+
+impl From<StoreError> for DeleteError {
+    fn from(e: StoreError) -> Self {
+        Self::Store(e)
+    }
+}
+
+impl std::fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(e) => e.fmt(f),
+            Self::Precondition { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl DeleteError {
+    pub(crate) fn into_status(
+        self,
+        group: &str,
+        resource: &str,
+        name: &str,
+        kind: &str,
+    ) -> StatusError {
+        match self {
+            Self::Store(e) => crate::handlers::generic::store_err(e, group, resource, name, kind),
+            Self::Precondition { key, message } => {
+                let qualified = if group.is_empty() {
+                    resource.to_string()
+                } else {
+                    format!("{resource}.{group}")
+                };
+                Status::conflict(format!(
+                    "Operation cannot be fulfilled on {qualified} \"{name}\": StorageError: \
+                     invalid object, Code: 4, Key: {key}, ResourceVersion: 0, \
+                     AdditionalErrorMsg: {message}"
+                ))
+            }
+        }
+    }
+}
+
+pub(crate) fn check_preconditions(
+    pre: Option<&Preconditions>,
+    key: &str,
+    value: &[u8],
+) -> Result<(), DeleteError> {
+    let Some(pre) = pre else { return Ok(()) };
+    let body = serde_json::from_slice::<serde_json::Value>(value).unwrap_or_default();
+    pre.check(&body)
+        .map_err(|message| DeleteError::Precondition {
+            key: key.to_string(),
+            message,
+        })
+}
+
 /// Hard-deletes `read`, conditional on the uid and revision it was read at, as upstream's
 /// delete preconditions. A write that lands in between is not discarded: the object is re-read
 /// and, unless it is gone, `keep` says it must stay (e.g. a finalizer was re-added), or it is
-/// a different object, the delete is retried at the new revision.
+/// a different object, the delete is retried at the new revision until the request deadline.
+/// `pre` is the client's `DeleteOptions.preconditions`, checked against `read` and again
+/// against every re-read, before anything is deleted.
 pub(crate) async fn delete_read<S: Store>(
     store: &S,
     key: &str,
     read: &StoreObject,
     keep: impl Fn(&serde_json::Value) -> bool,
-) -> Result<Deleted, StoreError> {
+    pre: Option<&Preconditions>,
+) -> Result<Deleted, DeleteError> {
     let uid = uid_of(&read.value);
     let mut revision = read.revision;
+    let deadline = tokio::time::Instant::now() + CONFLICT_RETRY_DEADLINE;
+    check_preconditions(pre, key, &read.value)?;
     loop {
         match store.delete(key, Some(revision)).await {
             Ok(_) => return Ok(Deleted::Removed),
@@ -78,15 +151,25 @@ pub(crate) async fn delete_read<S: Store>(
                 let Some(fresh) = store.get(key).await? else {
                     return Ok(Deleted::Gone);
                 };
+                check_preconditions(pre, key, &fresh.value)?;
                 if uid_of(&fresh.value) != uid {
                     return Ok(Deleted::Gone);
                 }
                 match serde_json::from_slice::<serde_json::Value>(&fresh.value) {
-                    Ok(body) if !keep(&body) => revision = fresh.revision,
+                    Ok(body) if !keep(&body) => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(StoreError::RevisionMismatch {
+                                expected: revision,
+                                current: fresh.revision,
+                            }
+                            .into());
+                        }
+                        revision = fresh.revision;
+                    }
                     _ => return Ok(Deleted::Kept),
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -121,6 +204,7 @@ pub(crate) struct GuaranteedUpdate<S> {
     deadline: tokio::time::Instant,
     expected: Option<u64>,
     read_object: Option<StoreObject>,
+    pre: Option<Preconditions>,
 }
 
 impl<S: Store> GuaranteedUpdate<S> {
@@ -147,7 +231,15 @@ impl<S: Store> GuaranteedUpdate<S> {
             deadline: tokio::time::Instant::now() + CONFLICT_RETRY_DEADLINE,
             expected: None,
             read_object: None,
+            pre: None,
         }
+    }
+
+    /// The client's `DeleteOptions.preconditions`: every [`Self::read`] of an existing object
+    /// fails with a 409 unless it matches, and [`Self::delete`] re-checks each re-read.
+    pub(crate) fn with_preconditions(mut self, pre: Option<Preconditions>) -> Self {
+        self.pre = pre;
+        self
     }
 
     /// Route creates through the namespace-phase gate for namespace `ns`.
@@ -167,6 +259,10 @@ impl<S: Store> GuaranteedUpdate<S> {
             .get(self.key.clone())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(c) = &current {
+            check_preconditions(self.pre.as_ref(), &self.key, &c.value)
+                .map_err(|e| e.into_status(&self.group, &self.resource, &self.name, &self.kind))?;
+        }
         self.expected = Some(match (&current, self.client_rv) {
             (_, Some(rv)) => rv,
             (Some(c), None) => c.revision,
@@ -243,18 +339,12 @@ impl<S: Store> GuaranteedUpdate<S> {
         if expected != read.revision {
             return Err(conflict(read.revision));
         }
-        match delete_read(&*self.store, &self.key, read, |_| true).await {
+        match delete_read(&*self.store, &self.key, read, |_| true, self.pre.as_ref()).await {
             Ok(Deleted::Removed) => Ok(Drain::Removed),
             Ok(Deleted::Gone) => Ok(Drain::Gone),
             Ok(Deleted::Kept) if self.client_rv.is_none() => Ok(Drain::Lost),
             Ok(Deleted::Kept) => Err(conflict(0)),
-            Err(e) => Err(crate::handlers::generic::store_err(
-                e,
-                &self.group,
-                &self.resource,
-                &self.name,
-                &self.kind,
-            )),
+            Err(e) => Err(e.into_status(&self.group, &self.resource, &self.name, &self.kind)),
         }
     }
 
@@ -350,6 +440,10 @@ mod tests {
         CreateOnly,
         /// `Some(rv)` or a caller-supplied expectation.
         Conditional,
+        /// `Some(rv)` where `rv` comes from a `for` loop variable, i.e. a list snapshot that may
+        /// be stale by the time it is written: the write fails on any change since the list,
+        /// so the caller must not re-decide from the snapshot's body on a lost race.
+        Snapshot,
     }
 
     /// Every production `.put(` call site: `(file, fn, argument class)` and how many there are.
@@ -368,7 +462,7 @@ mod tests {
         (
             "csr_approver.rs",
             "approve_kubelet_serving_csrs",
-            Put::Conditional,
+            Put::Snapshot,
             1,
         ),
         ("guaranteed_update.rs", "pending", Put::Conditional, 1),
@@ -397,7 +491,7 @@ mod tests {
             1,
         ),
         ("handlers/crd.rs", "create_crd", Put::CreateOnly, 1),
-        ("handlers/crd.rs", "delete_instances", Put::Conditional, 1),
+        ("handlers/crd.rs", "delete_instances", Put::Snapshot, 1),
         ("handlers/crd.rs", "finalize_crd", Put::Conditional, 4),
         ("handlers/crd.rs", "patch_crd", Put::CreateOnly, 1),
         ("handlers/crd.rs", "patch_crd_status", Put::Conditional, 1),
@@ -444,7 +538,6 @@ mod tests {
             1,
         ),
         ("handlers/pods.rs", "delete_pod", Put::Conditional, 1),
-        ("handlers/pods.rs", "evict_pod", Put::Conditional, 1),
         (
             "handlers/resource.rs",
             "create_resource",
@@ -575,6 +668,42 @@ mod tests {
         }
     }
 
+    /// True when the revision argument `Some(x.revision)` names a variable bound by a `for`
+    /// loop in `fn_text`, the text of the enclosing function before the call.
+    fn is_loop_snapshot(arg: &str, fn_text: &str) -> bool {
+        let root: String = arg
+            .trim_start_matches("Some(")
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        !root.is_empty()
+            && fn_text.lines().any(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("for ")
+                    .and_then(|r| r.split_once(" in "))
+                    .is_some_and(|(pat, _)| {
+                        pat.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .any(|w| w == root)
+                    })
+            })
+    }
+
+    /// A delete pinned to `Some(item.revision)` of a listed item has the right argument class
+    /// but is decided on a stale snapshot; the audit must tell it from a delete pinned to a
+    /// fresh `get`.
+    #[test]
+    fn audit_tells_a_delete_pinned_to_a_list_snapshot_from_one_pinned_to_a_fresh_read() {
+        let listed = "for item in resp.items {\n    let live = true;\n";
+        assert!(is_loop_snapshot("Some(item.revision)", listed));
+        assert!(is_loop_snapshot(
+            "Some(obj.revision)",
+            "for (obj, f) in zip {\n"
+        ));
+        let read = "let stored = store.get(&key).await?;\nfor _ in 0..MAX_ATTEMPTS {\n";
+        assert!(!is_loop_snapshot("Some(stored.revision)", read));
+        assert!(!is_loop_snapshot("Some(items.revision)", listed));
+    }
+
     /// `(file, fn, class) -> count` of every store `.put(` outside test code under `src/`.
     fn production_sites(
         call: &str,
@@ -607,6 +736,7 @@ mod tests {
             let mut in_test_mod = false;
             let mut prev_cfg_test = false;
             let mut current_fn = String::new();
+            let mut fn_start = 0;
             let mut offset = 0;
             for line in text.split_inclusive('\n') {
                 let line_start = offset;
@@ -632,6 +762,7 @@ mod tests {
                             .chars()
                             .take_while(|c| c.is_alphanumeric() || *c == '_')
                             .collect();
+                        fn_start = line_start;
                     }
                 }
                 if t.starts_with("//") {
@@ -643,8 +774,14 @@ mod tests {
                     from += i + call.len();
                     // A router's `.put(handler)` has too few arguments to be a store call.
                     if let Some(arg) = nth_arg(&text, open, arg) {
+                        let class = match classify(&arg) {
+                            Put::Conditional if is_loop_snapshot(&arg, &text[fn_start..open]) => {
+                                Put::Snapshot
+                            }
+                            c => c,
+                        };
                         *sites
-                            .entry((rel.clone(), current_fn.clone(), classify(&arg)))
+                            .entry((rel.clone(), current_fn.clone(), class))
                             .or_insert(0) += 1;
                     }
                 }
@@ -687,7 +824,10 @@ mod tests {
     /// (`None`) deletes only server-owned marker records that nothing updates (allocation
     /// sentinels, tombstones, Events) or a single-use join token; a delete of a user-visible
     /// object goes through [`delete_read`] or [`GuaranteedUpdate::delete`], conditional on the
-    /// revision and uid it read, so a write landing after the read is never discarded.
+    /// revision and uid it read, so a write landing after the read is never discarded. A
+    /// `Snapshot` delete is pinned to a listed item's revision: it fails on any write since the
+    /// list and the caller leaves the item for its next pass instead of re-deciding on the
+    /// stale body. A caller-supplied revision (a fn parameter) is not traced to its read.
     const AUDITED_DELETES: &[(&str, &str, Put, usize)] = &[
         ("bootstrap_rbac.rs", "reconcile_object", Put::Conditional, 1),
         (
@@ -700,7 +840,7 @@ mod tests {
         ("cert_expiry.rs", "clear_warnings", Put::Blind, 1),
         ("guaranteed_update.rs", "delete_read", Put::Conditional, 1),
         ("handlers/crd.rs", "create_crd", Put::Blind, 1),
-        ("handlers/crd.rs", "delete_instances", Put::Conditional, 1),
+        ("handlers/crd.rs", "delete_instances", Put::Snapshot, 1),
         ("handlers/crd.rs", "patch_crd", Put::Blind, 1),
         ("handlers/crd.rs", "purge_crd", Put::Conditional, 1),
         ("handlers/crd.rs", "replace_crd", Put::Blind, 1),
@@ -823,7 +963,9 @@ mod tests {
         let read = s.get(KEY).await.unwrap().unwrap();
         s.put(KEY, with_n(9), None).await.unwrap();
         s.put(KEY, with_uid("u", &[]), None).await.unwrap();
-        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers, None)
+            .await
+            .unwrap();
         assert!(matches!(out, Deleted::Removed));
         assert!(s.get(KEY).await.unwrap().is_none());
     }
@@ -836,7 +978,9 @@ mod tests {
         s.put(KEY, with_uid("u", &[]), None).await.unwrap();
         let read = s.get(KEY).await.unwrap().unwrap();
         s.put(KEY, with_uid("u", &["f"]), None).await.unwrap();
-        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers, None)
+            .await
+            .unwrap();
         assert!(matches!(out, Deleted::Kept));
         assert!(s.get(KEY).await.unwrap().is_some());
     }
@@ -849,7 +993,9 @@ mod tests {
         let read = s.get(KEY).await.unwrap().unwrap();
         s.delete(KEY, None).await.unwrap();
         s.put(KEY, with_uid("new", &[]), None).await.unwrap();
-        let out = delete_read(&*s, KEY, &read, has_finalizers).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, has_finalizers, None)
+            .await
+            .unwrap();
         assert!(matches!(out, Deleted::Gone));
         assert!(s.get(KEY).await.unwrap().is_some());
     }
@@ -860,8 +1006,105 @@ mod tests {
         let s = seeded().await;
         let read = s.get(KEY).await.unwrap().unwrap();
         s.delete(KEY, None).await.unwrap();
-        let out = delete_read(&*s, KEY, &read, |_| false).await.unwrap();
+        let out = delete_read(&*s, KEY, &read, |_| false, None).await.unwrap();
         assert!(matches!(out, Deleted::Gone));
+    }
+
+    fn pre(uid: Option<&str>, rv: Option<&str>) -> Preconditions {
+        Preconditions {
+            uid: uid.map(String::from),
+            resource_version: rv.map(String::from),
+        }
+    }
+
+    async fn conflict_message(e: DeleteError) -> String {
+        let st = e.into_status("", "configmaps", "c", "ConfigMap");
+        assert_eq!(st.0, StatusCode::CONFLICT);
+        st.1.message
+    }
+
+    /// The GC deletes with the uid it saw; a same-named object recreated since must survive,
+    /// and the client sees upstream's exact 409 text.
+    #[tokio::test]
+    async fn delete_read_refuses_a_uid_precondition_that_does_not_match() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("new", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        let Err(e) = delete_read(&*s, KEY, &read, |_| true, Some(&pre(Some("old"), None))).await
+        else {
+            panic!("a delete whose uid precondition does not match must be refused");
+        };
+        assert_eq!(
+            conflict_message(e).await,
+            "Operation cannot be fulfilled on configmaps \"c\": StorageError: invalid object, \
+             Code: 4, Key: /registry/configmaps/default/c, ResourceVersion: 0, \
+             AdditionalErrorMsg: Precondition failed: UID in precondition: old, UID in object \
+             meta: new"
+        );
+        assert!(s.get(KEY).await.unwrap().is_some(), "must not be deleted");
+    }
+
+    #[tokio::test]
+    async fn delete_read_refuses_a_resource_version_precondition_that_does_not_match() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        let stale = (read.revision + 7).to_string();
+        let Err(e) = delete_read(&*s, KEY, &read, |_| true, Some(&pre(None, Some(&stale)))).await
+        else {
+            panic!("a delete pinned to another resourceVersion must be refused");
+        };
+        assert_eq!(
+            conflict_message(e).await,
+            format!(
+                "Operation cannot be fulfilled on configmaps \"c\": StorageError: invalid \
+                 object, Code: 4, Key: /registry/configmaps/default/c, ResourceVersion: 0, \
+                 AdditionalErrorMsg: Precondition failed: ResourceVersion in precondition: \
+                 {stale}, ResourceVersion in object meta: {}",
+                read.revision
+            )
+        );
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    /// A delete pinned to a resourceVersion must not retry onto the writer that won the race:
+    /// that would delete an object the client never saw.
+    #[tokio::test]
+    async fn delete_read_rechecks_the_pin_on_the_object_a_concurrent_write_left() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        let pin = read.revision.to_string();
+        s.put(KEY, with_n(3), None).await.unwrap();
+        let r = delete_read(&*s, KEY, &read, |_| false, Some(&pre(None, Some(&pin)))).await;
+        assert!(matches!(r, Err(DeleteError::Precondition { .. })));
+        assert!(s.get(KEY).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_read_with_matching_preconditions_deletes() {
+        let s = Arc::new(SqliteStore::new(":memory:").unwrap());
+        s.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        let read = s.get(KEY).await.unwrap().unwrap();
+        let p = pre(Some("u"), Some(&read.revision.to_string()));
+        let out = delete_read(&*s, KEY, &read, |_| true, Some(&p)).await;
+        assert!(matches!(out, Ok(Deleted::Removed)));
+    }
+
+    /// A writer that wins every race must not hold the request open forever: the delete gives
+    /// up with a 409 at the request deadline, as GuaranteedUpdate does.
+    #[tokio::test(start_paused = true)]
+    async fn delete_read_gives_up_with_a_conflict_at_the_request_deadline() {
+        let mock = crate::handlers::test_support::MockStore::new();
+        mock.inner.put(KEY, with_uid("u", &[]), None).await.unwrap();
+        mock.arm_churn_before_every_delete(KEY);
+        let read = mock.inner.get(KEY).await.unwrap().unwrap();
+        let Err(e) = delete_read(&mock, KEY, &read, |_| false, None).await else {
+            panic!("a delete that loses every race must give up");
+        };
+        let st = e.into_status("", "configmaps", "c", "ConfigMap");
+        assert_eq!(st.0, StatusCode::CONFLICT);
+        assert!(mock.inner.get(KEY).await.unwrap().is_some());
     }
 
     /// Kinds with AllowCreateOnUpdate must still create on PUT to a missing key.

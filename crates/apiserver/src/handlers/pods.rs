@@ -1172,6 +1172,12 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            crate::guaranteed_update::check_preconditions(
+                delete_opts.preconditions.as_ref(),
+                &obj.key,
+                &obj.value,
+            )
+            .map_err(|e| e.into_status("", "pods", &pod_name, "Pod"))?;
             let admission_ctx = AdmissionContext {
                 group: "",
                 version: "v1",
@@ -1213,8 +1219,14 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                     &obj.key,
                     None,
                     ("", "pods", &pod_name, "Pod"),
-                );
-                while let Ok(fresh) = gu.read_existing().await {
+                )
+                .with_preconditions(delete_opts.preconditions.clone());
+                loop {
+                    let fresh = match gu.read_existing().await {
+                        Ok(fresh) => fresh,
+                        Err(e) if e.0 == StatusCode::NOT_FOUND => break,
+                        Err(e) => return Err(e),
+                    };
                     let Ok(fresh) = serde_json::from_slice::<serde_json::Value>(&fresh.value)
                     else {
                         break;
@@ -1244,16 +1256,19 @@ pub(crate) async fn delete_collection_pods<S: Store>(
         }
         // Decided on the list snapshot: a pod that got a finalizer since must survive, and one
         // deleted since needs no cleanup.
-        if !matches!(
-            delete_read(
-                &*state.store,
-                &obj.key,
-                &obj,
-                crate::guaranteed_update::has_finalizers
-            )
-            .await,
-            Ok(Deleted::Removed)
-        ) {
+        let removed = delete_read(
+            &*state.store,
+            &obj.key,
+            &obj,
+            crate::guaranteed_update::has_finalizers,
+            delete_opts.preconditions.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            let name = obj.key.rsplit('/').next().unwrap_or_default();
+            e.into_status("", "pods", name, "Pod")
+        })?;
+        if !matches!(removed, Deleted::Removed) {
             continue;
         }
         if let Some(pod_name) = obj.key.rsplit('/').next() {
@@ -1321,6 +1336,12 @@ pub(crate) async fn delete_pod<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("", "pods", &name))?;
+        crate::guaranteed_update::check_preconditions(
+            delete_opts.preconditions.as_ref(),
+            &key,
+            &stored.value,
+        )
+        .map_err(|e| e.into_status("", "pods", &name, "Pod"))?;
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1384,19 +1405,18 @@ pub(crate) async fn delete_pod<S: Store>(
             // Hard-delete: pod is already Terminating, or the caller forced it, and all
             // finalizers are gone. Conditional on the revision read, so a finalizer re-added
             // since (or any other write) is re-decided instead of discarded.
-            match delete_read(&*state.store, &key, &stored, |_| true)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?
+            match delete_read(
+                &*state.store,
+                &key,
+                &stored,
+                |_| true,
+                delete_opts.preconditions.as_ref(),
+            )
+            .await
+            .map_err(|e| e.into_status("", "pods", &name, "Pod"))?
             {
                 Deleted::Kept => continue,
-                Deleted::Gone => {
-                    return Ok(Json(serde_json::json!({
-                        "kind": "Status",
-                        "apiVersion": "v1",
-                        "status": "Success",
-                        "code": 200
-                    })))
-                }
+                Deleted::Gone => return Err(Status::not_found("", "pods", &name)),
                 Deleted::Removed => {}
             }
             state.node_graph.remove_pod(ns.as_str(), &name);
@@ -1803,8 +1823,14 @@ pub(crate) async fn evict_pod<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("", "pods", &name))?;
+    crate::guaranteed_update::check_preconditions(
+        delete_opts.preconditions.as_ref(),
+        &key,
+        &stored.value,
+    )
+    .map_err(|e| e.into_status("", "pods", &name, "Pod"))?;
 
-    let mut obj = Object::from_bytes(&stored.value)
+    let obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     // Eviction is a CREATE of an Eviction object, so both mutating and validating admission
@@ -1829,16 +1855,23 @@ pub(crate) async fn evict_pod<S: Store>(
         // Dry-run: validation passed and this is what a real eviction would hard-delete;
         // return without persisting.
         if !dry_run {
-            match delete_read(&*state.store, &key, &stored, |_| true)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?
+            // A concurrent write (a kubelet status update) is retried on the fresh pod unless
+            // the client pinned a resourceVersion, which then fails the precondition: as
+            // upstream's eviction, which retries conflicts only when none was pinned. A pod
+            // that gained a finalizer meanwhile stays terminating, the eviction having done
+            // its part.
+            match delete_read(
+                &*state.store,
+                &key,
+                &stored,
+                crate::guaranteed_update::has_finalizers,
+                delete_opts.preconditions.as_ref(),
+            )
+            .await
+            .map_err(|e| e.into_status("", "pods", &name, "Pod"))?
             {
-                Deleted::Kept => {
-                    return Err(Status::conflict(format!(
-                        "pod {name} changed while it was being evicted; retry the eviction"
-                    )))
-                }
-                Deleted::Gone => return Ok((StatusCode::CREATED, Json(eviction))),
+                Deleted::Kept => return Ok((StatusCode::CREATED, Json(eviction))),
+                Deleted::Gone => return Err(Status::not_found("", "pods", &name)),
                 Deleted::Removed => {}
             }
             state.node_graph.remove_pod(ns.as_str(), &name);
@@ -1855,20 +1888,30 @@ pub(crate) async fn evict_pod<S: Store>(
         // Dry-run: validation passed and this is what a real eviction would soft-delete to
         // (deletionTimestamp stamped); return without persisting.
         if !dry_run {
-            obj.body["metadata"]["deletionTimestamp"] =
-                serde_json::Value::String(utc_now_rfc3339());
-            set_disruption_target_condition(
-                &mut obj.body,
-                &utc_now_rfc3339(),
-                "EvictionByEvictionAPI",
-                "Eviction API: evicting pod",
-            );
-            let expected_rv = parse_resource_version(obj.resource_version())?;
-            state
-                .store
-                .put(&key, obj.to_bytes(), expected_rv)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
+            // The budget is already spent, so a concurrent write (a kubelet status update) is
+            // retried on the fresh pod rather than re-running the check; a pinned
+            // resourceVersion fails its precondition on the first change, as upstream.
+            let mut gu =
+                GuaranteedUpdate::new(state.store.clone(), &key, None, ("", "pods", &name, "Pod"))
+                    .with_preconditions(delete_opts.preconditions.clone());
+            loop {
+                let fresh = gu.read_existing().await?;
+                let mut body: serde_json::Value = serde_json::from_slice(&fresh.value)
+                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                if body["metadata"]["deletionTimestamp"].is_null() {
+                    body["metadata"]["deletionTimestamp"] =
+                        serde_json::Value::String(utc_now_rfc3339());
+                }
+                set_disruption_target_condition(
+                    &mut body,
+                    &utc_now_rfc3339(),
+                    "EvictionByEvictionAPI",
+                    "Eviction API: evicting pod",
+                );
+                if gu.commit(Object { body }.to_bytes()).await?.is_some() {
+                    break;
+                }
+            }
         }
     }
 
