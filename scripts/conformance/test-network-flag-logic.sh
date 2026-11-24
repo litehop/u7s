@@ -92,7 +92,7 @@ assert_true "run-all.sh parses --network into a NETWORK variable" \
 assert_true "run-all.sh builds _NETWORK_ARG from NETWORK" \
   grep -qF '_NETWORK_ARG="--network $NETWORK"' "$RUN_ALL"
 assert_true "run-all.sh forwards _NETWORK_ARG to the primary node's lima-start.sh call (Step 3)" \
-  grep -qF 'bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
+  grep -qF 'bash "$DIR/lima-start.sh" --with-kcm ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 assert_true "run-all.sh forwards _NETWORK_ARG to add-node.sh (2nd node, --extra-node) so both nodes can share a network" \
   grep -qF 'bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 
@@ -106,7 +106,7 @@ assert_true "add-node.sh forwards --network to its own lima-start.sh call" \
 # elsewhere -- protects against a future edit that reintroduces a duplicate
 # call site regressing back to the old, non-forwarding form.
 assert_false "(regression guard) run-all.sh's Step 3 lima-start.sh call no longer omits --network forwarding" \
-  grep -qF 'bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
+  grep -qF 'bash "$DIR/lima-start.sh" --with-kcm ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 assert_false "(regression guard) run-all.sh's add-node.sh call no longer omits --network forwarding" \
   grep -qF 'bash "$DIR/add-node.sh" "$EXTRA_NODE" "$EXTRA_KUBELET_PORT" ${_PORT_ARG} ${_WORKDIR_ARG} ${_VERBOSE_ARG}' "$RUN_ALL"
 

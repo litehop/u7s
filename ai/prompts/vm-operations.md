@@ -348,7 +348,10 @@ scripts/conformance/lima-start.sh \
   --kubelet-port <KUBELET_PORT>
 ```
 
-This provisions the VM (if needed) or reconnects the kubelet. Handles:
+This provisions the VM (if needed) or reconnects the kubelet. The kubelet joins through
+install.sh's CSR flow, which needs KCM to approve and sign: `run-all.sh` passes `--with-kcm`
+so lima-start.sh runs step 4 itself first; a standalone run must start KCM (step 4) beforehand
+or the join times out. Handles:
 - Rewriting `<IP>` → `host.lima.internal` in the kubelet kubeconfig
 - Kubelet serving cert signed by the cluster CA
 - konnectivity-agent pod (mTLS)

@@ -37,14 +37,14 @@ assert_eq() {
 # The full expected run-meta, literal: adding a rig-only step without deciding its token
 # here (and in _lib.sh) fails this test, so a result always says what extra it ran with.
 APPARMOR_TOKENS="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
-COMMON_TOKENS="$APPARMOR_TOKENS,crio-test-handler-runtime,e2e-ssh-key,sonobuoy-aggregator-limitrange"
+COMMON_TOKENS="$APPARMOR_TOKENS,crio-test-handler-runtime,e2e-ssh-key,sonobuoy-aggregator-limitrange,vm-nfs-common,vm-journald-limits,vm-logrotate-interval"
 ADDONS="metrics-server,external-snapshotter,kube-network-policies"
 U7S_RIG_BUILD_FEATURES="rig-test-knobs,pki-test-knobs"
 write_run_meta "$TMP/rig" host-rig
 assert_eq "host-rig run-meta lists every rig-only addition and deviation (add-ons, setup, konnectivity/host apiserver, kubelet overlay, build features)" \
   "$(cat "$TMP/rig/run-meta")" "topology=host-rig
 rig_only_addons=$ADDONS
-rig_only_setup=$COMMON_TOKENS,vm-nfs-common,vm-journald-limits,vm-logrotate-interval
+rig_only_setup=$COMMON_TOKENS,kubelet-unit-dropin-tz-nofile
 rig_only_deviations=host-side-apiserver,konnectivity-server,konnectivity-agent
 rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG
 rig_only_build_features=rig-test-knobs,pki-test-knobs"
@@ -62,9 +62,10 @@ token_anchor crio-test-handler-runtime lima/kubelet.yaml '20-test-handler.conf'
 token_anchor e2e-ssh-key scripts/conformance/lima-start.sh 'ssh-keygen'
 token_anchor e2e-ssh-key scripts/conformance/install-bringup.sh 'ssh-keygen'
 token_anchor sonobuoy-aggregator-limitrange scripts/conformance/06-run-sonobuoy.sh 'LimitRange'
-token_anchor vm-nfs-common scripts/conformance/lima-start.sh 'install -y nfs-common'
-token_anchor vm-journald-limits scripts/conformance/lima-start.sh 'journald.conf.d/conformance.conf'
-token_anchor vm-logrotate-interval scripts/conformance/lima-start.sh 'logrotate.timer.d'
+token_anchor vm-nfs-common scripts/conformance/_lib.sh 'install -y nfs-common'
+token_anchor vm-journald-limits scripts/conformance/_lib.sh 'journald.conf.d/conformance.conf'
+token_anchor vm-logrotate-interval scripts/conformance/_lib.sh 'logrotate.timer.d'
+token_anchor kubelet-unit-dropin-tz-nofile scripts/conformance/lima-start.sh 'rig_kubelet_unit_script'
 token_anchor host-side-apiserver scripts/conformance/02-start-apiserver.sh 'bash "$REPO/scripts/u7s-start.sh" --background'
 token_anchor konnectivity-agent scripts/conformance/lima-start.sh 'name: konnectivity-agent${NODE_SUFFIX}'
 token_anchor konnectivity-server scripts/u7s-start.sh '--mode=http-connect'

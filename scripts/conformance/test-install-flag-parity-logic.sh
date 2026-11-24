@@ -107,16 +107,13 @@ assert_eq() { [ "$2" = "$3" ] && ok "$1" || bad "$1 — expected '$3', got '$2'"
 assert_eq "rig KCM runs the controller set install.sh enables, so controller behaviour is what users get" \
   "$(printf '%s\n' "$kcm" | controllers)" "$install_controllers"
 
-# Kubelet feature gates: install.sh's base list plus the 1.37+ additions, which the rig's
-# kubelet (1.37) always carries.
-gates_of() { tr ',' '\n' | sed -E 's/^ *(--feature-gates=)?//' | grep -E '^[A-Za-z0-9]+=(true|false)$' | sort -u; }
-install_gates=$({
-  sed -n '/^kubelet_round2_flags()/,/^}/p' "$INSTALL_SH" | grep -E 'local flags="--feature-gates=|flags="\$flags,' | sed -E 's/^.*(--feature-gates=|\$flags,)//; s/"$//'
-} | gates_of)
-rig_gates=$(grep -E '^ *--feature-gates=' "$REPO/scripts/conformance/lima-start.sh" | gates_of)
-[ -n "$install_gates" ] && [ -n "$rig_gates" ] || { echo "FAIL: kubelet --feature-gates not found (install: '$install_gates', rig: '$rig_gates')"; exit 1; }
-assert_eq "rig kubelet disables exactly the feature gates install.sh does, so memory and behaviour match a real install" \
-  "$rig_gates" "$install_gates"
+# Kubelet feature gates: the rig's kubelet unit is install.sh's, rendered with its own
+# kubelet_round2_flags; a hand-written --feature-gates list in lima-start.sh would drift.
+if grep -qE -- '--feature-gates' "$REPO/scripts/conformance/lima-start.sh"; then
+  bad "lima-start.sh hand-lists kubelet --feature-gates instead of rendering install.sh's unit"
+else
+  ok "rig kubelet gates come from install.sh's kubelet_round2_flags via the rendered unit, so memory and behaviour match a real install"
+fi
 
 echo ""
 echo "install-flag-parity logic: $PASS passed, $FAIL failed"
