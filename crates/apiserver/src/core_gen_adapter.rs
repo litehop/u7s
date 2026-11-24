@@ -2973,7 +2973,7 @@ pub(crate) fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::Obj
         annotations: jstrmap(meta, "annotations"),
         owner_references,
         finalizers: jstrs(meta, "finalizers"),
-        managed_fields: json_to_managed_fields_proto(&meta),
+        managed_fields: json_to_managed_fields_proto(meta),
         ..Default::default()
     }
 }
