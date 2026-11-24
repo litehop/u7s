@@ -115,6 +115,46 @@ else
   ok "rig kubelet gates come from install.sh's kubelet_round2_flags via the rendered unit, so memory and behaviour match a real install"
 fi
 
+# Non-gate kubelet ExecStart flags: the control-plane kubelet unit's ExecStart (plus the flags
+# kubelet_round2_flags adds) is the expected set; the rig's is read from the script it ships
+# to the VM, drop-in included. A flag only one side carries fails unless listed here as
+# "<flag> <run-meta token> <reason>"; the token must be in RIG_ONLY_HOST_SETUP. None exist today.
+KUBELET_RIG_ONLY_FLAGS=""
+install_kubelet_flags() { # <install.sh>
+  {
+    grep -E '^ExecStart=\$BIN_DIR/kubelet .*--kubeconfig=\$STATE_DIR/kubelet-kubeconfig' "$1"
+    sed -n '/^kubelet_round2_flags()/,/^}/p' "$1"
+  } | flags_of
+}
+rig_kubelet_flags() { # <install.sh>
+  { rig_kubelet_unit_script "$1" lima-node 10.0.0.5 | grep -E '^ExecStart='; printf '%s\n' "$RIG_KUBELET_DROPIN" | grep -E '^ExecStart='; sed -n '/^kubelet_round2_flags()/,/^}/p' "$1"; } | flags_of
+}
+kubelet_flag_drift() { # <install.sh for install side> <install.sh the rig renders from>
+  local f allowed
+  { comm -23 <(install_kubelet_flags "$1") <(rig_kubelet_flags "$2") | sed 's/^/missing in rig: /'
+    comm -13 <(install_kubelet_flags "$1") <(rig_kubelet_flags "$2") | sed 's/^/rig-only: /'
+  } | while IFS= read -r f; do
+    allowed=$(printf '%s\n' "$KUBELET_RIG_ONLY_FLAGS" | awk -v f="${f##* }" '$1 == f && $2 != "" { print $2 }')
+    [ -n "$allowed" ] && [[ ",$RIG_ONLY_HOST_SETUP," == *",$allowed,"* ]] || echo "$f"
+  done
+}
+install_kubelet=$(install_kubelet_flags "$INSTALL_SH")
+[ -n "$install_kubelet" ] || { echo "FAIL: no control-plane kubelet ExecStart found in install.sh"; exit 1; }
+drift=$(kubelet_flag_drift "$INSTALL_SH" "$INSTALL_SH")
+[ -z "$drift" ] && ok "rig kubelet ExecStart carries exactly install.sh's control-plane flags" \
+  || bad "rig kubelet flags differ from install.sh's control-plane unit, so conformance runs a kubelet no installed node has: $drift"
+
+while read -r flag token _; do
+  [ -z "$flag" ] || { [[ ",$RIG_ONLY_HOST_SETUP," == *",$token,"* ]] && ok "allowlisted $flag is recorded as $token" \
+    || bad "allowlisted $flag cites '$token', which run-meta never records"; }
+done <<< "$KUBELET_RIG_ONLY_FLAGS"
+
+# The check must fire: a flag appearing in the rig's rendered unit but not install.sh's is reported.
+scratch="$TMP/install-dummy-flag.sh"
+sed -E 's|^(ExecStart=\$BIN_DIR/kubelet .*--kubeconfig=\$STATE_DIR/kubelet-kubeconfig.*)$|\1 --dummy-rig-flag=1|' "$INSTALL_SH" > "$scratch"
+assert_has "a flag added only to the rendered kubelet unit is reported as drift" \
+  "$(kubelet_flag_drift "$INSTALL_SH" "$scratch")" "rig-only: --dummy-rig-flag"
+
 echo ""
 echo "install-flag-parity logic: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
