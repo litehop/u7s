@@ -6635,7 +6635,19 @@ async fn cr_scale_patch_impl<S: Store>(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
-    let scale_body = super::scale::decode_scale_body(body, headers)?;
+    // A JSON Patch body is an array applied to the built Scale inside the loop; it has no
+    // Scale-shaped spec/metadata to decode up front.
+    let json_patch = content_type(headers)
+        .contains("application/json-patch+json")
+        .then(|| {
+            serde_json::from_slice::<serde_json::Value>(body)
+                .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))
+        })
+        .transpose()?;
+    let scale_body = match json_patch {
+        Some(_) => super::scale::Scale::default(),
+        None => super::scale::decode_scale_body(body, headers)?,
+    };
 
     let key = cr_store_key(target.group, target.plural, target.ns, target.name);
     let expected_rv = parse_resource_version(scale_body.metadata.resource_version.as_deref())?;
@@ -6659,6 +6671,28 @@ async fn cr_scale_patch_impl<S: Store>(
             .map(|p| scale_path_get_str(&obj, p).to_string())
             .unwrap_or_default();
 
+        let patch_replicas = if let Some(ops) = &json_patch {
+            let rv_before = obj["metadata"]["resourceVersion"]
+                .as_str()
+                .map(str::to_owned);
+            let mut scale = super::scale::build_scale(
+                target.name,
+                target.ns.unwrap_or(""),
+                scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path),
+                status_replicas,
+                rv_before.as_deref().unwrap_or(""),
+                &selector,
+            );
+            super::json_patch::apply_json_patch(&mut scale, ops)?;
+            gu.check_patched_pin(rv_before.as_deref(), &scale)?;
+            serde_json::from_value::<super::scale::ScaleSpec>(scale["spec"].take())
+                .map_err(|e| Status::bad_request(format!("invalid Scale after patch: {e}")))?
+                .replicas
+                .map(i64::from)
+        } else {
+            scale_body.spec.replicas.map(i64::from)
+        };
+
         // Mirrors apps/v1's scale_patch_impl: extract replicas from the patch body if present,
         // otherwise leave the stored value unchanged (a patch that doesn't touch spec.replicas
         // is a no-op write, not an error).
@@ -6669,7 +6703,7 @@ async fn cr_scale_patch_impl<S: Store>(
                 super::scale::plan_scale_apply(
                     headers,
                     &before,
-                    scale_body.spec.replicas.map(i64::from),
+                    patch_replicas,
                     &scale_cfg.spec_replicas_path,
                     &format!("{}/{}", target.group, target.version),
                     ctx.schema.as_deref(),
@@ -6679,7 +6713,7 @@ async fn cr_scale_patch_impl<S: Store>(
         let old_replicas = scale_path_get_i64(&obj, &scale_cfg.spec_replicas_path);
         let sent_replicas = super::scale::scale_apply_replicas(
             ssa_plan.as_ref(),
-            scale_body.spec.replicas.map(i64::from),
+            patch_replicas,
             &scale_cfg.spec_replicas_path,
         );
         let new_replicas = admit_cr_scale(
@@ -28755,6 +28789,106 @@ mod tests {
         assert!(
             entry["fieldsV1"]["f:spec"]["f:desiredReplicas"].is_object(),
             "the applier must own the CRD-declared replicas path, not spec.replicas: {entry}"
+        );
+    }
+
+    async fn seed_gizmo_and_json_patch_scale(
+        state: &AppState,
+        name: &str,
+        ops: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
+        install_namespaced_crd_with_scale_subresource(state).await;
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Gizmo",
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": { "desiredReplicas": 2 }
+            })
+            .to_string(),
+        );
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            create_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create must succeed: {e:?}"));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-patch+json".parse().unwrap(),
+        );
+        patch_cr_namespaced_scale(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "gizmos".to_string(),
+                name.to_string(),
+            )),
+            None,
+            headers,
+            Bytes::from(ops.to_string()),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn stored_desired_replicas(state: &AppState, name: &str) -> serde_json::Value {
+        let stored = state
+            .store
+            .get(&format!("/registry/cr/example.io/gizmos/default/{name}"))
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        obj["spec"]["desiredReplicas"].clone()
+    }
+
+    #[tokio::test]
+    async fn namespaced_cr_scale_json_patch_replace_replicas_scales_the_cr_not_a_400_or_noop() {
+        let state = make_state();
+        seed_gizmo_and_json_patch_scale(
+            &state,
+            "jp",
+            serde_json::json!([{"op":"replace","path":"/spec/replicas","value":6}]),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("kubectl patch --subresource=scale --type=json failed: {e:?}"));
+        assert_eq!(
+            stored_desired_replicas(&state, "jp").await,
+            6,
+            "a JSON Patch on a CR's scale subresource must land at the CRD's specReplicasPath"
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_cr_scale_json_patch_stale_resource_version_is_409_not_silently_applied() {
+        let state = make_state();
+        let err = seed_gizmo_and_json_patch_scale(
+            &state,
+            "jp-stale",
+            serde_json::json!([
+                {"op":"replace","path":"/metadata/resourceVersion","value":"999999"},
+                {"op":"replace","path":"/spec/replicas","value":6}
+            ]),
+        )
+        .await
+        .expect_err("a stale pinned resourceVersion must be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            stored_desired_replicas(&state, "jp-stale").await,
+            2,
+            "a rejected JSON Patch must not write"
         );
     }
 
