@@ -673,12 +673,18 @@ async fn scale_patch_impl<S: Store>(
             .unwrap_or_else(|| "unrecognised body format".into());
         return Err(Status::bad_request(format!("invalid JSON: {e}")));
     };
+    // A JSON Patch is applied to the built Scale inside the loop below; its body is an array,
+    // so the object-shaped reads here only apply to merge/strategic/apply/proto bodies.
+    let is_json_patch = ct.contains("application/json-patch+json");
     let patch_scale_spec: ScaleSpec =
         ScaleSpec::deserialize(&patch_body["spec"]).unwrap_or_default();
 
     let key = group_object_key(group, resource, Some(ns), name);
-    let expected_rv =
-        crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?;
+    let expected_rv = if is_json_patch {
+        None
+    } else {
+        crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?
+    };
     let mut gu = GuaranteedUpdate::new(
         state.store.clone(),
         &key,
@@ -696,12 +702,31 @@ async fn scale_patch_impl<S: Store>(
         let status_replicas = extract_status_replicas(&obj.body);
         let selector = label_selector_to_string(&obj.body["spec"]["selector"]);
         let before_write = obj.body.clone();
+        let patch_replicas = if is_json_patch {
+            let old_rv = obj.resource_version().map(str::to_owned);
+            let mut scale = build_scale(
+                name,
+                ns,
+                extract_replicas(&obj.body),
+                status_replicas,
+                old_rv.as_deref().unwrap_or(""),
+                &selector,
+            );
+            super::json_patch::apply_json_patch(&mut scale, &patch_body)?;
+            gu.check_patched_pin(old_rv.as_deref(), &scale)?;
+            ScaleSpec::deserialize(&scale["spec"])
+                .map_err(|e| Status::bad_request(format!("invalid Scale after patch: {e}")))?
+                .replicas
+                .map(i64::from)
+        } else {
+            patch_scale_spec.replicas.map(i64::from)
+        };
         let ssa_plan = is_ssa
             .then(|| {
                 plan_scale_apply(
                     headers,
                     &before_write,
-                    patch_scale_spec.replicas.map(i64::from),
+                    patch_replicas,
                     "spec.replicas",
                     &scale_api_version(group),
                     None,
@@ -711,11 +736,8 @@ async fn scale_patch_impl<S: Store>(
 
         // Extract replicas from patch if present; otherwise keep current value (no write).
         let old_replicas = extract_replicas(&obj.body);
-        let sent_replicas = scale_apply_replicas(
-            ssa_plan.as_ref(),
-            patch_scale_spec.replicas.map(i64::from),
-            "spec.replicas",
-        );
+        let sent_replicas =
+            scale_apply_replicas(ssa_plan.as_ref(), patch_replicas, "spec.replicas");
         let new_replicas = admit_scale_write(
             &state,
             &AdmissionTarget {
@@ -3013,6 +3035,91 @@ mod handler_tests {
              HPA scales exclusively via PATCH; without CAS it can overwrite a concurrent \
              kubectl scale or another HPA loop's update"
         );
+    }
+
+    async fn json_patch_scale(
+        state: AppState<SqliteStore>,
+        name: &str,
+        ops: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/apis/apps/v1/namespaces/default/deployments/{name}/scale"
+            ))
+            .header("content-type", "application/json-patch+json")
+            .body(json_body(&ops))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn json_patch_replace_spec_replicas_on_scale_changes_replicas_not_silent_200() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "jp-scale", 1).await;
+
+        let (status, out) = json_patch_scale(
+            state,
+            "jp-scale",
+            serde_json::json!([{"op":"replace","path":"/spec/replicas","value":5}]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            out["spec"]["replicas"], 5,
+            "response must show new replicas"
+        );
+
+        let stored = store
+            .get("/registry/apps/deployments/default/jp-scale".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["spec"]["replicas"], 5,
+            "kubectl patch --subresource=scale --type=json must scale the workload"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_patch_stale_resource_version_on_scale_returns_409_else_cas_precondition_ignored()
+    {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "jp-stale", 1).await;
+
+        let (status, _) = json_patch_scale(
+            state,
+            "jp-stale",
+            serde_json::json!([
+                {"op":"replace","path":"/metadata/resourceVersion","value":"999999"},
+                {"op":"replace","path":"/spec/replicas","value":5}
+            ]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a JSON Patch pinning a stale metadata.resourceVersion must 409"
+        );
+        let stored = store
+            .get("/registry/apps/deployments/default/jp-stale".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(obj["spec"]["replicas"], 1, "rejected patch must not write");
     }
 
     /// PATCH /scale with no resourceVersion in the patch body succeeds unconditionally.
