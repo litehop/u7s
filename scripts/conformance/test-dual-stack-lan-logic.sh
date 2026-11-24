@@ -179,8 +179,10 @@ check "kubelet config clusterDNS is replaced (not appended) and idempotent, othe
 rm -f "$kcfg"
 check "04-start-kcm.sh takes its CIDR flags from the rig helper" \
   "1" "$(grep -cF '$KCM_CIDR_FLAGS' "$DIR/04-start-kcm.sh")"
-check "run-all.sh forwards --dual-stack to KCM" \
-  "1" "$(grep -c '04-start-kcm.sh.*_DUAL_STACK_ARG' "$DIR/run-all.sh")"
+check "run-all.sh forwards --dual-stack to lima-start.sh, which starts KCM" \
+  "1" "$(grep -c 'lima-start.sh" --with-kcm.*_DUAL_STACK_ARG' "$DIR/run-all.sh")"
+check "lima-start.sh forwards --dual-stack to KCM" \
+  "1" "$(grep -cF 'KCM_ARGS+=(--dual-stack)' "$DIR/lima-start.sh")"
 check "run-all.sh defaults a dual-stack apiserver to the dual Service range" \
   "1" "$(grep -cF 'SERVICE_CIDR="$RIG_SERVICE_CIDR_DUAL"' "$DIR/run-all.sh")"
 check "lima-start.sh stages the shipped manifests through the dual-stack-aware helper" \

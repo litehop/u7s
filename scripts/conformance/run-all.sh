@@ -55,7 +55,7 @@
 #                unknown-owner VM, or a changed lima/kubelet.yaml.
 #   (default)    Without --reset every run starts from an EMPTY STORE on the kept VM:
 #                reset.sh --store-only kills host processes, deletes the apiserver DB,
-#                and wipes pod sandboxes and /var/lib/kubelet (except pki/) in the VM
+#                and wipes pod sandboxes and /var/lib/kubelet in the VM
 #                (seconds). The CA, kubeconfig and VM survive. Gates then exercise
 #                first-boot code (manifest apply, allocators, migrations) that a
 #                persisted DB would skip.
@@ -613,15 +613,12 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests
 banner "Applying external-snapshotter manifest"
 kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests/external-snapshotter.yaml"
 
-# Step 03: Start lima VM and join kubelet.
-banner "Step 3/6: Start lima VM"
+# Steps 03+04: start the lima VM, start kube-controller-manager inside it, join the kubelet.
+# lima-start.sh starts KCM itself (--with-kcm): the kubelet joins through a CSR that only
+# KCM approves and signs.
+banner "Steps 3-4/6: Start lima VM + kube-controller-manager, join kubelet"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG}
-
-# Step 04: Start kcm inside VM.
-banner "Step 4/6: Start kube-controller-manager"
-# shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG} ${_DUAL_STACK_ARG}
+bash "$DIR/lima-start.sh" --with-kcm ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
 
 # Step 05: Start the standalone u7s-scheduler binary — skipped when --embedded-scheduler
 # true already made the apiserver itself schedule: starting both would

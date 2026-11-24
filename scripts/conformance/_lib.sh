@@ -38,16 +38,6 @@ check_port_free() {
   fi
 }
 
-# True when the rig kubelet's client cert is unexpired and signed by the current
-# CA; anything else (a wiped/rotated CA, expiry) needs re-issuing or the kubelet
-# is rejected with 401 on an otherwise healthy stack.
-node_client_cert_valid() {
-  local crt="$1" ca_pem="$2"
-  [ -s "$crt" ] \
-    && openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 \
-    && openssl verify -CAfile "$ca_pem" "$crt" >/dev/null 2>&1
-}
-
 # Derives the per-node resource suffix (konnectivity-agent Pod/Secret, kubelet
 # serving cert) for a VM_NAME. Single source of truth for BOTH lima-start.sh
 # (the primary/direct-start path) and add-node.sh (the --extra-node join path)
@@ -638,6 +628,69 @@ rig_kubelet_config_script() {
     "$RIG_KUBELET_STATE_DIR" "$1" "$fn" "$RIG_KUBELET_OVERLAY"
 }
 
+# Rig-only additions to the kubelet unit install.sh renders, written as a drop-in and
+# recorded in run-meta (RIG_ONLY_SETUP): klog has no --utc flag, so TZ=UTC keeps kubelet.log
+# aligned with apiserver.log; sustained load needs more FDs than systemd's default (one per
+# log/exec/attach stream).
+RIG_KUBELET_DROPIN='[Service]
+Environment=TZ=UTC
+LimitNOFILE=1048576'
+
+# The rig VM is the control-plane node (the apiserver is started with --local-node-name <VM>),
+# so its kubelet gets the identity install.sh gives the control-plane node: a kubelet-client
+# CSR submitted with the admin kubeconfig, approved and signed by KCM (a bootstrap-token join
+# is refused for the local node's name). The two functions below are install.sh's own.
+
+# Prints a script that exits 0 when the VM already holds a kubelet kubeconfig and an unexpired
+# client cert chaining to the current CA (install.sh's current_client_cert, replayed), so a
+# re-run keeps the identity the kubelet already rotated. Args: <install.sh path>.
+rig_kubelet_identity_script() {
+  local fn
+  fn="$(install_sh_function current_client_cert "$1")"
+  [ -n "$fn" ] || { echo "error: current_client_cert not found in $1" >&2; return 1; }
+  printf 'set -euo pipefail\nSTATE_DIR=%s\n%s\n[ -s "$STATE_DIR/kubelet-kubeconfig" ]\ncurrent_client_cert >/dev/null\n' "$RIG_KUBELET_STATE_DIR" "$fn"
+}
+
+# Prints a script, run on the host, that issues the node identity with install.sh's own
+# issue_cp_kubelet_identity: key and CSR, submission under the admin kubeconfig, wait for
+# KCM to sign. It writes <state dir>/kubelet-client.{crt,key} and kubelet-kubeconfig; the
+# state dir must already hold the admin kubeconfig as `kubeconfig` and `ca-bundle.pem`.
+# Substitutions: generate_node_csr (install.sh's runs the release tarball's u7s-apiserver,
+# which is not a Linux binary here) builds the same CSR with openssl (P-256,
+# CN=system:node:<name>, O=system:nodes); base64 accepts GNU's -w0 on macOS.
+# Args: <install.sh path> <state dir> <node name>.
+rig_kubelet_issue_script() {
+  local issue current
+  issue="$(install_sh_function issue_cp_kubelet_identity "$1")"
+  current="$(install_sh_function current_client_cert "$1")"
+  if [ -z "$issue" ] || [ -z "$current" ]; then
+    echo "error: issue_cp_kubelet_identity or current_client_cert not found in $1" >&2
+    return 1
+  fi
+  printf 'set -euo pipefail\nSTATE_DIR=%q\nNODE_NAME=%q\nensure_jq() { command -v jq >/dev/null; }\nbase64() { if [ "${1:-}" = -w0 ]; then shift; command base64 "$@" | tr -d "\\n"; else command base64 "$@"; fi; }\ngenerate_node_csr() {\n  openssl ecparam -genkey -name prime256v1 -noout -out "$1"\n  chmod 600 "$1"\n  openssl req -new -key "$1" -subj "/O=system:nodes/CN=system:node:$NODE_NAME" -sha256 -out "$2"\n}\n%s\n%s\nissue_cp_kubelet_identity\n' \
+    "$2" "$3" "$current" "$issue"
+}
+
+# Prints a script that writes install.sh's control-plane kubelet.service (the second
+# kubelet.service heredoc, with kubelet_round2_flags for the installed kubelet's minor)
+# plus the RIG_KUBELET_DROPIN drop-in, then reloads systemd. Two lines are cut because
+# the rig has no u7s-apiserver unit on the VM: Requires/After on it and the ExecStartPre
+# that converts its ca.crt. --cert-dir points at $RIG_KUBELET_STATE_DIR, so rotated certs
+# never land in /var/lib/kubelet/pki. Args: <install.sh path> <node name> <comma-separated
+# node IPs>.
+rig_kubelet_unit_script() {
+  local flags unit
+  flags="$(install_sh_function kubelet_round2_flags "$1")"
+  unit="$(awk '/^[[:space:]]*cat > \/etc\/systemd\/system\/kubelet\.service <<EOF$/ {n++} n == 2 {print} n == 2 && /^EOF$/ {exit}' "$1" \
+    | sed -e 's/ u7s-apiserver\.service//' -e '/^ExecStartPre=/d')"
+  if [ -z "$flags" ] || [ -z "$unit" ]; then
+    echo "error: kubelet_round2_flags or the control-plane kubelet.service block not found in $1" >&2
+    return 1
+  fi
+  printf 'set -euo pipefail\nSTATE_DIR=%s\nBIN_DIR=/usr/bin\nNODE_NAME=%q\nNODE_IPS=%q\ninstall -d -m 0700 "$STATE_DIR"\n%s\nKUBE_MINOR="$(/usr/bin/kubelet --version | grep -oE "[0-9]+\\.[0-9]+" | sed -n 1p)"\nKUBELET_ROUND2_FLAGS="$(kubelet_round2_flags "$KUBE_MINOR")"\n%s\nmkdir -p /etc/systemd/system/kubelet.service.d\ncat > /etc/systemd/system/kubelet.service.d/u7s.conf <<'"'"'RIG_DROPIN_EOF'"'"'\n%s\nRIG_DROPIN_EOF\nsystemctl daemon-reload\n' \
+    "$RIG_KUBELET_STATE_DIR" "$2" "$3" "$flags" "$unit" "$RIG_KUBELET_DROPIN"
+}
+
 # Package pins the rig VMs must run: cri-o and kubelet as pinned in lima/kubelet.yaml's
 # provision script, and CNI plugins at the version install tarballs ship
 # (scripts/lib/release-fetch.sh). A clone's frozen provision script, or a held package,
@@ -697,7 +750,7 @@ INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 # peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
 # Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
 # the matching host dig/nslookup overrides below; either layer alone still denies.
-RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write,vm-logrotate-journald-nfs-common"
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write,vm-logrotate-journald-nfs-common,kubelet-unit-dropin-tz-nofile"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 
