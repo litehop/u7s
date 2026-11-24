@@ -33,6 +33,15 @@
 #   and needs no extra handling here; --host-only leaving the VM alone is
 #   correct, not a gap.
 #
+# --store-only: keep the provisioned VM, $WORKDIR's CA/kubeconfig/keys and the host
+#   binary, but make the next bring-up a first boot. Kills host processes, deletes
+#   $WORKDIR/state.db* (the apiserver's whole store), and in each running VM
+#   (--vm and --extra-node) stops kubelet/KCM/sonobuoy, removes every pod sandbox
+#   and wipes /var/lib/kubelet except pki/ (pod dirs, volume and manager
+#   checkpoints). A stopped VM is started first so its disk is wiped too. Takes
+#   seconds, vs 15-20 min for the VM reprovision --reset does. Without it, boot-time
+#   code (manifest apply, allocator seeding, migrations) only ever sees an existing store.
+#
 # To resume a fresh run:
 #   scripts/conformance/run-all.sh
 set -euo pipefail
@@ -164,6 +173,38 @@ teardown_vm() {
   fi
 }
 
+wipe_store() {
+  local workdir="$1"
+  echo "[reset] Removing apiserver store $workdir/state.db* ..."
+  rm -f "$workdir"/state.db "$workdir"/state.db-*
+}
+
+# Everything on the guest that outlives the store and would mask a first boot:
+# pod sandboxes/containers, kubelet pod dirs and checkpoints. kubelet's pki/ stays
+# (its certs chain to the kept CA).
+wipe_guest_state() {
+  local vm="$1" vm_status
+  if ! grep -q "^${vm}$" < <(limactl list --format '{{.Name}}' 2>/dev/null); then
+    echo "[reset] $vm VM does not exist — nothing to wipe in the guest"
+    return 0
+  fi
+  vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${vm} / {print \$2}")"
+  if [ "$vm_status" != "Running" ]; then
+    echo "[reset] Starting stopped $vm VM to wipe its guest state ..."
+    limactl start "$vm"
+  fi
+  echo "[reset] Wiping kubelet/pod state inside $vm ..."
+  limactl shell "$vm" sudo bash -c '
+    systemctl stop kubelet 2>/dev/null || true
+    pkill -f '[k]cm-supervisor' || true
+    pkill -f '[k]ube-controller-manager' || true
+    pkill -f '[s]onobuoy' || true
+    if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
+    findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
+    find /var/lib/kubelet -mindepth 1 -maxdepth 1 ! -name pki -exec rm -rf {} +
+  '
+}
+
 # Succeeds only when <workdir> resolves (physically, so symlinks and ".."
 # cannot escape) to a strict subdirectory of <checkout>/temp for some checkout
 # listed by `git worktree list` (main checkout and every linked worktree).
@@ -194,12 +235,14 @@ main() {
   local VM_NAME="${U7S_VM_NAME:-lima-node}"
   local EXTRA_NODE=""
   local HOST_ONLY=0
+  local STORE_ONLY=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --workdir) WORKDIR="$2"; shift 2 ;;
       --vm) VM_NAME="$2"; shift 2 ;;
       --extra-node) EXTRA_NODE="$2"; shift 2 ;;
       --host-only) HOST_ONLY=1; shift ;;
+      --store-only) STORE_ONLY=1; shift ;;
       # --port and --konnectivity-server-port: see the usage-banner note above.
       --port) shift 2 ;;
       --konnectivity-server-port) shift 2 ;;
@@ -310,6 +353,31 @@ main() {
 
     echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
     echo "[reset] Done (host-only)."
+    exit 0
+  fi
+
+  if [ "$STORE_ONLY" -eq 1 ]; then
+    # Same verify-then-report as --host-only; the store must not be deleted
+    # under a live apiserver.
+    local survivors="" _try
+    for _try in 1 2 3 4 5; do
+      survivors="$(host_process_survivors "$WORKDIR")"
+      [ -z "$survivors" ] && break
+      sleep 0.2
+    done
+    if [ -n "$survivors" ]; then
+      echo "[reset] ERROR: host process(es) survived the kill attempt:" >&2
+      while read -r surv_component surv_pid; do
+        echo "[reset]   ${surv_component} (PID ${surv_pid}) still alive" >&2
+      done <<< "$survivors"
+      exit 1
+    fi
+    wipe_store "$WORKDIR"
+    wipe_guest_state "$VM_NAME"
+    if [ -n "$EXTRA_NODE" ]; then
+      wipe_guest_state "$EXTRA_NODE"
+    fi
+    echo "[reset] Done (store-only). VM(s) kept; next bring-up is a first boot."
     exit 0
   fi
 

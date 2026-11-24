@@ -881,15 +881,16 @@ not wired into `run-all.sh` today — an option when you only need "is the clust
   final gate once a fix is in, not for iterative diagnosis.
 - `--stack-only` + `--focus` together: `--focus` is ignored (warning to stderr),
   stack-only wins.
-- **Decide `--reset` by work-relatedness, not a fixed default.** UNRELATED work should
-  `--reset` — an unrelated bead can't trust the accumulated state a prior run left, so
-  it needs a clean, known-good base. A bead RESUMING the same or closely-related work
-  (same rig/run/investigation) on a stack that's already up can OMIT `--reset` and
-  reproduce straight against it (`kubectl --kubeconfig ./temp/u7s/kubeconfig ...`) with
-  no bring-up. `--reset` tears down and rebuilds from scratch (~25 min on the flannel
-  rig), so spend it only when relatedness (or an unhealthy/stale stack) warrants it
-  (mayor-dkov2, a resumption, burned ~25 min on an unneeded `--reset` because the brief
-  defaulted to it).
+- **VM reprovision (`--reset`) vs store reset (default).** Two different resets:
+  `--reset` deletes and reprovisions the VM (~15-25 min); every run WITHOUT it already
+  starts from an empty apiserver store on the kept VM (`reset.sh --store-only`: wipes the
+  DB, pods and kubelet state, keeps CA and VM; seconds), so first-boot paths are gated.
+  Use `--reset` only for an unrelated bead that can't trust the VM's disk, a cold,
+  broken or unknown-owner VM, or a changed `lima/kubelet.yaml`. A bead RESUMING related
+  work on a stack that's already up can skip bring-up and use kubectl directly, and
+  `--keep-store` reuses the persisted DB; use it only to test boot against an existing
+  store (restart/migration). Never `--reset` just to get an empty store
+  (mayor-dkov2 burned ~25 min on an unneeded `--reset`).
 
 `--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
 `--verbose` turns on `RUST_LOG=debug` (set inside the script — never export it
@@ -1125,7 +1126,9 @@ When a worker returns from a VM/sonobuoy-touching bead:
   this doc's earlier ~5min estimate) — so applying it to an already-warm slot wastes a full
   reprovision for nothing: observed on #1517/mayor-j1oq9 rounds 3-5, all on `lima-node-4`,
   each cleanly reaped by the prior round. State explicitly in every continuation-round
-  dispatch which case applies; enforce it at return-review time.
+  dispatch which case applies; enforce it at return-review time. A warm slot still gets
+  an empty store: runs without `--reset` wipe the apiserver DB and guest pod state
+  themselves, so reprovisioning is never needed to exercise first boot.
 - **Workers embed bead IDs and task refs in source comments.** These rot
   immediately as beads close and PRs age. worker.md Rule 10 bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send

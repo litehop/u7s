@@ -12,7 +12,7 @@
 #
 # Usage:
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--unsafe-focus] [--all-e2e]
-#                                  [--stack-only] [--vm <name>] [--network <name>]
+#                                  [--stack-only] [--keep-store] [--vm <name>] [--network <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #                                  [--konnectivity-server-port <N>] [--procs <N>]
 #                                  [--k8s-version <ver>]
@@ -51,6 +51,16 @@
 #                the same command line, so a stale pre-existing extra node is
 #                never silently reused on a network config it predates), and
 #                wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
+#                A VM reprovision (~15-20 min); needed only for a cold, broken or
+#                unknown-owner VM, or a changed lima/kubelet.yaml.
+#   (default)    Without --reset every run starts from an EMPTY STORE on the kept VM:
+#                reset.sh --store-only kills host processes, deletes the apiserver DB,
+#                and wipes pod sandboxes and /var/lib/kubelet (except pki/) in the VM
+#                (seconds). The CA, kubeconfig and VM survive. Gates then exercise
+#                first-boot code (manifest apply, allocators, migrations) that a
+#                persisted DB would skip.
+#   --keep-store Skip that wipe and reuse the persisted DB and running pods. Only for
+#                testing a boot against an existing store (restart/migration paths).
 #   --focus      Passed through to sonobuoy to narrow test selection.
 #                Also settable via SONOBUOY_FOCUS env var. Mutually exclusive
 #                with --all-e2e (error if both given).
@@ -243,6 +253,7 @@ FOCUS="${SONOBUOY_FOCUS:-}"
 ALL_E2E=0
 UNSAFE_FOCUS=0
 RESET=0
+KEEP_STORE=0
 VERBOSE=0
 STACK_ONLY=0
 BINARY=""
@@ -268,6 +279,7 @@ INSTALL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
+    --keep-store) KEEP_STORE=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
     --all-e2e) ALL_E2E=1; shift ;;
     --unsafe-focus) UNSAFE_FOCUS=1; shift ;;
@@ -416,6 +428,10 @@ banner() {
 # --install: the real install.sh on the VM instead of the host rig. Options that configure
 # the host rig have no install-mode meaning, so reject them rather than ignore them silently.
 if [ "$INSTALL" -eq 1 ]; then
+  if [ "$KEEP_STORE" -eq 1 ]; then
+    echo "error: --keep-store is a host-rig option; --install keeps its store unless --reset is given" >&2
+    exit 1
+  fi
   source "$DIR/_lib.sh"
   _INSTALL_BAD=$(install_mode_incompatible_flags "--binary=$BINARY" \
     "--konnectivity-server-port=$KONNECTIVITY_SERVER_PORT" "--dual-stack=$_DUAL_STACK_ARG" \
@@ -514,6 +530,10 @@ if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
   # shellcheck disable=SC2086
   bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_EXTRA_NODE_ARG}
+elif [ "$KEEP_STORE" -eq 0 ]; then
+  banner "Fresh store: wiping apiserver state, keeping the VM"
+  # shellcheck disable=SC2086
+  bash "$DIR/reset.sh" --store-only ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_EXTRA_NODE_ARG}
 fi
 
 # Step 01: Build — skipped when --binary is supplied (caller provides the binary).
