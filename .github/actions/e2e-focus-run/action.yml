@@ -163,6 +163,29 @@ runs:
         path: /tmp/conformance-image-${{ inputs.k8s_version }}.tar
         key: conformance-image-${{ inputs.k8s_version }}-${{ runner.arch }}
 
+    - name: Resolve install.sh's pinned cri-o version
+      id: crio-version
+      shell: bash
+      run: |
+        v="$(sed -n 's/^CRIO_VERSION="\(.*\)"$/\1/p' scripts/install.sh)"
+        [ -n "$v" ] || { echo "error: CRIO_VERSION not found in scripts/install.sh" >&2; exit 1; }
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cri-o .deb cache
+      id: cache-crio
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/crio-debs
+        key: crio-debs-${{ steps.crio-version.outputs.version }}-${{ runner.arch }}
+
+    - name: Pre-seed apt archive with cached cri-o .debs
+      # install.sh's own `apt-get install cri-o=<pin>` then finds each .deb
+      # (matching the repo index's size and hash) in apt's archive and
+      # downloads nothing from the OBS mirror; only the small index fetch remains.
+      if: steps.cache-crio.outputs.cache-hit == 'true'
+      shell: bash
+      run: sudo cp "$HOME"/crio-debs/*.deb /var/cache/apt/archives/
+
     - name: Rig-only prerequisites
       # Everything the CI node does that install.sh does not, recorded in
       # run-meta (topology=install). Docker, pre-installed and running on the
@@ -198,6 +221,21 @@ runs:
     - name: Run scripts/install.sh
       shell: bash
       run: sudo scripts/install.sh --tarball-dir "$U7S_TREE"
+
+    - name: Collect cri-o .debs for the cache
+      if: steps.cache-crio.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ~/crio-debs
+        cp /var/cache/apt/archives/cri-o_*.deb /var/cache/apt/archives/crun_*.deb /var/cache/apt/archives/conmon_*.deb ~/crio-debs/
+        ls -l ~/crio-debs
+
+    - name: Save cri-o .deb cache
+      if: steps.cache-crio.outputs.cache-hit != 'true' && success()
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/crio-debs
+        key: crio-debs-${{ steps.crio-version.outputs.version }}-${{ runner.arch }}
 
     - name: Expose admin kubeconfig
       shell: bash

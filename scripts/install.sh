@@ -120,8 +120,9 @@ Usage:
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]]
 
   --tarball-dir <dir>   An already-unpacked release tree (same layout as the tarball),
-                         read in place and never removed. Exclusive with --tarball
-                         and --tarball-url.
+                         read in place and never removed. NOT signature-verified:
+                         for CI/dev trees you built yourself. Exclusive with
+                         --tarball and --tarball-url.
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
                          Overrides the release URL baked into this copy.
