@@ -583,16 +583,41 @@ fn build_server_sans(
         SanType::DnsName("kubernetes.default.svc.cluster.local".try_into()?),
     ];
     if let Some(host) = advertise_host_str {
-        sans.push(host_san(host)?);
+        push_unique_san(&mut sans, host_san(host)?);
     }
     Ok(sans)
 }
 
+fn push_unique_san(sans: &mut Vec<SanType>, san: SanType) {
+    if !sans.contains(&san) {
+        sans.push(san);
+    }
+}
+
+/// An IP literal or an RFC 1123 DNS name. Empty entries (e.g. a trailing comma) and wildcards
+/// are rejected: a wildcard SAN would make the serving cert valid for every sibling host.
 fn host_san(host: &str) -> anyhow::Result<SanType> {
-    Ok(match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => SanType::IpAddress(ip),
-        Err(_) => SanType::DnsName(host.try_into()?),
-    })
+    if host.is_empty() {
+        anyhow::bail!("serving-cert SAN must not be empty (trailing or doubled comma?)");
+    }
+    if host.contains('*') {
+        anyhow::bail!("serving-cert SAN {host:?} must not be a wildcard");
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SanType::IpAddress(ip));
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.len() > 253 || !host.split('.').all(label_ok) {
+        anyhow::bail!(
+            "serving-cert SAN {host:?} is neither an IP address nor an RFC 1123 DNS name"
+        );
+    }
+    Ok(SanType::DnsName(host.try_into()?))
 }
 
 /// The hybrid X25519MLKEM768 provider (preferred first) every u7s-owned rustls config is built
@@ -753,10 +778,7 @@ fn generate_tls_with(
         &args.service_cluster_ip_range,
     )?;
     for host in &args.apiserver_cert_extra_sans {
-        let san = host_san(host)?;
-        if !sans.contains(&san) {
-            sans.push(san);
-        }
+        push_unique_san(&mut sans, host_san(host)?);
     }
     let plans = vec![
         LeafPlan {
@@ -1364,6 +1386,83 @@ mod tests {
             !has_lima,
             "host.lima.internal must not be in the default server SANs"
         );
+    }
+
+    /// A trailing comma in the flag yields an empty entry; silently minting a cert from it
+    /// would hide an operator typo in a security-relevant input.
+    #[test]
+    fn host_san_rejects_empty_entry() {
+        assert!(host_san("").is_err(), "empty SAN must fail startup");
+        let mut args = args_with(Some("https://127.0.0.1:6443"));
+        args.apiserver_cert_extra_sans = vec!["a.example.com".into(), "".into()];
+        assert!(generate_tls(&args).is_err());
+    }
+
+    /// A wildcard SAN would let a cert for one host vouch for every sibling name.
+    #[test]
+    fn host_san_rejects_wildcards() {
+        for w in ["*", "*.example.com", "a.*.com", "*.1.2.3"] {
+            let e = host_san(w).expect_err(w).to_string();
+            assert!(e.contains("wildcard"), "{w}: {e}");
+        }
+    }
+
+    /// Non-RFC-1123 names would produce a cert no client can match, or smuggle separators.
+    #[test]
+    fn host_san_rejects_malformed_dns_names() {
+        for bad in [
+            " ",
+            "a b",
+            "-a.com",
+            "a-.com",
+            "a..com",
+            ".a.com",
+            "a.com.",
+            "a_b.com",
+            "a/b",
+            "a:b",
+            &"a".repeat(64),
+            &format!("{}.com", "a.".repeat(130)),
+        ] {
+            assert!(host_san(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn host_san_accepts_ips_and_dns_names() {
+        assert_eq!(
+            host_san("192.168.5.2").unwrap(),
+            SanType::IpAddress("192.168.5.2".parse().unwrap())
+        );
+        assert_eq!(
+            host_san("fd00::5").unwrap(),
+            SanType::IpAddress("fd00::5".parse().unwrap())
+        );
+        for ok in [
+            "host.lima.internal",
+            "localhost",
+            "a-b.c1.example.com",
+            "Host.Example.COM",
+        ] {
+            assert!(
+                matches!(host_san(ok).unwrap(), SanType::DnsName(_)),
+                "{ok} is a valid RFC 1123 name"
+            );
+        }
+    }
+
+    /// The advertise host 127.0.0.1 is already a built-in SAN; repeating it yields a
+    /// duplicate IP:127.0.0.1 in the cert and the set must keep its order.
+    #[test]
+    fn build_server_sans_dedupes_advertise_host_keeping_order() {
+        let base = build_server_sans(None, "10.96.0.0/12").unwrap();
+        for dup in ["127.0.0.1", "localhost", "10.96.0.1"] {
+            let sans = build_server_sans(Some(dup), "10.96.0.0/12").unwrap();
+            assert_eq!(sans, base, "advertise host {dup} must not duplicate a SAN");
+        }
+        let sans = build_server_sans(Some("192.168.5.1"), "10.96.0.0/12").unwrap();
+        assert_eq!(sans.len(), base.len() + 1);
+        assert_eq!(sans[..base.len()], base[..]);
     }
 
     /// The host rig's kubelet dials host.lima.internal; if the extra-SAN input stops reaching
