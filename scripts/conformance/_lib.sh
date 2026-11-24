@@ -592,7 +592,7 @@ INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 # peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
 # Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
 # the matching host dig/nslookup overrides below; either layer alone still denies.
-RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 

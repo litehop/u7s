@@ -38,13 +38,13 @@ write_run_meta "$TMP/rig" host-rig
 assert_eq "host-rig archive is stamped topology=host-rig so it is never read as a sign-off run" \
   "$(sed -n 1p "$TMP/rig/run-meta")" "topology=host-rig"
 assert_eq "host-rig archive records the rig-only setup -- DNS specs pass only with it, so an archive must say it was applied" \
-  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
 write_run_meta "$TMP/inst" install
 assert_eq "install archive is stamped topology=install" "$(sed -n 1p "$TMP/inst/run-meta")" "topology=install"
 assert_eq "install archive lists the rig-only add-ons that are not shipped by install.sh" \
   "$(sed -n 2p "$TMP/inst/run-meta")" "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"
 assert_eq "install archive records the same rig-only setup as the host rig" \
-  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
 for f in lima-start.sh install-bringup.sh; do
   grep -q "rig_apply_apparmor_rig_setup" "$REPO/scripts/conformance/$f" \
     && ok "$f applies both AppArmor layers via the shared step -- without them dig/nslookup in pods abort (rc 139) and 7 DNS/Service specs fail in that mode" \
