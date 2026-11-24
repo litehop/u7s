@@ -587,32 +587,44 @@ pub fn apply_label_selector(
     }
     items
         .into_iter()
-        .filter(|item| {
-            // Read labels directly off the JSON tree — skips a full ObjectMeta
-            // reparse per item just to reach this one sub-map.
-            let labels = item["metadata"]["labels"].as_object();
-            terms.iter().all(|term| match term {
-                LabelSelectorTerm::Equality { key, value } => {
-                    labels.and_then(|l| l.get(*key)).and_then(|v| v.as_str()) == Some(value)
-                }
-                LabelSelectorTerm::NotEquals { key, value } => {
-                    labels.and_then(|l| l.get(*key)).and_then(|v| v.as_str()) != Some(value)
-                }
-                LabelSelectorTerm::Exists { key } => labels.is_some_and(|l| l.contains_key(*key)),
-                LabelSelectorTerm::DoesNotExist { key } => {
-                    !labels.is_some_and(|l| l.contains_key(*key))
-                }
-                LabelSelectorTerm::In { key, values } => labels
-                    .and_then(|l| l.get(*key))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| values.contains(&v)),
-                LabelSelectorTerm::NotIn { key, values } => !labels
-                    .and_then(|l| l.get(*key))
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| values.contains(&v)),
-            })
-        })
+        .filter(|item| item_matches_label_terms(item, terms))
         .collect()
+}
+
+/// `apply_label_selector`'s per-item decision, for callers that filter one item at a time.
+pub(crate) fn item_matches_label_terms(
+    item: &serde_json::Value,
+    terms: &[LabelSelectorTerm<'_>],
+) -> bool {
+    // Read labels directly off the JSON tree — skips a full ObjectMeta
+    // reparse per item just to reach this one sub-map.
+    let labels = item["metadata"]["labels"].as_object();
+    label_terms_match(
+        terms,
+        |key| labels.is_some_and(|l| l.contains_key(key)),
+        |key| labels.and_then(|l| l.get(key)).and_then(|v| v.as_str()),
+    )
+}
+
+/// Evaluates `terms` against a label set reached through `has_key`/`label`, so the full
+/// `Value` matcher and the pre-parse projection one decide membership with the same operators.
+/// `has_key` is separate from `label(key).is_some()` because a non-string label value still
+/// counts as present for `Exists`/`DoesNotExist`.
+pub(crate) fn label_terms_match<'a>(
+    terms: &[LabelSelectorTerm<'_>],
+    has_key: impl Fn(&str) -> bool,
+    label: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
+    terms.iter().all(|term| match term {
+        LabelSelectorTerm::Equality { key, value } => label(key) == Some(value),
+        LabelSelectorTerm::NotEquals { key, value } => label(key) != Some(value),
+        LabelSelectorTerm::Exists { key } => has_key(key),
+        LabelSelectorTerm::DoesNotExist { key } => !has_key(key),
+        LabelSelectorTerm::In { key, values } => label(key).is_some_and(|v| values.contains(&v)),
+        LabelSelectorTerm::NotIn { key, values } => {
+            !label(key).is_some_and(|v| values.contains(&v))
+        }
+    })
 }
 
 /// TTL for continue tokens. Tokens older than this are rejected with 410 Gone.

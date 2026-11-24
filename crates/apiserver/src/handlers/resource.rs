@@ -25,9 +25,9 @@ use crate::{
 
 use super::field_selector::FieldSelector;
 use super::generic::{
-    apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
-    check_crb_escalation, check_rb_escalation, check_role_escalation, clear_create_status,
-    decode_continue, generate_name, lookup, parse_label_selector, pin_server_owned_deletion_fields,
+    apply_delete_policy, apply_label_selector, check_clusterrole_escalation, check_crb_escalation,
+    check_rb_escalation, check_role_escalation, clear_create_status, decode_continue,
+    generate_name, lookup, parse_label_selector, pin_server_owned_deletion_fields,
     resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
     CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
@@ -35,6 +35,7 @@ use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
     ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
+use super::list_items::{ListEnvelope, ListFilter, ListFormat};
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
 /// Restores the previously-stored `status` onto `body`, or strips whatever `status` is
@@ -80,85 +81,6 @@ fn restore_or_strip_status(
 ///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
 fn wants_partial_object_metadata(accept: &str) -> bool {
     accept.contains("as=PartialObjectMetadata")
-}
-
-/// Builds a LIST response's raw JSON bytes by parsing, defaulting, and filtering one
-/// stored object at a time and serializing each survivor straight into the output
-/// buffer — never materializing a `Vec<serde_json::Value>` of every item. A LIST's peak
-/// memory is dominated by how many parsed `Value` trees are alive at once, not by the
-/// final byte count, so keeping that count at 1 instead of the full item count is what
-/// makes a large LIST (hundreds of Pods) cheap instead of the dominant allocator.
-///
-/// The envelope's shape (kind/apiVersion/metadata, including continue-token encoding) is
-/// delegated to `build_list_response` with an empty items array, then the streamed items
-/// array is spliced into the one place that placeholder appears — so this can never drift
-/// from that function's byte-for-byte-tested envelope output.
-///
-/// `field_selector` is the handler's already-validated selector, evaluated against each
-/// defaulted item — shared here across every LIST handler rather than forked per-caller.
-/// `on_item`, if set, runs
-/// once per surviving item (e.g. list_pods' per-pod lifecycle debug log) so that diagnostic
-/// hook still fires on the streaming path, not just the materializing one.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn stream_list_json(
-    kind: &str,
-    group: &str,
-    version: &str,
-    plural: &str,
-    revision: u64,
-    raw_items: &[u7s_store::StoreObject],
-    label_pairs: &[LabelSelectorTerm<'_>],
-    field_selector: &FieldSelector,
-    on_item: Option<fn(&serde_json::Value)>,
-    continue_key: Option<String>,
-    remaining_count: Option<u64>,
-    signing_key: &[u8; 32],
-) -> Result<Vec<u8>, crate::status::StatusError> {
-    let envelope = build_list_response(
-        kind,
-        group,
-        version,
-        revision,
-        Vec::new(),
-        continue_key,
-        remaining_count,
-        signing_key,
-    );
-    let envelope_bytes =
-        serde_json::to_vec(&envelope).map_err(|e| Status::internal(e.to_string()))?;
-    let marker = b"\"items\":[]";
-    let marker_pos = envelope_bytes
-        .windows(marker.len())
-        .position(|w| w == marker)
-        .expect("build_list_response always emits an empty items array for an empty items Vec");
-
-    let mut body = Vec::new();
-    body.extend_from_slice(&envelope_bytes[..marker_pos]);
-    body.extend_from_slice(b"\"items\":[");
-    let mut wrote_item = false;
-    for obj in raw_items {
-        let mut item: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(group, plural, &mut item);
-        item = match apply_label_selector(vec![item], label_pairs).pop() {
-            Some(v) => v,
-            None => continue,
-        };
-        if !field_selector.matches(&item) {
-            continue;
-        }
-        if let Some(f) = on_item {
-            f(&item);
-        }
-        if wrote_item {
-            body.push(b',');
-        }
-        wrote_item = true;
-        serde_json::to_writer(&mut body, &item).map_err(|e| Status::internal(e.to_string()))?;
-    }
-    body.push(b']');
-    body.extend_from_slice(&envelope_bytes[marker_pos + marker.len()..]);
-    Ok(body)
 }
 
 pub(crate) async fn list_resource<S: Store>(
@@ -285,100 +207,20 @@ pub(crate) async fn list_resource<S: Store>(
         .transpose()?
         .unwrap_or_default();
 
-    // The common case (no PartialObjectMetadata/Table transform, no protobuf re-encode)
-    // never needs every item alive at once — stream straight to output bytes instead of
-    // materializing a Vec<Value> of every item below. PartialObjectMetadata/Table build
-    // their own projected shape from the full collection, and protobuf negotiation needs
-    // a real parsed Value tree to find its per-kind encoder, so both keep the
-    // materializing path — but only for kinds that actually HAVE a registered encoder.
-    // Real clients (kubelet/client-go) send a combined `Accept: .../protobuf, .../json`
-    // on every request, so gating on `wants_protobuf` alone routed every kind outside the
-    // handful in `encoders()` (everything else falls back to JSON regardless) into the
-    // materializing path, defeating the streaming path's memory win for almost all real
-    // LIST traffic.
-    let list_api_version = if group.is_empty() {
-        version.clone()
-    } else {
-        format!("{}/{}", group, version)
-    };
-    let list_kind = format!("{}List", meta.kind);
-    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
-        && crate::content_type::has_encoder(&list_api_version, &list_kind);
-    if !pom && !table && !wants_real_protobuf {
-        let body = stream_list_json(
-            &meta.kind,
-            &group,
-            &version,
-            &plural,
-            list_revision,
-            &resp.items,
-            &label_pairs,
-            &field_selector,
-            None,
-            resp.continue_key,
-            resp.remaining_count,
-            &state.continue_token_key,
-        )?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response());
-    }
-
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(&group, &plural, &mut v);
-        items.push(v);
-    }
-
-    let items = apply_label_selector(items, &label_pairs);
-    let items = field_selector.filter(items);
-    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
-
-    if pom {
-        let pom_items: Vec<serde_json::Value> = items
-            .iter()
-            .map(super::watch::to_partial_object_metadata)
-            .collect();
-        let body = serde_json::json!({
-            "apiVersion": "meta.k8s.io/v1",
-            "kind": "PartialObjectMetadataList",
-            "metadata": { "resourceVersion": list_revision.to_string() },
-            "items": pom_items
-        });
-        return Ok(Json(body).into_response());
-    }
-
-    if table {
-        let api_version = super::table::table_api_version(accept);
-        let continue_token = resp.continue_key.map(|key| {
-            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
-        });
-        let built = super::table::build_table(&group, &plural, items);
-        return Ok(Json(super::table::finalize_table(
-            built,
-            &api_version,
-            Some(&list_revision.to_string()),
-            continue_token,
-        ))
-        .into_response());
-    }
-
-    let body = build_list_response(
-        &meta.kind,
-        &group,
-        &version,
-        list_revision,
-        items,
-        resp.continue_key,
-        resp.remaining_count,
-        &state.continue_token_key,
-    );
-    Ok(crate::content_type::negotiated_response(accept, body))
+    let filter = ListFilter::new(&group, &plural, &label_pairs, &field_selector, None);
+    let format = ListFormat::negotiate(accept, pom, table, &group, &version, &meta.kind);
+    filter.respond(
+        format,
+        &resp.items,
+        ListEnvelope {
+            kind: &meta.kind,
+            version: &version,
+            revision: list_revision,
+            continue_key: resp.continue_key,
+            remaining_count: resp.remaining_count,
+            signing_key: &state.continue_token_key,
+        },
+    )
 }
 
 pub(crate) async fn get_resource<S: Store>(
@@ -3322,91 +3164,20 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
         .transpose()?
         .unwrap_or_default();
 
-    // See list_resource's identically-shaped guard above for why this checks has_encoder
-    // rather than wants_protobuf alone.
-    let list_api_version = if group.is_empty() {
-        version.clone()
-    } else {
-        format!("{}/{}", group, version)
-    };
-    let list_kind = format!("{}List", meta.kind);
-    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
-        && crate::content_type::has_encoder(&list_api_version, &list_kind);
-    if !pom && !table && !wants_real_protobuf {
-        let body = stream_list_json(
-            &meta.kind,
-            &group,
-            &version,
-            &plural,
-            list_revision,
-            &resp.items,
-            &label_pairs,
-            &field_selector,
-            None,
-            resp.continue_key,
-            resp.remaining_count,
-            &state.continue_token_key,
-        )?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response());
-    }
-
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(&group, &plural, &mut v);
-        items.push(v);
-    }
-
-    let items = apply_label_selector(items, &label_pairs);
-    let items = field_selector.filter(items);
-    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
-
-    if pom {
-        let pom_items: Vec<serde_json::Value> = items
-            .iter()
-            .map(super::watch::to_partial_object_metadata)
-            .collect();
-        let body = serde_json::json!({
-            "apiVersion": "meta.k8s.io/v1",
-            "kind": "PartialObjectMetadataList",
-            "metadata": { "resourceVersion": list_revision.to_string() },
-            "items": pom_items
-        });
-        return Ok(Json(body).into_response());
-    }
-
-    if table {
-        let api_version = super::table::table_api_version(accept);
-        let continue_token = resp.continue_key.map(|key| {
-            super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
-        });
-        let built = super::table::build_table(&group, &plural, items);
-        return Ok(Json(super::table::finalize_table(
-            built,
-            &api_version,
-            Some(&list_revision.to_string()),
-            continue_token,
-        ))
-        .into_response());
-    }
-
-    let body = build_list_response(
-        &meta.kind,
-        &group,
-        &version,
-        list_revision,
-        items,
-        resp.continue_key,
-        resp.remaining_count,
-        &state.continue_token_key,
-    );
-    Ok(crate::content_type::negotiated_response(accept, body))
+    let filter = ListFilter::new(&group, &plural, &label_pairs, &field_selector, None);
+    let format = ListFormat::negotiate(accept, pom, table, &group, &version, &meta.kind);
+    filter.respond(
+        format,
+        &resp.items,
+        ListEnvelope {
+            kind: &meta.kind,
+            version: &version,
+            revision: list_revision,
+            continue_key: resp.continue_key,
+            remaining_count: resp.remaining_count,
+            signing_key: &state.continue_token_key,
+        },
+    )
 }
 
 pub(crate) async fn get_namespaced_resource<S: Store>(

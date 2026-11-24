@@ -717,21 +717,21 @@ const PROJECTED_FIELD_LABELS: [&str; 4] = [
 /// stand-in object rebuilt from the projection, so it can never disagree with the full
 /// matcher; a selector reading any label outside `PROJECTED_FIELD_LABELS` is "don't know".
 #[derive(serde::Deserialize, Default)]
-struct SelectorProjection<'a> {
+pub(super) struct SelectorProjection<'a> {
     #[serde(default, borrow)]
-    metadata: SelectorProjectionMetadata<'a>,
+    pub(super) metadata: SelectorProjectionMetadata<'a>,
     #[serde(default, borrow)]
     spec: SelectorProjectionSpec<'a>,
 }
 
 #[derive(serde::Deserialize, Default)]
-struct SelectorProjectionMetadata<'a> {
+pub(super) struct SelectorProjectionMetadata<'a> {
     #[serde(default, borrow)]
     name: Option<&'a str>,
     #[serde(default, borrow)]
     namespace: Option<&'a str>,
     #[serde(default, borrow)]
-    labels: std::collections::BTreeMap<&'a str, &'a str>,
+    pub(super) labels: std::collections::BTreeMap<&'a str, &'a str>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -756,16 +756,21 @@ impl SelectorProjection<'_> {
         })
     }
 
+    /// `None` when the selector reads a label outside `PROJECTED_FIELD_LABELS`.
+    pub(super) fn field_selector_verdict(&self, field_selector: &FieldSelector) -> Option<bool> {
+        field_selector
+            .labels()
+            .all(|l| PROJECTED_FIELD_LABELS.contains(&l))
+            .then(|| field_selector.matches(&self.stand_in_object()))
+    }
+
     /// `false` only when the object definitely fails the selectors.
     fn may_match(&self, label_selector: &str, field_selector: &FieldSelector) -> bool {
         label_selector_matches(
             label_selector,
             |key| self.metadata.labels.contains_key(key),
             |key| self.metadata.labels.get(key).copied(),
-        ) && (!field_selector
-            .labels()
-            .all(|l| PROJECTED_FIELD_LABELS.contains(&l))
-            || field_selector.matches(&self.stand_in_object()))
+        ) && self.field_selector_verdict(field_selector).unwrap_or(true)
     }
 }
 
