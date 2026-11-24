@@ -64,7 +64,7 @@
 #
 # After starting (foreground mode):
 #   export KUBECONFIG=./temp/u7s/kubeconfig   (relative to CWD / active worktree)
-#   scripts/conformance/lima-start.sh  # join kubelet (first run or after --reset)
+#   scripts/conformance/lima-start.sh --with-kcm  # start KCM, join kubelet (first run or after --reset)
 #   kubectl get nodes
 set -euo pipefail
 
@@ -524,7 +524,7 @@ else
   echo "  export KUBECONFIG=$WORKDIR/kubeconfig"
   echo ""
   echo "Next steps:"
-  echo "  Start/reconnect the VM kubelet: scripts/conformance/lima-start.sh"
+  echo "  Start/reconnect the VM kubelet: scripts/conformance/lima-start.sh --with-kcm"
   echo "  kubectl get nodes"
   echo ""
   echo "u7s logs are going to stdout/stderr of this process."

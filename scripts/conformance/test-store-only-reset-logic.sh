@@ -7,7 +7,7 @@
 # breaks every fresh install passes the gate. --store-only must therefore (a) delete the
 # whole store, (b) keep CA/kubeconfig/keys and the VM (a delete costs 15-20 min and
 # invalidates the kubelet's certs), and (c) clear guest state that would mask first boot:
-# pod sandboxes and /var/lib/kubelet, except pki/.
+# pod sandboxes and /var/lib/kubelet.
 #
 # limactl, pkill and pgrep are stubbed on PATH; rm is real but confined to a sandbox repo.
 #
@@ -78,10 +78,10 @@ if [[ "$guest" == *"crictl rmp -fa"* ]]; then
 else
   bad "--store-only left pod sandboxes in the guest; old pods would outlive the empty store"
 fi
-if [[ "$guest" == *"! -name pki"* && "$guest" == *"/var/lib/kubelet"* ]]; then
-  ok "--store-only wipes /var/lib/kubelet but keeps pki/"
+if [[ "$guest" == *"find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf"* && "$guest" != *"-name pki"* ]]; then
+  ok "--store-only wipes all of /var/lib/kubelet, pki/ included, so no stale cert survives a reset (the kubelet's own certs live in /etc/u7s-rig)"
 else
-  bad "--store-only does not wipe /var/lib/kubelet state (excluding pki/): $guest"
+  bad "--store-only does not wipe /var/lib/kubelet entirely: $guest"
 fi
 
 seed

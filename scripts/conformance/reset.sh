@@ -37,8 +37,8 @@
 #   binary, but make the next bring-up a first boot. Kills host processes, deletes
 #   $WORKDIR/state.db* (the apiserver's whole store), and in each running VM
 #   (--vm and --extra-node) stops kubelet/KCM/sonobuoy, removes every pod sandbox
-#   and wipes /var/lib/kubelet except pki/ (pod dirs, volume and manager
-#   checkpoints). A stopped VM is started first so its disk is wiped too. Takes
+#   and wipes /var/lib/kubelet (pod dirs, volume and manager checkpoints; the kubelet's
+#   certs live under /etc/u7s-rig/kubelet/pki and survive). A stopped VM is started first so its disk is wiped too. Takes
 #   seconds, vs 15-20 min for the VM reprovision --reset does. Without it, boot-time
 #   code (manifest apply, allocator seeding, migrations) only ever sees an existing store.
 #
@@ -201,7 +201,7 @@ wipe_guest_state() {
     pkill -f '[s]onobuoy' || true
     if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
     findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
-    find /var/lib/kubelet -mindepth 1 -maxdepth 1 ! -name pki -exec rm -rf {} +
+    find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   '
 }
 

@@ -50,15 +50,13 @@ for name in "${REMOVED_FLAGS[@]}" "${LOCKED_GATES[@]}"; do
     PASS=$(( PASS + 1 ))
   fi
 done
-for gate in "${REQUIRED_OFF_IN_LIMA_START[@]}"; do
-  if printf '%s' "$lima_code" | drain_grep -qF -- "${gate}=false"; then
-    echo "PASS: lima-start.sh disables '$gate' alongside PodLevelResources=false"
-    PASS=$(( PASS + 1 ))
-  else
-    echo "FAIL: lima-start.sh disables PodLevelResources but not '$gate'; 1.37 kubelet refuses to start"
-    FAIL=$(( FAIL + 1 ))
-  fi
-done
+if printf '%s' "$lima_code" | drain_grep -qF -- '--feature-gates'; then
+  echo "FAIL: lima-start.sh hand-lists --feature-gates; they must come from install.sh's kubelet_round2_flags (checked below)"
+  FAIL=$(( FAIL + 1 ))
+else
+  echo "PASS: lima-start.sh takes its kubelet feature gates from install.sh, not a hand-copied list"
+  PASS=$(( PASS + 1 ))
+fi
 
 # install.sh ships a tarball that may still be 1.36, so assert the OUTPUT of its
 # flag builder per kubelet minor instead of grepping its source.
