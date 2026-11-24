@@ -140,6 +140,7 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system rollout status ds/kube-ne
 
 banner "RIG-ONLY setup (NOT shipped by install.sh): $RIG_ONLY_SETUP"
 rig_apply_apparmor_rig_setup "$VM_NAME"
+rig_apply_vm_rig_setup "$VM_NAME"
 
 echo ""
 echo "Install-mode stack up: kubectl --kubeconfig $KUBECONFIG_PATH get pods -A"

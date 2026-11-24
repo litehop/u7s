@@ -141,7 +141,7 @@ assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log
 #    not a regression. A future drop back to 2G (or below 5G) would silently
 #    start truncating forensic evidence again.
 # ---------------------------------------------------------------------------
-LIMA_START="$(dirname "${BASH_SOURCE[0]}")/lima-start.sh"
+LIMA_START="$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 assert "journald_system_max_use_is_5g -- 2G was measured insufficient for an 11h --all-e2e run under 16-way load (0805-2202 run lost its own DiskPressure incident window); regression below the current 5G floor silently truncates forensic evidence again" \
   "$(grep -q '^SystemMaxUse=5G$' "$LIMA_START" && ! grep -q '^SystemMaxUse=2G$' "$LIMA_START" && echo 1 || echo 0)"
 
