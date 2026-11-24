@@ -81,6 +81,26 @@ grep -qF 'peer=@{profile_name}//&u7s-default,' "$AALOG.host" \
   && grep -qF '/etc/apparmor.d/local/' "$AALOG.host" \
   && ok "host layer: dig/nslookup local overrides are written -- the host profiles deny the stacked peer too" \
   || bad "host layer missing: container dig/nslookup is denied at profile=dig/nslookup"
+grep -qF 'owner /results/** w,' "$AALOG.host" \
+  && ok "host layer: dig may write /results/** -- else it aborts on its redirected stdout (file_inherit DENIED) and the DNS ExternalName spec reads an empty file" \
+  || bad "host dig override lacks write on /results/**: dig aborts and DNS ExternalName services fails"
+# Behavioural: run the real host script with stubbed tools; the file rule must reach local/dig only.
+HOSTROOT="$TMP/hostroot"
+mkdir -p "$HOSTROOT/apparmor.d/local" "$HOSTROOT/sys"
+touch "$HOSTROOT/apparmor.d/dig" "$HOSTROOT/apparmor.d/nslookup"
+printf 'dig (enforce)\nnslookup (enforce)\n' > "$HOSTROOT/sys/profiles"
+printf '#!/bin/sh\nexit 0\n' > "$AASTUB/apparmor_parser"
+chmod +x "$AASTUB/apparmor_parser"
+hs="${RIG_AA_HOST_SCRIPT//\/etc\/apparmor.d/$HOSTROOT/apparmor.d}"
+hs="${hs//\/sys\/kernel\/security\/apparmor\/profiles/$HOSTROOT/sys/profiles}"
+PATH="$AASTUB:$PATH" bash -c "$hs" >/dev/null 2>&1 && rc=0 || rc=$?
+assert_eq "host script runs against a stubbed host" "$rc" "0"
+grep -qF 'owner /results/** w,' "$HOSTROOT/apparmor.d/local/dig" \
+  && ok "local/dig carries the /results write rule" || bad "local/dig lacks the /results write rule: DNS ExternalName services fails"
+grep -qF '/results' "$HOSTROOT/apparmor.d/local/nslookup" \
+  && bad "nslookup got a /results write grant it does not need" || ok "nslookup override stays signal-only (narrowest grant)"
+grep -qF 'peer=@{profile_name}//&u7s-default,' "$HOSTROOT/apparmor.d/local/dig" \
+  && ok "local/dig keeps the signal rule" || bad "local/dig lost the signal rule"
 grep -qF 'apparmor_parser -r /etc/apparmor.d/$p' "$AALOG.host" \
   && grep -qF 'rm -f $f' "$AALOG.host" \
   && ok "host layer reloads both profiles and undoes the override when the reload fails" \

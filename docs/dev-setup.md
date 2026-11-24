@@ -81,7 +81,9 @@ The rig changes two AppArmor layers, in both modes. On hosts whose kernel stacks
 2. The host's `dig` and `nslookup` profiles. The rig changes them through
    `/etc/apparmor.d/local/{dig,nslookup}` with
    `signal (send,receive) peer=@{profile_name}//&u7s-default,` and reloads both. This is host setup a
-   user would do themselves.
+   user would do themselves. `local/dig` also gets `owner /results/** w,`: the DNS specs redirect
+   `dig`'s stdout into `/results`, and the host profile denies `file_inherit` on that fd, so `dig`
+   aborts and `should provide DNS for ExternalName services` reads an empty file.
 
 Either layer alone still denies. The host rig injects the `u7s-default` rule into the profile text
 taken from `install.sh` (`lima-start.sh`); `run-all.sh --install` edits the installed

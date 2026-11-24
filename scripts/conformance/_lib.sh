@@ -611,11 +611,16 @@ rig_aa_with_rule() {
 # Rig-only host layer: the host's dig/nslookup profiles (Ubuntu 26.04) also deny the
 # stacked peer "dig//&u7s-default", so each gets a local override allowing it. Written
 # idempotently and reloaded; a failed reload restores the previous override (or removes
-# it) so no half-applied rule is left behind.
+# it) so no half-applied rule is left behind. dig also gets write on /results/**: the
+# DNS conformance specs redirect dig's stdout there, and the host profile DENIES
+# file_inherit on that fd, so dig aborts (libuv assertion) and the lookup file is empty.
 RIG_AA_HOST_SCRIPT='set -euo pipefail
-want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
+sig="signal (send,receive) peer=@{profile_name}//&u7s-default,"
 for p in dig nslookup; do
   [ -f /etc/apparmor.d/$p ] || continue
+  want="$sig"
+  if [ $p = dig ]; then want="$sig
+owner /results/** w,"; fi
   rm -f /etc/apparmor.d/disable/$p
   f=/etc/apparmor.d/local/$p
   if [ "$(cat $f 2>/dev/null || true)" != "$want" ] || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
