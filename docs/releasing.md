@@ -23,6 +23,16 @@ operator first. Every release is gated, patch releases included. Whether
    Also run the upgrade check, previous release to the same snapshot:
    `scripts/release-gate/upgrade-gate.sh --backend gcp --from <previous-release-tag> --release <snapshot-tag>`
    ([dev-setup.md](dev-setup.md#upgrade-check)).
+   **Minor releases only** (`X.Y.0`; patch releases skip it): also run the
+   capacity benchmark against the same snapshot, agent-run like the burst gate
+   and on its own GCP VM, never concurrently with it:
+   `scripts/release-gate/capacity-benchmark.sh --backend gcp --release <snapshot-tag>`.
+   Commit the resulting `docs/benchmarks/<date>-<sha>/` on main, update the
+   "Latest stamped benchmark" link in [capacity.md](capacity.md), and add a
+   `### Benchmark` line to the release's CHANGELOG section linking
+   `benchmark.md` (`- Capacity benchmark (<date>, <sha>): [benchmark.md](docs/benchmarks/<date>-<sha>/benchmark.md)`).
+   The benchmark informs; it never gates. An INVALID or non-authoritative
+   (Lima) artefact is not citable as the release's benchmark.
 4. **Release only on 3/3 PASS and an upgrade-check PASS.** On a failure,
    find the root cause; do not retry until it passes. INVALID and PREEMPTED runs are not verdicts.
 5. **Tag `vX.Y.Z`** on the exact commit whose snapshot passed the gate; the

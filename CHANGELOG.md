@@ -1,7 +1,9 @@
 # Changelog
 
 User-visible changes to u7s releases. Pre-releases (snapshots) are not listed
-individually; their changes land in the next release's section.
+individually; their changes land in the next release's section. Each minor
+release ends with a `### Benchmark` line linking its stamped
+[capacity benchmark](docs/capacity.md) (date, git SHA, VM shape).
 
 ## [Unreleased]
 
