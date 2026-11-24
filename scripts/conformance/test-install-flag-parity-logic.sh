@@ -73,6 +73,51 @@ assert_lacks "KCM drops the rig-only GC concurrency override" "$kcm" "--concurre
 kcm_dual=$(render_kcm --dual-stack)
 assert_has "dual-stack KCM gets both Service CIDRs" "$kcm_dual" "--service-cluster-ip-range=10.96.0.0/12,fd00:96::/108"
 
+# Expected flags are read from install.sh's own unit text, so a flag added there that the rig
+# never passes fails here instead of going unnoticed. Rig-only differences are listed
+# by filtering them out of the missing set with a one-line reason; none exist today.
+flags_of() { grep -oE -- '--[a-z][a-z0-9-]*' | sort -u; }
+assert_install_flags_passed() { # <name> <install flags> <rig flags>
+  local missing f
+  missing=$(comm -23 <(printf '%s\n' "$2") <(printf '%s\n' "$3"))
+  [ -z "$missing" ] && ok "$1: the rig passes every flag install.sh's unit carries" \
+    || for f in $missing; do bad "$1: install.sh passes $f but the rig does not, so conformance runs a configuration no installed cluster has"; done
+}
+INSTALL_SH="$REPO/scripts/install.sh"
+
+install_api=$(grep -E '^ExecStart=\$BIN_DIR/u7s-apiserver ' "$INSTALL_SH" | flags_of)
+[ -n "$install_api" ] || { echo "FAIL: no u7s-apiserver ExecStart found in install.sh"; exit 1; }
+rig_api=$({
+  awk '/^ *"\$BINARY" \\$/ { on = 1; next } on { print } on && !/\\$/ { on = 0 }' "$REPO/scripts/u7s-start.sh"
+  grep -E '(INSTALL_PARITY_ARGS|ADVERTISE_ARG|EMBEDDED_SCHEDULER_ARG)=' "$REPO/scripts/u7s-start.sh"
+} | flags_of)
+assert_install_flags_passed "apiserver" "$install_api" "$rig_api"
+
+install_kcm=$({
+  grep -E '^ExecStart=\$BIN_DIR/kube-controller-manager ' "$INSTALL_SH"
+  sed -n '/^kcm_node_cidr_mask_flags()/,/^}/p' "$INSTALL_SH"
+} | flags_of)
+[ -n "$install_kcm" ] || { echo "FAIL: no kube-controller-manager ExecStart found in install.sh"; exit 1; }
+rig_kcm=$({ printf '%s\n' "$kcm" "$kcm_dual"; } | awk '/setsid bash \/tmp\/kcm-supervisor.sh/ { on = 1 } on { print } on && /&$/ { on = 0 }' | flags_of)
+assert_install_flags_passed "kube-controller-manager" "$install_kcm" "$rig_kcm"
+
+controllers() { grep -oE -- '--controllers=[^ ]+' | head -1 | tr -d "'\\\\"; }
+install_controllers=$(grep -E '^ExecStart=\$BIN_DIR/kube-controller-manager ' "$INSTALL_SH" | controllers)
+assert_eq() { [ "$2" = "$3" ] && ok "$1" || bad "$1 — expected '$3', got '$2'"; }
+assert_eq "rig KCM runs the controller set install.sh enables, so controller behaviour is what users get" \
+  "$(printf '%s\n' "$kcm" | controllers)" "$install_controllers"
+
+# Kubelet feature gates: install.sh's base list plus the 1.37+ additions, which the rig's
+# kubelet (1.37) always carries.
+gates_of() { tr ',' '\n' | sed -E 's/^ *(--feature-gates=)?//' | grep -E '^[A-Za-z0-9]+=(true|false)$' | sort -u; }
+install_gates=$({
+  sed -n '/^kubelet_round2_flags()/,/^}/p' "$INSTALL_SH" | grep -E 'local flags="--feature-gates=|flags="\$flags,' | sed -E 's/^.*(--feature-gates=|\$flags,)//; s/"$//'
+} | gates_of)
+rig_gates=$(grep -E '^ *--feature-gates=' "$REPO/scripts/conformance/lima-start.sh" | gates_of)
+[ -n "$install_gates" ] && [ -n "$rig_gates" ] || { echo "FAIL: kubelet --feature-gates not found (install: '$install_gates', rig: '$rig_gates')"; exit 1; }
+assert_eq "rig kubelet disables exactly the feature gates install.sh does, so memory and behaviour match a real install" \
+  "$rig_gates" "$install_gates"
+
 echo ""
 echo "install-flag-parity logic: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
