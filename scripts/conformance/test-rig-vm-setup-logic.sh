@@ -52,9 +52,7 @@ grep -qE 'apt-get .* install -y nfs-common' "$TMP/log" \
 grep -q 'journalctl --vacuum-size' "$TMP/log" && grep -q 'systemctl restart logrotate.timer' "$TMP/log" \
   && ok "journald retention and logrotate timer are applied" \
   || bad "journald/logrotate setup missing from the shared step"
-grep -qF 'vm-logrotate-journald-nfs-common' <<<"$RIG_ONLY_SETUP" \
-  && ok "the shared step is named in RIG_ONLY_SETUP so run-meta records it" \
-  || bad "RIG_ONLY_SETUP does not record the shared VM setup"
+for t in vm-nfs-common vm-journald-limits vm-logrotate-interval; do grep -qF "$t" <<<"$RIG_ONLY_SETUP" && ok "$t is in the common RIG_ONLY_SETUP so both topologies record it" || bad "RIG_ONLY_SETUP does not record $t"; done
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"

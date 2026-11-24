@@ -70,7 +70,7 @@ assert "the drop-in never resets ExecStart (it would replace install.sh's kubele
 assert "the drop-in is exactly RIG_KUBELET_DROPIN, the text run-meta records" \
   "$([ "$(cat "$DROPIN")" = "$RIG_KUBELET_DROPIN" ] && echo 1 || echo 0)"
 assert "RIG_ONLY_SETUP records the kubelet drop-in so an archive says the rig added it" \
-  "$([[ ",$RIG_ONLY_SETUP," == *",kubelet-unit-dropin-tz-nofile,"* ]] && echo 1 || echo 0)"
+  "$([[ ",$RIG_ONLY_HOST_SETUP," == *",kubelet-unit-dropin-tz-nofile,"* ]] && echo 1 || echo 0)"
 
 BROKEN="$TMP/broken-install.sh"
 sed 's/^kubelet_round2_flags() {$/renamed_flags() {/' "$INSTALL_SH" > "$BROKEN"
