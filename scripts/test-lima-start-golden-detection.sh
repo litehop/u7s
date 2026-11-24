@@ -64,6 +64,11 @@ case "$1" in
   clone)
     mkdir -p "$HOME/.lima/$3"
     ;;
+  template)
+    # Differs per file, so the clone's provision always looks stale and
+    # lima_sync_provision issues `limactl edit`.
+    echo "\"provision-of-$3\""
+    ;;
 esac
 exit 0
 STUB
@@ -118,8 +123,14 @@ export GOLDEN_STATUS="Stopped"
 run_lima_start "$WORKDIR/run-stopped"
 assert "stopped golden: lima-start.sh clones it (limactl clone invoked)" \
   "$(grep -q '^clone lima-golden test-clone-vm' "$LIMACTL_LOG" && echo 1 || echo 0)"
-assert "stopped golden: lima-start.sh does not fresh-provision" \
-  "$(grep -q '^start ' "$LIMACTL_LOG" && echo 0 || echo 1)"
+clone_ln=$(grep -n '^clone lima-golden test-clone-vm' "$LIMACTL_LOG" | head -1 | cut -d: -f1 || true)
+edit_ln=$(grep -n '^edit test-clone-vm ' "$LIMACTL_LOG" | head -1 | cut -d: -f1 || true)
+start_ln=$(grep -n '^start --tty=false test-clone-vm$' "$LIMACTL_LOG" | head -1 | cut -d: -f1 || true)
+assert "stopped golden: clone, then edit (provision sync), then start of the clone" \
+  "$([ -n "$clone_ln" ] && [ -n "$edit_ln" ] && [ -n "$start_ln" ] \
+     && [ "$clone_ln" -lt "$edit_ln" ] && [ "$edit_ln" -lt "$start_ln" ] && echo 1 || echo 0)"
+assert "stopped golden: lima-start.sh does not fresh-provision (no start of the golden, no --name= start)" \
+  "$(grep -qE '^start .*(--name=|lima-golden)' "$LIMACTL_LOG" && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 3. Golden present but Broken (e.g. an interrupted/failed bake) -> must
