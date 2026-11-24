@@ -1,0 +1,6 @@
+[
+  "On 1 GiB / 1 vCPU with no swap, a memory overload (30 BestEffort pods holding 25 MiB each on top of WordPress and MariaDB) does not recover: the node went NotReady or froze and the API stayed unreachable for 20+ minutes on every arm (bead mayor-pzhtd, GCP n1-custom-1-1024, n=1 per arm, findings commits ff2f35cc and e7866fdf on the bead's worker branches).",
+  "Capping kubepods at 657 MiB (the kubelet reservations and MemoryLow bundle of closed PR #2039) never engaged: every OOM kill was global and the node did worse than the uncapped control (bead mayor-pzhtd, findings commit ff2f35cc).",
+  "Capping kubepods at 400 MiB engaged (cgroup-local OOM kills) but kubelet stopped heartbeating and nothing recovered in 20 minutes; 300 MiB allocatable could not even schedule MariaDB (bead mayor-pzhtd, findings commit e7866fdf).",
+  "Overload survival is not a goal (operator decision 2026-11-24, bead mayor-jedol): size the node so the workload stays inside the envelope above."
+]

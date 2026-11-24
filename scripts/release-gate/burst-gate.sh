@@ -25,6 +25,9 @@
 # bursts) is INVALID too. INVALID runs are repeated (up to MAX_INVALID_RUNS, default 3, after
 # RG_RETRY_WAIT_SECS, default 300) and never counted.
 #
+# RG_ALLOW_CONTENDED=1 (lima, used by capacity-benchmark.sh --allow-contended) skips the pre-flight
+# refusal; the run is still judged INVALID, so it never counts toward the gate.
+#
 # A/B runs (comparing builds or mitigations) must use the in-VM sampler (vm-sampler.sh) only. Off-VM
 # observers (limactl shell streams) cost ~79 MiB MemAvailable on 1 GiB, die at the first burst,
 # and attach unevenly across arms; do not attach any to a measured run.
@@ -328,7 +331,7 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
   : > "$RUN_OUT/quiet.log"
   if [ "$BACKEND" = lima ]; then
     quiet_sample "$RUN_OUT/quiet.log"
-    if [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
+    if [ "${RG_ALLOW_CONTENDED:-0}" != 1 ] && [ -n "$(rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null)" ]; then
       status=INVALID
       echo "pre-flight: host not quiet, no VM created:"; rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null
     fi
