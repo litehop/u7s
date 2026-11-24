@@ -17,8 +17,8 @@ pattern), kubelet/KCM behaviour.
 
 ## Workload (repeatable)
 
-`scripts/bench/apiserver-hot-paths.sh --kubeconfig temp/u7s/kubeconfig --pid <apiserver pid>`
-(`lsof -nP -iTCP:<port> -sTCP:LISTEN` gives the pid; defaults are the numbers
+`scripts/bench/apiserver-hot-paths.sh --kubeconfig temp/u7s/kubeconfig --pid <apiserver pid> --i-know-this-is-a-test-cluster`
+(`--cleanup` deletes the `bench-*` namespaces and `bench-node`; `lsof -nP -iTCP:<port> -sTCP:LISTEN` gives the pid; defaults are the numbers
 below, `--skip-seed` reuses a seeded store).
 
 - Seed: 10 namespaces x 50 each of ConfigMap (~600 B data), Secret,
@@ -80,7 +80,7 @@ figures are discarded; POST pod is not a hotspot (1.4 ms, 1.6x a ConfigMap).
 
 macOS `sample` (1 ms) attached to the apiserver during the mixed phase and
 isolated loops; leaf self-time attributed to the nearest `u7s_*` frame
-(`file:line` from the release build's line tables). `sample` under-counts
+(`file:line` from the release build's line tables). Seed not recorded at capture time: the profile predates run D and is believed to come from the first pair of runs (scheduled pods), so the scheduler share is contaminated; the JSON, malloc and TLS shares do not depend on pod scheduling. Not re-taken. `sample` under-counts
 absolute CPU ~4x (60+ threads); use shares, not counts.
 
 - Mixed phase leaf shares: syscalls/IO (socket `writev`, sqlite `pread`) 28%,
@@ -96,6 +96,8 @@ absolute CPU ~4x (60+ threads); use shares, not counts.
 
 ## Allocation profile (dhat, depth 30, partial bench)
 
+**Contaminated seed (scheduled pods, not run D); all figures below must be re-taken before mayor-7s8gr is acted on.**
+
 `run-all.sh --profile --dhat-depth 30` run with the pre-correction seed
 (scheduled pods) through seeding, GETs and part of phase 2; attribution is by
 frame match over `dhat-heap.json`. Totals: 12.0 GB in 103 M blocks.
@@ -103,13 +105,13 @@ frame match over `dhat-heap.json`. Totals: 12.0 GB in 103 M blocks.
 - `stream_list_json` stacks: 1.35 GB / 7.52 M blocks over roughly 74 k listed
   items (derived from the apiserver log's LIST counts x item counts, +-30%):
   ~18 KB and ~100 allocations per item for a ~2 KB object, consistent with the
-  9.9x `Value` inflation in `ai/findings/2026-09-03-memory-audit-apiserver-store-scheduler.md`.
+  9.9x `Value` inflation in `2026-09-03-memory-audit-apiserver-store-scheduler.md`.
 - `create_pod` stacks: 119 MB / 1.36 M blocks over 500 pod creates:
   ~238 KB and ~2,700 allocations per POST pod (lower bound; frames beyond
   depth 30 are cut).
 - Heap at peak (t-gmax) 124 MB; 108 MB of it in stacks through
   `u7s_scheduler`, 65 MB in serde_json `Value` trees. Taken with scheduled pods
-  running, so it needs re-taking before acting (see the RSS bead).
+  running, so it needs re-taking before acting (RSS bead mayor-7s8gr; its run D RSS is 191 MiB peak).
 
 ## Fan-out measurement
 

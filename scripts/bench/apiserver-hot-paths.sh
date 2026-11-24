@@ -14,12 +14,19 @@
 # attached to the same pid for phase 3.
 #
 # Usage: scripts/bench/apiserver-hot-paths.sh --kubeconfig temp/u7s/kubeconfig \
-#          --pid <pid> [--ns 10] [--per-ns 50] [--watchers 20] [--readers 4] \
-#          [--duration 30] [--gets 300] [--lists 40] [--out results.txt] [--skip-seed]
+#          --pid <pid> --i-know-this-is-a-test-cluster [--ns 10] [--per-ns 50] \
+#          [--watchers 20] [--readers 4] [--duration 30] [--gets 2000] \
+#          [--lists 100] [--writes 200] [--out results.txt] [--skip-seed]
+#        scripts/bench/apiserver-hot-paths.sh --kubeconfig <path> \
+#          --i-know-this-is-a-test-cluster --cleanup
+#
+# Seeds and mutates the cluster (bench-* namespaces, node bench-node), so it
+# refuses to run unless the flag is given and the server URL is loopback.
+# --cleanup deletes the bench-* namespaces and bench-node.
 set -euo pipefail
 
 KUBECONFIG_PATH=""; PID=""; NS=10; PER_NS=50; WATCHERS=20; READERS=4
-DURATION=30; GETS=2000; LISTS=100; WRITES=200; FANOUT=100; FANOUT_WRITES=500; OUT=""; SKIP_SEED=0
+DURATION=30; GETS=2000; LISTS=100; WRITES=200; FANOUT=100; FANOUT_WRITES=500; OUT=""; SKIP_SEED=0; ACK=0; CLEANUP=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --kubeconfig) KUBECONFIG_PATH="$2"; shift 2 ;;
@@ -34,6 +41,8 @@ while [ $# -gt 0 ]; do
         --writes) WRITES="$2"; shift 2 ;;
         --out) OUT="$2"; shift 2 ;;
         --skip-seed) SKIP_SEED=1; shift ;;
+        --i-know-this-is-a-test-cluster) ACK=1; shift ;;
+        --cleanup) CLEANUP=1; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -46,6 +55,18 @@ CA="$(cfg '{.clusters[0].cluster.certificate-authority}')"
 CERT="$(cfg '{.users[0].user.client-certificate}')"
 KEY="$(cfg '{.users[0].user.client-key}')"
 [ -n "$KEY" ] || KEY="$CERT"
+case "$SERVER" in
+    https://127.0.0.1[:/]*|https://localhost[:/]*|https://\[::1\][:/]*) ;;
+    *) echo "refusing: server $SERVER is not loopback" >&2; exit 2 ;;
+esac
+[ "$ACK" = 1 ] || { echo "refusing: pass --i-know-this-is-a-test-cluster (this script creates and deletes objects)" >&2; exit 2; }
+if [ "$CLEANUP" = 1 ]; then
+    for ns in $("${K[@]}" get namespaces -o name | { grep '^namespace/bench-' || true; }); do
+        "${K[@]}" delete "$ns" --wait=false
+    done
+    "${K[@]}" delete node bench-node --ignore-not-found
+    exit 0
+fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/u7s-bench-hot-XXXXXX")"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
 TIMINGS="$WORK/timings.tsv"; : > "$TIMINGS"
