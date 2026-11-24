@@ -36,7 +36,7 @@ cap_build_json() {
   if [ "$provider" = gcp ]; then authoritative=true; label="provider=gcp ($detail)"
   else label="provider=$provider (non-authoritative)"; fi
   contention="$(cat "$run/contention.txt" 2>/dev/null || true)"
-  [ -z "$contention" ] || authoritative=false
+  [ -z "$contention" ] || { authoritative=false; label="provider=$provider (contended, non-authoritative)"; }
   for n in $sizes; do
     secs="$(_cap_get "$res" "ramp_${n}_secs")"
     row="$(rg_ramp_step "$res" "$n")" && pass=true || pass=false
@@ -134,4 +134,27 @@ cap_render_md() {
     "## Past the envelope\n",
     (.past_envelope[] | "- " + .)
   ' "$f"
+}
+
+# Succeeds only when burst-gate run dir $1 (run-N) was INVALID for host contention alone:
+# contention recorded, the VM produced results, and neither the harness nor the
+# infrastructure failed. A harness error or a VM that never came up is not a benchmark.
+cap_invalid_is_contention() {
+  local run="$1"
+  [ -s "$run/contention.txt" ] || return 1
+  [ -n "$(rg_get "$run/out/results.env" install_ok)" ] || return 1
+  [ -z "$(rg_get "$run/out/results.env" harness_error)" ] || return 1
+  ! grep -q '^INFRASTRUCTURE' "$run/verdict.txt" 2>/dev/null
+}
+
+# Artefact directory name <date>-<sha8>-<provider>[-contended]. Providers share a date and
+# SHA, so without the provider (and contention) in the name artefacts overwrite each other.
+cap_dir_name() {
+  echo "$1-${2:0:8}-$3$([ -z "$4" ] || echo -contended)"
+}
+
+# $1 out dir, $2 git sha, $3 dirty (1|0), $4 date, $5 version. Recorded when the run starts
+# so --from-run stamps the run's own identity, not the HEAD and date of a later build.
+cap_write_run_meta() {
+  printf 'git_sha=%s\ngit_dirty=%s\ndate=%s\nversion=%s\n' "$2" "$3" "$4" "$5" > "$1/run-meta.env"
 }

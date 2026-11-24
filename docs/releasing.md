@@ -27,13 +27,17 @@ operator first. Every release is gated, patch releases included. Whether
    capacity benchmark against the same snapshot, agent-run like the burst gate
    and on its own GCP VM, never concurrently with it:
    `scripts/release-gate/capacity-benchmark.sh --backend gcp --release <snapshot-tag>`.
-   Commit the resulting `docs/benchmarks/<date>-<sha>/` on main, update the
+   Commit the resulting `docs/benchmarks/<date>-<sha>-gcp/` on main, update the
    "Latest stamped benchmark" link in [capacity.md](capacity.md), and add a
    `### Benchmark` line to the release's CHANGELOG section linking
-   `benchmark.md` (`- Capacity benchmark (<date>, <sha>): [benchmark.md](docs/benchmarks/<date>-<sha>/benchmark.md)`).
-   The benchmark informs; it never gates. An INVALID or non-authoritative
-   (Lima) artefact is not citable as the release's benchmark.
-4. **Release only on 3/3 PASS and an upgrade-check PASS.** On a failure,
+   `benchmark.md` (`- Capacity benchmark (<date>, <sha>): [benchmark.md](docs/benchmarks/<date>-<sha>-gcp/benchmark.md)`).
+   A minor release cannot be tagged until its stamped artefact exists and its
+   CHANGELOG line cites it. The numbers never gate; only the 20-pod burst
+   gates. An INVALID or non-authoritative (Lima) artefact does not satisfy
+   this step.
+4. **Release only on 3/3 PASS and an upgrade-check PASS** (minor releases
+   also need the cited capacity artefact from step 3; its numbers are not a
+   condition). On a failure,
    find the root cause; do not retry until it passes. INVALID and PREEMPTED runs are not verdicts.
 5. **Tag `vX.Y.Z`** on the exact commit whose snapshot passed the gate; the
    release is rebuilt from the tag, not promoted from the snapshot. The

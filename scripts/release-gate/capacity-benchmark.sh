@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Capacity-envelope benchmark: one command that runs the release-gate harness in ramp mode and
-# writes a stamped artefact (benchmark.json + benchmark.md) under docs/benchmarks/<date>-<sha>/.
+# writes a stamped artefact (benchmark.json + benchmark.md) under docs/benchmarks/<date>-<sha8>-<provider>[-contended]/
+# (never overwrites an existing artefact).
 #
 # One install on a 1 vCPU / 1 GiB no-swap VM, WordPress + MariaDB resident, then Ready-bursts of
 # each --ramp size (20 is the release gate; larger sizes are documented, not gated). Records the
@@ -60,27 +61,58 @@ SIZES="$(rg_parse_ramp "$RAMP")" || { echo "--ramp must be strictly increasing p
 PAST="$(jq -c . "$ROOT/docs/benchmarks/past-envelope.json")" \
   || { echo "docs/benchmarks/past-envelope.json is missing or not JSON" >&2; exit 2; }
 
+BG_PID=""
+# burst-gate.sh deletes its VM from its own EXIT/TERM trap. Run it in the background so this
+# shell can react to signals mid-run, forward TERM and wait for that cleanup to finish.
+# SIGKILL cannot be trapped: a kill -9 of this script or of burst-gate.sh can leave the VM
+# behind, so list and delete leftovers by hand (limactl list / gcloud compute instances list).
+forward_to_gate() {
+  [ -z "$BG_PID" ] || { kill -TERM "$BG_PID" 2>/dev/null; wait "$BG_PID" 2>/dev/null; BG_PID=""; }
+}
+trap forward_to_gate EXIT
+trap 'forward_to_gate; exit 130' INT
+trap 'forward_to_gate; exit 143' TERM
+trap 'forward_to_gate; exit 129' HUP
+
 if [ -n "$FROM_RUN" ]; then
   RUN="$FROM_RUN/run-1"
   OUT_DIR_NOTE="$FROM_RUN"
 else
   STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
   OUT_DIR_NOTE="$ROOT/temp/release-gate/capacity-$STAMP"
+  mkdir -p "$OUT_DIR_NOTE"
+  if [ "$BACKEND" = gcp ]; then
+    meta_sha="$(git -C "$ROOT" rev-parse --verify "$RELEASE^{commit}" 2>/dev/null)" \
+      || { echo "tag $RELEASE is not in this checkout (git fetch --tags)" >&2; exit 1; }
+    meta_dirty=0; meta_version="$RELEASE"
+  else
+    meta_sha="$(git -C "$ROOT" rev-parse HEAD)"
+    meta_dirty=0; [ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] || meta_dirty=1
+    meta_version="$(git -C "$ROOT" describe --tags --always)"
+  fi
+  cap_write_run_meta "$OUT_DIR_NOTE" "$meta_sha" "$meta_dirty" "$(date -u +%Y-%m-%d)" "$meta_version"
   args=(--backend "$BACKEND" --runs 1 --ramp "$RAMP" --out "$OUT_DIR_NOTE")
   [ "$BACKEND" != gcp ] || args+=(--release "$RELEASE")
   [ -z "$MEMORY" ] || args+=(--memory "$MEMORY")
   brc=0
   if [ "$ALLOW_CONTENDED" = 1 ]; then
-    RG_ALLOW_CONTENDED=1 MAX_INVALID_RUNS=1 RG_RETRY_WAIT_SECS=0 "$HERE/burst-gate.sh" "${args[@]}" || brc=$?
+    RG_ALLOW_CONTENDED=1 MAX_INVALID_RUNS=1 RG_RETRY_WAIT_SECS=0 "$HERE/burst-gate.sh" "${args[@]}" &
   else
-    "$HERE/burst-gate.sh" "${args[@]}" || brc=$?
+    "$HERE/burst-gate.sh" "${args[@]}" &
   fi
+  BG_PID=$!
+  wait "$BG_PID" || brc=$?
+  BG_PID=""
   RUN="$OUT_DIR_NOTE/run-1"
-  # 0 = a size passed, 1 = none passed (still a measurement). 3 = INVALID, accepted only when
-  # contention was explicitly allowed. Anything else, or no recorded results, is not a benchmark.
+  # 0 = a size passed, 1 = none passed (still a measurement). 3 = INVALID: accepted only with
+  # --allow-contended and only when host contention alone caused it, never a harness error or
+  # a VM that did not come up. Anything else, or no recorded results, is not a benchmark.
   case "$brc" in
     0|1) ;;
-    3) [ "$ALLOW_CONTENDED" = 1 ] || { echo "benchmark run INVALID (host contention or infrastructure); no artefact written. Raw: $OUT_DIR_NOTE" >&2; exit 3; } ;;
+    3)
+      [ "$ALLOW_CONTENDED" = 1 ] || { echo "benchmark run INVALID (host contention or infrastructure); no artefact written. Raw: $OUT_DIR_NOTE" >&2; exit 3; }
+      cap_invalid_is_contention "$RUN" \
+        || { echo "benchmark run INVALID for a reason other than host contention (harness error or VM did not come up); no artefact written. Raw: $OUT_DIR_NOTE" >&2; exit 3; } ;;
     *) echo "burst-gate.sh exited $brc; no artefact written. Raw: $OUT_DIR_NOTE" >&2; exit "$brc" ;;
   esac
 fi
@@ -89,19 +121,17 @@ fi
 [ "$(rg_get "$RUN/out/results.env" install_ok)" = 1 ] \
   || { echo "install did not complete in $RUN: no benchmark" >&2; exit 1; }
 
+META="$OUT_DIR_NOTE/run-meta.env"
+[ -s "$META" ] || { echo "$META is missing: the run's SHA and date were not recorded, so it cannot be stamped" >&2; exit 1; }
+SHA="$(rg_get "$META" git_sha)"; DIRTY="$(rg_get "$META" git_dirty)"; DATE="$(rg_get "$META" date)"; VERSION="$(rg_get "$META" version)"
 if [ "$BACKEND" = gcp ]; then
-  SHA="$(git -C "$ROOT" rev-parse --verify "$RELEASE^{commit}" 2>/dev/null)" \
-    || { echo "tag $RELEASE is not in this checkout (git fetch --tags)" >&2; exit 1; }
-  VERSION="$RELEASE"; DIRTY=0
   DETAIL="$(grep -o 'machine=[^ ]*' "$OUT_DIR_NOTE/backend.txt" 2>/dev/null | head -1 | cut -d= -f2) $(grep -o 'disk=[^ ]*' "$OUT_DIR_NOTE/backend.txt" 2>/dev/null | head -1), authoritative"
 else
-  SHA="$(git -C "$ROOT" rev-parse HEAD)"
-  VERSION="$(git -C "$ROOT" describe --tags --always)"
-  DIRTY=0; [ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] || DIRTY=1
   DETAIL=""
 fi
-DATE="$(date -u +%Y-%m-%d)"
-DIR="$OUT_ROOT/$DATE-${SHA:0:8}"
+CONTENDED=""; [ ! -s "$RUN/contention.txt" ] || CONTENDED=1
+DIR="$OUT_ROOT/$(cap_dir_name "$DATE" "$SHA" "$BACKEND" "$CONTENDED")"
+[ ! -e "$DIR" ] || { echo "$DIR already exists; refusing to overwrite a stamped artefact (remove it deliberately to rebuild)" >&2; exit 1; }
 mkdir -p "$DIR"
 cap_build_json "$RUN" "$SIZES" "$VERSION" "$SHA" "$DIRTY" "$DATE" "$BACKEND" "$DETAIL" "${MEMORY:-1}" "$PAST" > "$DIR/benchmark.json" \
   || { echo "could not build benchmark.json" >&2; rm -rf "$DIR"; exit 1; }

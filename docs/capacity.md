@@ -13,17 +13,22 @@ Until a release cites one, treat every figure here as indicative.
 
 | Shape | Status | What to expect |
 |---|---|---|
-| 1 vCPU / 1 GiB, no swap, SSD-class disk | **Gated.** Every release must pass 3 of 3 runs of the 20-pod burst with WordPress and MariaDB resident ([release gate](dev-setup.md#release-gate-1-gib-burst-survival)). | Boots to Ready in about a minute with roughly 450 MiB of `MemAvailable` idle and about 320 MiB with a small app running ([install.md](install.md#running-on-a-1-gib-host)). Comfortable: a small app plus tens of pods that are already running. A burst of about 20 pods becoming Ready together is the gated ceiling. |
-| 1 vCPU / 1 GiB, with swap you provide | Not gated. | Larger bursts become survivable (an 80-pod burst timed out without swap and completed with 512 MiB zram, an indicative 2026-10 A/B). u7s never configures swap itself. |
+| 1 vCPU / 1 GiB, no swap, SSD-class disk | **Gated.** Every release must pass 3 of 3 runs of the 20-pod burst with WordPress and MariaDB resident ([release gate](dev-setup.md#release-gate-1-gib-burst-survival)). | Boots to Ready in about a minute with roughly 450 MiB of `MemAvailable` idle and about 320 MiB with a small app running ([install.md](install.md#running-on-a-1-gib-host)). A burst of about 20 pods becoming Ready together is the gated ceiling. |
+| 1 vCPU / 1 GiB, with swap you provide | Not gated. | **Not measured on a stamped run.** The only evidence is a historical 2026-10 A/B (an 80-pod burst timed out without swap and completed with 512 MiB zram) that predates #2115 and #2116, so it may no longer hold. u7s never configures swap itself. |
 | 2 GiB | Not gated, not yet measured. | Expected to carry larger bursts and steadier headroom; no figure is claimed until a stamped benchmark (`--memory 2`) records one. |
 | Under 1 GiB, or HDD-class disk | Out of scope. | HDD-class disks (GCP pd-standard) wedge a 1 GiB node under bursts. |
 
 ## What degrades
 
 Past the envelope the node degrades in the order the kernel decides, not the
-order you would pick: page cache is reclaimed first, so every process (kubelet,
-CRI-O, the apiserver) slows as it re-reads its own code from disk. Bursts take
-longer, probes time out, and the node can flap NotReady.
+order you would pick. The working explanation is that page cache is reclaimed
+first, so processes (kubelet, CRI-O, the apiserver) re-read their own code from
+disk and slow down. It comes from beads `mayor-i4bvb` (80-pod burst: page-cache
+refault thrash, lease and CRI timeouts, NotReady) and `mayor-hjwdo` (40-50 pod
+burst: 94% iowait, API unreachable). The per-cgroup file-versus-anon split that
+`mayor-pzhtd` asked for was not recorded in a committed artefact, so the
+mechanism is not measured on this page. Observed symptoms: longer bursts, probe
+timeouts, NotReady flapping.
 
 ## What is out of scope
 
@@ -46,7 +51,7 @@ scripts/release-gate/capacity-benchmark.sh --backend lima --allow-contended    #
 
 One install on a 1 vCPU / 1 GiB VM, WordPress and MariaDB resident, then
 Ready-bursts of 20, 30, 40, 50 and 60 pods (the ramp stops at the first size
-that fails the gate criteria). It writes `docs/benchmarks/<date>-<sha>/` with
+that fails the gate criteria). It writes `docs/benchmarks/<date>-<sha8>-<provider>[-contended]/` with
 `benchmark.json` and `benchmark.md`: version, git SHA, date, provider and VM
 shape, idle PSS/RSS per component, time-to-Ready per burst, MemAvailable
 headroom and the largest passing burst. Only the 20-pod burst gates a release;

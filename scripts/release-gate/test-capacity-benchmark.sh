@@ -90,5 +90,45 @@ assert "markdown: carries the SHA, date and provider label" \
 assert "markdown: lists the failed burst as NO" "$(yes_if grep -q '^| 30 | timeout | NO' "$TMP/b.md")"
 assert "markdown: includes the past-envelope notes" "$(yes_if grep -q 'past-envelope note' "$TMP/b.md")"
 
+echo "host idle 40% < 70%" > "$RUN/contention.txt"
+cap_build_json "$RUN" "20 30" v0.4.7 "$SHA" 0 2026-11-25 lima "" 1 "$PAST" > "$TMP/c.json"
+assert "contended: the provider label says contended so a noisy lima number is not read as a clean one" \
+  "$(yes_if jq -e '.provider_label | test("contended")' "$TMP/c.json")"
+assert "contended: a contended run still validates as stamped" "$(yes_if cap_validate_json "$TMP/c.json")"
+
+# --allow-contended must accept INVALID only for host contention.
+CRUN="$TMP/crun"; mkdir -p "$CRUN/out"
+echo install_ok=1 > "$CRUN/out/results.env"; echo "host idle 40% < 70%" > "$CRUN/contention.txt"
+assert "allow-contended: a contention-only INVALID is accepted" "$(yes_if cap_invalid_is_contention "$CRUN")"
+echo "harness_error=probe errored" >> "$CRUN/out/results.env"
+assert "allow-contended: a harness_error INVALID is refused, it is not a measurement" "$(no_if cap_invalid_is_contention "$CRUN")"
+echo install_ok=1 > "$CRUN/out/results.env"
+echo "INFRASTRUCTURE (run is INVALID): never created" > "$CRUN/verdict.txt"
+assert "allow-contended: an infrastructure INVALID is refused" "$(no_if cap_invalid_is_contention "$CRUN")"
+rm -f "$CRUN/verdict.txt"; : > "$CRUN/out/results.env"
+assert "allow-contended: a VM that produced no results is refused even when the host was contended" "$(no_if cap_invalid_is_contention "$CRUN")"
+echo install_ok=1 > "$CRUN/out/results.env"; rm -f "$CRUN/contention.txt"
+assert "allow-contended: INVALID with no recorded contention is refused" "$(no_if cap_invalid_is_contention "$CRUN")"
+
+# Artefact directory name: providers must not collide.
+assert "dir name: lima and gcp artefacts of the same SHA and date get different directories" \
+  "$([ "$(cap_dir_name 2026-11-25 "$SHA" lima "")" != "$(cap_dir_name 2026-11-25 "$SHA" gcp "")" ] && echo 1 || echo 0)"
+assert "dir name: contended differs from quiet for the same provider" \
+  "$([ "$(cap_dir_name 2026-11-25 "$SHA" lima 1)" = 2026-11-25-01234567-lima-contended ] && [ "$(cap_dir_name 2026-11-25 "$SHA" lima "")" = 2026-11-25-01234567-lima ] && echo 1 || echo 0)"
+
+# --from-run stamps with the run's own identity and refuses to overwrite.
+rm -f "$RUN/contention.txt"
+OLDSHA=fedcba9876543210fedcba9876543210fedcba98
+cap_write_run_meta "$TMP" "$OLDSHA" 1 2026-01-02 v0.1.0-old
+OUTROOT="$TMP/out-root"
+"$HERE/capacity-benchmark.sh" --from-run "$TMP" --ramp 20,30,40 --out-root "$OUTROOT" >/dev/null 2>&1
+assert "from-run: stamped with the run's recorded SHA and date, not HEAD and today" \
+  "$(yes_if jq -e --arg s "$OLDSHA" '.git_sha == $s and .date == "2026-01-02" and .git_dirty == true and .u7s_version == "v0.1.0-old"' "$OUTROOT/2026-01-02-fedcba98-lima/benchmark.json")"
+assert "from-run: refuses to overwrite an existing artefact" \
+  "$(no_if "$HERE/capacity-benchmark.sh" --from-run "$TMP" --ramp 20,30,40 --out-root "$OUTROOT")"
+rm -f "$TMP/run-meta.env"
+assert "from-run: a run without run-meta cannot be stamped" \
+  "$(no_if "$HERE/capacity-benchmark.sh" --from-run "$TMP" --ramp 20,30,40 --out-root "$TMP/o2")"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
