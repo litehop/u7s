@@ -41,7 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
 
-use crate::auth::{is_long_running_request, PeerAddr, UserInfo};
+use crate::auth::{is_long_running_request, is_proxy_request, PeerAddr, UserInfo};
 use crate::state::is_system_priority_username;
 use crate::status::Status;
 
@@ -80,11 +80,36 @@ const USER_MAP_PRUNE_AT: usize = 1024;
 /// genuinely stuck or overloaded backend.
 const MUTATING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Max time a non-long-running mutating request may take to deliver its body once
-/// admitted. Matches kube-apiserver's default 60s request timeout, which bounds every
-/// non-long-running request (and so releases its max-in-flight seat). Only the body read
-/// is bounded here, not the handler.
-const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Max time a request may take to deliver its body once admitted. Matches the 60s default
+/// of kube-apiserver's timeout filter (`filters/timeout.go`), which is what ends a stalled
+/// upstream body read. Only the body read is bounded here, not the handler. Applies to
+/// mutating requests and to proxy requests (whose handlers buffer the body); the
+/// exec/attach/portforward streams stay unbounded.
+pub(crate) const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Error a body yields when its read deadline passes; lets outer layers answer 504
+/// rather than the generic failure a handler would report.
+#[derive(Debug)]
+pub(crate) struct BodyReadTimedOut;
+
+impl std::fmt::Display for BodyReadTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request body read timed out")
+    }
+}
+
+impl std::error::Error for BodyReadTimedOut {}
+
+pub(crate) fn is_body_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if e.is::<BodyReadTimedOut>() {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
 
 /// Max number of mutating requests allowed to queue for a permit at once.
 ///
@@ -316,14 +341,7 @@ fn with_body_deadline(req: Request<Body>) -> Request<Body> {
                 match tokio::time::timeout_at(deadline, s.next()).await {
                     Ok(Some(item)) => Some((item.map_err(axum::BoxError::from), s)),
                     Ok(None) => None,
-                    Err(_) => Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "request body read timed out",
-                        )
-                        .into()),
-                        s,
-                    )),
+                    Err(_) => Some((Err(BodyReadTimedOut.into()), s)),
                 }
             });
         Body::from_stream(frames)
@@ -379,9 +397,17 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
 
-        if is_health_probe(req.uri().path())
-            || is_long_running_request(req.method(), req.uri().path(), req.uri().query())
-        {
+        if is_health_probe(req.uri().path()) {
+            return Box::pin(async move { inner.call(req).await });
+        }
+        if is_long_running_request(req.method(), req.uri().path(), req.uri().query()) {
+            // No seat, but a buffered proxy body must still arrive in time or one
+            // principal could hold body budget indefinitely.
+            let req = if is_proxy_request(req.uri().path()) {
+                with_body_deadline(req)
+            } else {
+                req
+            };
             return Box::pin(async move { inner.call(req).await });
         }
 
@@ -948,7 +974,7 @@ mod tests {
         }
 
         // Join late enough that its queue wait outlives the body deadline.
-        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT - Duration::from_secs(10)).await;
         assert_eq!(
             mutating.shared.available_permits(),
             0,
@@ -1318,9 +1344,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn proxied_upload_longer_than_the_body_deadline_is_not_cut() {
-        // Proxy is long-running upstream: a pods/proxy POST whose body takes minutes (an
-        // upload through the apiserver) must not be failed by the 60s body deadline.
+    async fn proxy_body_that_finishes_within_the_deadline_is_delivered() {
         let layer = InflightLayer::new();
         let (tx, body) = channel_body();
         let mut svc = layer.layer(ReadBodyService);
@@ -1333,15 +1357,41 @@ mod tests {
         let call = tokio::spawn(async move { svc.call(req).await.unwrap().status() });
 
         tx.send(b"part1".to_vec()).await.unwrap();
-        tokio::time::sleep(MUTATING_BODY_TIMEOUT * 2).await;
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT / 2).await;
         tx.send(b"part2".to_vec()).await.unwrap();
         drop(tx);
 
-        assert_eq!(
-            call.await.unwrap(),
-            StatusCode::OK,
-            "a proxy body taking longer than the deadline must still be delivered"
+        assert_eq!(call.await.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_body_stalling_past_the_deadline_is_cut_without_holding_a_seat() {
+        // Proxy handlers buffer the POST body, so a stalled one must be cut like any
+        // mutating body; the exec/attach/portforward streams after upgrade are not bodies
+        // and stay unbounded. Proxy is long-running, so it never takes a mutating seat.
+        let layer = InflightLayer::new();
+        let (tx, body) = channel_body();
+        let mut svc = layer.layer(ReadBodyService);
+        let mut req = request_as(
+            Method::POST,
+            "/api/v1/namespaces/a/pods/p/proxy/upload",
+            "tenant",
         );
+        *req.body_mut() = body;
+        let call = tokio::spawn(async move { svc.call(req).await.unwrap().status() });
+
+        tx.send(b"part1".to_vec()).await.unwrap();
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT + Duration::from_secs(1)).await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), call)
+                .await
+                .expect("proxy body read never ended")
+                .unwrap(),
+            StatusCode::REQUEST_TIMEOUT,
+            "a proxy body stalling past the deadline must fail its read"
+        );
+        drop(tx);
         assert_eq!(
             layer.mutating.all.available_permits(),
             MAX_MUTATING,

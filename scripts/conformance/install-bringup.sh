@@ -130,11 +130,11 @@ fi
 limactl shell "$VM_NAME" bash -c "$(authorized_keys_replace_cmd "$(cat "$SSH_KEY.pub")")"
 
 # ── rig-only add-ons ─────────────────────────────────────────────────────────
-banner "RIG-ONLY add-ons (NOT shipped by install.sh; labelled $INSTALL_RIG_ONLY_LABEL): $INSTALL_RIG_ONLY_ADDONS"
-for addon in ${INSTALL_RIG_ONLY_ADDONS//,/ }; do
+banner "RIG-ONLY add-ons (NOT shipped by install.sh; labelled $RIG_ONLY_LABEL): $RIG_ONLY_ADDONS"
+for addon in ${RIG_ONLY_ADDONS//,/ }; do
   manifest="$REPO/scripts/conformance/manifests/${addon}.yaml"
   kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f "$manifest"
-  kubectl --kubeconfig="$KUBECONFIG_PATH" label --overwrite -f "$manifest" "$INSTALL_RIG_ONLY_LABEL" >/dev/null
+  kubectl --kubeconfig="$KUBECONFIG_PATH" label --overwrite -f "$manifest" "$RIG_ONLY_LABEL" >/dev/null
 done
 kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system rollout status ds/kube-network-policies --timeout=180s
 

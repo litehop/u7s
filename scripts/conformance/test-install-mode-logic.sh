@@ -34,17 +34,66 @@ assert_eq() {
 }
 
 # 1. Stamping: both topologies, and a typo must not produce an unlabelled archive.
+# The full expected run-meta, literal: adding a rig-only step without deciding its token
+# here (and in _lib.sh) fails this test, so a result always says what extra it ran with.
+APPARMOR_TOKENS="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
+COMMON_TOKENS="$APPARMOR_TOKENS,crio-test-handler-runtime,e2e-ssh-key,sonobuoy-aggregator-limitrange,vm-nfs-common,vm-journald-limits,vm-logrotate-interval"
+ADDONS="metrics-server,external-snapshotter,kube-network-policies"
+U7S_RIG_BUILD_FEATURES="rig-test-knobs,pki-test-knobs"
 write_run_meta "$TMP/rig" host-rig
-assert_eq "host-rig archive is stamped topology=host-rig so it is never read as a sign-off run" \
-  "$(sed -n 1p "$TMP/rig/run-meta")" "topology=host-rig"
-assert_eq "host-rig archive records the rig-only setup -- DNS specs pass only with it, so an archive must say it was applied" \
-  "$(sed -n 2p "$TMP/rig/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write,vm-logrotate-journald-nfs-common,kubelet-unit-dropin-tz-nofile"
+assert_eq "host-rig run-meta lists every rig-only addition and deviation (add-ons, setup, konnectivity/host apiserver, kubelet overlay, build features)" \
+  "$(cat "$TMP/rig/run-meta")" "topology=host-rig
+rig_only_addons=$ADDONS
+rig_only_setup=$COMMON_TOKENS,kubelet-unit-dropin-tz-nofile
+rig_only_deviations=host-side-apiserver,konnectivity-server,konnectivity-agent
+rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG
+rig_only_build_features=rig-test-knobs,pki-test-knobs"
 write_run_meta "$TMP/inst" install
-assert_eq "install archive is stamped topology=install" "$(sed -n 1p "$TMP/inst/run-meta")" "topology=install"
-assert_eq "install archive lists the rig-only add-ons that are not shipped by install.sh" \
-  "$(sed -n 2p "$TMP/inst/run-meta")" "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"
-assert_eq "install archive records the same rig-only setup as the host rig" \
-  "$(sed -n 3p "$TMP/inst/run-meta")" "rig_only_setup=apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write,vm-logrotate-journald-nfs-common,kubelet-unit-dropin-tz-nofile"
+assert_eq "install run-meta lists every rig-only addition on top of what install.sh delivers" \
+  "$(cat "$TMP/inst/run-meta")" "topology=install
+rig_only_addons=$ADDONS
+rig_only_setup=$COMMON_TOKENS"
+
+# Each token must still correspond to code that applies it; a removed step must lose its token.
+token_anchor() { # <token> <file> <fixed string>
+  grep -qF -- "$3" "$REPO/$2" && ok "token $1 is backed by code in $2" || bad "token $1 has no applying code ($3 not in $2): drop the token or restore the step"
+}
+token_anchor crio-test-handler-runtime lima/kubelet.yaml '20-test-handler.conf'
+token_anchor e2e-ssh-key scripts/conformance/lima-start.sh 'ssh-keygen'
+token_anchor e2e-ssh-key scripts/conformance/install-bringup.sh 'ssh-keygen'
+token_anchor sonobuoy-aggregator-limitrange scripts/conformance/06-run-sonobuoy.sh 'LimitRange'
+token_anchor vm-nfs-common scripts/conformance/_lib.sh 'install -y nfs-common'
+token_anchor vm-journald-limits scripts/conformance/_lib.sh 'journald.conf.d/conformance.conf'
+token_anchor vm-logrotate-interval scripts/conformance/_lib.sh 'logrotate.timer.d'
+token_anchor kubelet-unit-dropin-tz-nofile scripts/conformance/lima-start.sh 'rig_kubelet_unit_script'
+token_anchor host-side-apiserver scripts/conformance/02-start-apiserver.sh 'bash "$REPO/scripts/u7s-start.sh" --background'
+token_anchor konnectivity-agent scripts/conformance/lima-start.sh 'name: konnectivity-agent${NODE_SUFFIX}'
+token_anchor konnectivity-server scripts/u7s-start.sh '--mode=http-connect'
+token_anchor rig-build-features scripts/conformance/01-build.sh 'rig-test-knobs'
+
+# Both profiling and PKI knobs alter the binary under test; recording only one hides the other.
+assert_eq "default rig build is rig-test-knobs only" "$(rig_build_features 0 0 0)" "rig-test-knobs"
+assert_eq "dhat build is recorded" "$(rig_build_features 0 1 0)" "rig-test-knobs,dhat"
+assert_eq "pki build is recorded" "$(rig_build_features 0 0 1)" "rig-test-knobs,pki-test-knobs"
+assert_eq "dhat and pki together are both recorded, neither overrides the other" "$(rig_build_features 0 1 1)" "rig-test-knobs,dhat,pki-test-knobs"
+assert_eq "a prebuilt binary's features are unknowable, never claimed as rig-test-knobs" "$(rig_build_features 1 0 0)" "prebuilt-binary"
+grep -qF 'rig_build_features "$_PREBUILT" "$PROFILE" "$_PKI"' "$REPO/scripts/conformance/run-all.sh" \
+  && ok "run-all.sh derives U7S_RIG_BUILD_FEATURES through rig_build_features" \
+  || bad "run-all.sh does not use rig_build_features: run-meta would not match the build"
+
+# Add-ons are derived from the manifests dir: a new rig-only manifest without an add-on
+# entry (and so without the label) fails here.
+for m in "$REPO"/scripts/conformance/manifests/*.yaml; do
+  name="$(basename "$m" .yaml)"
+  case ",$RIG_ONLY_ADDONS," in
+    *",$name,"*) ok "manifest $name is a recorded rig-only add-on" ;;
+    *) bad "scripts/conformance/manifests/$name.yaml is not in RIG_ONLY_ADDONS: it would run unrecorded and unlabelled" ;;
+  esac
+done
+assert_eq "RIG_ONLY_ADDONS is exactly the add-ons in the expected run-meta" "$RIG_ONLY_ADDONS" "$ADDONS"
+grep -qF 'label --overwrite -f "$REPO/scripts/conformance/manifests/${addon}.yaml" "$RIG_ONLY_LABEL"' "$REPO/scripts/conformance/run-all.sh" \
+  && ok "host rig labels every recorded add-on with the rig-only label, as install mode does" \
+  || bad "run-all.sh does not label the host-rig add-ons"
 for f in lima-start.sh install-bringup.sh; do
   grep -q "rig_apply_apparmor_rig_setup" "$REPO/scripts/conformance/$f" \
     && ok "$f applies both AppArmor layers via the shared step -- without them dig/nslookup in pods abort (rc 139) and 7 DNS/Service specs fail in that mode" \

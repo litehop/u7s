@@ -138,6 +138,8 @@ struct PodSpec {
     /// gates away when the pod is ready. Only presence matters here; gate
     /// names are opaque to the scheduler.
     scheduling_gates: Option<Vec<Value>>,
+    /// Which scheduler owns the pod; absent or empty means the apiserver default.
+    scheduler_name: Option<String>,
     /// The pod's tolerations, gating which tainted nodes it may be bound to.
     tolerations: Option<Vec<Toleration>>,
     affinity: Option<Affinity>,
@@ -640,7 +642,7 @@ pub fn needs_scheduling(event: &Value) -> Option<PendingPod> {
 fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
     let object: PodObject = PodObject::deserialize(pod).unwrap_or_default();
     let pod_name = object.metadata.name.as_deref().unwrap_or("");
-    if pod_name.is_empty() {
+    if pod_name.is_empty() || !responsible_for_pod(&object.spec) {
         return None;
     }
     let already_scheduled = object
@@ -759,6 +761,17 @@ fn pvc_key(namespace: &str, pvc_name: &str) -> String {
 
 /// The `PodScheduled` condition type name — matches `v1.PodScheduled`.
 const POD_SCHEDULED: &str = "PodScheduled";
+
+const DEFAULT_SCHEDULER_NAME: &str = "default-scheduler";
+
+/// Upstream's `responsibleForPod`: only pods naming this scheduler's profile
+/// enter the queue. An empty name is the apiserver default.
+fn responsible_for_pod(spec: &PodSpec) -> bool {
+    match spec.scheduler_name.as_deref() {
+        None | Some("") => true,
+        Some(name) => name == DEFAULT_SCHEDULER_NAME,
+    }
+}
 /// The reason upstream's real scheduler stamps on a gated pod — matches
 /// `v1.PodReasonSchedulingGated`. `WaitForPodsSchedulingGated`
 /// (k8s.io/kubernetes/test/e2e/framework/pod/wait.go) polls for exactly this
@@ -805,7 +818,7 @@ pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
         return None;
     }
     let pod_name = watch_event.object.metadata.name.clone().unwrap_or_default();
-    if pod_name.is_empty() {
+    if pod_name.is_empty() || !responsible_for_pod(&watch_event.object.spec) {
         return None;
     }
     let already_scheduled = watch_event
@@ -880,6 +893,9 @@ pub fn scheduling_gate_status_patch(event: &Value) -> Option<GatedStatusPatch> {
 pub fn scheduling_gate_status_reset(event: &Value) -> Option<Value> {
     let watch_event: WatchEvent<PodObject> = WatchEvent::<PodObject>::deserialize(event).ok()?;
     if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
+        return None;
+    }
+    if !responsible_for_pod(&watch_event.object.spec) {
         return None;
     }
     let already_scheduled = watch_event
@@ -6638,6 +6654,46 @@ mod tests {
         let pending = result.unwrap();
         assert_eq!(pending.namespace, "staging");
         assert_eq!(pending.pod_name, "pending-pod");
+    }
+
+    fn pod_event_with_scheduler(name: &str, scheduler: Option<&str>) -> Value {
+        let mut spec = json!({});
+        if let Some(s) = scheduler {
+            spec["schedulerName"] = json!(s);
+        }
+        json!({
+            "type": "ADDED",
+            "object": { "metadata": { "name": name, "namespace": "default" }, "spec": spec }
+        })
+    }
+
+    #[test]
+    fn pod_naming_another_scheduler_is_never_scheduled_so_custom_scheduler_workloads_are_not_hijacked(
+    ) {
+        let event = pod_event_with_scheduler("p", Some("other"));
+        assert!(needs_scheduling(&event).is_none());
+        assert!(
+            pods_needing_resync(std::slice::from_ref(&event["object"]), &Default::default())
+                .is_empty()
+        );
+        assert_eq!(unscheduled_pod_uids([&event["object"]]).len(), 0);
+    }
+
+    #[test]
+    fn gated_pod_of_another_scheduler_gets_no_status_patch() {
+        let mut event = pod_event_with_scheduler("p", Some("other"));
+        event["object"]["spec"]["schedulingGates"] = json!([{"name": "g"}]);
+        assert!(scheduling_gate_status_patch(&event).is_none());
+        event["object"]["spec"]["schedulerName"] = json!("default-scheduler");
+        assert!(scheduling_gate_status_patch(&event).is_some());
+    }
+
+    #[test]
+    fn pods_with_default_or_empty_scheduler_name_are_scheduled_so_ordinary_workloads_still_bind() {
+        for s in [None, Some(""), Some("default-scheduler")] {
+            let event = pod_event_with_scheduler("p", s);
+            assert!(needs_scheduling(&event).is_some(), "schedulerName {s:?}");
+        }
     }
 
     // schedulingGates tests: a ReplicaSet's pods can carry

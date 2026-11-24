@@ -741,16 +741,25 @@ lima_sync_provision() {
 
 # Add-ons applied after install.sh purely so specs that need them can run; u7s does not
 # ship them. Comma-separated, in the order install-bringup.sh applies them.
-INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
+RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
 # shellcheck disable=SC2034 # used by install-bringup.sh
-INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
+RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 
 # Rig-only AppArmor rule u7s does not ship: a container process stacked under a host
 # dig/nslookup profile is labelled "dig//&u7s-default", which u7s-default's own
 # peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
 # Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
 # the matching host dig/nslookup overrides below; either layer alone still denies.
-RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write,vm-logrotate-journald-nfs-common,kubelet-unit-dropin-tz-nofile"
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
+# Every other rig-only step, one token each. Both topologies: the CRI-O test-handler
+# runtime (lima/kubelet.yaml), the [Disruptive] ssh key, the sonobuoy aggregator LimitRange,
+# and the VM packages and log limits of rig_apply_vm_rig_setup.
+RIG_ONLY_SETUP="$RIG_ONLY_SETUP,crio-test-handler-runtime,e2e-ssh-key,sonobuoy-aggregator-limitrange,vm-nfs-common,vm-journald-limits,vm-logrotate-interval"
+# Host rig only (lima-start.sh): the kubelet unit drop-in.
+RIG_ONLY_HOST_SETUP="kubelet-unit-dropin-tz-nofile"
+# Host-rig topology differences from install.sh: where the control plane runs and how it
+# reaches the node.
+RIG_ONLY_HOST_DEVIATIONS="host-side-apiserver,konnectivity-server,konnectivity-agent"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 
@@ -929,6 +938,16 @@ EOF
   limactl shell "$vm" sudo apt-get -o DPkg::Lock::Timeout=300 install -y nfs-common
 }
 
+# Cargo features of the host-rig apiserver binary. Args: <prebuilt 0|1> <profile 0|1>
+# <pki-knobs 0|1>. Every enabled feature is listed; a prebuilt binary's features are unknown.
+rig_build_features() {
+  if [ "$1" = 1 ]; then echo "prebuilt-binary"; return; fi
+  local f="rig-test-knobs"
+  [ "$2" != 1 ] || f="$f,dhat"
+  [ "$3" != 1 ] || f="$f,pki-test-knobs"
+  echo "$f"
+}
+
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only
 # VM. "install": the real scripts/install.sh on the VM (the release sign-off path).
 # A host-rig PASS is not a delivered-behaviour PASS, so every archive says which it is.
@@ -943,9 +962,15 @@ write_run_meta() {
   mkdir -p "$run_dir"
   {
     echo "topology=$topology"
-    if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
-    echo "rig_only_setup=$RIG_ONLY_SETUP"
-    if [ "$topology" = "host-rig" ]; then echo "rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG"; fi
+    echo "rig_only_addons=$RIG_ONLY_ADDONS"
+    if [ "$topology" = "host-rig" ]; then
+      echo "rig_only_setup=$RIG_ONLY_SETUP,$RIG_ONLY_HOST_SETUP"
+      echo "rig_only_deviations=$RIG_ONLY_HOST_DEVIATIONS"
+      echo "rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG"
+      echo "rig_only_build_features=${U7S_RIG_BUILD_FEATURES:-unknown}"
+    else
+      echo "rig_only_setup=$RIG_ONLY_SETUP"
+    fi
   } > "$run_dir/run-meta"
 }
 

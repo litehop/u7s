@@ -120,6 +120,26 @@ fn body_conflicts(method: &Method, content_type: &str, body: &[u8], ns: &str) ->
     }
 }
 
+/// Only an exceeded size limit is a 413; a body that timed out is a 504 Timeout, and any
+/// other read failure (client reset) a 400, so clients are not told to shrink a body that
+/// was merely slow.
+fn read_error_response(err: &axum::Error) -> Response {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if e.is::<http_body_util::LengthLimitError>() {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        cur = e.source();
+    }
+    if crate::inflight::is_body_timeout(err) {
+        return Status::gateway_timeout(
+            "Timeout: request did not complete within the allotted timeout".into(),
+        )
+        .into_response();
+    }
+    Status::bad_request(format!("unable to read the request body: {err}")).into_response()
+}
+
 pub(crate) async fn guard(req: Request, next: Next) -> Response {
     if !matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH) {
         return next.run(req).await;
@@ -130,7 +150,7 @@ pub(crate) async fn guard(req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, crate::MAX_BODY_BYTES).await {
         Ok(b) => b,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(e) => return read_error_response(&e),
     };
     let content_type = crate::util::content_type(&parts.headers).to_owned();
     if body_conflicts(&parts.method, &content_type, &bytes, &ns) {
@@ -196,6 +216,36 @@ mod tests {
         assert!(c(json!({"metadata":null})));
         assert!(!c(json!({"metadata":{"namespace":"a","labels":{"x":"y"}}})));
         assert!(!c(json!({"data":{"namespace":"b"}})));
+    }
+
+    #[tokio::test]
+    async fn only_an_exceeded_limit_is_413_and_a_stalled_body_is_504() {
+        let over = axum::body::to_bytes(Body::from(vec![0u8; 8]), 4)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            read_error_response(&over).status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let stalled = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(crate::inflight::BodyReadTimedOut)
+        }));
+        let timeout = axum::body::to_bytes(stalled, 1024).await.unwrap_err();
+        assert_eq!(
+            read_error_response(&timeout).status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "a slow body must not tell the client its body was too large"
+        );
+
+        let reset = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, _>(std::io::Error::other("reset"))
+        }));
+        let reset = axum::body::to_bytes(reset, 1024).await.unwrap_err();
+        assert_eq!(
+            read_error_response(&reset).status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     mod routed {

@@ -185,8 +185,8 @@ struct Snapshot {
     public_pem: Vec<u8>,
 }
 
-fn build_snapshot(keys: &[KeyEntry], now: i64) -> anyhow::Result<Snapshot> {
-    let signer_entry = &keys[signer_index(keys, now)];
+fn build_snapshot(keys: &[KeyEntry], signer: usize) -> anyhow::Result<Snapshot> {
+    let signer_entry = &keys[signer];
     let mut verify = HashMap::new();
     let mut jwks = Vec::new();
     let mut public_pem = Vec::new();
@@ -263,7 +263,7 @@ impl SaKeyring {
         } else {
             (vec![generate_entry(now)?], true)
         };
-        let snapshot = Swap::new(Arc::new(build_snapshot(&keys, now)?));
+        let snapshot = Swap::new(Arc::new(build_snapshot(&keys, signer_index(&keys, now))?));
         let ring = Self(Arc::new(Inner {
             key_path: key_path.to_owned(),
             pub_path: pub_path.to_owned(),
@@ -275,6 +275,10 @@ impl SaKeyring {
         if fresh {
             tracing::info!("generated SA signing key → {key_path}");
             ring.persist(&ring.0.keys.lock().unwrap_or_else(|e| e.into_inner()))?;
+        } else {
+            // A crash between persist's two writes, or a deleted sa.pub, would otherwise leave
+            // the published bundle stale until the next rotation.
+            crate::tls::replace_file(pub_path, &ring.0.snapshot.get().public_pem, false)?;
         }
         ring.tick()?;
         Ok(ring)
@@ -285,7 +289,10 @@ impl SaKeyring {
             keys: keys.to_vec(),
         })?;
         crate::tls::replace_file(&self.0.key_path, &json, true)?;
-        let snap = build_snapshot(keys, self.0.clock.now().unix_timestamp())?;
+        let snap = build_snapshot(
+            keys,
+            signer_index(keys, self.0.clock.now().unix_timestamp()),
+        )?;
         crate::tls::replace_file(&self.0.pub_path, &snap.public_pem, false)
     }
 
@@ -305,7 +312,10 @@ impl SaKeyring {
             );
             *keys = next;
         }
-        let snap = build_snapshot(&keys, now)?;
+        // A wall clock stepped backward must not hand signing back to a key already superseded.
+        let current = self.0.snapshot.get().signer_kid.clone();
+        let floor = keys.iter().position(|k| k.kid == current).unwrap_or(0);
+        let snap = build_snapshot(&keys, signer_index(&keys, now).max(floor))?;
         if snap.signer_kid != self.0.snapshot.get().signer_kid {
             tracing::info!("SA tokens now signed with kid {}", snap.signer_kid);
         }
