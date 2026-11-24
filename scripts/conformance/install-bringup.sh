@@ -58,6 +58,7 @@ if [ -d "$VM_DIR" ]; then
   assert_kubelet_port_matches_vm "$VM_NAME" "$KUBELET_PORT" || exit 1
   if [ "$(limactl list --format '{{.Name}} {{.Status}}' | awk -v n="$VM_NAME" '$1 == n {print $2}')" != "Running" ]; then
     check_port_free "$KUBELET_PORT" "kubelet"
+    lima_sync_provision "$VM_NAME" "$REPO/lima/kubelet.yaml"
     limactl start "$VM_NAME"
   fi
 else
@@ -67,7 +68,9 @@ else
     limactl clone lima-golden "$VM_NAME" \
       --set ".networks[0].lima = \"${NETWORK}\"" \
       --set ".portForwards[0].hostPort = ${KUBELET_PORT}" \
-      --start --tty=false
+      --tty=false
+    lima_sync_provision "$VM_NAME" "$REPO/lima/kubelet.yaml"
+    limactl start --tty=false "$VM_NAME"
   else
     sed -e "s/hostPort: 10250/hostPort: ${KUBELET_PORT}/" \
         -e "s/lima: user-v2/lima: ${NETWORK}/" \
@@ -75,6 +78,8 @@ else
     limactl start --tty=false --timeout 30m --name="$VM_NAME" "$WORKDIR/kubelet-patched.yaml"
   fi
 fi
+
+assert_vm_package_pins "$VM_NAME" "$REPO/lima/kubelet.yaml" "$REPO/scripts/lib/release-fetch.sh" || exit 1
 
 if [ -n "$RUST_LOG_FILTER" ]; then
   banner "VM: u7s-apiserver RUST_LOG drop-in (harness-written, not install.sh)"

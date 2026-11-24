@@ -4,8 +4,8 @@
 # The provision script re-runs on every boot, including every golden clone.
 # kubelet is apt-mark held, so an unpinned `apt-get install -y kubelet` aborts
 # the whole script (set -e, "Held packages were changed") as soon as
-# pkgs.k8s.io publishes a newer patch -- skipping `mkdir -p /tmp/kubelet-pods`
-# and failing every run-all.sh --reset. An unpinned cri-o doesn't abort, but silently upgrades the runtime on
+# pkgs.k8s.io publishes a newer patch -- skipping every later step and failing
+# every run-all.sh --reset. An unpinned cri-o doesn't abort, but silently upgrades the runtime on
 # clones so they no longer match the golden they were cloned from.
 #
 # Exits 0 on success, 1 on any assertion failure.

@@ -121,8 +121,10 @@ provision:
       echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v1.37/deb/ /' \
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
-      # Pinned: this script re-runs on every boot (incl. golden clones), so an
-      # unpinned install silently upgrades cri-o whenever upstream publishes.
+      # Pinned: this script re-runs on every boot, so an unpinned install silently
+      # upgrades cri-o whenever upstream publishes. A golden clone runs the golden's
+      # frozen copy of this script, not this file; lima-start.sh syncs the clone's
+      # provision to this file before starting it and asserts the pins afterwards.
       CRIO_VERSION="1.37.3-1.1"
       apt-get install -y "cri-o=${CRIO_VERSION}" crun conmon
       # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun.
@@ -142,20 +144,9 @@ provision:
       # installed on this image; see the crun path caution above).
       printf '[crio.runtime.runtimes.test-handler]\nruntime_path = "/usr/libexec/crio/runc"\nruntime_type = "oci"\nruntime_root = "/run/runc"\nmonitor_path = "/usr/libexec/crio/conmon"\n' > /etc/crio/crio.conf.d/20-test-handler.conf
 
-      # Enable the CNI 1.0.0 conflist bridge config.
-      # The cri-o package ships two CNI configs:
-      #   10-crio-bridge.conf         — old 0.4.0 single-plugin format (fails with crun 1.26+)
-      #   10-crio-bridge.conflist     — new 1.0.0 conflist format (correct)
-      # Disable the old one and enable the new one.
-      CNI_DIR=/etc/cni/net.d
-      if [ -f "$CNI_DIR/10-crio-bridge.conf" ]; then
-        mv "$CNI_DIR/10-crio-bridge.conf" "$CNI_DIR/10-crio-bridge.conf.disabled" || true
-      fi
-      if [ -f "$CNI_DIR/10-crio-bridge.conflist.disabled" ]; then
-        mv "$CNI_DIR/10-crio-bridge.conflist.disabled" "$CNI_DIR/10-crio-bridge.conflist" || true
-      fi
-      # If conflist already exists and is correct, nothing to do.
-
+      # CNI config is not touched here: this script runs at every boot, and re-enabling
+      # the cri-o bridge conflist would put it ahead of flannel's (and of install.sh's
+      # own disabling of it). lima-start.sh and install.sh each manage /etc/cni/net.d.
       systemctl enable --now crio
 
       # Disable containerd — u7s uses cri-o exclusively; containerd on the same host
@@ -169,10 +160,10 @@ provision:
       echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /' \
         > /etc/apt/sources.list.d/kubernetes.list
       apt-get update -qq
-      # Pinned: this script re-runs on every boot (incl. golden clones), and an
-      # unpinned install against the held package aborts it (set -e) as soon as
-      # upstream publishes a newer patch. Keep in sync with the KUBELET_VERSION
-      # fallback in scripts/conformance/lima-start.sh.
+      # Pinned: this script re-runs on every boot, and an unpinned install against
+      # the held package aborts it (set -e) as soon as upstream publishes a newer
+      # patch. Keep in sync with the KUBELET_VERSION fallback in
+      # scripts/conformance/lima-start.sh.
       KUBELET_PKG_VERSION="1.37.1-1.1"
       apt-get install -y "kubelet=${KUBELET_PKG_VERSION}"
       apt-mark hold kubelet
@@ -259,37 +250,10 @@ provision:
         | tar -xz -C /usr/local/bin sonobuoy
       chmod +x /usr/local/bin/sonobuoy
 
-      # Disable kubelet until the kubeconfig is provisioned by scripts/lima-start.sh
-      systemctl disable kubelet
-
-      # Create static pod dir
-      mkdir -p /tmp/kubelet-pods
-
-      # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
-      mkdir -p /etc/systemd/system/kubelet.service.d
-      # serializeImagePulls/maxParallelImagePulls: HTTP/2 removed the pod-admission pacing that used to hide
-      # the upstream-default single-worker image-pull queue's cost under 16-way conformance load.
-      # NOTE: maxParallelImagePulls has no CLI flag equivalent — it must be set here, not via kubelet ExecStart.
-      #
-      # registryPullQPS: a csi-hostpath --focus run deploys ~15-16 concurrent CSI driver
-      # StatefulSets, each with ~8 sidecar containers (csi-attacher/provisioner/resizer/
-      # snapshotter/node-driver-registrar/liveness-probe/health-monitor), landing 100+ image
-      # pull requests within the same few seconds. That burst blew past the upstream default
-      # (registryPullQPS=5, registryBurst=10) — a SEPARATE token-bucket gate from
-      # maxParallelImagePulls above: the parallelism semaphore bounds concurrent in-flight
-      # pulls, while the QPS limiter independently throttles the *rate* of pull attempts
-      # regardless of concurrency — producing 274 "ErrImagePull: pull QPS exceeded" events and
-      # 0/324 specs ever starting Setup. `0` is kubelet's own documented off-switch
-      # ("If 0, unlimited", per `kubelet --help`'s --registry-qps doc), not a magic number;
-      # maxParallelImagePulls: 10 above remains the real concurrency bound.
-      #
-      # kubeadm-style resolvConf: with systemd-resolved, /etc/resolv.conf is the
-      # 127.0.0.53 stub; "" would hand CoreDNS nameserver 127.0.0.1 (self-forward loop).
-      RESOLV_CONF=/etc/resolv.conf
-      systemctl is-active --quiet systemd-resolved && RESOLV_CONF=/run/systemd/resolve/resolv.conf
-      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: '"$RESOLV_CONF"'\nstaticPodPath: /tmp/kubelet-pods\nclusterDNS:\n  - 10.96.0.10\nclusterDomain: cluster.local\nserializeImagePulls: false\nmaxParallelImagePulls: 10\nregistryPullQPS: 0\nfeatureGates:\n  AtomicWriteVolumeUserFields: true\n' > /etc/kubelet-config.yaml
-      printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' > /etc/systemd/system/kubelet.service.d/u7s.conf
-      systemctl daemon-reload
+      # The rig starts kubelet itself once lima-start.sh has written its config, drop-in
+      # and kubeconfig; none of that is written here. /var/lib/u7s exists only after
+      # install.sh ran, whose enabled kubelet.service this boot-time script must not undo.
+      [ -d /var/lib/u7s ] || systemctl disable kubelet
 
 probes:
   - description: cri-o is running

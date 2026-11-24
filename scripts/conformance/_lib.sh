@@ -581,6 +581,111 @@ rig_stage_manifests() {
   fi
 }
 
+# Prints the text of top-level function <name> from <script> (opening line to the closing
+# "}" at column 0); empty when absent.
+install_sh_function() {
+  awk -v f="$1" '$0 == f "() {" {p=1} p {print} p && /^}$/ {exit}' "$2"
+}
+
+# Node prep the rig shares with install.sh: CRI-O's memory drop-in, br_netfilter and the
+# persisted sysctls (ip_forward, IPv6 forwarding when dual-stack). The block is cut out of
+# install.sh between these two lines and replayed in the VM, so the rig cannot drift from it.
+RIG_NODE_PREP_FIRST="cat > /etc/crio/crio.conf.d/10-memory.conf <<'CRIO_MEM_EOF'"
+RIG_NODE_PREP_LAST='sysctl --system >/dev/null'
+
+# Prints a bash script that applies install.sh's node-prep block and restarts CRI-O when
+# its memory drop-in changed. Args: <1 if dual-stack> <install.sh path>. Fails if the block
+# markers are gone from install.sh.
+rig_node_prep_script() {
+  local dual="$1" install_sh="$2" block v6=""
+  block="$(awk -v b="$RIG_NODE_PREP_FIRST" -v e="$RIG_NODE_PREP_LAST" '$0 == b {p=1} p {print} p && $0 == e {exit}' "$install_sh")"
+  if [ "$(printf '%s\n' "$block" | sed -n '1p;$p')" != "$(printf '%s\n%s' "$RIG_NODE_PREP_FIRST" "$RIG_NODE_PREP_LAST")" ]; then
+    echo "error: install.sh's node-prep block ('$RIG_NODE_PREP_FIRST' .. '$RIG_NODE_PREP_LAST') not found; update RIG_NODE_PREP_FIRST/LAST" >&2
+    return 1
+  fi
+  [ "$dual" -eq 1 ] && v6="$RIG_POD_CIDR_V6"
+  printf 'set -euo pipefail\nSERVICE_CIDR_IPV6=%q\nPOD_CLUSTER_CIDR_IPV6=%q\nmkdir -p /etc/crio/crio.conf.d\nbefore="$(cat /etc/crio/crio.conf.d/10-memory.conf 2>/dev/null || true)"\n%s\n[ "$before" = "$(cat /etc/crio/crio.conf.d/10-memory.conf)" ] || systemctl restart crio\n' \
+    "$v6" "$v6" "$block"
+}
+
+# Where the rig keeps the kubelet's config and CA bundle (install.sh keeps them in
+# /var/lib/u7s; the rig uses its own directory so an install on the same VM never sees them).
+RIG_KUBELET_STATE_DIR=/etc/u7s-rig
+# shellcheck disable=SC2034 # used by lima-start.sh
+RIG_KUBELET_CONFIG="$RIG_KUBELET_STATE_DIR/kubelet-config.yaml"
+
+# Kubelet settings the rig adds on top of install.sh's KubeletConfiguration, recorded in
+# run-meta. Image-pull tuning: HTTP/2 removed the pod-admission pacing that hid the
+# single-worker pull queue under 16-way load, and a csi-hostpath focus lands 100+ pulls
+# within seconds, which the default registryPullQPS=5 rejects ("pull QPS exceeded", 0 specs
+# started); 0 is kubelet's documented "unlimited". AtomicWriteVolumeUserFields is
+# default-off alpha; without it projected defaultUser/user are ignored.
+RIG_KUBELET_OVERLAY='serializeImagePulls: false
+maxParallelImagePulls: 10
+registryPullQPS: 0'
+RIG_KUBELET_GATE=AtomicWriteVolumeUserFields
+RIG_ONLY_KUBELET_CONFIG="serializeImagePulls=false,maxParallelImagePulls=10,registryPullQPS=0,featureGates.${RIG_KUBELET_GATE}=true"
+
+# Prints a bash script that renders the kubelet config with install.sh's own
+# write_kubelet_config_yaml (control-plane form: clientCAFile is the CA bundle) into
+# RIG_KUBELET_CONFIG and appends RIG_KUBELET_OVERLAY. Args: <first clusterDNS VIP>
+# <install.sh path>. The gate is merged separately (set-kubelet-featuregate.sh).
+rig_kubelet_config_script() {
+  local fn
+  fn="$(install_sh_function write_kubelet_config_yaml "$2")"
+  [ -n "$fn" ] || { echo "error: write_kubelet_config_yaml not found in $2" >&2; return 1; }
+  printf 'set -euo pipefail\nSTATE_DIR=%s\nCLUSTER_DNS=%s\ninstall -d -m 0755 /etc/u7s/static-pods\ninstall -d -m 0700 "$STATE_DIR"\n%s\nwrite_kubelet_config_yaml 0\ncat >> "$STATE_DIR/kubelet-config.yaml" <<'"'"'RIG_KUBELET_EOF'"'"'\n%s\nRIG_KUBELET_EOF\n' \
+    "$RIG_KUBELET_STATE_DIR" "$1" "$fn" "$RIG_KUBELET_OVERLAY"
+}
+
+# Package pins the rig VMs must run: cri-o and kubelet as pinned in lima/kubelet.yaml's
+# provision script, and CNI plugins at the version install tarballs ship
+# (scripts/lib/release-fetch.sh). A clone's frozen provision script, or a held package,
+# can leave a VM on other versions silently.
+# lima_yaml_pin <yaml> <VAR>: the value of VAR="..." in the yaml's provision script.
+lima_yaml_pin() {
+  sed -n "s/^ *$2=\"\\([^\"]*\\)\".*/\\1/p" "$1" | sed -n 1p
+}
+
+# Fails loud, naming each mismatch, when <vm>'s cri-o, kubelet or kubernetes-cni (CNI
+# plugins) differ from the pins. Args: <vm> <lima yaml> <release-fetch.sh>.
+assert_vm_package_pins() {
+  local vm="$1" yaml="$2" fetch="$3" crio_pin kubelet_pin cni_pin have bad=0 pair pkg pin
+  crio_pin="$(lima_yaml_pin "$yaml" CRIO_VERSION)"
+  kubelet_pin="$(lima_yaml_pin "$yaml" KUBELET_PKG_VERSION)"
+  cni_pin="$(sed -n 's/^CNI_PLUGINS_VERSION="\([^"]*\)"$/\1/p' "$fetch")"
+  if [ -z "$crio_pin" ] || [ -z "$kubelet_pin" ] || [ -z "$cni_pin" ]; then
+    echo "error: could not read CRIO_VERSION/KUBELET_PKG_VERSION from $yaml or CNI_PLUGINS_VERSION from $fetch" >&2
+    return 1
+  fi
+  for pair in "cri-o=$crio_pin" "kubelet=$kubelet_pin" "kubernetes-cni=$cni_pin"; do
+    pkg="${pair%%=*}"
+    pin="${pair#*=}"
+    have="$(limactl shell "$vm" dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+    # The CNI pin is the upstream plugin version; the apt package adds a revision suffix.
+    case "$pkg:$have" in
+      kubernetes-cni:"$pin"-*) ;;
+      "$pkg:$pin") ;;
+      *) echo "error: $vm runs $pkg '${have:-not installed}' but the rig pins '$pin'; the provision script that applies pins runs at boot (limactl stop $vm, then re-run), or re-bake lima-golden (scripts/conformance/lima-golden-bake.sh --force)" >&2
+         bad=1 ;;
+    esac
+  done
+  return "$bad"
+}
+
+# A VM cloned from lima-golden carries the golden's lima.yaml, so it re-runs the golden's
+# frozen provision script at every boot, not the current lima/kubelet.yaml's: pin bumps and
+# removed steps never reach it. Replaces <vm>'s provision with <yaml>'s when they differ;
+# only valid while the VM is stopped. Args: <vm> <lima yaml>.
+lima_sync_provision() {
+  local vm="$1" yaml="$2" want have
+  want="$(limactl template yq "$yaml" '.provision | to_json')" || return 1
+  have="$(limactl template yq "$HOME/.lima/$vm/lima.yaml" '.provision | to_json')" || return 1
+  [ "$want" != "$have" ] || return 0
+  echo "Syncing $vm's provision script with $(basename "$yaml") (it was cloned from an older lima-golden)..."
+  limactl edit "$vm" --tty=false --set ".provision = $(printf '%s' "$want" | jq -c .)"
+}
+
 # Add-ons applied after install.sh purely so specs that need them can run; u7s does not
 # ship them. Comma-separated, in the order install-bringup.sh applies them.
 INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
@@ -675,6 +780,7 @@ write_run_meta() {
     echo "topology=$topology"
     if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
     echo "rig_only_setup=$RIG_ONLY_SETUP"
+    if [ "$topology" = "host-rig" ]; then echo "rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG"; fi
   } > "$run_dir/run-meta"
 }
 
