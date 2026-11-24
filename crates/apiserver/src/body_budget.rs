@@ -9,6 +9,10 @@
 //     holds them for the life of the request; a slow client therefore holds only what it
 //     has sent. When the budget is exhausted mid-body the request is answered 429 +
 //     Retry-After;
+//     Accepted: three concurrent maximum-size bodies can each take 2 MiB and all end in
+//     429; clients retry, and the budget bounds memory rather than guaranteeing admission;
+//   - answers 504 Timeout when the body read deadline (see inflight.rs) fired, whatever
+//     the handler made of the failed read;
 //   - turns the bare-text 413 that axum's body extractors (and several handlers) emit
 //     into the Status object kubectl and client-go expect.
 //
@@ -94,6 +98,7 @@ fn too_large(limit: usize) -> Response<Body> {
 struct Held {
     permit: Mutex<Option<OwnedSemaphorePermit>>,
     exhausted: AtomicBool,
+    timed_out: AtomicBool,
 }
 
 fn meter(body: Body, budget: Arc<Semaphore>, held: Arc<Held>) -> Body {
@@ -101,6 +106,11 @@ fn meter(body: Body, budget: Arc<Semaphore>, held: Arc<Held>) -> Body {
         (body.into_data_stream(), budget, held),
         |(mut s, budget, held)| async move {
             let item = s.next().await?;
+            if let Err(e) = &item {
+                if crate::inflight::is_body_timeout(e) {
+                    held.timed_out.store(true, Ordering::SeqCst);
+                }
+            }
             let item = item.and_then(|chunk| {
                 let Ok(p) = Arc::clone(&budget).try_acquire_many_owned(chunk.len() as u32) else {
                     held.exhausted.store(true, Ordering::SeqCst);
@@ -148,6 +158,7 @@ where
         let held = Arc::new(Held {
             permit: Mutex::new(None),
             exhausted: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
         });
         let req = if is_metered(&req) {
             let budget = Arc::clone(&self.budget);
@@ -166,6 +177,12 @@ where
                 return Ok(Status::too_many_requests_retry_after(
                     "Too many requests".to_owned(),
                     1,
+                )
+                .into_response());
+            }
+            if held.timed_out.load(Ordering::SeqCst) {
+                return Ok(Status::gateway_timeout(
+                    "Timeout: request did not complete within the allotted timeout".to_owned(),
                 )
                 .into_response());
             }
@@ -273,11 +290,34 @@ mod tests {
     /// otherwise a few large concurrent creates would exhaust a small host's memory.
     #[tokio::test]
     async fn concurrent_large_bodies_over_budget_get_429_and_budget_is_returned() {
+        const MIB: usize = 1024 * 1024;
         let (router, layer) = app();
-        let held = Arc::clone(&layer.budget)
-            .try_acquire_many_owned((BODY_BUDGET_BYTES - 100) as u32)
-            .unwrap();
+        let mut senders = Vec::new();
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let (req, tx) = trickle_req(CM, 3 * MIB);
+            tx.send(Ok(Bytes::from(vec![b'a'; 2 * MIB]))).await.unwrap();
+            pending.push(tokio::spawn(router.clone().oneshot(req)));
+            senders.push(tx);
+        }
+        // Mid-body each holds what it has sent (2 MiB), not the 3 MiB it declared.
+        settle_until(&layer, 4 * MIB).await;
 
+        let resp = router
+            .clone()
+            .oneshot(post_req(Body::from(vec![b'a'; MIB]), Some(MIB)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a write that fits in the unsent remainder of the budget was shed"
+        );
+
+        for tx in &senders {
+            tx.send(Ok(Bytes::from(vec![b'a'; MIB]))).await.unwrap();
+        }
+        settle_until(&layer, 6 * MIB).await;
         let resp = router
             .clone()
             .oneshot(post_req(Body::from(vec![b'a'; 200]), Some(200)))
@@ -286,28 +326,33 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().contains_key(header::RETRY_AFTER));
 
-        let small = router
-            .clone()
-            .oneshot(post_req(Body::from(vec![b'a'; 50]), Some(50)))
-            .await
-            .unwrap();
+        drop(senders);
+        for p in pending {
+            assert_eq!(p.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
         assert_eq!(
-            small.status(),
-            StatusCode::OK,
-            "bytes inside the budget must pass"
+            layer.budget.available_permits(),
+            BODY_BUDGET_BYTES,
+            "budget must be returned when the holders finish"
         );
-
-        drop(held);
         let resp = router
             .oneshot(post_req(Body::from(vec![b'a'; 200]), Some(200)))
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The limit and budget are sized together (two max-size bodies). Reverting the limit
+    /// to the old 4 MiB would let a body past what upstream accepts and shrink the
+    /// budget's worth to 1.5 bodies.
+    #[test]
+    fn body_limit_and_budget_are_pinned() {
         assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "budget must be returned on drop"
+            crate::MAX_BODY_BYTES,
+            3_145_728,
+            "upstream MaxRequestBodyBytes"
         );
-        assert_eq!(layer.budget.available_permits(), BODY_BUDGET_BYTES);
+        assert_eq!(BODY_BUDGET_BYTES, 2 * crate::MAX_BODY_BYTES);
     }
 
     /// A body exactly at the limit is what kubectl may legitimately send for a large
@@ -394,11 +439,10 @@ mod tests {
     #[tokio::test]
     async fn client_disconnect_mid_body_releases_its_reservation() {
         let (router, layer) = app();
-        let (req, tx) = trickle_req(CM, 4096);
-        tx.send(Ok(Bytes::from(vec![b'a'; 4096 / 2])))
-            .await
-            .unwrap();
+        let (req, tx) = trickle_req(CM, crate::MAX_BODY_BYTES);
+        tx.send(Ok(Bytes::from(vec![b'a'; 2048]))).await.unwrap();
         let task = tokio::spawn(router.oneshot(req));
+        // Held mid-body is exactly the bytes sent, not the declared length.
         settle_until(&layer, 2048).await;
 
         task.abort();
@@ -411,37 +455,66 @@ mod tests {
         drop(tx);
     }
 
-    /// A body that stalls past the mutating body deadline must fail the request and give
-    /// its bytes back; otherwise a client that sends a little and goes quiet pins budget
-    /// and an inflight seat indefinitely.
-    #[tokio::test(start_paused = true)]
-    async fn stalled_body_times_out_and_releases_its_budget() {
+    async fn stalled_body_is_cut_with_504(uri: &str) {
         let layer = BodyBudgetLayer::new();
         let router = Router::new()
-            .route(CM, post(echo_len))
+            .fallback(echo_len)
             .layer(layer.clone())
             .layer(crate::inflight::InflightLayer::new());
-        let (req, tx) = trickle_req(CM, crate::MAX_BODY_BYTES);
+        let (req, tx) = trickle_req(uri, crate::MAX_BODY_BYTES);
         tx.send(Ok(Bytes::from(vec![b'a'; 1024]))).await.unwrap();
-        let task = tokio::spawn(router.oneshot(req));
+        let task = tokio::spawn(router.clone().oneshot(req));
         settle_until(&layer, 1024).await;
 
-        assert!(
-            crate::inflight::MUTATING_BODY_TIMEOUT <= std::time::Duration::from_secs(34),
-            "body deadline must not exceed upstream's 34s mutating-request bound"
+        let n = 1024 * 1024;
+        let resp = router
+            .oneshot(post_req(Body::from(vec![b'a'; n]), Some(n)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a stalled body must not stop other writes"
         );
+
         tokio::time::advance(
             crate::inflight::MUTATING_BODY_TIMEOUT + std::time::Duration::from_secs(1),
         )
         .await;
-        let resp = task.await.unwrap().unwrap();
-        assert_ne!(resp.status(), StatusCode::OK, "stalled body must fail");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("stalled body read never ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "a stalled body is a timeout, not a size problem"
+        );
+        let status = status_body(resp).await;
+        assert_eq!(status["reason"], "Timeout");
+        assert_eq!(status["code"], 504);
         assert_eq!(
             layer.budget.available_permits(),
             BODY_BUDGET_BYTES,
             "timed-out body kept its bytes reserved"
         );
         drop(tx);
+    }
+
+    /// A body that stalls past the body deadline must fail the request with 504 and give
+    /// its bytes back; otherwise a client that sends a little and goes quiet pins budget
+    /// and an inflight seat indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_times_out_with_504_and_releases_its_budget() {
+        stalled_body_is_cut_with_504(CM).await;
+    }
+
+    /// Proxy is exempt from inflight seats but its buffered body draws on the budget, so a
+    /// trickling proxy POST must be cut too, or one principal pins the budget indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_proxy_body_times_out_with_504_and_releases_its_budget() {
+        stalled_body_is_cut_with_504("/api/v1/namespaces/default/pods/p/proxy/x").await;
     }
 
     /// Proxy handlers buffer the request body up to the limit, so it must draw on the same
