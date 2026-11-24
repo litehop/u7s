@@ -3,7 +3,7 @@ name: roadmap
 description: u7s roadmap — current state and priorities via a per-component decision matrix and horizontal gates. Not a phase list. Durable north star, decision framework, and guiding principles live in north-star.md; this file changes often and links back rather than restating them.
 metadata:
   type: project
-as_of: 2026-10-23
+as_of: 2026-11-24
 kind: roadmap
 ---
 
@@ -30,8 +30,8 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **API server** | NATIVE | Yes | KEEP | Decode-correctness and security-audit fixes ongoing. |
 | **Scheduler** | NATIVE | Yes | KEEP | Bin-spread, custom preemption. No DRA allocation. |
 | **Store** | NATIVE (in apiserver) | Yes | KEEP | SQLite WAL + sharded watch fan-out + per-shard compaction horizon. |
-| **KCM** | UPSTREAM | Yes | MEASURED | `--controllers='*,-cloud-*'`. Second-largest component. Rewrite go/no-go is the operator's open decision: `mayor-vc844`. |
-| **Kubelet** | UPSTREAM | Yes | MEASURED | Largest component. Same decision. |
+| **KCM** | UPSTREAM | Yes | PORT (next) | `--controllers='*,-cloud-*'`. Second-largest component. Rust port first, controller by controller with upstream fallback: Phase 2 design `mayor-w9xt5`. |
+| **Kubelet** | UPSTREAM | Yes | MEASURED | Largest component. Revisited after the `mayor-jedol` capacity data. |
 | **CRI-O + crun** | UPSTREAM | Yes | KEEP | No rewrite plan. |
 | **kube-proxy** | UPSTREAM | Yes | KEEP | East-west only. Replacement is out of scope (beep repo, post-v1.0). |
 | **ServiceLB** | UPSTREAM (beep) | Yes | KEEP | Not shipped. Planned: `litehop/beep` (`mayor-jlm8z`), pending v0.5.0 evaluation (`mayor-da224`). |
@@ -40,61 +40,65 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **metrics-server** | not shipped | n/a | KEEP | Documented as user-applied (Gate 6 C4). |
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle; closed the silent-decode-drop bug class. |
 
-**Rewrite decision (`mayor-vc844`):** open, operator's call. No clean flag
-lever remains; rewrite-only residual (2026-10-21, loaded 1 GiB node):
-~10-22 MB KCM, ~19-24 MB kubelet.
+**Rewrite decision (`mayor-vc844`, operator 2026-11-24):** port KCM first
+(design `mayor-w9xt5`). Sonobuoy Conformance and upstream parity stay a
+reliable guardrail throughout. Kubelet is revisited after the `mayor-jedol`
+data. No clean flag lever remains; rewrite-only residual (2026-10-21, loaded
+1 GiB node): ~10-22 MB KCM, ~19-24 MB kubelet.
 
 ---
 
 ## Gates (horizontal cuts across the matrix)
 
 ### Gate 1 — Conformance floor ✓ CLEARED, with known blind spots
-Full sonobuoy Conformance passes: single-node first green 2026-07-24;
-two-node 446/0/0/7133 2026-08-10. Latest recorded (1.37.1, two-node,
-iptables kube-proxy): 460/460 + 2/2 disruptive on 2026-10-14. These
-counts predate the 2026-10-23 merges; a re-run is pending.
+Full sonobuoy Conformance passes: single-node first green 2026-07-24.
+Latest recorded (1.37.1, two-node, iptables kube-proxy): 460/460 + 2/2
+disruptive on 2026-10-14; a re-run is pending.
 
-Green is necessary, not sufficient: single-node bias (Gate 5) and security
-surface (Gate 8) are not conformance-visible. Any regression preempts perf.
+Green is necessary, not sufficient (single-node bias, security surface).
+Any regression preempts perf.
 
 ### Gate 2 — Measurement baseline — DONE
-Per-process RSS for every component under a 2-node conformance run
-(`mayor-jnk90`), plus real k3s (`mayor-5x0kh`). Re-measure after every
-non-trivial perf change.
+Per-process RSS per component under 2-node conformance (`mayor-jnk90`) and
+real k3s (`mayor-5x0kh`). Re-measure after non-trivial perf changes.
 
 ### Gate 3 — Correctness infrastructure ✓ SUBSTANTIALLY DONE
 Proto-descriptor oracle, filter-is-empty bug class fixed, observability EPIC.
-InflightLayer bounded-wait backpressure is a deliberate minimal APF subset —
-guardrail: bd memory `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`.
+InflightLayer backpressure is a deliberate minimal APF subset (bd memory
+`u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`).
 
 ### Gate 4 — Perf (ACTIVE since 2026-07-24)
 Method: audit → bead → measure before/after → land. Wins: `dashboard.md`.
+Current focus: apiserver hot request paths (audit `mayor-f7ym1`).
 
 **Aspiration, blocks nothing:** host-level control-plane processes (pods
-excluded) under 128 MiB. Release-gate run 2026-10-15, peak PSS: kubelet
-82-114 MiB, KCM 76-81, CRI-O 75-84, apiserver 27-31.
+excluded) under 128 MiB. Peak PSS 2026-10-15: kubelet 82-114 MiB, KCM
+76-81, CRI-O 75-84, apiserver 27-31.
 
-### Release gate — no PASS recorded (first verdict FAIL, 2026-10-15)
-Minor releases must pass the 1 GiB / 1 vCPU no-swap burst test: WordPress +
-MariaDB, then 20- and N-pod bursts. N = largest of 50, 40 passing 3/3 on a
-quiet host (`burst-gate.sh --confirm`; patch releases not gated).
-Harness: `scripts/release-gate/` (`mayor-6uez9`); noisy hosts yield an
-INVALID verdict that `--confirm` re-runs.
+### Release gate — 20-pod burst on 1 GiB / 1 vCPU
+Releases must pass the 1 GiB / 1 vCPU no-swap burst test: WordPress +
+MariaDB, then a 20-pod burst. Lowered to 20 pods by the operator on
+2026-11-05 (from 40/50; 20 passed 4/4 on GCP, 40 and 50 passed 0/3); all
+releases so far were tested against it. Harness: `scripts/release-gate/`
+(`mayor-6uez9`); noisy hosts yield an INVALID verdict that `--confirm`
+re-runs.
 
-Decided (operator 2026-10-23): the authoritative gate runs on a real 1-vCPU
-VPS (GCP e2-micro, x86_64 tarball); Mac Lima is an optional pre-check. Not
-built: `mayor-p3ktl` is open and `mayor-6uez9` is open-partial, depending on
-it. Operator 2026-10-23: no rush to cut a release. Operator 2026-10-20:
-cert rotation (`mayor-xdw6u.11`) blocks a release; lifting that is not yet
-confirmed.
+Overload is not a goal: u7s does not aim to survive extreme bursts. Limits
+are documented instead via date/git-hash-stamped capacity benchmarks that
+the CHANGELOG cites (`mayor-jedol`). Evidence (`mayor-pzhtd`, two GCP runs):
+a kubepods memory cap does not make a 1 GiB / 1 vCPU node recover.
+
+The authoritative gate runs on a real 1-vCPU GCP VM (n1-custom-1-1024,
+operator 2026-11-04); Mac Lima is an optional pre-check. Cert rotation
+(`mayor-xdw6u.11`) blocks a release (operator 2026-10-20).
 
 ### Gate 5 — Correctness beyond Conformance (ongoing, opportunistic)
 Representative workloads (WordPress+MariaDB, GPU-request, Argo CD) and
-non-Conformance upstream e2e subsets (multi-node, CSI).
+upstream e2e subsets (multi-node, CSI).
 
 ### Gate 6 — Packaging & distribution (local-install MVP shipped 2026-08-21)
-End-game: k3s-style one-shell-script install. Install UX, component shipping,
-systemd contract, and hosting are settled in ADRs (`docs/decisions/`).
+End-game: k3s-style one-shell-script install; settled in ADRs
+(`docs/decisions/`).
 
 MVP: `scripts/install.sh` — zero-argument single-node install from a
 pre-built tarball to working `kubectl get nodes`/`logs`/`exec`. Decided
@@ -106,23 +110,21 @@ pre-built tarball to working `kubectl get nodes`/`logs`/`exec`. Decided
 - C5: agent-friendly install (`mayor-yxe9t`). C6: networking flags
   (`mayor-rv1aw`).
 
-Release authenticity (`mayor-pfykw`, closed, PR #1952): the tarball,
-`.sha256` and `install.sh` are Ed25519-signed, and `install.sh` verifies.
-Open: operator-side Release Environment settings (`mayor-1gfa6`), follow-ups
-`mayor-b4guu`. C2 (`mayor-u251u`) still awaits operator confirmation.
+Release authenticity (`mayor-pfykw`, PR #1952): tarball, `.sha256` and
+`install.sh` are Ed25519-signed; `install.sh` verifies. Open: Release
+Environment settings (`mayor-1gfa6`), `mayor-b4guu`. C2 (`mayor-u251u`)
+awaits operator confirmation.
 
 ### Gate 7 — Migration story (STARTED)
 MVP epic `mayor-te4sn`: single-node k3s → u7s via `u7s migrate`, API-based
-export/import (UID/resourceVersion loss accepted, PVs reused in place).
-Export dry-run landed. Decisions on `mayor-ffgal`.
+export/import (UID/resourceVersion loss accepted). Decisions: `mayor-ffgal`.
 
 ### Gate 8 — Security (ACTIVE)
 Epic `mayor-qap3i`: audit run-1 (30 confirmed findings, 4 leads), filed
-2026-10-22. All four P1s landed (JSON Patch depth, mirror-pod references,
-encoded-route bypass, RoleBinding escalation) plus several P2s (`.5` closed). Open P2s as of 2026-10-23, in progress:
-`.43` (CEL absent-key fail-open), `.23`, `.15`, `.25`, `.4`, `mayor-fg6oo`
-(Service externalIPs), `mayor-d07ct` (KCM wildcard identity). Open, partial
-via #1963: `.19` (CEL gate metering). `.35` is claimed, `.40` unstarted.
+2026-10-22. All four P1s landed plus several P2s. Open P2s as of
+2026-10-23, in progress: `.43` (CEL absent-key fail-open), `.23`, `.15`,
+`.25`, `.4`, `mayor-fg6oo` (Service externalIPs), `mayor-d07ct` (KCM
+wildcard identity). Partial via #1963: `.19`. `.35` claimed, `.40` unstarted.
 
 ---
 
