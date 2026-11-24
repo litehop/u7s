@@ -7,8 +7,9 @@
 #
 # Idempotent: re-running against an already-baked (stopped) golden is a
 # no-op. Use --force to delete and re-bake from scratch (e.g. after
-# lima/kubelet.yaml's provision script changes -- there is no automatic
-# staleness detection yet, that is a separate follow-on).
+# lima/kubelet.yaml's provision script changes; clones sync that script from
+# lima/kubelet.yaml before booting and lima-start.sh asserts the package pins,
+# so a stale golden costs boot time, not correctness).
 #
 # Usage:
 #   scripts/conformance/lima-golden-bake.sh [--force]

@@ -2,8 +2,7 @@
 # Removes the conformance rig's own systemd units from a Lima VM so a
 # scripts/install.sh-path test starts from a node the rig never configured.
 #
-# lima-start.sh (and lima/kubelet.yaml's provision script, which re-runs on every
-# boot) write /etc/systemd/system/kubelet.service.d/u7s.conf, whose bare
+# lima-start.sh writes /etc/systemd/system/kubelet.service.d/u7s.conf, whose bare
 # `ExecStart=` reset replaces the ExecStart of the kubelet.service install.sh
 # writes with the rig's flags/kubeconfig; lima-start.sh also installs
 # kube-proxy.service. install.sh does not know about either.

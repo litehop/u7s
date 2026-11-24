@@ -559,7 +559,7 @@ fn advertise_host(advertise_address: Option<&str>) -> anyhow::Result<Option<Stri
 }
 
 /// Build the full SAN list for the server certificate.
-/// Always includes localhost, 127.0.0.1, ::1, host.lima.internal, and the kubernetes
+/// Always includes localhost, 127.0.0.1, ::1, and the kubernetes
 /// Service's ClusterIP derived from `--service-cluster-ip-range` (first host —
 /// same offset `bootstrap_service_ips` uses to seed the `default/kubernetes`
 /// Service, e.g. 10.96.0.1 for the default 10.96.0.0/12 range). In-cluster
@@ -576,7 +576,6 @@ fn build_server_sans(
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
-        SanType::DnsName("host.lima.internal".try_into()?),
         SanType::IpAddress(kubernetes_ip),
         SanType::DnsName("kubernetes".try_into()?),
         SanType::DnsName("kubernetes.default".try_into()?),
@@ -747,8 +746,8 @@ fn generate_tls_with(
     // Persisted leaves sit next to ca.key/ca.crt rather than behind new CLI flags.
     let files = |stem: &str| leaf_files(args, stem);
 
-    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
-    // plus the advertise-address host if provided.
+    // Always include localhost / 127.0.0.1, plus the advertise-address host and any
+    // --apiserver-cert-extra-sans if provided.
     let mut sans = build_server_sans(
         advertise_host(args.advertise_address.as_deref())?.as_deref(),
         &args.service_cluster_ip_range,
@@ -1352,19 +1351,41 @@ mod tests {
         generate_tls(&args_none).expect("generate_tls failed with no advertise address");
     }
 
-    /// build_server_sans must always include host.lima.internal as a DNS SAN.
-    /// This is the lima VM-to-host alias required for kubelet-to-apiserver TLS.
-    /// If this entry is absent, kubelets running inside lima VMs cannot verify the
-    /// server certificate and will refuse to connect.
+    /// The shipped serving cert must not vouch for the dev rig's host alias: a real install
+    /// has no such host, and the name would let anyone who can resolve it impersonate the
+    /// apiserver. The rig opts in through --apiserver-cert-extra-sans instead.
     #[test]
-    fn build_server_sans_always_includes_lima_host() {
+    fn build_server_sans_excludes_lima_host_by_default() {
         let sans = build_server_sans(None, "10.96.0.0/12").expect("build_server_sans failed");
         let has_lima = sans
             .iter()
             .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
         assert!(
-            has_lima,
-            "host.lima.internal must be in server SANs regardless of advertise_address"
+            !has_lima,
+            "host.lima.internal must not be in the default server SANs"
+        );
+    }
+
+    /// The host rig's kubelet dials host.lima.internal; if the extra-SAN input stops reaching
+    /// the serving cert, the rig kubelet fails TLS verification and the node never registers.
+    #[test]
+    fn extra_sans_flag_adds_lima_host_to_serving_cert() {
+        let der_has_name = |der: &[u8]| {
+            der.windows(b"host.lima.internal".len())
+                .any(|w| w == b"host.lima.internal")
+        };
+        let mut args = args_with(Some("https://127.0.0.1:6443"));
+        args.apiserver_cert_extra_sans = vec!["host.lima.internal".into()];
+        let with = generate_tls(&args).expect("generate_tls");
+        assert!(
+            der_has_name(&with.server_cert_der),
+            "extra SAN must appear in the serving cert"
+        );
+        let without =
+            generate_tls(&args_with(Some("https://127.0.0.1:6443"))).expect("generate_tls");
+        assert!(
+            !der_has_name(&without.server_cert_der),
+            "default serving cert must not carry the rig alias"
         );
     }
 
@@ -1445,19 +1466,11 @@ mod tests {
         }
     }
 
-    /// build_server_sans with an IP advertise_host must include both host.lima.internal
-    /// (DNS) and the IP address SAN.
+    /// build_server_sans with an IP advertise_host must include the IP address SAN.
     #[test]
-    fn build_server_sans_with_ip_includes_both() {
+    fn build_server_sans_with_ip_includes_advertise_ip() {
         let sans = build_server_sans(Some("192.168.5.1"), "10.96.0.0/12")
             .expect("build_server_sans failed");
-        let has_lima = sans
-            .iter()
-            .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
-        assert!(
-            has_lima,
-            "host.lima.internal must be present even when advertise_address is an IP"
-        );
         let has_ip = sans
             .iter()
             .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "192.168.5.1"));
@@ -2918,7 +2931,7 @@ mod tests {
     fn extra_sans(advertise: &str) -> Vec<SanType> {
         let host = advertise_host(Some(advertise)).unwrap();
         let sans = build_server_sans(host.as_deref(), "10.96.0.0/12").unwrap();
-        sans[9..].to_vec()
+        sans[8..].to_vec()
     }
 
     /// An IPv6-literal advertise URL must yield an IP SAN; the old ':' split produced

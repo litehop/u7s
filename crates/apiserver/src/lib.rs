@@ -3115,9 +3115,9 @@ async fn seed_services(
     // exclusively. The Endpoints above carry skip-mirror:true so the mirroring controller won't
     // create a slice; we seed it directly, matching upstream apiserver behaviour where the
     // apiserver's own reconciler calls EnsureEndpointSliceFromEndpoints on each cycle.
-    // The address here must be routable from inside pods — use the advertised IP, which callers
-    // set to host.lima.internal's IP when running in a lima VM so kube-proxy's IPVS rule
-    // programs 10.96.0.1:443 → <host-ip>:6443 rather than → 127.0.0.1:6443 (the VM loopback).
+    // The address here must be routable from inside pods — use the advertised IP, so
+    // kube-proxy's IPVS rule programs 10.96.0.1:443 → <host-ip>:6443 rather than
+    // → 127.0.0.1:6443 (the node's loopback).
     let eps_key = keys::group_object_key(
         "discovery.k8s.io",
         "endpointslices",
