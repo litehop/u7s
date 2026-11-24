@@ -688,9 +688,9 @@ lima_sync_provision() {
 
 # Add-ons applied after install.sh purely so specs that need them can run; u7s does not
 # ship them. Comma-separated, in the order install-bringup.sh applies them.
-INSTALL_RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
+RIG_ONLY_ADDONS="metrics-server,external-snapshotter,kube-network-policies"
 # shellcheck disable=SC2034 # used by install-bringup.sh
-INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
+RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 
 # Rig-only AppArmor rule u7s does not ship: a container process stacked under a host
 # dig/nslookup profile is labelled "dig//&u7s-default", which u7s-default's own
@@ -698,6 +698,14 @@ INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 # Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
 # the matching host dig/nslookup overrides below; either layer alone still denies.
 RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
+# Every other rig-only step, one token each. Both topologies: the CRI-O test-handler
+# runtime (lima/kubelet.yaml), the [Disruptive] ssh key, the sonobuoy aggregator LimitRange.
+RIG_ONLY_SETUP="$RIG_ONLY_SETUP,crio-test-handler-runtime,e2e-ssh-key,sonobuoy-aggregator-limitrange"
+# Host rig only (lima-start.sh): VM packages and log limits.
+RIG_ONLY_HOST_SETUP="vm-nfs-common,vm-journald-limits,vm-logrotate-interval"
+# Host-rig topology differences from install.sh: where the control plane runs and how it
+# reaches the node.
+RIG_ONLY_HOST_DEVIATIONS="host-side-apiserver,konnectivity-server,konnectivity-agent"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 
@@ -783,9 +791,15 @@ write_run_meta() {
   mkdir -p "$run_dir"
   {
     echo "topology=$topology"
-    if [ "$topology" = "install" ]; then echo "rig_only_addons=$INSTALL_RIG_ONLY_ADDONS"; fi
-    echo "rig_only_setup=$RIG_ONLY_SETUP"
-    if [ "$topology" = "host-rig" ]; then echo "rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG"; fi
+    echo "rig_only_addons=$RIG_ONLY_ADDONS"
+    if [ "$topology" = "host-rig" ]; then
+      echo "rig_only_setup=$RIG_ONLY_SETUP,$RIG_ONLY_HOST_SETUP"
+      echo "rig_only_deviations=$RIG_ONLY_HOST_DEVIATIONS"
+      echo "rig_only_kubelet_config=$RIG_ONLY_KUBELET_CONFIG"
+      echo "rig_only_build_features=${U7S_RIG_BUILD_FEATURES:-unknown}"
+    else
+      echo "rig_only_setup=$RIG_ONLY_SETUP"
+    fi
   } > "$run_dir/run-meta"
 }
 
