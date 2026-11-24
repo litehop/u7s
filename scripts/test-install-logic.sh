@@ -3510,6 +3510,16 @@ assert_true "a keyring-format sa.key is left alone (an upgrade must not be block
   sa_check "$SA_DIR/ring.key"
 assert_true "an absent sa.key (fresh install, worker) passes" \
   sa_check "$SA_DIR/absent.key"
+if [ "$(id -u)" -ne 0 ]; then
+  cp "$SA_DIR/ring.key" "$SA_DIR/unreadable.key"
+  chmod 000 "$SA_DIR/unreadable.key"
+  assert_false "an unreadable sa.key is refused" sa_check "$SA_DIR/unreadable.key"
+  assert_true "an unreadable sa.key reports 'cannot read', not a false pre-keyring diagnosis that sends the operator to discard a valid key" \
+    grep -qF "cannot read $SA_DIR/unreadable.key" "$SA_DIR/stderr"
+  assert_false "an unreadable sa.key does not get the pre-keyring remedy" \
+    grep -qF 'pre-keyring' "$SA_DIR/stderr"
+  chmod 600 "$SA_DIR/unreadable.key"
+fi
 assert_true "the keyring shape the preflight matches is still the apiserver's KeyringFile" \
   grep -qE '^struct KeyringFile \{$' "$ROOT_DIR/crates/apiserver/src/sa_keys.rs"
 assert_true "the preflight runs before the apiserver is restarted" \

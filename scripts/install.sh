@@ -1955,7 +1955,12 @@ fi
 check_sa_key_format() {
   local key="$1"
   [ -f "$key" ] || return 0
-  tr -d '[:space:]' < "$key" | grep -q '^{"keys":\[' && return 0
+  local compact
+  if ! compact=$(tr -d '[:space:]' < "$key"); then
+    echo "error: cannot read $key; fix its permissions and re-run install.sh." >&2
+    return 1
+  fi
+  case "$compact" in '{"keys":['*) return 0 ;; esac
   cat >&2 <<EOF
 error: $key is not an SA keyring (pre-keyring RSA key from an older u7s build); u7s-apiserver would refuse to start with it.
 Replacing it invalidates every issued ServiceAccount token (pods refresh projected tokens; static tokens must be reissued). To proceed:
