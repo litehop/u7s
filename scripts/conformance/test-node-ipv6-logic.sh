@@ -92,7 +92,7 @@ assert_true "lima-start.sh assigns NODE_IPV6 to the detected interface, not a ha
 assert_true "lima-start.sh derives LIMA_VM_IFACE the same interface-agnostic way as LIMA_VM_IP (scope global, not a fixed name)" \
   grep -qF "LIMA_VM_IFACE=\$(limactl shell \"\$VM_NAME\" ip -4 -o addr show scope global" "$LIMA_START"
 assert_true "lima-start.sh passes both address families to kubelet via --node-ip" \
-  grep -qF '  --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\' "$LIMA_START"
+  grep -qF 'rig_kubelet_unit_script "$INSTALL_SH" "$VM_NAME" "${LIMA_VM_IP},${NODE_IPV6}"' "$LIMA_START"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
