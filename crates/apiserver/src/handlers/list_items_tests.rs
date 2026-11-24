@@ -178,6 +178,69 @@ fn kinds() -> Vec<Kind> {
                 json!({"spec": {"ports": [{"port": 80}], "selector": {"a": "b"}}}),
             ),
         },
+        Kind {
+            group: "",
+            plural: "nodes",
+            kind: "Node",
+            version: "v1",
+            items: many(
+                "Node",
+                "node",
+                4,
+                json!({
+                    "spec": {"podCIDR": "10.0.0.0/24", "taints": [{"key": "k", "effect": "NoSchedule"}]},
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
+                        "capacity": {"cpu": "4"},
+                    },
+                }),
+            ),
+        },
+        Kind {
+            group: "",
+            plural: "endpoints",
+            kind: "Endpoints",
+            version: "v1",
+            items: many(
+                "Endpoints",
+                "ep",
+                4,
+                json!({"subsets": [{"addresses": [{"ip": "10.0.0.2"}], "ports": [{"port": 80, "protocol": "TCP"}]}]}),
+            ),
+        },
+        Kind {
+            group: "",
+            plural: "events",
+            kind: "Event",
+            version: "v1",
+            items: many(
+                "Event",
+                "ev",
+                4,
+                json!({
+                    "involvedObject": {"kind": "Pod", "name": "p", "namespace": "ns1"},
+                    "reason": "Started", "message": "started", "type": "Normal", "count": 2,
+                    "firstTimestamp": "2026-01-02T03:04:05Z", "lastTimestamp": "2026-01-02T03:04:06Z",
+                }),
+            ),
+        },
+        Kind {
+            group: "discovery.k8s.io",
+            plural: "endpointslices",
+            kind: "EndpointSlice",
+            version: "v1",
+            items: many(
+                "EndpointSlice",
+                "es",
+                4,
+                json!({
+                    "addressType": "IPv4",
+                    "endpoints": [{"addresses": ["10.0.0.3"], "conditions": {"ready": true}}],
+                    "ports": [{"name": "http", "port": 80, "protocol": "TCP"}],
+                }),
+            ),
+        },
     ]
 }
 
@@ -208,7 +271,10 @@ fn field_selectors(plural: &str) -> Vec<&'static str> {
         ],
         "secrets" => vec!["", "metadata.name=s-1", "type=Opaque"],
         "namespaces" => vec!["", "metadata.name=n-1", "status.phase=Active"],
-        _ => vec!["", "metadata.name=d-1", "metadata.namespace=ns1"],
+        "deployments" | "services" | "endpoints" | "events" => {
+            vec!["", "metadata.name=d-1", "metadata.namespace=ns1"]
+        }
+        _ => vec!["", "metadata.name=d-1"],
     }
 }
 
@@ -237,26 +303,96 @@ fn legacy_stream_list_json(
         .unwrap();
     let mut body = envelope_bytes[..pos].to_vec();
     body.extend_from_slice(b"\"items\":[");
-    let mut wrote = false;
-    for obj in &k.items {
-        let mut item: Value = serde_json::from_slice(&obj.value).unwrap();
-        crate::handlers::defaults::apply_defaults(k.group, k.plural, &mut item);
-        let Some(item) = crate::handlers::generic::apply_label_selector(vec![item], terms).pop()
-        else {
-            continue;
-        };
-        if !fs.matches(&item) {
-            continue;
-        }
-        if wrote {
+    for (i, item) in legacy_items(k, terms, fs).iter().enumerate() {
+        if i > 0 {
             body.push(b',');
         }
-        wrote = true;
-        serde_json::to_writer(&mut body, &item).unwrap();
+        serde_json::to_writer(&mut body, item).unwrap();
     }
     body.push(b']');
     body.extend_from_slice(&envelope_bytes[pos + marker.len()..]);
     body
+}
+
+/// The pre-optimization survivors: every item fully parsed, defaulted and then filtered.
+fn legacy_items(k: &Kind, terms: &[LabelSelectorTerm<'_>], fs: &FieldSelector) -> Vec<Value> {
+    let items: Vec<Value> = k
+        .items
+        .iter()
+        .map(|obj| {
+            let mut item: Value = serde_json::from_slice(&obj.value).unwrap();
+            crate::handlers::defaults::apply_defaults(k.group, k.plural, &mut item);
+            item
+        })
+        .collect();
+    fs.filter(crate::handlers::generic::apply_label_selector(items, terms))
+}
+
+fn envelope(k: &Kind) -> ListEnvelope<'static> {
+    ListEnvelope {
+        kind: k.kind,
+        version: k.version,
+        revision: 9,
+        continue_key: None,
+        remaining_count: Some(4),
+        signing_key: &[3u8; 32],
+    }
+}
+
+async fn body_of(resp: axum::response::Response) -> (Option<String>, Vec<u8>) {
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .map(|v| v.to_str().unwrap().to_string());
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (content_type, body.to_vec())
+}
+
+/// What the pre-optimization handlers returned for a non-JSON-stream LIST: every survivor
+/// materialized, then handed to the per-format builders.
+fn legacy_response(
+    k: &Kind,
+    accept: &str,
+    format: &ListFormat,
+    terms: &[LabelSelectorTerm<'_>],
+    fs: &FieldSelector,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let items = legacy_items(k, terms, fs);
+    match format {
+        ListFormat::PartialObjectMetadata => axum::Json(json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": { "resourceVersion": "9" },
+            "items": items.iter().map(crate::handlers::watch::to_partial_object_metadata).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        ListFormat::Table { api_version } => {
+            let built = crate::handlers::table::build_table(k.group, k.plural, items);
+            axum::Json(crate::handlers::table::finalize_table(
+                built,
+                api_version,
+                Some("9"),
+                None,
+            ))
+            .into_response()
+        }
+        ListFormat::Protobuf => crate::content_type::negotiated_response(
+            accept,
+            crate::handlers::generic::build_list_response(
+                k.kind,
+                k.group,
+                k.version,
+                9,
+                items,
+                None,
+                Some(4),
+                &[3u8; 32],
+            ),
+        ),
+    }
 }
 
 /// A LIST's bytes are what every client decodes: if the selector pre-filter ever dropped, kept,
@@ -272,18 +408,7 @@ fn list_output_is_byte_identical_to_the_full_parse_path() {
                 let field_selector = FieldSelector::parse(Some(fs), k.group, k.plural).unwrap();
                 let expected = legacy_stream_list_json(&k, &terms, &field_selector);
                 let filter = ListFilter::new(k.group, k.plural, &terms, &field_selector, None);
-                let actual = crate::handlers::resource::stream_list_json(
-                    k.kind,
-                    k.group,
-                    k.version,
-                    9,
-                    &k.items,
-                    &filter,
-                    None,
-                    Some(4),
-                    &[3u8; 32],
-                )
-                .unwrap();
+                let actual = filter.render_json(&k.items, envelope(&k)).unwrap();
                 assert_eq!(
                     String::from_utf8(actual).unwrap(),
                     String::from_utf8(expected).unwrap(),
@@ -295,6 +420,104 @@ fn list_output_is_byte_identical_to_the_full_parse_path() {
         }
     }
     assert!(cases > 200, "corpus shrank to {cases} cases");
+}
+
+/// Protobuf maps (labels, annotations) are emitted in `HashMap` iteration order, which differs
+/// between two encodes of the same object even within one process, so two encodings of the same
+/// list are compared decoded. `content_type`'s builder test compares raw bytes on single-key maps.
+fn protobuf_lists_equal(kind: &str, a: &[u8], b: &[u8]) -> bool {
+    use prost::Message;
+    use u7s_proto_generated::k8s::io::api::{core::v1 as core_v1, discovery::v1 as discovery_v1};
+    let raw = |body: &[u8]| {
+        crate::proto::decode_k8s_proto_envelope(body)
+            .expect("a protobuf LIST body is a k8s envelope")
+            .raw
+    };
+    let (a, b) = (raw(a), raw(b));
+    macro_rules! decoded_eq {
+        ($t:ty) => {
+            <$t>::decode(a.as_slice()).unwrap() == <$t>::decode(b.as_slice()).unwrap()
+        };
+    }
+    match kind {
+        "Pod" => decoded_eq!(core_v1::PodList),
+        "Service" => decoded_eq!(core_v1::ServiceList),
+        "Node" => decoded_eq!(core_v1::NodeList),
+        "Endpoints" => decoded_eq!(core_v1::EndpointsList),
+        "Event" => decoded_eq!(core_v1::EventList),
+        "EndpointSlice" => decoded_eq!(discovery_v1::EndpointSliceList),
+        other => panic!("no protobuf list type registered for {other}"),
+    }
+}
+
+/// kubelet and KCM decode protobuf, kubectl decodes Table and the GC reads
+/// PartialObjectMetadata: each must stay byte-identical to what the materialize-everything
+/// handlers produced, or an informer cache or `kubectl get` output silently changes.
+#[tokio::test]
+async fn protobuf_table_and_metadata_lists_are_byte_identical_to_the_materializing_path() {
+    let proto_accept = "application/vnd.kubernetes.protobuf,application/json";
+    let table_accept = "application/json;as=Table;v=v1;g=meta.k8s.io";
+    let mut protobuf_kinds = 0;
+    let mut cases = 0;
+    for k in kinds() {
+        let formats = [
+            (ListFormat::PartialObjectMetadata, proto_accept),
+            (
+                ListFormat::negotiate(table_accept, false, true, k.group, k.version, k.kind)
+                    .unwrap(),
+                table_accept,
+            ),
+            (
+                ListFormat::negotiate(proto_accept, false, false, k.group, k.version, k.kind)
+                    .unwrap_or(ListFormat::PartialObjectMetadata),
+                proto_accept,
+            ),
+        ];
+        for ls in ["", "app=app-1", "app!=app-1,tier", "app in (app-1,app-2)"] {
+            for fs in field_selectors(k.plural) {
+                let terms = parse_label_selector(ls).unwrap();
+                let field_selector = FieldSelector::parse(Some(fs), k.group, k.plural).unwrap();
+                let filter = ListFilter::new(k.group, k.plural, &terms, &field_selector, None);
+                for (format, accept) in &formats {
+                    let format_name = match format {
+                        ListFormat::PartialObjectMetadata => "partialObjectMetadata",
+                        ListFormat::Table { .. } => "table",
+                        ListFormat::Protobuf => "protobuf",
+                    };
+                    let expected =
+                        body_of(legacy_response(&k, accept, format, &terms, &field_selector)).await;
+                    let actual = body_of(
+                        filter
+                            .respond(Some(format.clone()), &k.items, envelope(&k))
+                            .unwrap(),
+                    )
+                    .await;
+                    assert_eq!(
+                        actual.0, expected.0,
+                        "{} {format_name} labelSelector={ls:?} fieldSelector={fs:?}: content type",
+                        k.plural
+                    );
+                    let same = if matches!(format, ListFormat::Protobuf) {
+                        protobuf_lists_equal(k.kind, &actual.1, &expected.1)
+                    } else {
+                        actual.1 == expected.1
+                    };
+                    assert!(
+                        same,
+                        "{} {format_name} labelSelector={ls:?} fieldSelector={fs:?}: bodies differ",
+                        k.plural,
+                    );
+                    protobuf_kinds += usize::from(format_name == "protobuf");
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert!(cases > 300, "corpus shrank to {cases} cases");
+    assert!(
+        protobuf_kinds > 60,
+        "protobuf was exercised in only {protobuf_kinds} cases; the registered-encoder kinds fell out of the corpus"
+    );
 }
 
 /// The skim may only decide what the full matchers decide the same way; anything it cannot read

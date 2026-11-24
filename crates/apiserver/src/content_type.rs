@@ -154,6 +154,54 @@ pub fn negotiated_response(accept: &str, obj: serde_json::Value) -> Response<Bod
     axum::Json(obj).into_response()
 }
 
+/// Protobuf LIST body built one item at a time, byte-identical to running the registered list
+/// encoder over the whole list: a protobuf List message is its ListMeta (field 1) followed by
+/// every item as a length-delimited field 2, so the list encoder on an item-less envelope plus
+/// the item encoder per item reproduce it without holding every item at once.
+pub(crate) struct ProtobufListBuilder {
+    kind: String,
+    api_version: String,
+    raw: Vec<u8>,
+    item_encoder: EncoderFn,
+}
+
+impl ProtobufListBuilder {
+    /// `envelope` is the list as `build_list_response` shapes it, with no items. `None` when
+    /// the list kind (or its item kind) has no registered encoder.
+    pub(crate) fn new(envelope: &serde_json::Value, items_size_hint: usize) -> Option<Self> {
+        let kind = envelope.get("kind")?.as_str()?;
+        let api_version = envelope.get("apiVersion")?.as_str()?;
+        let list_encoder = encoders().get(&(api_version, kind))?;
+        let item_encoder = encoders().get(&(api_version, kind.strip_suffix("List")?))?;
+        let meta = list_encoder(envelope);
+        let mut raw = Vec::with_capacity(meta.len() + items_size_hint);
+        raw.extend_from_slice(&meta);
+        Some(Self {
+            kind: kind.to_string(),
+            api_version: api_version.to_string(),
+            raw,
+            item_encoder: *item_encoder,
+        })
+    }
+
+    pub(crate) fn push(&mut self, item: &serde_json::Value) {
+        const ITEMS_FIELD_KEY: u8 = (2 << 3) | 2;
+        let encoded = (self.item_encoder)(item);
+        self.raw.push(ITEMS_FIELD_KEY);
+        prost::encoding::encode_varint(encoded.len() as u64, &mut self.raw);
+        self.raw.extend_from_slice(&encoded);
+    }
+
+    pub(crate) fn finish(self) -> Response<Body> {
+        let body = crate::proto::encode_k8s_envelope(&self.kind, &self.api_version, self.raw);
+        (
+            [(header::CONTENT_TYPE, "application/vnd.kubernetes.protobuf")],
+            body,
+        )
+            .into_response()
+    }
+}
+
 /// Rewrites `<`, `>`, `&`, U+2028 and U+2029 in serialized JSON to the `\uXXXX` escapes Go's
 /// `encoding/json` emits. Those characters occur only inside JSON strings, so a byte-level pass
 /// is safe. ControllerRevision `data` is an opaque `RawExtension`: the StatefulSet/DaemonSet
@@ -1435,6 +1483,56 @@ mod tests {
     }
 
     // ---- negotiated_response / encoders() dispatch tests -------------------
+
+    /// A LIST built item by item must be exactly the bytes the whole-list encoder produces, for
+    /// every registered list kind and for 0, 1 and many items, with every ListMeta field set:
+    /// a client decoding a LIST that differs in a single byte sees a different collection.
+    #[tokio::test]
+    async fn protobuf_list_builder_matches_the_list_encoder_for_every_registered_list_kind() {
+        let mut list_kinds = 0;
+        for ((api_version, kind), list_encoder) in encoders() {
+            let Some(item_kind) = kind.strip_suffix("List") else {
+                continue;
+            };
+            list_kinds += 1;
+            let items = |n: usize| -> Vec<serde_json::Value> {
+                (0..n)
+                    .map(|i| {
+                        serde_json::json!({
+                            "metadata": {
+                                "name": format!("o-{i}"), "namespace": "ns",
+                                "labels": {"a": "b"}, "resourceVersion": "7",
+                                "managedFields": [{"manager": "m", "operation": "Update"}],
+                            },
+                            "spec": {"nodeName": "n", "ports": [{"port": 80}]},
+                            "status": {"phase": "Running"},
+                        })
+                    })
+                    .collect()
+            };
+            for n in [0, 1, 3] {
+                let envelope = serde_json::json!({
+                    "kind": kind, "apiVersion": api_version,
+                    "metadata": {"resourceVersion": "42", "continue": "tok", "remainingItemCount": 5},
+                    "items": [],
+                });
+                let mut builder = ProtobufListBuilder::new(&envelope, 0)
+                    .unwrap_or_else(|| panic!("{kind}: item encoder {item_kind} missing"));
+                for item in items(n) {
+                    builder.push(&item);
+                }
+                let mut whole = envelope.clone();
+                whole["items"] = serde_json::Value::Array(items(n));
+                let expected =
+                    crate::proto::encode_k8s_envelope(kind, api_version, list_encoder(&whole));
+                let body = axum::body::to_bytes(builder.finish().into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected.as_slice(), "{kind} with {n} items");
+            }
+        }
+        assert_eq!(list_kinds, 6, "a new list encoder needs coverage here");
+    }
 
     /// Every hot-path kind registered in `encoders()` must produce a protobuf-encoded
     /// response (correct Content-Type header + k8s magic-prefix bytes) when the client asks

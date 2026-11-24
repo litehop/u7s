@@ -10,12 +10,21 @@
 //! An included item whose kind has no read-time defaults is served as its stored bytes. The
 //! store writes every object as `serde_json::to_vec` of a `Value` (it re-serializes on every
 //! put), so those bytes are exactly what parsing and re-serializing would produce.
+//!
+//! Every response encoding consumes the survivors one item at a time: a LIST's peak memory is
+//! dominated by how many parsed `Value` trees are alive at once, so only the encoded output
+//! (and, for a Table, its small rows) is ever held in full.
 
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::Value;
 
 use super::field_selector::FieldSelector;
-use super::generic::{item_matches_label_terms, label_terms_match, LabelSelectorTerm};
+use super::generic::{
+    build_list_response, item_matches_label_terms, label_terms_match, LabelSelectorTerm,
+};
 use super::watch::SelectorProjection;
+use crate::content_type::ProtobufListBuilder;
 use crate::status::{Status, StatusError};
 
 pub(crate) struct ListFilter<'a> {
@@ -49,6 +58,54 @@ enum Membership {
     Excluded,
     Included,
     Unknown,
+}
+
+/// How a LIST is encoded when the client asked for something other than plain JSON.
+#[derive(Clone)]
+pub(crate) enum ListFormat {
+    PartialObjectMetadata,
+    Table { api_version: String },
+    Protobuf,
+}
+
+impl ListFormat {
+    /// `None` means a plain JSON LIST. Protobuf only counts for kinds with a registered
+    /// encoder: clients send `protobuf, json` on every request and get JSON for the rest.
+    pub(crate) fn negotiate(
+        accept: &str,
+        pom: bool,
+        table: bool,
+        group: &str,
+        version: &str,
+        kind: &str,
+    ) -> Option<Self> {
+        if pom {
+            return Some(Self::PartialObjectMetadata);
+        }
+        if table {
+            return Some(Self::Table {
+                api_version: super::table::table_api_version(accept),
+            });
+        }
+        let api_version = if group.is_empty() {
+            version.to_string()
+        } else {
+            format!("{group}/{version}")
+        };
+        (crate::content_type::wants_protobuf(accept)
+            && crate::content_type::has_encoder(&api_version, &format!("{kind}List")))
+        .then_some(Self::Protobuf)
+    }
+}
+
+/// Everything about a LIST response that is not an item: the list's identity and paging state.
+pub(crate) struct ListEnvelope<'a> {
+    pub kind: &'a str,
+    pub version: &'a str,
+    pub revision: u64,
+    pub continue_key: Option<String>,
+    pub remaining_count: Option<u64>,
+    pub signing_key: &'a [u8; 32],
 }
 
 impl<'a> ListFilter<'a> {
@@ -120,17 +177,144 @@ impl<'a> ListFilter<'a> {
         Ok(Some(Selected::Parsed(item)))
     }
 
-    pub(crate) fn select_all(
+    /// Hands `consume` the surviving items as parsed values, one alive at a time. A stored
+    /// object that fails to parse ends the iteration and is reported instead of `consume`'s
+    /// result.
+    fn with_values<T>(
         &self,
         raw_items: &[u7s_store::StoreObject],
-    ) -> Result<Vec<Value>, StatusError> {
-        let mut items = Vec::new();
+        consume: impl FnOnce(&mut dyn Iterator<Item = Value>) -> T,
+    ) -> Result<T, StatusError> {
+        let mut failure = None;
+        let out = {
+            let mut values = raw_items
+                .iter()
+                .filter_map(|obj| {
+                    self.select(&obj.value)
+                        .and_then(|s| s.map(Selected::into_value).transpose())
+                        .transpose()
+                })
+                .map_while(|r| r.map_err(|e| failure = Some(e)).ok());
+            consume(&mut values)
+        };
+        failure.map_or(Ok(out), Err)
+    }
+
+    /// The JSON body: the envelope as `build_list_response` shapes it with an empty items array,
+    /// with the survivors spliced into the one place that placeholder appears, so it cannot
+    /// drift from that function's byte-for-byte-tested envelope.
+    pub(crate) fn render_json(
+        &self,
+        raw_items: &[u7s_store::StoreObject],
+        env: ListEnvelope<'_>,
+    ) -> Result<Vec<u8>, StatusError> {
+        let envelope = build_list_response(
+            env.kind,
+            self.group,
+            env.version,
+            env.revision,
+            Vec::new(),
+            env.continue_key,
+            env.remaining_count,
+            env.signing_key,
+        );
+        let envelope_bytes =
+            serde_json::to_vec(&envelope).map_err(|e| Status::internal(e.to_string()))?;
+        let marker = b"\"items\":[]";
+        let marker_pos = envelope_bytes
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("build_list_response always emits an empty items array for an empty items Vec");
+
+        let mut body = Vec::with_capacity(
+            envelope_bytes.len() + raw_items.iter().map(|o| o.value.len() + 1).sum::<usize>(),
+        );
+        body.extend_from_slice(&envelope_bytes[..marker_pos]);
+        body.extend_from_slice(b"\"items\":[");
+        let mut wrote_item = false;
         for obj in raw_items {
-            if let Some(selected) = self.select(&obj.value)? {
-                items.push(selected.into_value()?);
+            let Some(item) = self.select(&obj.value)? else {
+                continue;
+            };
+            if wrote_item {
+                body.push(b',');
+            }
+            wrote_item = true;
+            match item {
+                Selected::Raw(raw) => body.extend_from_slice(raw),
+                Selected::Parsed(item) => serde_json::to_writer(&mut body, &item)
+                    .map_err(|e| Status::internal(e.to_string()))?,
             }
         }
-        Ok(items)
+        body.push(b']');
+        body.extend_from_slice(&envelope_bytes[marker_pos + marker.len()..]);
+        Ok(body)
+    }
+
+    pub(crate) fn respond(
+        &self,
+        format: Option<ListFormat>,
+        raw_items: &[u7s_store::StoreObject],
+        env: ListEnvelope<'_>,
+    ) -> Result<Response, StatusError> {
+        let revision = env.revision;
+        match format {
+            None => {
+                let body = self.render_json(raw_items, env)?;
+                Ok((
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+                    .into_response())
+            }
+            Some(ListFormat::PartialObjectMetadata) => {
+                let items = self.with_values(raw_items, |values| {
+                    values
+                        .map(|v| super::watch::to_partial_object_metadata(&v))
+                        .collect::<Vec<_>>()
+                })?;
+                Ok(Json(serde_json::json!({
+                    "apiVersion": "meta.k8s.io/v1",
+                    "kind": "PartialObjectMetadataList",
+                    "metadata": { "resourceVersion": revision.to_string() },
+                    "items": items
+                }))
+                .into_response())
+            }
+            Some(ListFormat::Table { api_version }) => {
+                let continue_token = env
+                    .continue_key
+                    .map(|key| super::generic::encode_continue(&key, revision, env.signing_key));
+                let built = self.with_values(raw_items, |values| {
+                    super::table::build_table(self.group, self.plural, values)
+                })?;
+                Ok(Json(super::table::finalize_table(
+                    built,
+                    &api_version,
+                    Some(&revision.to_string()),
+                    continue_token,
+                ))
+                .into_response())
+            }
+            Some(ListFormat::Protobuf) => {
+                let envelope = build_list_response(
+                    env.kind,
+                    self.group,
+                    env.version,
+                    revision,
+                    Vec::new(),
+                    env.continue_key,
+                    env.remaining_count,
+                    env.signing_key,
+                );
+                let encoded_size_hint = raw_items.iter().map(|o| o.value.len()).sum::<usize>() / 2;
+                let mut builder = ProtobufListBuilder::new(&envelope, encoded_size_hint)
+                    .expect("ListFormat::negotiate only picks Protobuf for kinds with an encoder");
+                self.with_values(raw_items, |values| values.for_each(|v| builder.push(&v)))?;
+                Ok(builder.finish())
+            }
+        }
     }
 }
 
