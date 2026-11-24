@@ -35,7 +35,7 @@ use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
     ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
-use super::list_items::ListFilter;
+use super::list_items::{ListFilter, Selected};
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
 /// Restores the previously-stored `status` onto `body`, or strips whatever `status` is
@@ -124,7 +124,9 @@ pub(crate) fn stream_list_json(
         .position(|w| w == marker)
         .expect("build_list_response always emits an empty items array for an empty items Vec");
 
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(
+        envelope_bytes.len() + raw_items.iter().map(|o| o.value.len() + 1).sum::<usize>(),
+    );
     body.extend_from_slice(&envelope_bytes[..marker_pos]);
     body.extend_from_slice(b"\"items\":[");
     let mut wrote_item = false;
@@ -136,7 +138,11 @@ pub(crate) fn stream_list_json(
             body.push(b',');
         }
         wrote_item = true;
-        serde_json::to_writer(&mut body, &item).map_err(|e| Status::internal(e.to_string()))?;
+        match item {
+            Selected::Raw(raw) => body.extend_from_slice(raw),
+            Selected::Parsed(item) => serde_json::to_writer(&mut body, &item)
+                .map_err(|e| Status::internal(e.to_string()))?,
+        }
     }
     body.push(b']');
     body.extend_from_slice(&envelope_bytes[marker_pos + marker.len()..]);

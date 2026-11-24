@@ -115,7 +115,16 @@ fn kinds() -> Vec<Kind> {
             plural: "secrets",
             kind: "Secret",
             version: "v1",
-            items: many("Secret", "s", 6, json!({"data": {"k": "dg=="}})),
+            items: {
+                let mut secrets = many("Secret", "s", 6, json!({"data": {"k": "dg=="}}));
+                secrets.push(stored(labeled(
+                    "Secret",
+                    "s-string-data",
+                    json!({"app": "app-1"}),
+                    json!({"stringData": {"plain": "text"}}),
+                )));
+                secrets
+            },
         },
         Kind {
             group: "apps",
@@ -288,28 +297,119 @@ fn list_output_is_byte_identical_to_the_full_parse_path() {
     assert!(cases > 200, "corpus shrank to {cases} cases");
 }
 
-/// The skim may only exclude what the full matchers also exclude; anything it cannot read
+/// The skim may only decide what the full matchers decide the same way; anything it cannot read
 /// (non-string label values, a ReplicationController whose defaults rewrite labels) must be left
 /// to the full path or a matching object disappears from the LIST.
 #[test]
-fn prefilter_excludes_only_what_it_can_prove_and_defers_the_rest() {
+fn skim_decides_only_what_it_can_prove_and_defers_the_rest() {
     let terms = parse_label_selector("app=app-1").unwrap();
     let fs = FieldSelector::default();
     let filter = ListFilter::new("", "pods", &terms, &fs, None);
     let raw = |v: Value| serde_json::to_vec(&v).unwrap();
-    assert!(filter.definitely_excluded(&raw(json!({"metadata": {"labels": {"app": "other"}}}))));
-    assert!(!filter.definitely_excluded(&raw(json!({"metadata": {"labels": {"app": "app-1"}}}))));
+    assert!(matches!(
+        filter.membership(&raw(json!({"metadata": {"labels": {"app": "other"}}}))),
+        Membership::Excluded
+    ));
+    assert!(matches!(
+        filter.membership(&raw(json!({"metadata": {"labels": {"app": "app-1"}}}))),
+        Membership::Included
+    ));
     assert!(
-        !filter.definitely_excluded(&raw(json!({"metadata": {"labels": {"app": 1}}}))),
-        "a label the skim cannot read as a string is not a proof of exclusion"
+        matches!(
+            filter.membership(&raw(json!({"metadata": {"labels": {"app": 1}}}))),
+            Membership::Unknown
+        ),
+        "a label the skim cannot read as a string is not a proof either way"
     );
-    assert!(!filter.definitely_excluded(br#"{"metadata":{"labels":{"app":"x""#));
+    assert!(matches!(
+        filter.membership(br#"{"metadata":{"labels":{"app":"x""#),
+        Membership::Unknown
+    ));
 
     let rc = ListFilter::new("", "replicationcontrollers", &terms, &fs, None);
     assert!(
-        !rc.definitely_excluded(&raw(json!({"metadata": {"labels": {}}}))),
+        matches!(
+            rc.membership(&raw(json!({"metadata": {"labels": {}}}))),
+            Membership::Unknown
+        ),
         "RC defaults inherit template labels, so raw labels prove nothing"
     );
+
+    let status = FieldSelector::parse(Some("status.phase=Running"), "", "pods").unwrap();
+    let by_phase = ListFilter::new("", "pods", &[], &status, None);
+    assert!(
+        matches!(
+            by_phase.membership(&raw(json!({"status": {"phase": "Running"}}))),
+            Membership::Unknown
+        ),
+        "status.phase is outside the projection, so only the full object can answer"
+    );
+}
+
+/// The speedup only exists if the cheap outcomes are actually taken: included items of a kind
+/// with no defaults are served from their stored bytes, kinds with defaults and `on_item` hooks
+/// still get a parsed (defaulted) object.
+#[test]
+fn included_items_are_served_raw_only_when_nothing_needs_the_parsed_object() {
+    let fs = FieldSelector::default();
+    let cm = stored(json!({"metadata": {"name": "a", "labels": {"app": "x"}}, "data": {"k": "v"}}));
+    let terms = parse_label_selector("app=x").unwrap();
+
+    let plain = ListFilter::new("", "configmaps", &terms, &fs, None);
+    assert!(matches!(
+        plain.select(&cm.value).unwrap(),
+        Some(Selected::Raw(_))
+    ));
+    let none = ListFilter::new("", "configmaps", &[], &fs, None);
+    assert!(matches!(
+        none.select(&cm.value).unwrap(),
+        Some(Selected::Raw(_))
+    ));
+
+    let defaulted = ListFilter::new("", "secrets", &terms, &fs, None);
+    assert!(matches!(
+        defaulted.select(&cm.value).unwrap(),
+        Some(Selected::Parsed(_))
+    ));
+
+    fn hook(_: &Value) {}
+    let hooked = ListFilter::new("", "configmaps", &terms, &fs, Some(hook));
+    assert!(matches!(
+        hooked.select(&cm.value).unwrap(),
+        Some(Selected::Parsed(_))
+    ));
+
+    let miss = parse_label_selector("app=y").unwrap();
+    let excluded = ListFilter::new("", "configmaps", &miss, &fs, None);
+    assert!(excluded.select(&cm.value).unwrap().is_none());
+}
+
+/// `Selected::Raw` is only correct while stored bytes equal their own parse-and-reserialize.
+/// The store stamps resourceVersion by re-serializing a `Value` on every put, so even a
+/// client-formatted, unsorted body is persisted canonically; if that ever stopped, LIST would
+/// start emitting key orders and number forms that differ from the parsed path.
+#[tokio::test]
+async fn the_store_persists_canonical_bytes() {
+    use u7s_store::Store;
+    let store = u7s_store::SqliteStore::new(":memory:").unwrap();
+    let messy = br#"{ "metadata" : {"name":"a", "labels": {"z":"1","a":"2"}},
+        "data": {"b": 1.0, "a": 10000000000000000000000, "e": 1e3, "u": "\u00e9\u003c"},   "kind":"ConfigMap" }"#;
+    store
+        .put(
+            "/registry/configmaps/ns/a",
+            bytes::Bytes::from_static(messy),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    let listed = store
+        .list("/registry/configmaps/", Default::default())
+        .await
+        .unwrap();
+    let bytes = &listed.items[0].value;
+    let reserialized =
+        serde_json::to_vec(&serde_json::from_slice::<Value>(bytes).unwrap()).unwrap();
+    assert_eq!(bytes.as_ref(), reserialized.as_slice());
 }
 
 /// Defaults sit between stored bytes and what LIST matches selectors on; a new defaulting arm
@@ -339,4 +439,46 @@ fn only_listed_kinds_have_defaults_that_alter_selected_metadata() {
             key.plural
         );
     }
+}
+
+/// A kind missing from `defaults_apply` would be served from its stored bytes and silently lose
+/// the defaulting `apply_defaults` performs (kubectl/KCM then read unset fields), so every
+/// registered kind outside it must leave bare and typical objects untouched.
+#[test]
+fn kinds_without_defaults_are_untouched_by_apply_defaults() {
+    let state = crate::handlers::test_support::make_state_with_store(std::sync::Arc::new(
+        u7s_store::SqliteStore::new(":memory:").unwrap(),
+    ));
+    let samples = [
+        json!({"apiVersion": "v1", "metadata": {"name": "n", "namespace": "ns"}}),
+        json!({
+            "apiVersion": "v1",
+            "metadata": {"name": "n", "namespace": "ns", "labels": {"a": "b"}},
+            "spec": {"selector": {}, "template": {"metadata": {}, "spec": {"containers": []}}},
+            "status": {},
+            "data": {},
+            "stringData": {"k": "v"},
+            "type": "",
+        }),
+    ];
+    let mut with_defaults = 0;
+    for key in state.resource_registry.keys() {
+        if crate::handlers::defaults::defaults_apply(&key.group, &key.plural) {
+            with_defaults += 1;
+            continue;
+        }
+        for sample in &samples {
+            let mut defaulted = sample.clone();
+            crate::handlers::defaults::apply_defaults(&key.group, &key.plural, &mut defaulted);
+            assert_eq!(
+                &defaulted, sample,
+                "{}/{} has defaults but is missing from defaults_apply",
+                key.group, key.plural
+            );
+        }
+    }
+    assert!(
+        with_defaults > 10,
+        "registry walk found only {with_defaults} defaulting kinds"
+    );
 }

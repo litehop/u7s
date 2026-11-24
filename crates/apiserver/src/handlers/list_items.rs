@@ -3,9 +3,13 @@
 //!
 //! Membership is decided from the stored bytes through the watch path's `SelectorProjection`
 //! (labels plus the handful of field-selector labels it carries) before any full parse, so an
-//! item a selector excludes costs one skim instead of a `Value` tree. The projection only ever
-//! answers "definitely excluded" or "don't know"; the full object is still checked against the
-//! real matchers after defaulting.
+//! item a selector excludes costs one skim instead of a `Value` tree. The projection answers
+//! "excluded", "included" or "don't know"; "don't know" falls through to the full parse, which
+//! checks the real matchers after defaulting.
+//!
+//! An included item whose kind has no read-time defaults is served as its stored bytes. The
+//! store writes every object as `serde_json::to_vec` of a `Value` (it re-serializes on every
+//! put), so those bytes are exactly what parsing and re-serializing would produce.
 
 use serde_json::Value;
 
@@ -20,6 +24,31 @@ pub(crate) struct ListFilter<'a> {
     terms: &'a [LabelSelectorTerm<'a>],
     field_selector: &'a FieldSelector,
     on_item: Option<fn(&Value)>,
+    /// Whether a surviving item must be parsed: its kind has defaults, or `on_item` reads it.
+    parse_survivors: bool,
+}
+
+/// A surviving item: its stored bytes when no parse was needed, else the defaulted object.
+pub(crate) enum Selected<'a> {
+    Raw(&'a [u8]),
+    Parsed(Value),
+}
+
+impl Selected<'_> {
+    pub(crate) fn into_value(self) -> Result<Value, StatusError> {
+        match self {
+            Selected::Parsed(v) => Ok(v),
+            Selected::Raw(raw) => {
+                serde_json::from_slice(raw).map_err(|e| Status::internal(e.to_string()))
+            }
+        }
+    }
+}
+
+enum Membership {
+    Excluded,
+    Included,
+    Unknown,
 }
 
 impl<'a> ListFilter<'a> {
@@ -36,34 +65,48 @@ impl<'a> ListFilter<'a> {
             terms,
             field_selector,
             on_item,
+            parse_survivors: on_item.is_some() || super::defaults::defaults_apply(group, plural),
         }
     }
 
-    /// `true` only when the stored bytes definitely fail the selectors. Skipped for kinds whose
-    /// read-time defaults rewrite `metadata.labels`, where the raw labels are not what LIST
-    /// matches against.
-    fn definitely_excluded(&self, raw: &[u8]) -> bool {
-        if (self.terms.is_empty() && self.field_selector.is_empty())
-            || super::defaults::defaults_may_alter_labels(self.group, self.plural)
-        {
-            return false;
+    /// Decides from the stored bytes alone. Always `Unknown` for kinds whose read-time defaults
+    /// rewrite `metadata.labels`, where the raw labels are not what LIST matches against.
+    fn membership(&self, raw: &[u8]) -> Membership {
+        if self.terms.is_empty() && self.field_selector.is_empty() {
+            return Membership::Included;
+        }
+        if super::defaults::defaults_may_alter_labels(self.group, self.plural) {
+            return Membership::Unknown;
         }
         let Ok(projection) = serde_json::from_slice::<SelectorProjection>(raw) else {
-            return false;
+            return Membership::Unknown;
         };
         let labels = &projection.metadata.labels;
-        !label_terms_match(
+        if !label_terms_match(
             self.terms,
             |key| labels.contains_key(key),
             |key| labels.get(key).copied(),
-        ) || (!self.field_selector.is_empty()
-            && projection.field_selector_verdict(self.field_selector) == Some(false))
+        ) {
+            return Membership::Excluded;
+        }
+        if self.field_selector.is_empty() {
+            return Membership::Included;
+        }
+        match projection.field_selector_verdict(self.field_selector) {
+            Some(true) => Membership::Included,
+            Some(false) => Membership::Excluded,
+            None => Membership::Unknown,
+        }
     }
 
-    /// Parses, defaults and filters one stored object; `None` when a selector excludes it.
-    pub(crate) fn select(&self, raw: &[u8]) -> Result<Option<Value>, StatusError> {
-        if self.definitely_excluded(raw) {
-            return Ok(None);
+    /// Filters one stored object; `None` when a selector excludes it.
+    pub(crate) fn select<'r>(&self, raw: &'r [u8]) -> Result<Option<Selected<'r>>, StatusError> {
+        match self.membership(raw) {
+            Membership::Excluded => return Ok(None),
+            Membership::Included if !self.parse_survivors => {
+                return Ok(Some(Selected::Raw(raw)));
+            }
+            Membership::Included | Membership::Unknown => {}
         }
         let mut item: Value =
             serde_json::from_slice(raw).map_err(|e| Status::internal(e.to_string()))?;
@@ -74,7 +117,7 @@ impl<'a> ListFilter<'a> {
         if let Some(f) = self.on_item {
             f(&item);
         }
-        Ok(Some(item))
+        Ok(Some(Selected::Parsed(item)))
     }
 
     pub(crate) fn select_all(
@@ -83,7 +126,9 @@ impl<'a> ListFilter<'a> {
     ) -> Result<Vec<Value>, StatusError> {
         let mut items = Vec::new();
         for obj in raw_items {
-            items.extend(self.select(&obj.value)?);
+            if let Some(selected) = self.select(&obj.value)? {
+                items.push(selected.into_value()?);
+            }
         }
         Ok(items)
     }
