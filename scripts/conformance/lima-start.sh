@@ -35,6 +35,7 @@
 set -euo pipefail
 
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
+INSTALL_SH="$(dirname "$0")/../install.sh"
 KUBE_NETWORK_POLICIES_YAML="$(dirname "$0")/manifests/kube-network-policies.yaml"
 # shellcheck source=scripts/conformance/_lib.sh
 source "$(dirname "$0")/_lib.sh"
@@ -49,6 +50,9 @@ _KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _NODE_SUFFIX_OVERRIDE=""
 DUAL_STACK=0
 VERBOSE=0
+START_KCM=0
+KCM_V=""
+SIGNING_DURATION=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
@@ -61,6 +65,9 @@ while [[ $# -gt 0 ]]; do
     --node-suffix) _NODE_SUFFIX_OVERRIDE="$2"; shift 2 ;;
     --dual-stack) DUAL_STACK=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
+    --with-kcm) START_KCM=1; shift ;;
+    --kcm-v) KCM_V="$2"; shift 2 ;;
+    --signing-duration) SIGNING_DURATION="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -130,12 +137,13 @@ fi
 
 check_deps() {
   local missing=0
-  for cmd in limactl kubectl; do
+  for cmd in limactl kubectl jq; do
     if ! command -v "$cmd" &>/dev/null; then
       echo "error: $cmd not found" >&2
       case "$cmd" in
         limactl) echo "  install: brew install lima" >&2 ;;
         kubectl)  echo "  install: aqua install" >&2 ;;
+        jq)       echo "  install: brew install jq (install.sh's CSR flow runs on the host)" >&2 ;;
       esac
       missing=1
     fi
@@ -373,102 +381,8 @@ fi
 # rather than leaving iptables DNAT unable to fire.
 rig_node_prep_script "$DUAL_STACK" "$(dirname "$0")/../install.sh" | limactl shell "$VM_NAME" sudo bash -s
 
-# Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
-# run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
-# (size-based) from the remaining logs (weekly). Written on every start so it survives
-# VM reprovisions.
-limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROTATEOF'
-/var/log/syslog {
-    size 2G
-    rotate 2
-    compress
-    delaycompress
-    missingok
-    notifempty
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate
-    endscript
-}
-/var/log/mail.log
-/var/log/kern.log
-/var/log/auth.log
-/var/log/user.log
-/var/log/cron.log
-{
-    rotate 4
-    weekly
-    missingok
-    notifempty
-    compress
-    delaycompress
-    sharedscripts
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate
-    endscript
-}
-LOGROTATEOF
-
-# Override the logrotate systemd timer to fire every 2 hours instead of daily.
-# The size-based trigger in logrotate.d/rsyslog only acts when logrotate runs;
-# with the default daily schedule a 10-hour conformance run can exhaust 2GB before
-# midnight and evict the e2e pod. OnCalendar= (empty) clears the inherited value.
-limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/logrotate.timer.d && cat > /etc/systemd/system/logrotate.timer.d/override.conf' <<'EOF'
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* *:00/2:00
-RandomizedDelaySec=0
-EOF
-limactl shell "$VM_NAME" sudo systemctl daemon-reload
-limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
-
-# Raise journald's rate-limit and disk retention so a 16-way conformance run's
-# kubelet/crio log volume on the busiest node isn't rate-limited or rotated away
-# before scripts/conformance/06-run-sonobuoy.sh collects it: the stock
-# RateLimitBurst=10000/30s silently drops lines once a unit's log rate exceeds
-# it, and the stock SystemMaxUse evicts the oldest segment once total journal
-# disk usage crosses a few hundred MB — together these erased the first ~5
-# minutes of one node's kubelet.log/crio.log in a real run while an identically
-# collected, less-loaded node kept the full window. Written on every start so it
-# survives VM reprovisions.
-#
-# SystemMaxUse=2G (this drop-in's original value) still wasn't enough: the
-# 0805-2202 --all-e2e run's collected kubelet.log/crio.log covered only the
-# LAST 1h54m of an 11h run (measured directly off that node's timestamps,
-# 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
-# entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
-# rate; going further eats into the VM disk conformance tests themselves need.
-# That margin was the original constraint: at the 20GiB disk ceiling this
-# drop-in was written against, only ~14G was free with base images pulled —
-# tight enough that it's part of what tripped the DiskPressure storm above.
-# The disk ceiling (lima/kubelet.yaml) has since doubled to 40GiB specifically
-# to fix that trigger (~33G free now observed with only base images pulled),
-# so 6G stays a deliberate compromise against overall journal disk usage, not
-# one forced by a tight VM-disk margin anymore.
-limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
-[Journal]
-RateLimitBurst=100000
-RateLimitIntervalSec=30s
-SystemMaxUse=5G
-SystemMaxFileSize=32M
-SystemMaxFiles=160
-SystemKeepFree=100M
-Storage=persistent
-EOF
-limactl shell "$VM_NAME" sudo systemctl restart systemd-journald
-
-# This block re-runs on every invocation, not only --reset ones (reset.sh does
-# a full 'limactl delete --force', but a plain re-run against an existing VM
-# hits this same code path). On a VM reused across several conformance
-# sessions without --reset in between, journal volume from EARLIER sessions
-# is still sitting in the budget when a NEW run starts, silently shrinking how
-# much of the fresh run's own window that 6G actually covers. --rotate forces
-# the currently-active file closed so --vacuum-size can delete it along with
-# any older archived segments (a raw --vacuum-size alone leaves the active
-# file alone), reclaiming the full budget for THIS run. Safe to discard here
-# because any prior run's data that mattered was already evacuated to the
-# host by 06-run-sonobuoy.sh's end-of-run collection.
-limactl shell "$VM_NAME" sudo journalctl --rotate
-limactl shell "$VM_NAME" sudo journalctl --vacuum-size=1M
+# Rig-only VM userspace (log rotation, journald retention, nfs-common), shared with install mode.
+rig_apply_vm_rig_setup "$VM_NAME"
 
 # Copy cluster CA so the kubelet can authenticate the apiserver's mTLS client cert
 # when proxying log/exec/attach requests. Without a clientCAFile the kubelet falls
@@ -482,62 +396,51 @@ if [ -f "$CA_CERT" ]; then
   # Extra trusted CAs (successor/predecessor) join the kubelet's trust bundle.
   if [ -f "$(dirname "$CA_CERT")/ca-extra.pem" ]; then cat "$(dirname "$CA_CERT")/ca-extra.pem" >> "$CA_PEM"; fi
   limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
-  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt
+  limactl shell "$VM_NAME" sudo install -D -m 0644 /tmp/kubelet-ca.crt "$RIG_KUBELET_STATE_DIR/ca-bundle.pem"
+  # Files an earlier rig wrote outside the state dir; the host-signed identity they held is gone.
+  limactl shell "$VM_NAME" sudo rm -f /etc/kubelet-ca.crt /etc/kubelet-client.crt /etc/kubelet-client.key /etc/kubelet-kubeconfig
 
-  # The kubelet authenticates as system:node:<VM> (O=system:nodes), never as the admin
-  # kubeconfig, so the Node authorizer and NodeRestriction bind it as on a real node.
-  # The CA key is on this host, so the initial client cert is signed here; the kubelet
-  # then rotates it through the CSR API (rotateCertificates in its config below).
-  # File-path kubeconfig: kubelet re-reads the cert files it points at.
-  NODE_CLIENT_KEY="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.key"
-  NODE_CLIENT_CRT="$(dirname "$KUBECONFIG_PATH")/kubelet-client${NODE_SUFFIX}.crt"
-  if [ ! -f "$NODE_CLIENT_KEY" ] || ! node_client_cert_valid "$NODE_CLIENT_CRT" "$CA_PEM"; then
-    NODE_CLIENT_CSR=$(mktemp)
-    openssl ecparam -genkey -name prime256v1 -noout -out "$NODE_CLIENT_KEY"
-    openssl req -new -key "$NODE_CLIENT_KEY" \
-      -subj "/O=system:nodes/CN=system:node:${VM_NAME}" -sha256 \
-      -out "$NODE_CLIENT_CSR"
-    openssl x509 -req -in "$NODE_CLIENT_CSR" \
-      -CA "$CA_PEM" -CAkey "$(dirname "$KUBECONFIG_PATH")/ca.key" \
-      -CAcreateserial -CAserial "$(dirname "$KUBECONFIG_PATH")/ca.srl" \
-      -days 365 -sha256 \
-      -extfile <(printf 'extendedKeyUsage=clientAuth\n') \
-      -out "$NODE_CLIENT_CRT"
-    rm -f "$NODE_CLIENT_CSR"
+  # The kubelet gets the identity install.sh gives its control-plane node (its own
+  # issue_cp_kubelet_identity, replayed): a kubelet-client CSR that KCM approves and signs, so
+  # KCM must be up first. The apiserver refuses a bootstrap-token join under the local node's
+  # name, which is this VM's. The identity is kept while it is unexpired and chains to the
+  # current CA, so a re-run never replaces a cert the kubelet already rotated.
+  if [ "$START_KCM" -eq 1 ]; then
+    KCM_ARGS=(--vm "$VM_NAME" --port "$PORT" --workdir "$(dirname "$KUBECONFIG_PATH")")
+    [ -z "$KCM_V" ] || KCM_ARGS+=(--kcm-v "$KCM_V")
+    [ -z "$SIGNING_DURATION" ] || KCM_ARGS+=(--signing-duration "$SIGNING_DURATION")
+    [ "$DUAL_STACK" -eq 0 ] || KCM_ARGS+=(--dual-stack)
+    bash "$(dirname "$0")/04-start-kcm.sh" "${KCM_ARGS[@]}"
   fi
-  limactl copy "$NODE_CLIENT_CRT" "${VM_NAME}:/tmp/kubelet-client.crt"
-  limactl copy "$NODE_CLIENT_KEY" "${VM_NAME}:/tmp/kubelet-client.key"
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-client.crt /etc/kubelet-client.crt
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-client.key /etc/kubelet-client.key
-  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-client.crt
-  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-client.key
-  limactl shell "$VM_NAME" rm -f /tmp/kubelet-client.key
-  NODE_KUBECONFIG=$(mktemp)
-  cat > "$NODE_KUBECONFIG" <<KCEOF
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://host.lima.internal:${PORT}
-    certificate-authority: /etc/kubelet-ca.crt
-  name: u7s
-contexts:
-- context:
-    cluster: u7s
-    user: system:node:${VM_NAME}
-  name: u7s
-current-context: u7s
-users:
-- name: system:node:${VM_NAME}
-  user:
-    client-certificate: /etc/kubelet-client.crt
-    client-key: /etc/kubelet-client.key
-KCEOF
-  limactl copy "$NODE_KUBECONFIG" "${VM_NAME}:/tmp/kubelet-kubeconfig"
-  rm -f "$NODE_KUBECONFIG"
-  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
-  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
+  if rig_kubelet_identity_script "$INSTALL_SH" | limactl shell "$VM_NAME" sudo bash -s; then
+    echo "Kubelet identity for $VM_NAME is current; not re-issuing."
+  else
+    if [ "$START_KCM" -eq 0 ] && [ -z "$(kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" ]; then
+      echo "error: ${VM_NAME} needs a kubelet identity, which KCM must sign, and no KCM is running. Re-run with --with-kcm." >&2
+      exit 1
+    fi
+    ID_DIR="$(dirname "$KUBECONFIG_PATH")/kubelet-identity${NODE_SUFFIX}"
+    rm -rf "$ID_DIR"
+    mkdir -p "$ID_DIR"
+    cp "$KUBECONFIG_PATH" "$ID_DIR/kubeconfig"
+    cp "$CA_PEM" "$ID_DIR/ca-bundle.pem"
+    rig_kubelet_issue_script "$INSTALL_SH" "$ID_DIR" "$VM_NAME" | bash -s
+    sed -e "s#^\( *server:\) .*#\1 https://host.lima.internal:${PORT}#" -e "s#$ID_DIR#$RIG_KUBELET_STATE_DIR#g" \
+      "$ID_DIR/kubelet-kubeconfig" > "$ID_DIR/kubelet-kubeconfig.vm"
+    for f in kubelet-client.crt kubelet-client.key kubelet-kubeconfig.vm; do
+      limactl copy "$ID_DIR/$f" "${VM_NAME}:/tmp/rig-$f"
+    done
+    rm -rf "$ID_DIR"
+    limactl shell "$VM_NAME" sudo bash -c "
+      set -e
+      systemctl stop kubelet.service 2>/dev/null || true
+      cd $RIG_KUBELET_STATE_DIR
+      rm -rf kubelet/pki
+      install -m 0644 /tmp/rig-kubelet-client.crt kubelet-client.crt
+      install -m 0600 /tmp/rig-kubelet-client.key kubelet-client.key
+      install -m 0600 /tmp/rig-kubelet-kubeconfig.vm kubelet-kubeconfig
+      rm -f /tmp/rig-kubelet-client.crt /tmp/rig-kubelet-client.key /tmp/rig-kubelet-kubeconfig.vm"
+  fi
 
   # The kubelet config is install.sh's write_kubelet_config_yaml output plus the recorded
   # rig-only overlay (RIG_KUBELET_OVERLAY, RIG_KUBELET_GATE), rewritten every start. That
@@ -551,14 +454,16 @@ KCEOF
   # writes the first and set-kubelet-clusterdns.sh the full per-family list.
   KUBE_DNS_LINES=$(rig_kube_dns_ips "$(rig_effective_service_cidr "$DUAL_STACK")") || exit 1
   KUBE_DNS_IPS=$(echo "$KUBE_DNS_LINES" | paste -sd' ' -)
-  rig_kubelet_config_script "$(echo "$KUBE_DNS_LINES" | sed -n 1p)" "$(dirname "$0")/../install.sh" | limactl shell "$VM_NAME" sudo bash -s
-  limactl shell "$VM_NAME" sudo cp /etc/kubelet-ca.crt "$RIG_KUBELET_STATE_DIR/ca-bundle.pem"
+  rig_kubelet_config_script "$(echo "$KUBE_DNS_LINES" | sed -n 1p)" "$INSTALL_SH" | limactl shell "$VM_NAME" sudo bash -s
   # shellcheck disable=SC2086 # one word per VIP
   limactl shell "$VM_NAME" sudo bash -s -- "$RIG_KUBELET_CONFIG" $KUBE_DNS_IPS < "$(dirname "$0")/set-kubelet-clusterdns.sh"
   limactl shell "$VM_NAME" sudo bash -s -- "$RIG_KUBELET_CONFIG" "$RIG_KUBELET_GATE" < "$(dirname "$0")/../set-kubelet-featuregate.sh"
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf 'logging:\n  verbosity: %s\n' "$KUBELET_V" | limactl shell "$VM_NAME" sudo tee -a "$RIG_KUBELET_CONFIG" >/dev/null
+  fi
   # A serving cert issued by an earlier CA (workdir wiped, VM kept) is reused by the
   # kubelet while unexpired; drop it so the kubelet files a fresh CSR.
-  limactl shell "$VM_NAME" sudo bash -c 'f=/var/lib/kubelet/pki/kubelet-server-current.pem; if [ -e "$f" ] && ! openssl verify -CAfile /etc/kubelet-ca.crt "$f" >/dev/null 2>&1; then rm -f /var/lib/kubelet/pki/kubelet-server-*; fi'
+  limactl shell "$VM_NAME" sudo bash -c 'd='"$RIG_KUBELET_STATE_DIR"'/kubelet/pki; f=$d/kubelet-server-current.pem; if [ -e "$f" ] && ! openssl verify -CAfile '"$RIG_KUBELET_STATE_DIR"'/ca-bundle.pem "$f" >/dev/null 2>&1; then rm -f $d/kubelet-server-*; fi'
 
   # The VM IP is the kubelet's --node-ip, and so the address the serving CSR is approved
   # against.
@@ -611,51 +516,10 @@ KCEOF
     limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
   fi
 
-  # Write the kubelet drop-in (idempotent: overwrite each run).
-  limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
-[Service]
-# klog has no --utc flag, so kubelet's embedded klog lines render whatever local
-# time the process inherits; force UTC so kubelet.log matches apiserver.log.
-Environment=TZ=UTC
-# Default GOGC=100 + unbounded heap let kubelet's RSS sawtooth up to 235MB on a
-# lima-node run (164.9->235.1MB single-tick step-up, classic GC-lag signature).
-# Measured on lima-node-2: 31-pod create/delete cycle post-cleanup RSS dropped
-# 167.5MB->104.6MB (and stayed flat, no delayed step-up) with this tuple vs.
-# unset; idle RSS -21.6MB, mid-load RSS -22.1MB. GOMEMLIMIT is a soft cap (GC
-# works harder as it's approached, never OOM-kills); pod-actuation timing for
-# 31 pods was unchanged (still fully Running within ~2min in both conditions).
-Environment=GOMEMLIMIT=200MiB
-Environment=GOGC=50
-Environment=GOMAXPROCS=2
-ExecStart=
-ExecStart=/usr/bin/kubelet \\\\
-  --config=${RIG_KUBELET_CONFIG} \\\\
-  --kubeconfig=/etc/kubelet-kubeconfig \\\\
-  --hostname-override=${VM_NAME} \\\\
-  --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
-  --v=${KUBELET_V} \\\\
-  --feature-gates=ContainerCheckpoint=false,ContainerRestartRules=false,InPlacePodLevelResourcesVerticalScaling=false,KubeletCrashLoopBackOffMax=false,KubeletEnsureSecretPulledImages=false,KubeletSeparateDiskGC=false,KubeletServiceAccountTokenForCredentialProviders=false,PodLevelResources=false,PodLevelResourcesFixDefaulting=false,PodLevelResourcesFixKubeletQOSClass=false,ReloadKubeletClientCAFile=false,ReloadKubeletServerCertificateFile=false,ResourceHealthStatus=false,ResourceHealthStatusMessage=false,RestartAllContainersOnContainerExits=false
-# Round-2 tuning: feature-gate audit -- see the matching kubelet.service
-# comment in scripts/install.sh for the full per-gate rationale (mirrored
-# here so the conformance run exercises what production ships), including
-# why --housekeeping-interval was tried and reverted (desyncs from
-# kubelet's hardcoded eviction-monitoring period), why
-# --application-metrics-count-limit=0 (the prior cAdvisor trim flag here)
-# was dropped -- kubelet 1.37 removed it entirely (unknown flag, a
-# crash-loop, not a deprecation) -- and why InPlacePodVerticalScalingInitContainers
-# is no longer in this list (kubelet 1.37 graduated it to GA + LockToDefault:true,
-# so passing =false is now a startup error, not a no-op) while
-# PodLevelResourcesFixDefaulting/PodLevelResourcesFixKubeletQOSClass were added
-# (new in 1.37, default true, both hard-depend on PodLevelResources per
-# pkg/features/kube_features.go's dependency map, so keeping PodLevelResources
-# disabled now requires disabling these two as well or kubelet refuses to start).
-# --max-pods/ChangeDetectionStrategy intentionally untouched -- operator scope
-# narrowing.
-# Sustained conformance load (one FD per container log/exec/attach stream) can
-# exceed the systemd default.
-LimitNOFILE=1048576
-EOF"
-  limactl shell "$VM_NAME" sudo systemctl daemon-reload
+  # install.sh's own worker kubelet.service (--cert-dir under the rig state dir, the shared
+  # feature-gate flags), plus the recorded rig-only drop-in (RIG_KUBELET_DROPIN). Any
+  # earlier rig drop-in that overrode ExecStart is overwritten by it.
+  rig_kubelet_unit_script "$INSTALL_SH" "$VM_NAME" "${LIMA_VM_IP},${NODE_IPV6}" | limactl shell "$VM_NAME" sudo bash -s
   echo "Kubelet config rendered from install.sh; serving cert comes from its serverTLSBootstrap CSR."
 else
   echo "WARNING: $CA_CERT not found — kubelet client auth will not work (logs/exec will return 401)" >&2
@@ -789,14 +653,6 @@ limactl shell "$VM_NAME" sudo bash -c '
   systemctl daemon-reload
 '
 
-# nfs-common provides the /sbin/mount.nfs helper: without it kubelet's `mount -t nfs` fails with
-# "bad option; ... need /sbin/mount.<type> helper program" for every nfs/nfs3 driver
-# storage conformance test, even once the PV/PVC bind itself succeeds. No output
-# suppression / `|| true` here: let `set -euo pipefail` fail the script loudly
-# if either command fails, rather than continuing with a half-provisioned VM.
-limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
-limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y nfs-common
-
 # Resolve the host gateway IP used to route the kubernetes ClusterIP. This (and the
 # patch below) used to only WARN and continue on failure — but skipping either one
 # leaves kube-proxy's iptables rule for 10.96.0.1:443 pointed at 127.0.0.1 (this node's
@@ -838,6 +694,18 @@ if [ "$FOUND" -eq 0 ]; then
   echo "--- kubelet log (last 30 lines) ---" >&2
   limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager --utc -n 30 >&2
   exit 1
+fi
+
+if [ -z "$_NODE_SUFFIX_OVERRIDE" ]; then
+  # install.sh's label_control_plane_node, replayed: the primary VM is the control-plane node;
+  # add-node.sh passes --node-suffix for the others.
+  _label_fn="$(install_sh_function label_control_plane_node "$INSTALL_SH")"
+  [ -n "$_label_fn" ] || { echo "error: label_control_plane_node not found in $INSTALL_SH" >&2; exit 1; }
+  eval "$_label_fn"
+  STATE_DIR="$(dirname "$KUBECONFIG_PATH")"
+  NODE_NAME="$VM_NAME"
+  [ "$(basename "$KUBECONFIG_PATH")" = kubeconfig ] || cp "$KUBECONFIG_PATH" "$STATE_DIR/kubeconfig"
+  label_control_plane_node
 fi
 
 echo ""

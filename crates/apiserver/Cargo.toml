@@ -67,7 +67,7 @@ chrono          = { version = "0.4", default-features = false, features = ["allo
 regex           = "1"
 regex-automata  = { version = "0.4", default-features = false, features = ["meta", "syntax", "perf", "unicode", "hybrid", "dfa-onepass"] }
 dhat            = { version = "0.3", optional = true }
-rlimit          = "0.11"
+rlimit          = "0.12"
 socket2         = "0.6"
 libc            = "0.2"
 
