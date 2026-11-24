@@ -9,7 +9,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Extension,
 };
 use bytes::Bytes;
 use u7s_store::{ListOptions, Store};
@@ -17,11 +17,9 @@ use u7s_store::{ListOptions, Store};
 use crate::{auth::UserInfo, state::AppState, status::Status};
 
 use super::field_selector::FieldSelector;
-use super::generic::{
-    apply_label_selector, build_list_response, decode_continue, parse_label_selector,
-    CollectionQuery,
-};
+use super::generic::{decode_continue, parse_label_selector, CollectionQuery};
 use super::json_patch::{CreateQuery, PatchQuery, ReplaceQuery};
+use super::list_items::{ListEnvelope, ListFilter, ListFormat};
 use super::resource::{
     create_namespaced_resource, create_resource, delete_collection_namespaced_resource,
     delete_collection_resource, delete_namespaced_resource, delete_resource,
@@ -163,88 +161,23 @@ pub(crate) async fn core_list_resource<S: Store>(
             .transpose()?
             .unwrap_or_default();
 
-        // See list_resource's identically-shaped guard for why this checks has_encoder rather
-        // than wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes
-        // the streaming path when the client isn't going to get real protobuf anyway.
-        let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
-            && crate::content_type::has_encoder("v1", "PodList");
-        if !pom && !table && !wants_real_protobuf {
-            let body = super::resource::stream_list_json(
-                "Pod",
-                "",
-                "v1",
-                "pods",
-                list_revision,
-                &resp.items,
-                &label_pairs,
-                &field_selector,
-                None,
-                resp.continue_key,
-                resp.remaining_count,
-                &state.continue_token_key,
-            )?;
-            return Ok((
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response());
-        }
-
-        let mut items = Vec::with_capacity(resp.items.len());
-        for obj in &resp.items {
-            let v: serde_json::Value =
-                serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-            items.push(v);
-        }
-        let items = field_selector.filter(items);
-        let items = apply_label_selector(items, &label_pairs);
-        tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
-
-        if pom {
-            let pom_items: Vec<serde_json::Value> = items
-                .iter()
-                .map(super::watch::to_partial_object_metadata)
-                .collect();
-            let body = serde_json::json!({
-                "apiVersion": "meta.k8s.io/v1",
-                "kind": "PartialObjectMetadataList",
-                "metadata": { "resourceVersion": list_revision.to_string() },
-                "items": pom_items
-            });
-            return Ok(Json(body).into_response());
-        }
-
         // `kubectl get pods -A` sends the same Accept: application/json;as=Table;... header
-        // as `kubectl get pods -n <ns>` (list_pods, which already handles this). Without this,
-        // kubectl can't decode the response and falls back to printing only NAME/AGE instead of
-        // the usual READY/STATUS/RESTARTS/AGE columns.
-        if table {
-            let api_version = super::table::table_api_version(accept);
-            let continue_token = resp.continue_key.map(|key| {
-                super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
-            });
-            let built = super::table::build_table("", "pods", items);
-            return Ok(Json(super::table::finalize_table(
-                built,
-                &api_version,
-                Some(&list_revision.to_string()),
-                continue_token,
-            ))
-            .into_response());
-        }
-
-        let body = build_list_response(
-            "Pod",
-            "",
-            "v1",
-            list_revision,
-            items,
-            resp.continue_key,
-            resp.remaining_count,
-            &state.continue_token_key,
+        // as `kubectl get pods -n <ns>`; without a Table response kubectl falls back to
+        // printing only NAME/AGE instead of the usual READY/STATUS/RESTARTS/AGE columns.
+        let filter = ListFilter::new("", "pods", &label_pairs, &field_selector, None);
+        let format = ListFormat::negotiate(accept, pom, table, "", "v1", "Pod");
+        return filter.respond(
+            format,
+            &resp.items,
+            ListEnvelope {
+                kind: "Pod",
+                version: "v1",
+                revision: list_revision,
+                continue_key: resp.continue_key,
+                remaining_count: resp.remaining_count,
+                signing_key: &state.continue_token_key,
+            },
         );
-        return Ok(crate::content_type::negotiated_response(accept, body).into_response());
     }
 
     list_resource(
