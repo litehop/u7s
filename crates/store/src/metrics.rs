@@ -9,15 +9,11 @@ use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts};
 /// sums those `n`s, so a non-zero rate is the literal "events that should have been delivered
 /// but weren't" signal.
 ///
-/// `channel="event"` lag is on the real-event channel (`SqliteStore::tx`): it always triggers
-/// an O(ring) recovery scan (see `watch`'s lag-recovery path), so this label is the leading
-/// indicator that a watcher is too slow, even before recovery fails and forces a client relist.
-/// `channel="bookmark"` lag is on the dedicated global-bookmark channel (`SqliteStore::
-/// bookmark_tx`): it is advisory-only and never triggers ring recovery (a dropped bookmark
-/// carries no payload; the next bookmark or matching event re-establishes it). The two MUST
-/// stay on separate label values — collapsing them back onto one series would make this
-/// counter's "did a recovery scan run" signal unreliable, since a `channel="bookmark"` lag is
-/// silently free while a `channel="event"` lag is not.
+/// `channel="event"` lag is on a shard's real-event channel: it always triggers an O(ring)
+/// recovery scan (see `watch`'s lag-recovery path), so this label is the leading indicator that
+/// a watcher is too slow, even before recovery fails and forces a client relist. Global
+/// bookmarks are a coalesced `tokio::sync::watch` value that cannot lag, so `channel="bookmark"`
+/// is no longer emitted.
 pub static WATCH_BROADCAST_LAGGED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
