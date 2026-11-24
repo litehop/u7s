@@ -15,8 +15,12 @@ const RING_CAPACITY: usize = 512;
 /// Per-shard live-event fan-out. Each `RingShard` owns its own channel and a write publishes only
 /// to the shards (and namespace sub-channels) that can contain its key, so a watcher is never
 /// woken by another resource type's writes and no receiver-tail lock is shared across types.
-/// Smaller than `RING_CAPACITY` so overflow (`Lagged`) is always recoverable from that shard's ring.
-const BROADCAST_CAPACITY: usize = 256;
+/// Kept at the pre-sharding global depth: a watcher that was never lagged by up to 1024 events
+/// of ANY type before is never lagged by 1024 events of its own scope now. Larger than
+/// `RING_CAPACITY`, so a `Lagged` can outrun the ring and end in a 410 relist, exactly as before.
+/// Cost: a channel allocates its slots up front (~40 B each, ~40 KB), per shard and per watched
+/// namespace; event bodies are shared `Arc`s, retained for at most 1024 events per live channel.
+const BROADCAST_CAPACITY: usize = 1024;
 
 /// Minimum spacing between global-bookmark publications to open watches (see `BookmarkPump`).
 /// KCM's EnsureReady() only requires eventual convergence of an informer's sync RV, not a
@@ -145,6 +149,10 @@ pub(crate) struct RingShard {
     watchers: AtomicUsize,
     /// Live events for watchers whose prefix is exactly this shard's key.
     tx: broadcast::Sender<Arc<InternalEvent>>,
+    /// Flipped to `true` when the shard is torn down because its resource type no longer exists,
+    /// so every attached stream ends and its client relists. Channel closure cannot signal this:
+    /// each stream's `ShardWatcherGuard` keeps the shard, and so `tx`, alive.
+    closed: tokio::sync::watch::Sender<bool>,
     /// Live events for watchers that reuse this shard's history but watch one namespace under it
     /// (prefix = shard key + `<ns>/`), keyed by that prefix, so a write in another namespace never
     /// wakes them. Entries without receivers are pruned on the next `subscribe`.
@@ -160,31 +168,27 @@ impl RingShard {
             deletion_log: RwLock::new(DeletionLog::default()),
             watchers: AtomicUsize::new(0),
             tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            closed: tokio::sync::watch::channel(false).0,
             scoped: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Subscribe to exactly the events a watch on `prefix` can match. `key` is this shard's own
-    /// map key; the returned sender is kept by the stream to re-subscribe after `Lagged`.
-    fn subscribe(
-        &self,
-        key: &str,
-        prefix: &str,
-    ) -> (
-        broadcast::Sender<Arc<InternalEvent>>,
-        broadcast::Receiver<Arc<InternalEvent>>,
-    ) {
+    /// map key.
+    fn subscribe(&self, key: &str, prefix: &str) -> broadcast::Receiver<Arc<InternalEvent>> {
         if prefix == key {
-            return (self.tx.clone(), self.tx.subscribe());
+            return self.tx.subscribe();
         }
         let mut scoped = self.scoped.lock().expect("scoped poisoned");
         scoped.retain(|_, tx| tx.receiver_count() > 0);
-        let tx = scoped
+        scoped
             .entry(prefix.to_string())
             .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-            .clone();
-        let rx = tx.subscribe();
-        (tx, rx)
+            .subscribe()
+    }
+
+    fn close(&self) {
+        self.closed.send_replace(true);
     }
 
     /// Deliver `event` to this shard's whole-shard watchers and, when it lives in namespace
@@ -631,7 +635,6 @@ impl SqliteStore {
             &self.shards,
             &self.reclaimed_horizons,
             &shard,
-            ns,
             &self.compaction_horizon,
             now_secs,
             event,
@@ -932,7 +935,6 @@ fn push_event_locked(
     shards: &Arc<RwLock<BTreeMap<String, Arc<RingShard>>>>,
     reclaimed_horizons: &Arc<RwLock<ReclaimedHorizons>>,
     shard_key: &str,
-    ns: Option<&str>,
     compaction_horizon: &AtomicU64,
     now_secs: u32,
     event: Arc<InternalEvent>,
@@ -953,7 +955,7 @@ fn push_event_locked(
     // otherwise find nothing, and the delete would silently vanish. So a delete with no matching
     // shard creates one (idle-GC'd exactly like any other if nobody ever attaches a watcher —
     // see `get_or_create_shard`'s doc) instead of being dropped.
-    let matched = matching_shards(&shards.read().expect("shards poisoned"), shard_key, ns);
+    let matched = matching_shards(&shards.read().expect("shards poisoned"), &event.key);
 
     // `now_secs` is seconds since the store's epoch, taken by the caller (see `SqliteStore::epoch`)
     // rather than read here, for two reasons: it is used for BOTH this event's push stamp and the
@@ -965,13 +967,11 @@ fn push_event_locked(
     // Live delivery: only the matched shards' channels are touched, and within a root shard only
     // the one namespace's sub-channel, so watchers on other resource types or namespaces are not
     // woken at all.
-    let ns_prefix = ns.map(|ns| format!("{shard_key}{ns}/"));
     if matched.is_empty() && event.value.is_none() {
         let shard = get_or_create_shard(shards, reclaimed_horizons, shard_key);
         push_into_shard(shard_key, &shard, compaction_horizon, now_secs, &event);
-        shard.publish(ns_prefix.as_deref(), &event);
     } else {
-        for (matched_key, shard) in &matched {
+        for (matched_key, shard, ns_prefix) in &matched {
             push_into_shard(matched_key, shard, compaction_horizon, now_secs, &event);
             shard.publish(ns_prefix.as_deref(), &event);
         }
@@ -1078,44 +1078,40 @@ pub(crate) fn tear_down_shard(
     if let Some(shard) = &removed {
         preserve_reclaimed_horizon(reclaimed_horizons, key, shard);
         crate::metrics::remove_shard_series(key);
+        shard.close();
     }
     removed
 }
 
-/// Every existing shard relevant to a write whose own resource-type root is `root` (as returned
-/// by `shard_key`) and whose object lives in namespace `ns` (`None` for cluster-scoped), paired
-/// with each shard's own key (for per-shard metric labeling). Plural (unlike `find_shard`'s
-/// single best match) because a watch can create a shard keyed to ITS OWN prefix (see
-/// `SqliteStore::watch`), and a namespace-scoped watch's prefix (e.g.
-/// `/registry/configmaps/default/`) is NOT derivable from a cluster-scoped or all-namespaces
-/// watch's shard root (e.g. `/registry/configmaps/`) or vice versa — both can exist
-/// simultaneously for the same resource type, and a single write can be relevant to both.
-/// Fanning out to every match (instead of picking one, as `find_shard` does for a watch
-/// resolving ITS OWN already-known shard) is what keeps every open watch's ring accurate
-/// regardless of how many different-granularity shards currently exist for its resource type.
+/// Every existing shard a write to `key` can reach, each with its own key (for per-shard metric
+/// labeling) and, for a root shard, the namespace sub-channel prefix the write belongs to.
+/// Plural (unlike `find_shard`'s single best match) because a watch can create a shard keyed to
+/// ITS OWN prefix (see `SqliteStore::watch`), and a namespace-scoped watch's prefix (e.g.
+/// `/registry/configmaps/default/`) is NOT derivable from an all-namespaces watch's shard root
+/// (e.g. `/registry/configmaps/`) or vice versa — both can exist simultaneously for the same
+/// resource type, and a single write can be relevant to both.
 ///
-/// Checks at most two exact keys — `root` itself, and (when `ns` is `Some`) `root` plus that one
-/// namespace segment — rather than scanning every live shard with a `starts_with` check. This
-/// relies on the same invariant `find_shard`/`find_shard_key` already document and depend on: a
-/// watch's own prefix, and therefore every key that can ever live in `shards`, is always EXACTLY
-/// one of those two shapes for a given resource type (see `group_list_prefix` and `cr_list_prefix`
-/// in the apiserver crate, and crd.rs's own `list_prefix` — the independent places a watch prefix
-/// gets built, all producing one of these two shapes), so no other shard key could ever be a
-/// prefix of this write's key. Two `BTreeMap::get` calls replace what used to be an O(shard-count)
-/// `.iter().filter(starts_with)` scan run on every single write.
+/// Routed by `key` alone, never by the object body: the key is what a watch's prefix filter
+/// matches, so a namespaced key whose body lacks `metadata.namespace` still reaches its watchers.
+/// A shard key is always a resource-type root or that root plus one namespace segment, so only
+/// two keys can match: `key` minus its name segment (a cluster-scoped root, or a namespace's own
+/// shard) and that minus one more segment (the all-namespaces root, whose sub-channel for the
+/// first of those is the returned prefix). Two `BTreeMap::get` calls, not a scan of every shard.
 fn matching_shards(
     shards: &BTreeMap<String, Arc<RingShard>>,
-    root: &str,
-    ns: Option<&str>,
-) -> Vec<(String, Arc<RingShard>)> {
+    key: &str,
+) -> Vec<(String, Arc<RingShard>, Option<String>)> {
     let mut matched = Vec::new();
-    if let Some(shard) = shards.get(root) {
-        matched.push((root.to_string(), Arc::clone(shard)));
+    let Some((head, _)) = key.rsplit_once('/') else {
+        return matched;
+    };
+    let name_parent = format!("{head}/");
+    if let Some(shard) = shards.get(&name_parent) {
+        matched.push((name_parent.clone(), Arc::clone(shard), None));
     }
-    if let Some(ns) = ns {
-        let ns_key = format!("{root}{ns}/");
-        if let Some(shard) = shards.get(&ns_key) {
-            matched.push((ns_key, Arc::clone(shard)));
+    if let Some(root) = parent_prefix(&name_parent) {
+        if let Some(shard) = shards.get(&root) {
+            matched.push((root, Arc::clone(shard), Some(name_parent)));
         }
     }
     matched
@@ -2282,7 +2278,6 @@ impl Store for SqliteStore {
                     &shards,
                     &reclaimed_horizons,
                     &shard,
-                    ns.as_deref(),
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
@@ -2342,7 +2337,6 @@ impl Store for SqliteStore {
                 &shards,
                 &reclaimed_horizons,
                 &shard,
-                ns.as_deref(),
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
@@ -2391,7 +2385,6 @@ impl Store for SqliteStore {
                 &shards,
                 &reclaimed_horizons,
                 &shard,
-                ns.as_deref(),
                 &compaction_horizon,
                 epoch.elapsed().as_secs() as u32,
                 Arc::new(InternalEvent {
@@ -2464,7 +2457,6 @@ impl Store for SqliteStore {
                     &shards,
                     &reclaimed_horizons,
                     &shard,
-                    Some(&ns),
                     &compaction_horizon,
                     epoch.elapsed().as_secs() as u32,
                     Arc::new(InternalEvent {
@@ -2539,7 +2531,8 @@ impl Store for SqliteStore {
 
         // Subscribe BEFORE the backfill and the ring snapshot so no event can fall between replay
         // and live; events seen on both sides are dropped by the `last_replayed` dedup.
-        let (event_tx, mut rx) = shard.subscribe(&shard_key_owned, prefix);
+        let mut rx = shard.subscribe(&shard_key_owned, prefix);
+        let mut closed_rx = shard.closed.subscribe();
 
         // Backfill a freshly-created shard with the CURRENT state of everything under this
         // watch's own prefix, as synthetic ADDED events ordered oldest-revision-first. Without
@@ -2604,14 +2597,10 @@ impl Store for SqliteStore {
             from_revision,
             horizon,
             replayed_count = replayed.len(),
-            receiver_count = event_tx.receiver_count(),
             "watch: stream opened"
         );
 
         let prefix_owned = prefix.to_string();
-        // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
-        // without terminating the stream when the broadcast channel lags transiently.
-        let tx_clone = event_tx;
         // Re-resolved (via `find_shard`) on every use inside the stream below, rather than
         // reusing the `shard` computed above, so a watch opened before this resource type's
         // first-ever write still recovers correctly if that write (and its shard) arrives later
@@ -2745,7 +2734,7 @@ impl Store for SqliteStore {
                         // If the ring buffer has also been compacted past last_replayed, we
                         // fall back to yielding Compacted so the client can relist from a valid
                         // revision rather than silently skipping events.
-                        rx = tx_clone.subscribe();
+                        rx = rx.resubscribe();
                         // Timed separately from the `for event in &catchup { yield ... }` loop
                         // below: `yield` inside this generator suspends on the consumer's poll
                         // rate (backpressure), which would fold client-drain latency into this
@@ -2753,6 +2742,10 @@ impl Store for SqliteStore {
                         // itself — the part that runs synchronously while holding the shard's
                         // ring read lock and blocks whichever tokio worker is polling this stream.
                         let recovery_scan_started = std::time::Instant::now();
+                        // The floor check below uses the pre-catchup position: catchup advances
+                        // `last_replayed` past the ring floor, which would hide events the ring
+                        // no longer holds and lose them silently.
+                        let lag_from = last_replayed;
                         let catchup: Vec<Arc<InternalEvent>> = {
                             let shards_guard = shards_arc.read().expect("shards poisoned");
                             match find_shard(&shards_guard, &prefix_owned) {
@@ -2793,7 +2786,7 @@ impl Store for SqliteStore {
                             find_shard(&shards_guard, &prefix_owned)
                                 .map_or(0, |shard| shard.horizon.load(Ordering::Relaxed))
                         };
-                        let recovered = current_horizon <= last_replayed;
+                        let recovered = current_horizon <= lag_from;
                         tracing::debug!(
                             prefix = %prefix_owned,
                             missed = n,
@@ -2802,7 +2795,7 @@ impl Store for SqliteStore {
                             recovered,
                             "watch: lag detected, ring-buffer recovery attempted"
                         );
-                        if current_horizon > last_replayed {
+                        if current_horizon > lag_from {
                             // Use from_revision (the watcher's original start) rather than
                             // last_replayed as the lower bound for deletion_log replay.
                             //
@@ -2854,22 +2847,18 @@ impl Store for SqliteStore {
                         // Ring buffer covered the gap; continue watching from last_replayed.
                     }
                     Err(broadcast::error::RecvError::Closed) => {
-                        // Structurally unreachable: `tx_clone` (captured above) lives inside
-                        // this same generator for as long as this `rx.recv()` call is being
-                        // polled, so this stream always holds at least one Sender handle of
-                        // its own. The broadcast channel's sender count can therefore never
-                        // reach zero from this stream's point of view — dropping the
-                        // originating `SqliteStore` only releases `SqliteStore::tx`, never the
-                        // clone this stream is holding. Kept as an exhaustive match arm rather
-                        // than deleted so a future change to `tx_clone`'s capture strategy that
-                        // defeats this invariant fails loudly instead of silently leaking watch
-                        // streams that poll a dead channel forever.
-                        unreachable!(
-                            "watch() retains its own broadcast Sender clone for this stream's \
-                             entire lifetime, so RecvError::Closed can never be observed here"
-                        )
+                        // Unreachable while `_watcher_guard` keeps this stream's shard (and so
+                        // the channel's Sender) alive; ending is the safe answer if that changes.
+                        return;
                     }
                     },
+                    // The resource type was deleted: end the stream so the client relists. Polled
+                    // after `rx`, so the DELETED events its objects' removal queued are delivered
+                    // first.
+                    _ = async { let _ = closed_rx.wait_for(|closed| *closed).await; } => {
+                        tracing::debug!(prefix = %prefix_owned, "watch: shard torn down, ending stream");
+                        return;
+                    }
                     changed = bookmark_rx.changed(), if bookmarks_open => {
                         if changed.is_err() {
                             bookmarks_open = false;
@@ -4604,10 +4593,9 @@ mod tests {
         // A different resource type's shard — must never match a pods write.
         shards.insert("/registry/configmaps/".into(), Arc::new(RingShard::new()));
 
-        let root = shard_key("/registry/pods/default/pod-a", Some("default"));
-        let matched = matching_shards(&shards, &root, Some("default"));
+        let matched = matching_shards(&shards, "/registry/pods/default/pod-a");
 
-        let mut matched_keys: Vec<&str> = matched.iter().map(|(k, _)| k.as_str()).collect();
+        let mut matched_keys: Vec<&str> = matched.iter().map(|(k, _, _)| k.as_str()).collect();
         matched_keys.sort_unstable();
         assert_eq!(
             matched_keys,
@@ -4631,12 +4619,11 @@ mod tests {
     fn matching_shards_reflects_shard_added_then_removed_between_writes() {
         let mut shards: BTreeMap<String, Arc<RingShard>> = BTreeMap::new();
         shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
-        let root = "/registry/pods/";
 
         // Before any namespace-scoped watch exists, only the root shard matches.
-        let before: Vec<String> = matching_shards(&shards, root, Some("default"))
+        let before: Vec<String> = matching_shards(&shards, "/registry/pods/default/pod-a")
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|(k, _, _)| k)
             .collect();
         assert_eq!(
             before,
@@ -4646,9 +4633,9 @@ mod tests {
 
         // A namespace-scoped watch on "default" opens, creating its own shard.
         shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
-        let mut during: Vec<String> = matching_shards(&shards, root, Some("default"))
+        let mut during: Vec<String> = matching_shards(&shards, "/registry/pods/default/pod-a")
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|(k, _, _)| k)
             .collect();
         during.sort();
         assert_eq!(
@@ -4661,9 +4648,9 @@ mod tests {
 
         // The namespace-scoped shard is torn down (idle-GC or CRD delete).
         shards.remove("/registry/pods/default/");
-        let after: Vec<String> = matching_shards(&shards, root, Some("default"))
+        let after: Vec<String> = matching_shards(&shards, "/registry/pods/default/pod-a")
             .into_iter()
-            .map(|(k, _)| k)
+            .map(|(k, _, _)| k)
             .collect();
         assert_eq!(
             after,
@@ -4698,10 +4685,9 @@ mod tests {
         shards.insert("/registry/pods/".into(), Arc::new(RingShard::new()));
         shards.insert("/registry/pods/default/".into(), Arc::new(RingShard::new()));
 
-        let root = "/registry/pods/";
         let started = std::time::Instant::now();
         for _ in 0..WRITES {
-            let matched = matching_shards(&shards, root, Some("default"));
+            let matched = matching_shards(&shards, "/registry/pods/default/pod-a");
             assert_eq!(
                 matched.len(),
                 2,
@@ -6206,17 +6192,10 @@ mod tests {
         );
     }
 
-    /// Dropping the store that created a watch stream must not end that stream: `watch()`
-    /// captures its own broadcast `Sender` clone (`tx_clone`, used for lag-recovery
-    /// re-subscription) for the entire lifetime of the returned stream, so the channel's
-    /// sender count can never reach zero while this same stream is the one polling
-    /// `rx.recv()`. This pins down the invariant the `RecvError::Closed` match arm's
-    /// `unreachable!()` relies on: if a future change to `tx_clone`'s capture strategy ever
-    /// broke it, a real store shutdown would either panic every open watch task (loud, this
-    /// test would start failing by panicking instead of timing out) or — if `unreachable!()`
-    /// were also reverted back to a plain `return` — silently end every open watch stream
-    /// clients still expect events from, instead of leaving them correctly pending forever
-    /// (the actual behavior for as long as the apiserver process is alive).
+    /// Dropping the store that created a watch stream must not end that stream: the stream's
+    /// `ShardWatcherGuard` keeps its shard, and so the channel's Sender, alive, so a store
+    /// shutdown never reads as a closed channel. Ending here would silently drop every open
+    /// watch clients still expect events from.
     #[tokio::test]
     async fn watch_stream_stays_pending_after_originating_store_is_dropped() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
@@ -6233,16 +6212,12 @@ mod tests {
         // before the drop.
         drop(store);
 
-        // If `tx_clone` did not exist (or were dropped along with the store), the next
-        // rx.recv() would return RecvError::Closed and the stream would resolve — to `None`
-        // before this fix, or by panicking inside `unreachable!()` after it — well within this
-        // window instead of staying pending.
         let outcome = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
         assert!(
             outcome.is_err(),
             "a watch stream must remain pending after its originating store is dropped — \
              resolving here means the channel was observed as closed, which should be \
-             structurally impossible while this stream holds its own Sender clone; got: \
+             structurally impossible while this stream's shard guard is alive; got: \
              {outcome:?}"
         );
     }
@@ -8863,6 +8838,7 @@ mod tests {
         let stream = store.watch("/registry/secrets/", 0).await.expect("watch");
         futures_util::pin_mut!(stream);
 
+        let started = Instant::now();
         let mut last = 0;
         for i in 0..50 {
             last = store
@@ -8889,10 +8865,185 @@ mod tests {
             Some(last),
             "the watcher's sync RV must converge on the latest write"
         );
+        // The pump publishes at most once per debounce interval, so the bound scales with the
+        // wall time actually elapsed and holds on a loaded host; one bookmark per write would
+        // exceed it on any host fast enough to finish the 50 writes quickly.
+        let max_publications =
+            (started.elapsed().as_millis() / GLOBAL_BOOKMARK_DEBOUNCE.as_millis()) as usize + 2;
         assert!(
-            bookmarks.len() < 10,
-            "50 writes produced {} bookmarks; per-write bookmarks wake every idle watcher",
-            bookmarks.len()
+            bookmarks.len() <= max_publications,
+            "50 writes produced {} bookmarks, more than the {max_publications} the debounce \
+             allows over {:?}; per-write bookmarks wake every idle watcher",
+            bookmarks.len(),
+            started.elapsed()
+        );
+    }
+
+    /// Deleting a resource type must end every stream attached to its shards, or an informer on
+    /// a deleted CRD stays pending until `timeoutSeconds` and never relists.
+    #[tokio::test]
+    async fn evict_resource_type_ends_attached_streams_promptly() {
+        let store = SqliteStore::new(":memory:").expect("store");
+        let all = store.watch("/registry/gone/", 0).await.expect("watch all");
+        let ns = store
+            .watch("/registry/gone/ns-a/", 0)
+            .await
+            .expect("watch ns");
+        let other = store.watch("/registry/kept/", 0).await.expect("watch kept");
+        futures_util::pin_mut!(all, ns, other);
+
+        store.evict_resource_type("/registry/gone/");
+
+        for (label, stream) in [("all-namespaces", &mut all), ("namespaced", &mut ns)] {
+            let ended = tokio::time::timeout(Duration::from_secs(2), stream.next()).await;
+            assert!(
+                matches!(ended, Ok(None)),
+                "{label} watch must end when its resource type is torn down; got {ended:?}"
+            );
+        }
+        let survivor = tokio::time::timeout(Duration::from_millis(300), other.next()).await;
+        assert!(
+            survivor.is_err(),
+            "a watch on an unrelated resource type must keep running; got {survivor:?}"
+        );
+    }
+
+    /// Routing uses the key, not the body: a namespaced key whose body lacks
+    /// `metadata.namespace` must still reach watchers on its prefix, as the old prefix filter
+    /// delivered it.
+    #[tokio::test]
+    async fn namespaced_key_with_namespaceless_body_reaches_prefix_watchers() {
+        let store = SqliteStore::new(":memory:").expect("store");
+        let all = store.watch("/registry/pods/", 0).await.expect("watch all");
+        let ns = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch ns");
+        futures_util::pin_mut!(all, ns);
+
+        store
+            .put(
+                "/registry/pods/default/p",
+                scoped_value("Pod", "p", None),
+                None,
+            )
+            .await
+            .expect("put");
+
+        for (label, stream) in [("all-namespaces", &mut all), ("namespaced", &mut ns)] {
+            let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("{label} watcher never saw the event"));
+            assert!(
+                matches!(&ev, Some(WatchEvent::Added(o)) if o.key == "/registry/pods/default/p"),
+                "{label} watcher must see a namespaced key even when its body has no namespace; \
+                 got {ev:?}"
+            );
+        }
+    }
+
+    /// A lag that outruns the ring must end in Compacted (client relists), never a silent gap.
+    /// Catchup replays only what the ring still holds; judging recovery after that replay moved
+    /// the position past the ring floor made every such lag look recovered while the events
+    /// older than the ring were lost.
+    #[tokio::test]
+    async fn lag_beyond_ring_ends_in_compacted_not_silent_gap() {
+        let store = SqliteStore::new(":memory:").expect("store");
+        let prefix = "/registry/lagring/";
+        let stream = store.watch(prefix, 0).await.expect("watch");
+        futures_util::pin_mut!(stream);
+
+        let writes = BROADCAST_CAPACITY + RING_CAPACITY;
+        for i in 0..writes {
+            store
+                .put(
+                    &format!("{prefix}default/p{i}"),
+                    scoped_value("Pod", &format!("p{i}"), Some("default")),
+                    None,
+                )
+                .await
+                .expect("put");
+        }
+
+        let mut saw_compacted = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            if matches!(ev, WatchEvent::Compacted { .. }) {
+                saw_compacted = true;
+                break;
+            }
+        }
+        assert!(
+            saw_compacted,
+            "{writes} missed events exceed the {RING_CAPACITY}-event ring, so the watcher must \
+             be told to relist; continuing silently drops the oldest events"
+        );
+    }
+
+    /// A namespace-drain-like burst (1000 events to one type and namespace, plus unrelated
+    /// namespace traffic) while a watcher is not being polled must be delivered losslessly: no
+    /// `Lagged`, so no ring-bounded recovery that can end in a 410. The pre-sharding global
+    /// channel held 1024, so this was lossless before and must stay so.
+    #[tokio::test]
+    async fn namespace_drain_burst_is_lossless_for_a_slow_watcher() {
+        const BURST: usize = 1000;
+        let store = SqliteStore::new(":memory:").expect("store");
+        let prefix = "/registry/drainpods/";
+        let ns_prefix = "/registry/drainpods/drain/";
+        let all = store.watch(prefix, 0).await.expect("watch all");
+        let ns = store.watch(ns_prefix, 0).await.expect("watch ns");
+        futures_util::pin_mut!(all, ns);
+
+        let lagged = || {
+            super::metrics::WATCH_BROADCAST_LAGGED_TOTAL
+                .with_label_values(&[super::metrics::prefix_bucket(prefix), "event"])
+                .get()
+        };
+        let before = lagged();
+
+        let mut total = 0;
+        for i in 0..BURST {
+            store
+                .put(
+                    &format!("{prefix}drain/p{i}"),
+                    scoped_value("Pod", &format!("p{i}"), Some("drain")),
+                    None,
+                )
+                .await
+                .expect("put");
+            total += 1;
+            if i % 50 == 0 {
+                store
+                    .put(
+                        &format!("{prefix}other/p{i}"),
+                        scoped_value("Pod", &format!("p{i}"), Some("other")),
+                        None,
+                    )
+                    .await
+                    .expect("put");
+                total += 1;
+            }
+        }
+
+        for (label, stream, want) in [
+            ("all-namespaces", &mut all, total),
+            ("namespaced", &mut ns, BURST),
+        ] {
+            let mut seen = 0;
+            while seen < want {
+                match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(WatchEvent::Added(_))) => seen += 1,
+                    Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                    other => panic!(
+                        "{label} slow watcher lost events after {seen} of {want} (a 410 here \
+                         forces a full client relist): {other:?}"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            lagged(),
+            before,
+            "a {BURST}-event burst must not lag any watcher's channel"
         );
     }
 }

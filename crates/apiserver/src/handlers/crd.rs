@@ -5612,6 +5612,76 @@ mod tests {
         );
     }
 
+    /// A watch open on a custom resource must END when its CRD is deleted, so the client relists
+    /// and learns the type is gone (upstream closes the cacher's watchers on CRD teardown).
+    ///
+    /// Why it matters: without it the stream stays pending until `timeoutSeconds` (up to 30
+    /// minutes), so an informer on a deleted CRD never notices and never relists.
+    ///
+    /// Fails on revert: without the shard's close signal on teardown, `next()` stays pending and
+    /// the timeout below fires.
+    #[tokio::test]
+    async fn delete_crd_ends_open_watch_streams_promptly() {
+        use futures_util::StreamExt;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let name = "sprockets.teardown3.example.com";
+        let group = "teardown3.example.com";
+        let plural = "sprockets";
+        let prefix = crate::handlers::cr::cr_list_prefix(group, plural, None);
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            minimal_crd_bytes_with_group(name, group, plural),
+        )
+        .await
+        .expect("create must succeed");
+
+        let all_ns = store.watch(&prefix, 0).await.expect("watch must succeed");
+        let ns_scoped = store
+            .watch(&format!("{prefix}default/"), 0)
+            .await
+            .expect("watch must succeed");
+        futures_util::pin_mut!(all_ns, ns_scoped);
+
+        delete_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            test_user(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete must succeed");
+
+        for (label, stream) in [
+            ("all-namespaces", &mut all_ns),
+            ("namespaced", &mut ns_scoped),
+        ] {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await {
+                    Ok(None) => break,
+                    Ok(Some(u7s_store::WatchEvent::Bookmark { .. })) => {}
+                    other => panic!(
+                        "{label} watch must end after its CRD is deleted so the client relists, \
+                         got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
     /// Deleting a CRD must tear down EVERY shard rooted at its resource type, not just the
     /// exact cluster-scoped key — a namespace-scoped shard for the same plural can coexist
     /// alongside the cluster-scoped one (see `matching_shards`' doc in the store crate), and a
