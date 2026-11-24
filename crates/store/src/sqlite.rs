@@ -4859,49 +4859,55 @@ mod tests {
     /// `.keys().filter(starts_with)` scan `evict_resource_type` used to run over the WHOLE
     /// `shards` map, whose cost scales with total shard count across every resource type in the
     /// store, not just the one being deleted.
+    ///
+    /// Asserts scaling (10x more decoys vs. baseline) rather than an absolute wall-clock bound,
+    /// so instrumented/coverage builds, which slow both sides equally, cannot trip it.
     #[tokio::test]
     async fn evict_resource_type_stays_fast_with_many_unrelated_shards() {
-        const DECOY_SHARDS: usize = 20_000;
-        const EVICTIONS: usize = 5_000;
-
-        let store = SqliteStore::new(":memory:").expect("in-memory store");
-        {
-            let mut guard = store.shards.write().expect("shards poisoned");
-            for i in 0..DECOY_SHARDS {
-                guard.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
-            }
-        }
+        const EVICTIONS: usize = 2_000;
+        const SMALL: usize = 2_000;
+        const LARGE: usize = 20_000;
         let root = "/registry/widgets.example.com/widgets/";
 
-        // Re-inserted before each call (evict_resource_type removes it every time) so the loop
-        // amplifies the per-call scan cost the same way the matching_shards perf test amplifies
-        // its own O(1)-vs-O(shard-count) lookup, instead of measuring a single call whose cost
-        // is too small in absolute terms to distinguish O(1) from O(shard-count) reliably.
-        let started = std::time::Instant::now();
-        for _ in 0..EVICTIONS {
-            store
-                .shards
-                .write()
-                .expect("shards poisoned")
-                .insert(root.to_string(), Arc::new(RingShard::new()));
-            store.evict_resource_type(root);
-        }
-        let elapsed = started.elapsed();
+        let time_evictions = |decoys: usize| {
+            let store = SqliteStore::new(":memory:").expect("in-memory store");
+            {
+                let mut guard = store.shards.write().expect("shards poisoned");
+                for i in 0..decoys {
+                    guard.insert(format!("/registry/decoy-{i}/"), Arc::new(RingShard::new()));
+                }
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..EVICTIONS {
+                store
+                    .shards
+                    .write()
+                    .expect("shards poisoned")
+                    .insert(root.to_string(), Arc::new(RingShard::new()));
+                store.evict_resource_type(root);
+            }
+            let elapsed = started.elapsed();
+            assert!(
+                !store
+                    .shards
+                    .read()
+                    .expect("shards poisoned")
+                    .contains_key(root),
+                "sanity: the targeted shard must actually be gone after the final eviction"
+            );
+            elapsed
+        };
+
+        let best = |decoys: usize| (0..5).map(|_| time_evictions(decoys)).min().unwrap();
+        let small = best(SMALL);
+        let large = best(LARGE);
+        eprintln!("evict scaling: {SMALL} decoys {small:?}, {LARGE} decoys {large:?}");
 
         assert!(
-            !store
-                .shards
-                .read()
-                .expect("shards poisoned")
-                .contains_key(root),
-            "sanity: the targeted shard must actually be gone after the final eviction"
-        );
-        assert!(
-            elapsed < Duration::from_millis(300),
-            "{EVICTIONS} evict_resource_type calls against {DECOY_SHARDS} unrelated shards took \
-             {elapsed:?}; a BTreeMap range-seek should complete this in low single-digit \
-             milliseconds — this budget is only reachable by a linear starts_with scan over \
-             every shard in the store if that O(shard-count) cost has been reintroduced"
+            large < small * 4 + Duration::from_millis(20),
+            "{EVICTIONS} evict_resource_type calls took {small:?} with {SMALL} unrelated shards \
+             but {large:?} with {LARGE}; a 10x larger shard map must not cost anything like 10x — \
+             that is the O(shard-count) starts_with scan over every shard being reintroduced"
         );
     }
 
