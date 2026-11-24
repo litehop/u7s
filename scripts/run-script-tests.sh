@@ -14,10 +14,39 @@ jobs="${SCRIPT_TESTS_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null 
 out_dir="$(mktemp -d)"
 trap 'rm -rf "$out_dir"' EXIT
 
-find scripts -type f \( -name 'test-*-logic.sh' -o -name 'test-critical-reviewer-hook.sh' -o -name 'test-install-checksum.sh' -o -name 'test-release-tarball-licenses.sh' -o -name 'test-add-node-warning.sh' \) | sort > "$out_dir/list"
+# Every scripts/**/*test*.sh is either run (name matches test-*.sh) or listed here with a
+# reason. A test-looking script that is neither (e.g. test_foo.sh, foo.test.sh) fails the
+# runner, so a new test can never be silently skipped.
+excluded=(
+  "scripts/conformance/lima-install-test.sh" # driver that needs a live rig Lima VM, not a logic test
+)
+
+find scripts -type f -iname '*test*.sh' ! -path scripts/run-script-tests.sh | sort > "$out_dir/all"
+: > "$out_dir/list"
+problems=()
+while IFS= read -r t; do
+  listed=0
+  for e in "${excluded[@]}"; do
+    [ "$t" = "$e" ] && listed=1
+  done
+  if [ "$listed" -eq 1 ]; then
+    continue
+  elif [[ "$(basename "$t")" == test-*.sh ]]; then
+    echo "$t" >> "$out_dir/list"
+  else
+    problems+=("$t: looks like a test but is not named test-*.sh; rename it or add it to excluded")
+  fi
+done < "$out_dir/all"
+for e in "${excluded[@]}"; do
+  [ -f "$e" ] || problems+=("$e: excluded entry does not exist (stale allowlist)")
+done
+if [ "${#problems[@]}" -ne 0 ]; then
+  printf 'script-tests: %s\n' "${problems[@]}" >&2
+  exit 1
+fi
 count=$(wc -l < "$out_dir/list")
 if [ "$count" -eq 0 ]; then
-  echo "no scripts/**/test-*-logic.sh regression scripts found -- discovery is broken" >&2
+  echo "no scripts/**/test-*.sh regression scripts found -- discovery is broken" >&2
   exit 1
 fi
 echo "found $count regression-guard scripts, running $jobs at a time"

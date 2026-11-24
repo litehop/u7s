@@ -309,6 +309,9 @@ if [ -f "$WORKDIR/ca.crt" ]; then
 fi
 
 ADVERTISE_ARG="--advertise-address https://$HOST_IP:$PORT"
+# Rig-only: the Lima guest dials the host apiserver as host.lima.internal; a real install has
+# no such host and its cert must not carry the name.
+RIG_SAN_ARG="--apiserver-cert-extra-sans host.lima.internal"
 
 # When ca.crt doesn't exist yet, the launch below is "Phase 1" (bootstraps
 # the CA, no --konnectivity-proxy-addr) and gets killed + restarted as
@@ -346,7 +349,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --service-cluster-ip-range "$SERVICE_CIDR" \
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
-    $ADVERTISE_ARG \
+    $ADVERTISE_ARG $RIG_SAN_ARG \
     $INSTALL_PARITY_ARGS \
     $EMBEDDED_SCHEDULER_ARG \
     > "$LOG" 2>&1 &
@@ -370,7 +373,7 @@ else
     --service-cluster-ip-range "$SERVICE_CIDR" \
     --manifest-dir "$MANIFEST_DIR" \
     $PROXY_ARG \
-    $ADVERTISE_ARG \
+    $ADVERTISE_ARG $RIG_SAN_ARG \
     $INSTALL_PARITY_ARGS \
     $EMBEDDED_SCHEDULER_ARG \
     &
@@ -501,7 +504,7 @@ EXTEOF
       --service-cluster-ip-range "$SERVICE_CIDR" \
       --manifest-dir "$MANIFEST_DIR" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
-      $ADVERTISE_ARG \
+      $ADVERTISE_ARG $RIG_SAN_ARG \
       $INSTALL_PARITY_ARGS \
       $EMBEDDED_SCHEDULER_ARG \
       > "$LOG" 2>&1 &

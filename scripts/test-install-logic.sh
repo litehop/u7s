@@ -420,7 +420,7 @@ assert "passing both --tarball and --tarball-url is rejected by name before the 
 # on a released copy where DEFAULT_TARBALL_URL is always non-empty (so an
 # unguarded fetch would run on every install).
 assert_true "--tarball short-circuits the download entirely, rather than fetching the baked URL and discarding it" \
-  grep -qF 'if [ -z "$TARBALL" ]; then' "$INSTALL"
+  grep -qF 'if [ -z "$TARBALL" ] && [ -z "$TARBALL_DIR" ]; then' "$INSTALL"
 
 # Ordering guard. The download used to sit next to `tar -xzf`, well after apt
 # had installed and started CRI-O -- so a 404 (the expected state until a
@@ -430,6 +430,39 @@ fetch_line="$(grep -n 'fetch_tarball "$TARBALL_URL"' "$INSTALL" | cut -d: -f1)"
 apt_line="$(grep -n '^apt_get update -qq' "$INSTALL" | head -n1 | cut -d: -f1)"
 assert "the tarball is downloaded before apt installs anything, so an unreachable or wrong URL aborts with the host untouched instead of half-configured with CRI-O running" \
   "$([ -n "$fetch_line" ] && [ -n "$apt_line" ] && [ "$fetch_line" -lt "$apt_line" ] && echo 1 || echo 0)"
+
+# --tarball-dir: CI hands install.sh the build job's binaries as an unpacked
+# tree instead of paying a second cargo build to pack them into a tarball.
+# The tree is the caller's: staging must read it in place and the EXIT trap
+# must never delete it, or a re-run (or the caller's own cleanup) loses it.
+dir_conflict_out="$(bash "$INSTALL" --tarball-dir /x --tarball /y 2>&1 || true)"
+dir_conflict_url_out="$(bash "$INSTALL" --tarball-dir /x --tarball-url http://y 2>&1 || true)"
+dir_conflict_ok=0
+if [[ "$dir_conflict_out" == *"mutually exclusive"* && "$dir_conflict_url_out" == *"mutually exclusive"* ]]; then
+  dir_conflict_ok=1
+fi
+assert "--tarball-dir combined with --tarball or --tarball-url is rejected by name before the root check, so two payload sources never silently pick one" \
+  "$dir_conflict_ok"
+
+TD_WORK="$(mktemp -d)"
+mkdir -p "$TD_WORK/tree/sub" "$TD_WORK/bin"
+printf '#!/bin/sh\n' > "$TD_WORK/tree/sub/kubelet"
+chmod 0755 "$TD_WORK/tree/sub/kubelet"
+{
+  echo 'set -euo pipefail'
+  awk '/^mktemp_disk_dir\(\) \{/,/^\}/' "$INSTALL"
+  awk '/^stage_binaries\(\) \{/,/^\}/' "$INSTALL"
+  echo 'TARBALL=""; DOWNLOAD_DIR=""; TARBALL_DIR="$1"; BIN_DIR="$2"'
+  awk '/^if \[ -n "\$TARBALL_DIR" \]; then$/,/^fi$/' "$INSTALL"
+  echo 'stage_binaries kubelet'
+  echo 'echo "STAGE_DIR=$STAGE_DIR"'
+} > "$TD_WORK/run.sh"
+td_out="$(bash "$TD_WORK/run.sh" "$TD_WORK/tree" "$TD_WORK/bin" 2>&1)" || td_out="FAILED: $td_out"
+assert "--tarball-dir stages binaries from the unpacked tree in place (no extraction into a scratch dir)" \
+  "$([ -x "$TD_WORK/bin/kubelet" ] && printf '%s' "$td_out" | drain_grep -qxF "STAGE_DIR=$TD_WORK/tree" && echo 1 || echo 0)"
+assert "--tarball-dir leaves the caller's tree intact on exit: the EXIT trap removes only install-owned scratch dirs" \
+  "$([ -x "$TD_WORK/tree/sub/kubelet" ] && echo 1 || echo 0)"
+rm -rf "$TD_WORK"
 
 # ---------------------------------------------------------------------------
 # Regression guard: KCM disabled node-ipam-controller with no

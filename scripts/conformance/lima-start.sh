@@ -195,6 +195,7 @@ if [ -d "$VM_DIR" ]; then
   if [ "$STATUS" != "Running" ]; then
     check_port_free "$KUBELET_PORT" "kubelet"
     echo "Starting stopped VM '$VM_NAME'..."
+    lima_sync_provision "$VM_NAME" "$LIMA_YAML"
     limactl start "$VM_NAME"
   else
     echo "VM '$VM_NAME' already running."
@@ -252,7 +253,11 @@ else
     limactl clone lima-golden "$VM_NAME" \
       --set ".networks[0].lima = \"${NETWORK}\"" \
       --set ".portForwards[0].hostPort = ${KUBELET_PORT}" \
-      --start --tty=false
+      --tty=false
+    # The clone carries the golden's frozen provision script; swap in this checkout's
+    # before the first boot runs it.
+    lima_sync_provision "$VM_NAME" "$LIMA_YAML"
+    limactl start --tty=false "$VM_NAME"
   else
     echo "Provisioning VM '$VM_NAME' (first run, takes ~15-20 min with the e2e-test-image pre-pull)..."
     # lima's own default boot-readiness timeout (10m, DefaultWatchHostAgentEventsTimeout
@@ -270,6 +275,11 @@ fi
 # already in the cluster; fail before anything is applied if they are on
 # different Lima networks.
 assert_same_lima_network "$VM_NAME" "$KUBECONFIG_PATH" || exit 1
+
+# Fail loud when the VM's cri-o, kubelet or CNI plugins differ from the pins: a stale
+# golden or a still-running VM with an older provision script would otherwise run the
+# conformance suite against other versions than lima/kubelet.yaml and install tarballs name.
+assert_vm_package_pins "$VM_NAME" "$LIMA_YAML" "$(dirname "$0")/../lib/release-fetch.sh" || exit 1
 
 # A prior install.sh run on this slot leaves u7s-apiserver/u7s-kcm enabled; they collide with
 # the host rig's KCM on :10257 and race it for podCIDRs. Idempotent.
@@ -356,6 +366,12 @@ if limactl shell "$VM_NAME" sh -c '[ "$(cat /sys/module/apparmor/parameters/enab
   # Rig-only: the shared step also adds the host dig/nslookup local overrides.
   rig_apply_apparmor_rig_setup "$VM_NAME"
 fi
+
+# CRI-O memory drop-in, br_netfilter and the persisted sysctls, applied with install.sh's
+# own node-prep block (see rig_node_prep_script) before kubelet starts: kube-proxy's iptables
+# DNAT and flannel's vxlan backend both need br_netfilter. Fails loud (set -e in the script)
+# rather than leaving iptables DNAT unable to fire.
+rig_node_prep_script "$DUAL_STACK" "$(dirname "$0")/../install.sh" | limactl shell "$VM_NAME" sudo bash -s
 
 # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
 # run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
@@ -455,7 +471,7 @@ limactl shell "$VM_NAME" sudo journalctl --rotate
 limactl shell "$VM_NAME" sudo journalctl --vacuum-size=1M
 
 # Copy cluster CA so the kubelet can authenticate the apiserver's mTLS client cert
-# when proxying log/exec/attach requests. Without --client-ca-file the kubelet falls
+# when proxying log/exec/attach requests. Without a clientCAFile the kubelet falls
 # back to webhook auth and rejects the apiserver's cert with 401.
 # ca.crt is DER-encoded; kubelet requires PEM.
 CA_CERT="$(dirname "$KUBECONFIG_PATH")/ca.crt"
@@ -522,14 +538,24 @@ KCEOF
   rm -f "$NODE_KUBECONFIG"
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
   limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
-  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-rotate-certificates.sh"
 
-  # The kubelet requests its own serving cert through the CSR API (serverTLSBootstrap) so
-  # the apiserver can verify it on exec/log/attach connections and the kubelet renews it
-  # before expiry. The apiserver's approver admits the CSR only for the node's own
-  # addresses; the apiserver verifies the cert against the node's InternalIP although it
-  # dials the host port-forward on 127.0.0.1.
-  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-server-tls-bootstrap.sh"
+  # The kubelet config is install.sh's write_kubelet_config_yaml output plus the recorded
+  # rig-only overlay (RIG_KUBELET_OVERLAY, RIG_KUBELET_GATE), rewritten every start. That
+  # covers rotateCertificates (the kubelet renews its client cert over the CSR API) and
+  # serverTLSBootstrap (it requests its own serving cert so the apiserver can verify it on
+  # exec/log/attach and the kubelet renews it; the approver admits the CSR only for the
+  # node's own addresses, and the apiserver verifies against the node's InternalIP although
+  # it dials the host port-forward on 127.0.0.1), the resolvConf choice, and clientCAFile
+  # (the apiserver's client cert; without it the kubelet falls back to webhook auth and 401s).
+  # clusterDNS must equal CoreDNS's Service VIP(s) or pods resolve nothing; the renderer
+  # writes the first and set-kubelet-clusterdns.sh the full per-family list.
+  KUBE_DNS_LINES=$(rig_kube_dns_ips "$(rig_effective_service_cidr "$DUAL_STACK")") || exit 1
+  KUBE_DNS_IPS=$(echo "$KUBE_DNS_LINES" | paste -sd' ' -)
+  rig_kubelet_config_script "$(echo "$KUBE_DNS_LINES" | sed -n 1p)" "$(dirname "$0")/../install.sh" | limactl shell "$VM_NAME" sudo bash -s
+  limactl shell "$VM_NAME" sudo cp /etc/kubelet-ca.crt "$RIG_KUBELET_STATE_DIR/ca-bundle.pem"
+  # shellcheck disable=SC2086 # one word per VIP
+  limactl shell "$VM_NAME" sudo bash -s -- "$RIG_KUBELET_CONFIG" $KUBE_DNS_IPS < "$(dirname "$0")/set-kubelet-clusterdns.sh"
+  limactl shell "$VM_NAME" sudo bash -s -- "$RIG_KUBELET_CONFIG" "$RIG_KUBELET_GATE" < "$(dirname "$0")/../set-kubelet-featuregate.sh"
   # A serving cert issued by an earlier CA (workdir wiped, VM kept) is reused by the
   # kubelet while unexpired; drop it so the kubelet files a fresh CSR.
   limactl shell "$VM_NAME" sudo bash -c 'f=/var/lib/kubelet/pki/kubelet-server-current.pem; if [ -e "$f" ] && ! openssl verify -CAfile /etc/kubelet-ca.crt "$f" >/dev/null 2>&1; then rm -f /var/lib/kubelet/pki/kubelet-server-*; fi'
@@ -585,23 +611,7 @@ KCEOF
     limactl shell "$VM_NAME" sudo ip -6 addr replace "${NODE_IPV6}/64" dev "$LIMA_VM_IFACE"
   fi
 
-  # A golden baked before lima/kubelet.yaml set a kubeadm-style resolvConf still carries
-  # `resolvConf: ""`, which gives CoreDNS nameserver 127.0.0.1 (self-forward loop). Idempotent.
-  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml < "$(dirname "$0")/../set-kubelet-resolvconf.sh"
-
-  # kubelet's clusterDNS must equal CoreDNS's Service VIP(s) or pods resolve nothing;
-  # the baked config carries the default 10.96.0.10, so rewrite it from the effective
-  # Service CIDR on every start.
-  KUBE_DNS_LINES=$(rig_kube_dns_ips "$(rig_effective_service_cidr "$DUAL_STACK")") || exit 1
-  KUBE_DNS_IPS=$(echo "$KUBE_DNS_LINES" | paste -sd' ' -)
-  # shellcheck disable=SC2086 # one word per VIP
-  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml $KUBE_DNS_IPS < "$(dirname "$0")/set-kubelet-clusterdns.sh"
-
-  # A golden baked before AtomicWriteVolumeUserFields joined lima/kubelet.yaml's featureGates
-  # lacks it, and without it kubelet ignores projected defaultUser/user. Idempotent.
-  limactl shell "$VM_NAME" sudo bash -s -- /etc/kubelet-config.yaml AtomicWriteVolumeUserFields < "$(dirname "$0")/../set-kubelet-featuregate.sh"
-
-  # Write --client-ca-file into the kubelet drop-in (idempotent: overwrite each run).
+  # Write the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
 # klog has no --utc flag, so kubelet's embedded klog lines render whatever local
@@ -619,9 +629,8 @@ Environment=GOGC=50
 Environment=GOMAXPROCS=2
 ExecStart=
 ExecStart=/usr/bin/kubelet \\\\
-  --config=/etc/kubelet-config.yaml \\\\
+  --config=${RIG_KUBELET_CONFIG} \\\\
   --kubeconfig=/etc/kubelet-kubeconfig \\\\
-  --client-ca-file=/etc/kubelet-ca.crt \\\\
   --hostname-override=${VM_NAME} \\\\
   --node-ip=${LIMA_VM_IP},${NODE_IPV6} \\\\
   --v=${KUBELET_V} \\\\
@@ -647,7 +656,7 @@ ExecStart=/usr/bin/kubelet \\\\
 LimitNOFILE=1048576
 EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
-  echo "Kubelet client-ca-file configured; serving cert comes from its serverTLSBootstrap CSR."
+  echo "Kubelet config rendered from install.sh; serving cert comes from its serverTLSBootstrap CSR."
 else
   echo "WARNING: $CA_CERT not found — kubelet client auth will not work (logs/exec will return 401)" >&2
 fi
@@ -788,22 +797,6 @@ limactl shell "$VM_NAME" sudo bash -c '
 limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 update
 limactl shell "$VM_NAME" sudo apt-get -o DPkg::Lock::Timeout=300 install -y nfs-common
 
-# Load the bridge netfilter kernel module.
-# br_netfilter is required so that bridge traffic (pod-to-pod) passes through
-# netfilter hooks; without it, iptables DNAT for ClusterIP services never fires for
-# traffic originating from pods, breaking in-pod DNS and service connectivity.
-# modprobe of an already-loaded module is a documented no-op (exit 0), so this
-# does NOT need `|| true` to be safe on repeat runs — but a genuinely missing
-# module (wrong kernel, module not built) also exits nonzero with a FATAL
-# message, and that case is load-bearing for kube-proxy's iptables mode. No
-# suppression here (nor on the whole block, previously via a trailing
-# `2>/dev/null`): let `set -euo pipefail` fail loud with the real modprobe/sysctl
-# error text instead of silently leaving iptables DNAT unable to fire.
-limactl shell "$VM_NAME" sudo bash -c '
-  modprobe br_netfilter
-  sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
-'
-
 # Resolve the host gateway IP used to route the kubernetes ClusterIP. This (and the
 # patch below) used to only WARN and continue on failure — but skipping either one
 # leaves kube-proxy's iptables rule for 10.96.0.1:443 pointed at 127.0.0.1 (this node's
@@ -815,7 +808,6 @@ if [ -z "$HOST_IP" ]; then
   echo "error: could not resolve host.lima.internal inside ${VM_NAME} — cannot patch the kubernetes EndpointSlice with the host gateway IP" >&2
   exit 1
 fi
-limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
 # Patch the kubernetes EndpointSlice with the host IP so kube-proxy's iptables rule
 # routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).

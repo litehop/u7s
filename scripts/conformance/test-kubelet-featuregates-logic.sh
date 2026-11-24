@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the kubelet feature-gate config in lima/kubelet.yaml.
+# Regression test for the kubelet feature-gate config of the host rig.
 #
 # ClusterTrustBundle, ClusterTrustBundleProjection and PodCertificateRequest are
 # GA and default-ON in kubelet 1.37 (install.sh appends them only for kubelet
@@ -13,7 +13,6 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/drain-grep.sh"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-LIMA_YAML="$DIR/../../lima/kubelet.yaml"
 
 PASS=0
 FAIL=0
@@ -29,16 +28,18 @@ assert_contains() {
   fi
 }
 
-# Extract the single printf line that writes /etc/kubelet-config.yaml — the only
-# place in the repo that generates the real kubelet's KubeletConfiguration
-# (scripts/conformance/lima-start.sh only overrides the ExecStart drop-in, never
-# this file's content — see lima-start.sh's own u7s.conf generation).
-KUBELET_CONFIG_LINE="$(grep -F 'kubelet-config.yaml' "$LIMA_YAML" | grep -F 'printf')"
+source "$DIR/_lib.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
-if [ -z "$KUBELET_CONFIG_LINE" ]; then
-  echo "FAIL: could not locate the /etc/kubelet-config.yaml printf line in $LIMA_YAML" >&2
-  exit 1
-fi
+# The rig's kubelet config is install.sh's own write_kubelet_config_yaml output plus the
+# recorded overlay (rig_kubelet_config_script); render it locally with /etc redirected.
+mkdir -p "$WORK/bin" "$WORK/etc"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/systemctl"
+chmod +x "$WORK/bin/systemctl"
+rig_kubelet_config_script 10.96.0.10 "$DIR/../install.sh" | sed -e "s#/etc/#$WORK/etc/#g" > "$WORK/render.sh"
+PATH="$WORK/bin:$PATH" bash "$WORK/render.sh"
+KUBELET_CONFIG_LINE="$(cat "$WORK/etc/u7s-rig/kubelet-config.yaml")"
 
 assert_lacks() {
   local label="$1" haystack="$2" needle="$3"
@@ -56,13 +57,12 @@ for gate in ClusterTrustBundle ClusterTrustBundleProjection PodCertificateReques
     "$KUBELET_CONFIG_LINE" "$gate:"
 done
 
-assert_contains "KubeletConfiguration enables AtomicWriteVolumeUserFields (Alpha, default-off: without it kubelet ignores projected defaultUser/user and files are owned by UID 0)" \
-  "$KUBELET_CONFIG_LINE" 'AtomicWriteVolumeUserFields: true'
+assert_contains "lima-start.sh merges $RIG_KUBELET_GATE into the rendered config (Alpha, default-off: without it kubelet ignores projected defaultUser/user and files are owned by UID 0)" \
+  "$(cat "$DIR/lima-start.sh")" '"$RIG_KUBELET_GATE" < "$(dirname "$0")/../set-kubelet-featuregate.sh"'
+assert_contains "the rig's one gate overlay is AtomicWriteVolumeUserFields" "$RIG_KUBELET_GATE" 'AtomicWriteVolumeUserFields'
 
-# lima-start.sh patches the gate into VMs cloned from an older golden via set-kubelet-featuregate.sh.
+# lima-start.sh merges the gate into the rendered config via set-kubelet-featuregate.sh.
 SET_GATE="$DIR/../set-kubelet-featuregate.sh"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
 
 printf 'kind: KubeletConfiguration\nfeatureGates:\n  ClusterTrustBundle: true\n' >"$WORK/with-block.yaml"
 bash "$SET_GATE" "$WORK/with-block.yaml" AtomicWriteVolumeUserFields
