@@ -143,6 +143,8 @@ Differences from upstream Kubernetes:
   to ready endpoints on other nodes, with the client IP preserved, instead of
   dropping the traffic.
 - `sessionAffinity: ClientIP` is honoured. `timeoutSeconds` is not.
+- Request body limits and proxy timeouts differ for slow or long-lived proxy
+  uploads: see [docs/apiserver-request-limits.md](docs/apiserver-request-limits.md).
 
 ## Logs and exec
 
