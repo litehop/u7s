@@ -92,7 +92,8 @@ done
 
 # --- provision script writes no rig kubelet/CNI state -------------------------------------
 SCRIPT="$(cat "$LIMA_YAML")"
-no() { printf '%s' "$SCRIPT" | grep -v '^ *#' | grep -qF -- "$1" && echo 0 || echo 1; }
+SCRIPT_CODE="$(grep -v '^ *#' <<<"$SCRIPT")"
+no() { grep -qF -- "$1" <<<"$SCRIPT_CODE" && echo 0 || echo 1; }
 assert "provision (runs every boot) does not rewrite the kubelet config" "$(no '/etc/kubelet-config.yaml')"
 assert "provision (runs every boot) does not write the kubelet drop-in over install.sh's kubelet.service" "$(no 'kubelet.service.d/u7s.conf')"
 assert "provision (runs every boot) does not re-enable the CRI-O bridge conflist ahead of flannel's" "$(no '10-crio-bridge.conflist')"
