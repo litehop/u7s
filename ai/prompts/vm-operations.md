@@ -82,7 +82,9 @@ scripts/conformance/run-all.sh \
 ```
 
 **Subsequent runs — omit `--reset`.**
-Reuses the existing CA, kubeconfig, and VM — significantly faster.
+Reuses the existing CA, kubeconfig, and VM — significantly faster. The apiserver store,
+pods and kubelet state are still wiped first (`reset.sh --store-only`), so the run is a
+first boot; `--keep-store` reuses the persisted DB instead.
 
 ```bash
 scripts/conformance/run-all.sh \
