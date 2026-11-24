@@ -163,6 +163,17 @@ pub fn defaults_apply(group: &str, plural: &str) -> bool {
             && (plural == "rolebindings" || plural == "clusterrolebindings"))
 }
 
+/// Whether `apply_defaults` could change this stored object, decided without parsing it. A
+/// Secret only defaults when `stringData` is present, and the store's serialization writes that
+/// key verbatim, so a byte search has no false negatives; every other kind with a defaulting arm
+/// is treated as always changing.
+pub fn defaults_may_change(group: &str, plural: &str, raw: &[u8]) -> bool {
+    match (group, plural) {
+        ("", "secrets") => raw.windows(12).any(|w| w == b"\"stringData\""),
+        _ => defaults_apply(group, plural),
+    }
+}
+
 /// Whether `apply_defaults` can rewrite `metadata.labels` for this kind. Only a
 /// ReplicationController does (it inherits the template's labels), so LIST may not match label
 /// selectors against its stored bytes.

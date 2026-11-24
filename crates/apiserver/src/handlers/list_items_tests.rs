@@ -589,11 +589,32 @@ fn included_items_are_served_raw_only_when_nothing_needs_the_parsed_object() {
         Some(Selected::Raw(_))
     ));
 
-    let defaulted = ListFilter::new("", "secrets", &terms, &fs, None);
+    let deployments = ListFilter::new("apps", "deployments", &terms, &fs, None);
     assert!(matches!(
-        defaulted.select(&cm.value).unwrap(),
+        deployments.select(&cm.value).unwrap(),
         Some(Selected::Parsed(_))
     ));
+
+    let secrets = ListFilter::new("", "secrets", &terms, &fs, None);
+    let plain_secret =
+        stored(json!({"metadata": {"name": "s", "labels": {"app": "x"}}, "data": {"k": "dg=="}}));
+    assert!(
+        matches!(
+            secrets.select(&plain_secret.value).unwrap(),
+            Some(Selected::Raw(_))
+        ),
+        "a Secret without stringData has nothing to default"
+    );
+    let string_data = stored(
+        json!({"metadata": {"name": "s", "labels": {"app": "x"}}, "stringData": {"k": "v"}}),
+    );
+    assert!(
+        matches!(
+            secrets.select(&string_data.value).unwrap(),
+            Some(Selected::Parsed(_))
+        ),
+        "stringData is folded into data on read, so the Secret must be parsed"
+    );
 
     fn hook(_: &Value) {}
     let hooked = ListFilter::new("", "configmaps", &terms, &fs, Some(hook));

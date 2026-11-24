@@ -33,8 +33,6 @@ pub(crate) struct ListFilter<'a> {
     terms: &'a [LabelSelectorTerm<'a>],
     field_selector: &'a FieldSelector,
     on_item: Option<fn(&Value)>,
-    /// Whether a surviving item must be parsed: its kind has defaults, or `on_item` reads it.
-    parse_survivors: bool,
 }
 
 /// A surviving item: its stored bytes when no parse was needed, else the defaulted object.
@@ -122,7 +120,6 @@ impl<'a> ListFilter<'a> {
             terms,
             field_selector,
             on_item,
-            parse_survivors: on_item.is_some() || super::defaults::defaults_apply(group, plural),
         }
     }
 
@@ -156,11 +153,16 @@ impl<'a> ListFilter<'a> {
         }
     }
 
+    /// Whether a surviving item must be parsed: defaults could change it, or `on_item` reads it.
+    fn needs_parsed_survivor(&self, raw: &[u8]) -> bool {
+        self.on_item.is_some() || super::defaults::defaults_may_change(self.group, self.plural, raw)
+    }
+
     /// Filters one stored object; `None` when a selector excludes it.
     pub(crate) fn select<'r>(&self, raw: &'r [u8]) -> Result<Option<Selected<'r>>, StatusError> {
         match self.membership(raw) {
             Membership::Excluded => return Ok(None),
-            Membership::Included if !self.parse_survivors => {
+            Membership::Included if !self.needs_parsed_survivor(raw) => {
                 return Ok(Some(Selected::Raw(raw)));
             }
             Membership::Included | Membership::Unknown => {}
