@@ -3515,6 +3515,50 @@ nn_run "node-1.example.com" host
 assert "a dotted DNS-1123 subdomain is accepted (FQDN hostnames are common)" \
   "$([ "$NN_STATUS" -eq 0 ] && echo 1 || echo 0)"
 
+# ---------------------------------------------------------------------------
+# Pre-keyring sa.key preflight: a re-run over an install whose sa.key is the
+# old PEM RSA key must stop with the remedy instead of restarting an apiserver
+# that crash-loops on it. The function is extracted from install.sh's source.
+# ---------------------------------------------------------------------------
+SA_FN="$MANIFEST_WORK/sa-fn.sh"
+awk '/^check_sa_key_format\(\) \{$/,/^\}$/' "$INSTALL" > "$SA_FN"
+assert_true "check_sa_key_format is present in install.sh" test -s "$SA_FN"
+SA_DIR="$MANIFEST_WORK/sa-state"
+mkdir -p "$SA_DIR"
+sa_check() { bash -c '. "$1"; check_sa_key_format "$2"' _ "$SA_FN" "$1" 2>"$SA_DIR/stderr"; }
+
+printf -- '-----BEGIN RSA PRIVATE KEY-----\nlegacy\n-----END RSA PRIVATE KEY-----\n' > "$SA_DIR/rsa.key"
+assert_false "a pre-keyring PEM sa.key is refused (the apiserver would crash-loop on it after the restart)" \
+  sa_check "$SA_DIR/rsa.key"
+assert_true "the refusal prints the backup-and-delete remedy" \
+  grep -qF "mv $SA_DIR/rsa.key $SA_DIR/rsa.key.pre-keyring.bak" "$SA_DIR/stderr"
+assert_true "the refusal warns that issued ServiceAccount tokens are invalidated" \
+  grep -qF 'invalidates every issued ServiceAccount token' "$SA_DIR/stderr"
+assert_true "the refused key is left untouched (replacing it is the operator's call)" \
+  grep -qF 'legacy' "$SA_DIR/rsa.key"
+
+# Same shape as serde_json::to_vec_pretty(KeyringFile) in crates/apiserver/src/sa_keys.rs.
+printf '{\n  "keys": [\n    {\n      "kid": "k",\n      "private_key": "AA==",\n      "sign_from": 1\n    }\n  ]\n}' > "$SA_DIR/ring.key"
+assert_true "a keyring-format sa.key is left alone (an upgrade must not be blocked)" \
+  sa_check "$SA_DIR/ring.key"
+assert_true "an absent sa.key (fresh install, worker) passes" \
+  sa_check "$SA_DIR/absent.key"
+if [ "$(id -u)" -ne 0 ]; then
+  cp "$SA_DIR/ring.key" "$SA_DIR/unreadable.key"
+  chmod 000 "$SA_DIR/unreadable.key"
+  assert_false "an unreadable sa.key is refused" sa_check "$SA_DIR/unreadable.key"
+  assert_true "an unreadable sa.key reports 'cannot read', not a false pre-keyring diagnosis that sends the operator to discard a valid key" \
+    grep -qF "cannot read $SA_DIR/unreadable.key" "$SA_DIR/stderr"
+  assert_false "an unreadable sa.key does not get the pre-keyring remedy" \
+    grep -qF 'pre-keyring' "$SA_DIR/stderr"
+  chmod 600 "$SA_DIR/unreadable.key"
+fi
+assert_true "the keyring shape the preflight matches is still the apiserver's KeyringFile" \
+  grep -qE '^struct KeyringFile \{$' "$ROOT_DIR/crates/apiserver/src/sa_keys.rs"
+assert_true "the preflight runs before the apiserver is restarted" \
+  test "$(grep -n '^check_sa_key_format "\$STATE_DIR/sa.key" || exit 1$' "$INSTALL" | cut -d: -f1)" -lt \
+    "$(grep -n '^if ! systemctl restart u7s-apiserver.service; then$' "$INSTALL" | cut -d: -f1)"
+
 echo ""
 echo "Results:${PASS} passed, ${FAIL} failed"
 if [ "$FAIL" -gt 0 ]; then
