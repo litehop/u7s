@@ -209,6 +209,17 @@ grep -q "u7s-lan-v6" "$CALLS" && bad "bring-up touched the rig's u7s-lan-v6 unit
 : > "$CALLS"
 out=$(STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash -c 'systemctl() { [ "$1" = is-active ] && return 3; [ "$1" = is-enabled ] && return 1; return 0; }; export -f systemctl; bash "$0"' "$REPO/scripts/conformance/clear-native-units.sh" 2>&1)
 case "$out" in *"no leftover native u7s units") ok "a clean slot reports nothing to remove" ;; *) bad "clean slot output wrong: $out" ;; esac
+# The cleared list must be every u7s unit install.sh writes, plus the standalone scheduler it
+# retires; a unit missing here (u7s-scheduler.service once was) survives on the slot and collides
+# with the rig's own processes.
+install_units=$({
+  grep -oE 'cat > /etc/systemd/system/u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | sed 's|.*/||'
+  grep -oE 'systemctl (enable|disable) u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | awk '{print $3}'
+} | sort -u)
+cleared_units=$(sed -n 's/^units="\(.*\)"$/\1/p' "$REPO/scripts/conformance/clear-native-units.sh" | tr ' ' '\n' | sort -u)
+[ -n "$install_units" ] && [ -n "$cleared_units" ] || bad "could not read the u7s unit lists (install: '$install_units', cleared: '$cleared_units')"
+assert_eq "clear-native-units.sh clears exactly the u7s units install.sh writes or retires, so no install leftover survives a rig bring-up" \
+  "$cleared_units" "$install_units"
 # install.sh's kubelet.service Requires=u7s-apiserver.service; left in place after the
 # apiserver unit is removed it fails every rig kubelet start ("Unit u7s-apiserver.service not found").
 UD="$TMP/unitdir"
