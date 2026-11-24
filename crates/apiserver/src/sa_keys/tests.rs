@@ -292,6 +292,45 @@ fn corrupt_or_foreign_keyring_file_fails_loud_and_is_left_untouched() {
 }
 
 #[test]
+fn clock_stepping_backward_never_returns_signing_to_a_superseded_key() {
+    let f = Fixture::new();
+    let ring = f.open().unwrap();
+    let a = ring.signing_kid();
+    f.at(rotate_at(&f.policy));
+    ring.tick().unwrap();
+    f.at(switch_at(&f.policy));
+    ring.tick().unwrap();
+    let b = ring.signing_kid();
+    assert_ne!(a, b);
+
+    f.at(switch_at(&f.policy) - 1);
+    ring.tick().unwrap();
+    assert_eq!(
+        ring.signing_kid(),
+        b,
+        "an NTP step back across the switch must not re-sign with the old key whose retirement clock already started"
+    );
+}
+
+#[test]
+fn startup_rewrites_a_missing_or_stale_pub_bundle() {
+    let f = Fixture::new();
+    drop(f.open().unwrap());
+    let pub_path = f.dir.join("sa.pub");
+    let want = std::fs::read(&pub_path).unwrap();
+    std::fs::remove_file(&pub_path).unwrap();
+    drop(f.open().unwrap());
+    assert_eq!(
+        std::fs::read(&pub_path).unwrap(),
+        want,
+        "a deleted sa.pub must be regenerated on restart, not wait for the next rotation"
+    );
+    std::fs::write(&pub_path, "stale").unwrap();
+    drop(f.open().unwrap());
+    assert_eq!(std::fs::read(&pub_path).unwrap(), want);
+}
+
+#[test]
 fn tampered_kid_in_keyring_file_is_rejected() {
     let f = Fixture::new();
     drop(f.open().unwrap());

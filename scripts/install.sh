@@ -1946,6 +1946,28 @@ if [ -f "$STATE_DIR/ca.key" ] || [ -f "$STATE_DIR/kubeconfig" ]; then
   echo "existing u7s install detected -- upgrading in place, preserving cluster state and CA. To wipe and start over instead: stop the u7s services, rm -rf $STATE_DIR, and re-run install.sh." >&2
 fi
 
+# The apiserver loads sa.key as a JSON object {"keys":[...]} (crates/apiserver/
+# src/sa_keys.rs) and refuses anything else, e.g. the PEM RSA key older builds
+# wrote. Left in place it crash-loops the restarted unit, while
+# wait_for_apiserver_files still passes because the file exists. Never replace
+# the key here: that invalidates every issued ServiceAccount token, so the
+# operator decides.
+check_sa_key_format() {
+  local key="$1"
+  [ -f "$key" ] || return 0
+  tr -d '[:space:]' < "$key" | grep -q '^{"keys":\[' && return 0
+  cat >&2 <<EOF
+error: $key is not an SA keyring (pre-keyring RSA key from an older u7s build); u7s-apiserver would refuse to start with it.
+Replacing it invalidates every issued ServiceAccount token (pods refresh projected tokens; static tokens must be reissued). To proceed:
+  systemctl stop u7s-apiserver
+  mv $key $key.pre-keyring.bak
+  # then re-run install.sh; the apiserver generates a new keyring
+Or restore a keyring-format sa.key from backup.
+EOF
+  return 1
+}
+check_sa_key_format "$STATE_DIR/sa.key" || exit 1
+
 # EXISTING_WORKER narrows EXISTING_INSTALL to specifically the worker half of
 # that detection (kubeconfig present, no local CA key): this node already
 # completed join_cluster() at least once.
