@@ -141,9 +141,9 @@ assert "tar -czf on a pod log dir picks up both the live 0.log and rotated 0.log
 #    not a regression. A future drop back to 2G (or below 5G) would silently
 #    start truncating forensic evidence again.
 # ---------------------------------------------------------------------------
-LIMA_START="$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
+CONF_LIB="$(dirname "${BASH_SOURCE[0]}")/_lib.sh"
 assert "journald_system_max_use_is_5g -- 2G was measured insufficient for an 11h --all-e2e run under 16-way load (0805-2202 run lost its own DiskPressure incident window); regression below the current 5G floor silently truncates forensic evidence again" \
-  "$(grep -q '^SystemMaxUse=5G$' "$LIMA_START" && ! grep -q '^SystemMaxUse=2G$' "$LIMA_START" && echo 1 || echo 0)"
+  "$(grep -q '^SystemMaxUse=5G$' "$CONF_LIB" && ! grep -q '^SystemMaxUse=2G$' "$CONF_LIB" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # 9. journal_is_rotated_and_vacuumed_after_config_apply -- lima-start.sh runs
@@ -156,8 +156,8 @@ assert "journald_system_max_use_is_5g -- 2G was measured insufficient for an 11h
 #    reordering these two calls would quietly reintroduce the exact bug this
 #    is meant to fix.
 # ---------------------------------------------------------------------------
-ROTATE_LINE="$(grep -n 'journalctl --rotate' "$LIMA_START" | head -1 | cut -d: -f1)"
-VACUUM_LINE="$(grep -n 'journalctl --vacuum-size' "$LIMA_START" | head -1 | cut -d: -f1)"
+ROTATE_LINE="$(grep -n 'journalctl --rotate' "$CONF_LIB" | head -1 | cut -d: -f1)"
+VACUUM_LINE="$(grep -n 'journalctl --vacuum-size' "$CONF_LIB" | head -1 | cut -d: -f1)"
 assert "journal_is_rotated_and_vacuumed_after_config_apply -- vacuum without a prior rotate leaves the active journal segment's stale volume intact, silently reintroducing truncated forensic logs" \
   "$([ -n "$ROTATE_LINE" ] && [ -n "$VACUUM_LINE" ] && [ "$ROTATE_LINE" -lt "$VACUUM_LINE" ] && echo 1 || echo 0)"
 

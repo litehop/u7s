@@ -137,12 +137,13 @@ fi
 
 check_deps() {
   local missing=0
-  for cmd in limactl kubectl; do
+  for cmd in limactl kubectl jq; do
     if ! command -v "$cmd" &>/dev/null; then
       echo "error: $cmd not found" >&2
       case "$cmd" in
         limactl) echo "  install: brew install lima" >&2 ;;
         kubectl)  echo "  install: aqua install" >&2 ;;
+        jq)       echo "  install: brew install jq (install.sh's CSR flow runs on the host)" >&2 ;;
       esac
       missing=1
     fi
@@ -414,6 +415,10 @@ if [ -f "$CA_CERT" ]; then
   if rig_kubelet_identity_script "$INSTALL_SH" | limactl shell "$VM_NAME" sudo bash -s; then
     echo "Kubelet identity for $VM_NAME is current; not re-issuing."
   else
+    if [ "$START_KCM" -eq 0 ] && [ -z "$(kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" ]; then
+      echo "error: ${VM_NAME} needs a kubelet identity, which KCM must sign, and no KCM is running. Re-run with --with-kcm." >&2
+      exit 1
+    fi
     ID_DIR="$(dirname "$KUBECONFIG_PATH")/kubelet-identity${NODE_SUFFIX}"
     rm -rf "$ID_DIR"
     mkdir -p "$ID_DIR"
@@ -689,6 +694,18 @@ if [ "$FOUND" -eq 0 ]; then
   echo "--- kubelet log (last 30 lines) ---" >&2
   limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager --utc -n 30 >&2
   exit 1
+fi
+
+if [ -z "$_NODE_SUFFIX_OVERRIDE" ]; then
+  # install.sh's label_control_plane_node, replayed: the primary VM is the control-plane node;
+  # add-node.sh passes --node-suffix for the others.
+  _label_fn="$(install_sh_function label_control_plane_node "$INSTALL_SH")"
+  [ -n "$_label_fn" ] || { echo "error: label_control_plane_node not found in $INSTALL_SH" >&2; exit 1; }
+  eval "$_label_fn"
+  STATE_DIR="$(dirname "$KUBECONFIG_PATH")"
+  NODE_NAME="$VM_NAME"
+  [ "$(basename "$KUBECONFIG_PATH")" = kubeconfig ] || cp "$KUBECONFIG_PATH" "$STATE_DIR/kubeconfig"
+  label_control_plane_node
 fi
 
 echo ""

@@ -14,27 +14,25 @@ cargo build --release -p u7s-apiserver
 scripts/u7s-start.sh
 # → prints: export KUBECONFIG=./temp/u7s/kubeconfig
 
-# 3. In a second terminal — join the kubelet
+# 3. In a second terminal — start kcm (runs inside the Lima VM; downloaded on first run,
+#    cached in ~/.cache/u7s/kcm/) and join the kubelet. --with-kcm is required: the
+#    kubelet identity is a CSR that kcm signs.
 export KUBECONFIG=./temp/u7s/kubeconfig
-scripts/conformance/lima-start.sh
+scripts/conformance/lima-start.sh --with-kcm
 # → waits for lima-node to appear in kubectl get nodes
 
-# 4. Start kcm (runs inside the Lima VM — kcm is a Linux binary)
-scripts/conformance/04-start-kcm.sh
-# Downloads kcm binary on first run, caches in ~/.cache/u7s/kcm/ inside the VM
-
-# 5. Verify
+# 4. Verify
 kubectl get nodes
 kubectl get pods -A
 ```
 
-**Re-joining after a server restart:** Just re-run `scripts/conformance/lima-start.sh` — it rewrites the kubeconfig in the VM and restarts kubelet. The CA is stable across restarts so no re-provisioning is needed.
+**Re-joining after a server restart:** Just re-run `scripts/conformance/lima-start.sh --with-kcm` — it rewrites the kubeconfig in the VM and restarts kubelet. The CA is stable across restarts so no re-provisioning is needed.
 
 **Full reset** (rotates CA — kubelet must re-join; wipes `./temp/u7s/` in CWD):
 ```bash
 scripts/u7s-start.sh --reset
 export KUBECONFIG=./temp/u7s/kubeconfig
-scripts/conformance/lima-start.sh
+scripts/conformance/lima-start.sh --with-kcm
 ```
 
 **VM re-provisioning** (slow, ~5 min — only needed once or if VM is broken):
@@ -73,8 +71,7 @@ scripts/conformance/run-all.sh --focus "ConfigMap"
 scripts/conformance/01-build.sh
 scripts/conformance/02-start-apiserver.sh   # starts apiserver backgrounded; logs to ./temp/u7s/apiserver.log (relative to CWD)
 export KUBECONFIG=./temp/u7s/kubeconfig
-scripts/conformance/lima-start.sh
-scripts/conformance/04-start-kcm.sh
+scripts/conformance/lima-start.sh --with-kcm
 scripts/conformance/05-start-scheduler.sh
 scripts/conformance/06-run-sonobuoy.sh [--focus <regex>]
 ```
@@ -83,7 +80,7 @@ scripts/conformance/06-run-sonobuoy.sh [--focus <regex>]
 |---|---|
 | `01-build.sh` | `cargo build --release -p u7s-apiserver -p u7s-scheduler` |
 | `02-start-apiserver.sh` | Delegates to `scripts/u7s-start.sh --background`; exports KUBECONFIG |
-| `lima-start.sh` | Provisions/starts the lima VM and joins its kubelet to u7s |
+| `lima-start.sh` | Provisions/starts the lima VM and joins its kubelet to u7s; `--with-kcm` also starts kube-controller-manager (needed to sign the kubelet identity) |
 | `04-start-kcm.sh` | Downloads (if needed) and starts kube-controller-manager inside the lima VM |
 | `05-start-scheduler.sh` | Starts u7s-scheduler on the host (backgrounded) |
 | `06-run-sonobuoy.sh` | Runs sonobuoy conformance tests inside the lima VM; supports `--focus` |

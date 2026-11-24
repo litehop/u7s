@@ -113,6 +113,12 @@ KCM_LINE="$(grep -n '04-start-kcm.sh' "$LIMA_START" | sed -n 1p | cut -d: -f1)"
 ISSUE_LINE="$(grep -n 'rig_kubelet_issue_script' "$LIMA_START" | sed -n 1p | cut -d: -f1)"
 assert "lima-start.sh starts KCM before issuing the identity (nothing signs the CSR otherwise and the kubelet never registers)" \
   "$([ -n "$KCM_LINE" ] && [ -n "$ISSUE_LINE" ] && [ "$KCM_LINE" -lt "$ISSUE_LINE" ] && echo 1 || echo 0)"
+assert "a standalone lima-start.sh that must issue an identity fails fast naming --with-kcm (otherwise it hangs at the CSR wait)" \
+  "$(grep -qF 'no KCM is running. Re-run with --with-kcm' "$LIMA_START" && echo 1 || echo 0)"
+assert "lima-start.sh checks for host jq up front (install.sh's CSR flow needs it)" \
+  "$(grep -qF 'for cmd in limactl kubectl jq' "$LIMA_START" && echo 1 || echo 0)"
+assert "lima-start.sh replays install.sh's label_control_plane_node so the rig node carries the control-plane role label like an install" \
+  "$(grep -qF 'install_sh_function label_control_plane_node' "$LIMA_START" && echo 1 || echo 0)"
 assert "run-all.sh asks lima-start.sh to start KCM" \
   "$(grep -qF 'lima-start.sh" --with-kcm' "$DIR/run-all.sh" && echo 1 || echo 0)"
 assert "run-all.sh no longer starts KCM separately (a second KCM would double-write cluster state)" \

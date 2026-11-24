@@ -828,11 +828,11 @@ rig_apply_apparmor_rig_setup() {
 # /sbin/mount.<type> helper program"). Idempotent; fails loud on any step. Args: <vm>.
 rig_apply_vm_rig_setup() {
   local vm="$1"
-# Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
-# run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
-# (size-based) from the remaining logs (weekly). Written on every start so it survives
-# VM reprovisions.
-limactl shell "$vm" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROTATEOF'
+  # Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
+  # run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
+  # (size-based) from the remaining logs (weekly). Written on every start so it survives
+  # VM reprovisions.
+  limactl shell "$vm" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROTATEOF'
 /var/log/syslog {
     size 2G
     rotate 2
@@ -863,43 +863,43 @@ limactl shell "$vm" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROTATEOF
 }
 LOGROTATEOF
 
-# Override the logrotate systemd timer to fire every 2 hours instead of daily.
-# The size-based trigger in logrotate.d/rsyslog only acts when logrotate runs;
-# with the default daily schedule a 10-hour conformance run can exhaust 2GB before
-# midnight and evict the e2e pod. OnCalendar= (empty) clears the inherited value.
-limactl shell "$vm" sudo bash -c 'mkdir -p /etc/systemd/system/logrotate.timer.d && cat > /etc/systemd/system/logrotate.timer.d/override.conf' <<'EOF'
+  # Override the logrotate systemd timer to fire every 2 hours instead of daily.
+  # The size-based trigger in logrotate.d/rsyslog only acts when logrotate runs;
+  # with the default daily schedule a 10-hour conformance run can exhaust 2GB before
+  # midnight and evict the e2e pod. OnCalendar= (empty) clears the inherited value.
+  limactl shell "$vm" sudo bash -c 'mkdir -p /etc/systemd/system/logrotate.timer.d && cat > /etc/systemd/system/logrotate.timer.d/override.conf' <<'EOF'
 [Timer]
 OnCalendar=
 OnCalendar=*-*-* *:00/2:00
 RandomizedDelaySec=0
 EOF
-limactl shell "$vm" sudo systemctl daemon-reload
-limactl shell "$vm" sudo systemctl restart logrotate.timer
+  limactl shell "$vm" sudo systemctl daemon-reload
+  limactl shell "$vm" sudo systemctl restart logrotate.timer
 
-# Raise journald's rate-limit and disk retention so a 16-way conformance run's
-# kubelet/crio log volume on the busiest node isn't rate-limited or rotated away
-# before scripts/conformance/06-run-sonobuoy.sh collects it: the stock
-# RateLimitBurst=10000/30s silently drops lines once a unit's log rate exceeds
-# it, and the stock SystemMaxUse evicts the oldest segment once total journal
-# disk usage crosses a few hundred MB — together these erased the first ~5
-# minutes of one node's kubelet.log/crio.log in a real run while an identically
-# collected, less-loaded node kept the full window. Written on every start so it
-# survives VM reprovisions.
-#
-# SystemMaxUse=2G (this drop-in's original value) still wasn't enough: the
-# 0805-2202 --all-e2e run's collected kubelet.log/crio.log covered only the
-# LAST 1h54m of an 11h run (measured directly off that node's timestamps,
-# 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
-# entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
-# rate; going further eats into the VM disk conformance tests themselves need.
-# That margin was the original constraint: at the 20GiB disk ceiling this
-# drop-in was written against, only ~14G was free with base images pulled —
-# tight enough that it's part of what tripped the DiskPressure storm above.
-# The disk ceiling (lima/kubelet.yaml) has since doubled to 40GiB specifically
-# to fix that trigger (~33G free now observed with only base images pulled),
-# so 6G stays a deliberate compromise against overall journal disk usage, not
-# one forced by a tight VM-disk margin anymore.
-limactl shell "$vm" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
+  # Raise journald's rate-limit and disk retention so a 16-way conformance run's
+  # kubelet/crio log volume on the busiest node isn't rate-limited or rotated away
+  # before scripts/conformance/06-run-sonobuoy.sh collects it: the stock
+  # RateLimitBurst=10000/30s silently drops lines once a unit's log rate exceeds
+  # it, and the stock SystemMaxUse evicts the oldest segment once total journal
+  # disk usage crosses a few hundred MB — together these erased the first ~5
+  # minutes of one node's kubelet.log/crio.log in a real run while an identically
+  # collected, less-loaded node kept the full window. Written on every start so it
+  # survives VM reprovisions.
+  #
+  # SystemMaxUse=2G (this drop-in's original value) still wasn't enough: the
+  # 0805-2202 --all-e2e run's collected kubelet.log/crio.log covered only the
+  # LAST 1h54m of an 11h run (measured directly off that node's timestamps,
+  # 20:08-22:02) under 16-way load — losing the 09:33-09:35 DiskPressure incident
+  # entirely. 6G buys a fresh run roughly 5-6x that headroom at the same growth
+  # rate; going further eats into the VM disk conformance tests themselves need.
+  # That margin was the original constraint: at the 20GiB disk ceiling this
+  # drop-in was written against, only ~14G was free with base images pulled —
+  # tight enough that it's part of what tripped the DiskPressure storm above.
+  # The disk ceiling (lima/kubelet.yaml) has since doubled to 40GiB specifically
+  # to fix that trigger (~33G free now observed with only base images pulled),
+  # so 6G stays a deliberate compromise against overall journal disk usage, not
+  # one forced by a tight VM-disk margin anymore.
+  limactl shell "$vm" sudo bash -c 'mkdir -p /etc/systemd/journald.conf.d && cat > /etc/systemd/journald.conf.d/conformance.conf' <<'EOF'
 [Journal]
 RateLimitBurst=100000
 RateLimitIntervalSec=30s
@@ -909,21 +909,21 @@ SystemMaxFiles=160
 SystemKeepFree=100M
 Storage=persistent
 EOF
-limactl shell "$vm" sudo systemctl restart systemd-journald
+  limactl shell "$vm" sudo systemctl restart systemd-journald
 
-# This block re-runs on every invocation, not only --reset ones (reset.sh does
-# a full 'limactl delete --force', but a plain re-run against an existing VM
-# hits this same code path). On a VM reused across several conformance
-# sessions without --reset in between, journal volume from EARLIER sessions
-# is still sitting in the budget when a NEW run starts, silently shrinking how
-# much of the fresh run's own window that 6G actually covers. --rotate forces
-# the currently-active file closed so --vacuum-size can delete it along with
-# any older archived segments (a raw --vacuum-size alone leaves the active
-# file alone), reclaiming the full budget for THIS run. Safe to discard here
-# because any prior run's data that mattered was already evacuated to the
-# host by 06-run-sonobuoy.sh's end-of-run collection.
-limactl shell "$vm" sudo journalctl --rotate
-limactl shell "$vm" sudo journalctl --vacuum-size=1M
+  # This block re-runs on every invocation, not only --reset ones (reset.sh does
+  # a full 'limactl delete --force', but a plain re-run against an existing VM
+  # hits this same code path). On a VM reused across several conformance
+  # sessions without --reset in between, journal volume from EARLIER sessions
+  # is still sitting in the budget when a NEW run starts, silently shrinking how
+  # much of the fresh run's own window that 6G actually covers. --rotate forces
+  # the currently-active file closed so --vacuum-size can delete it along with
+  # any older archived segments (a raw --vacuum-size alone leaves the active
+  # file alone), reclaiming the full budget for THIS run. Safe to discard here
+  # because any prior run's data that mattered was already evacuated to the
+  # host by 06-run-sonobuoy.sh's end-of-run collection.
+  limactl shell "$vm" sudo journalctl --rotate
+  limactl shell "$vm" sudo journalctl --vacuum-size=1M
 
   limactl shell "$vm" sudo apt-get -o DPkg::Lock::Timeout=300 update
   limactl shell "$vm" sudo apt-get -o DPkg::Lock::Timeout=300 install -y nfs-common
