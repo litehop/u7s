@@ -29,6 +29,11 @@ RG_JIFFIES_PER_SEC=$(( $(nproc 2>/dev/null || echo 1) * 100 ))
 
 mkdir -p "$OUT"
 : > "$OUT/results.env"
+{
+  echo "kernel=$(uname -r)"; echo "arch=$(uname -m)"; echo "vcpus=$(nproc)"
+  echo "os=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+  awk '/^MemTotal:/ {print "mem_total_kb=" $2} /^SwapTotal:/ {print "swap_total_kb=" $2}' /proc/meminfo
+} > "$OUT/vm-shape.env"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 # Last write wins: the tally is rewritten after every burst so a dead guest leaves what was
 # observed so far, and rg_get reads the first match.
