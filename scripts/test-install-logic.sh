@@ -3112,7 +3112,7 @@ AR_WANT="$(printf '%s\n' "$AR_PROFILE" | awk '{print} /^  signal \(send,receive\
 assert "the --install step inserts exactly the rig-only rule after the anchor in the installed profile and reloads it once -- the reload is what makes running containers pick the rule up" \
   "$([ "$ar_rc" -eq 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_WANT" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 1 ] && echo 1 || echo 0)"
 assert "the host layer writes the dig and nslookup local overrides inside the VM and reloads each profile -- either layer alone still denies BIND's self-signal" \
-  "$([ "$(cat "$AR_DIR/etc/local/dig")" = "$ar_want_override" ] && [ "$(cat "$AR_DIR/etc/local/nslookup")" = "$ar_want_override" ] && [ "$(wc -l < "$AR_DIR/hostreloads")" -eq 2 ] && [ "$(cat "$AR_DIR/hostscript")" = via-limactl ] && echo 1 || echo 0)"
+  "$([ "$(cat "$AR_DIR/etc/local/dig")" = "$ar_want_override"$'\n'"owner /results/** w," ] && [ "$(cat "$AR_DIR/etc/local/nslookup")" = "$ar_want_override" ] && [ "$(wc -l < "$AR_DIR/hostreloads")" -eq 2 ] && [ "$(cat "$AR_DIR/hostscript")" = via-limactl ] && echo 1 || echo 0)"
 ar_run && ar_rc=0 || ar_rc=$?
 assert "re-running the --install step is a no-op for both layers (no duplicate rule, no extra reload) -- run-all.sh --install is re-run on the same VM" \
   "$([ "$ar_rc" -eq 0 ] && [ "$(cat "$AR_DIR/profile")" = "$AR_WANT" ] && [ "$(wc -l < "$AR_DIR/reloads")" -eq 1 ] && [ "$(wc -l < "$AR_DIR/hostreloads")" -eq 2 ] && echo 1 || echo 0)"

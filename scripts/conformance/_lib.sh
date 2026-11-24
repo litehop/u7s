@@ -592,7 +592,7 @@ INSTALL_RIG_ONLY_LABEL="u7s.io/conformance-rig-only=true"
 # peer=u7s-default//&* does not match, so BIND's self-signal is DENIED (rc 139).
 # Both topologies add this rule to u7s-default (install.sh's profile is untouched) plus
 # the matching host dig/nslookup overrides below; either layer alone still denies.
-RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup"
+RIG_ONLY_SETUP="apparmor-u7s-default-dig-nslookup,apparmor-host-dig-nslookup,apparmor-host-dig-results-write"
 RIG_AA_ANCHOR='  signal (send,receive) peer=u7s-default//&*,'
 RIG_AA_RULE='  signal (send,receive) peer={dig,nslookup}//&u7s-default,'
 
@@ -611,11 +611,16 @@ rig_aa_with_rule() {
 # Rig-only host layer: the host's dig/nslookup profiles (Ubuntu 26.04) also deny the
 # stacked peer "dig//&u7s-default", so each gets a local override allowing it. Written
 # idempotently and reloaded; a failed reload restores the previous override (or removes
-# it) so no half-applied rule is left behind.
+# it) so no half-applied rule is left behind. dig also gets write on /results/**: the
+# DNS conformance specs redirect dig's stdout there, and the host profile DENIES
+# file_inherit on that fd, so dig aborts (libuv assertion) and the lookup file is empty.
 RIG_AA_HOST_SCRIPT='set -euo pipefail
-want="signal (send,receive) peer=@{profile_name}//&u7s-default,"
+sig="signal (send,receive) peer=@{profile_name}//&u7s-default,"
 for p in dig nslookup; do
   [ -f /etc/apparmor.d/$p ] || continue
+  want="$sig"
+  if [ $p = dig ]; then want="$sig
+owner /results/** w,"; fi
   rm -f /etc/apparmor.d/disable/$p
   f=/etc/apparmor.d/local/$p
   if [ "$(cat $f 2>/dev/null || true)" != "$want" ] || ! grep -q "^$p (" /sys/kernel/security/apparmor/profiles; then
