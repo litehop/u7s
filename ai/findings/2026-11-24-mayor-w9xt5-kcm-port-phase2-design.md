@@ -5,8 +5,6 @@ Date: 2026-11-24 (main a1b0a1e0)
 
 **Recommendation:** port KCM as a separate Rust process that runs alongside upstream KCM, one controller group at a time, where every phase must clear a total-KCM-side memory ceiling (hybrid phases included, no higher than today's shipped Go KCM, and cumulatively no higher than the trimmed-Go baseline) and a sonobuoy gate (identical executed spec-name set, no new failures, zero KCM restarts) before it merges. The Rust process talks to the apiserver over loopback HTTP with per-controller identities, and each phase has an `--controllers` kill switch back to Go. Phase 0 is the measurement harness plus a validated Go trim, which funds the Rust process's fixed memory cost.
 
-Sources: Phase 1 audit (`2026-09-16-mayor-vc844-...`), mayor-w898x memory decomposition (branch `871d58e7`), roadmap Gate 4, `scripts/install.sh:2712`, `scripts/conformance/*`, `.github/workflows/e2e-focus.yaml`, upstream v1.35.0 `test/e2e/apps` and `test/integration` listings (`gh api`, `temp/research/`).
-
 **Tags and units.** Every number is MEASURED (source named) or TARGET (proposed, not yet measured). All sizes are MiB; w898x and the Phase 1 audit print "MB", and those figures are read as MiB (the difference is under 5% and below the noise band).
 
 ## 1. Memory: the first-class constraint
@@ -19,9 +17,7 @@ Sources: Phase 1 audit (`2026-09-16-mayor-vc844-...`), mayor-w898x memory decomp
 | KCM anon, shipped config (idle / WordPress / 50-pod burst) | 40.2 / 41.9 / 45.2 MiB | MEASURED, w898x |
 | KCM anon, trimmed `--controllers` (stock env, idle / WordPress) | 31.7 / 33.4 MiB | MEASURED, w898x |
 | KCM file-backed PSS (73 MiB binary) | 9 MiB loaded, 50 MiB idle | MEASURED, w898x |
-| Live informer caches + workqueues at ~170 objects | 0.3 MiB | MEASURED, w898x |
 | Rewrite-only residual after flags | 10-22 MiB | MEASURED, w898x |
-| Phase 1 modelled Rust KCM | 12-45 MiB | TARGET (model), Phase 1 audit |
 | u7s-apiserver PSS | 27-31 MiB | MEASURED, w898x run tables; Phase 0 re-measures it as `Pss_Anon` |
 | Rust KCM fixed cost (runtime, TLS, binary data) | at most 8 MiB | TARGET; no measurement exists, Phase 0 spike measures it |
 | Single-run variation | about 3 MiB | MEASURED, w898x |
@@ -53,7 +49,7 @@ Metric: `Pss_Anon` from `/proc/<pid>/smaps_rollup` for KCM-Go, KCM-Rust and u7s-
 
 **Cumulative cap.** The per-phase gate alone lets small passing regressions accumulate, so at each phase end also measure 5 runs each of the phase build H_k and the Phase 0 trimmed Go (T), interleaved on one VM. Let `K(x)` = `anon(KCM-Go) + anon(KCM-Rust)` (apiserver excluded) per stage. Require `median5(K(H_k)) - median5(K(T)) <= 0` at every stage. The cap is the same at every phase and never rises, so total KCM-side memory across all phases so far cannot exceed the trimmed-Go baseline. Same terminal-per-SHA rule.
 
-This is a ceiling against shipped Go, not a progression bound: a "+3 over previous phase" rule is dropped because it overlaps the ceiling and the ceiling already bounds growth. Headroom comes from Phase 0: the trim is TARGET -8 (w898x measured 41.9 -> 33.4 at WordPress), so with Rust fixed cost TARGET at most 8, Phase 1 can pass with `H = R` even if Go saves nothing. Phase 0 itself passes if `median(R) - median(T) >= 5` (the -8 target minus the 3 band).
+Headroom comes from Phase 0: the trim is TARGET -8 (w898x measured 41.9 -> 33.4 at WordPress), so with Rust fixed cost TARGET at most 8, Phase 1 can pass with `H = R` even if Go saves nothing. Phase 0 itself passes if `median(R) - median(T) >= 5` (the -8 target minus the 3 band).
 
 | Phase | Gate | TARGET budget |
 |---|---|---|
@@ -117,15 +113,15 @@ Order is by risk (stateless, small, deterministic) and coverage (breakage is lou
 | 5 | PV binder, attach-detach, expand, protection controllers, ephemeral-volume, CSR approving/signing, bootstrap-signer, token-cleaner, resource-claim, HPA (if kept) | Storage and security-sensitive, thin e2e coverage in single-node; CSR signing is on the join path | sig-storage, `certificates`, `dra` |
 | 6 | Remove Go KCM | The 50 MiB file-backed binary and runtime go | full suite |
 
-Memory win per phase, from the numbers we have: Phase 0 about 8 MiB (TARGET; w898x trim, unvalidated). Phases 1-5 are expected neutral to slightly negative in the hybrid (Rust fixed cost against small Go savings), which is what the ceiling polices. Phase 6 realises the main win: w898x bounds the total rewrite saving at 22-34 MiB anon (MEASURED bound), of which 10-22 MiB beyond flags.
+Memory win per phase, from the numbers we have: Phase 0 about 8 MiB (TARGET; w898x trim, unvalidated). Phases 1-5 are expected neutral to slightly negative in the hybrid (Rust fixed cost against small Go savings), which is what the ceiling polices. Phase 6 realises the main win (w898x bounds the total rewrite saving at 22-34 MiB anon, MEASURED).
 
 ## 4. Rollback
 
-One source of truth renders both unit files: an env file (for example `/etc/u7s/kcm-ported`) listing ported controllers. `install.sh` expands it into Go's `--controllers=*,...,-<ported>` and Rust's `--controllers=<ported>`; `04-start-kcm.sh` does the same for the rig. The current Go list at `install.sh:2712` is the template. Rolling one controller back is: remove its name from the file and restart both units. A logic test in the style of `test-install-flag-parity-logic.sh` asserts the two sets are **disjoint and their union is the full set**, since KCM runs with `--leader-elect=false` and a double-owned controller would fight silently. A global fallback is an empty file, which gives pure Go. The Rust unit gets the same `kcm-supervisor.sh` supervision as Go in production; gate runs forbid restarts (invariant 4).
+One source of truth renders both unit files: an env file (for example `/etc/u7s/kcm-ported`) listing ported controllers. `install.sh` expands it into Go's `--controllers=*,...,-<ported>` and Rust's `--controllers=<ported>`; `04-start-kcm.sh` does the same for the rig. The current Go list at `install.sh:2712` is the template. Rolling back one controller means removing its name and restarting both units. A logic test in the style of `test-install-flag-parity-logic.sh` asserts the two sets are **disjoint and their union is the full set**, since KCM runs with `--leader-elect=false` and a double-owned controller would fight silently. The Rust unit gets the same `kcm-supervisor.sh` supervision as Go in production; gate runs forbid restarts (invariant 4).
 
 ## 5. Rust building blocks
 
-Loopback HTTP, separate process, own identities is **recommended**: it pays a cache copy and JSON parse, but RBAC, admission, validation and audit see controller traffic, as with Go KCM. In-process store access (like an embedded controller in the apiserver) has the lowest memory but the worst verification: writes bypass authn, RBAC, admission and audit, an apiserver bug can be masked, hybrid phases (Go over HTTP) differ from the final shape, and restarts couple. Rejected for now; revisit after parity as a separately measured step. Client candidates: kube-rs full, kube-rs runtime plus narrow own types, or the scheduler's hyper client plus a small own informer (decision 2).
+Loopback HTTP, separate process, own identities is **recommended**: RBAC, admission, validation and audit see controller traffic, as with Go KCM, at the cost of a cache copy and JSON parse. In-process store access (like an embedded controller in the apiserver) has the lowest memory but the worst verification: writes bypass authn, RBAC, admission and audit, an apiserver bug can be masked, hybrid phases (Go over HTTP) differ from the final shape, and restarts couple. Rejected for now. Client candidates: kube-rs full, kube-rs runtime plus narrow own types, or the scheduler's hyper client plus a small own informer (decision 2).
 
 Precedent: the scheduler went embedded but still dials the apiserver over loopback TLS with its own `system:kube-scheduler` kubeconfig (`crates/apiserver/src/lib.rs`, step 10h). It uses plain hyper with its own caches and has no kube-rs dependency.
 
