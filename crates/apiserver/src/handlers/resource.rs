@@ -35,6 +35,7 @@ use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
     ssa_body_to_json, strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
+use super::list_items::ListFilter;
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
 /// Restores the previously-stored `status` onto `body`, or strips whatever `status` is
@@ -82,9 +83,9 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
     accept.contains("as=PartialObjectMetadata")
 }
 
-/// Builds a LIST response's raw JSON bytes by parsing, defaulting, and filtering one
-/// stored object at a time and serializing each survivor straight into the output
-/// buffer — never materializing a `Vec<serde_json::Value>` of every item. A LIST's peak
+/// Builds a LIST response's raw JSON bytes by selecting, defaulting and serializing one
+/// stored object at a time (`ListFilter::select`) straight into the output buffer — never
+/// materializing a `Vec<serde_json::Value>` of every item. A LIST's peak
 /// memory is dominated by how many parsed `Value` trees are alive at once, not by the
 /// final byte count, so keeping that count at 1 instead of the full item count is what
 /// makes a large LIST (hundreds of Pods) cheap instead of the dominant allocator.
@@ -93,23 +94,14 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
 /// delegated to `build_list_response` with an empty items array, then the streamed items
 /// array is spliced into the one place that placeholder appears — so this can never drift
 /// from that function's byte-for-byte-tested envelope output.
-///
-/// `field_selector` is the handler's already-validated selector, evaluated against each
-/// defaulted item — shared here across every LIST handler rather than forked per-caller.
-/// `on_item`, if set, runs
-/// once per surviving item (e.g. list_pods' per-pod lifecycle debug log) so that diagnostic
-/// hook still fires on the streaming path, not just the materializing one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_list_json(
     kind: &str,
     group: &str,
     version: &str,
-    plural: &str,
     revision: u64,
     raw_items: &[u7s_store::StoreObject],
-    label_pairs: &[LabelSelectorTerm<'_>],
-    field_selector: &FieldSelector,
-    on_item: Option<fn(&serde_json::Value)>,
+    filter: &ListFilter<'_>,
     continue_key: Option<String>,
     remaining_count: Option<u64>,
     signing_key: &[u8; 32],
@@ -137,19 +129,9 @@ pub(crate) fn stream_list_json(
     body.extend_from_slice(b"\"items\":[");
     let mut wrote_item = false;
     for obj in raw_items {
-        let mut item: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(group, plural, &mut item);
-        item = match apply_label_selector(vec![item], label_pairs).pop() {
-            Some(v) => v,
-            None => continue,
-        };
-        if !field_selector.matches(&item) {
+        let Some(item) = filter.select(&obj.value)? else {
             continue;
-        }
-        if let Some(f) = on_item {
-            f(&item);
-        }
+        };
         if wrote_item {
             body.push(b',');
         }
@@ -304,17 +286,15 @@ pub(crate) async fn list_resource<S: Store>(
     let list_kind = format!("{}List", meta.kind);
     let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
         && crate::content_type::has_encoder(&list_api_version, &list_kind);
+    let filter = ListFilter::new(&group, &plural, &label_pairs, &field_selector, None);
     if !pom && !table && !wants_real_protobuf {
         let body = stream_list_json(
             &meta.kind,
             &group,
             &version,
-            &plural,
             list_revision,
             &resp.items,
-            &label_pairs,
-            &field_selector,
-            None,
+            &filter,
             resp.continue_key,
             resp.remaining_count,
             &state.continue_token_key,
@@ -327,16 +307,7 @@ pub(crate) async fn list_resource<S: Store>(
             .into_response());
     }
 
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(&group, &plural, &mut v);
-        items.push(v);
-    }
-
-    let items = apply_label_selector(items, &label_pairs);
-    let items = field_selector.filter(items);
+    let items = filter.select_all(&resp.items)?;
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {
@@ -3332,17 +3303,15 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
     let list_kind = format!("{}List", meta.kind);
     let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
         && crate::content_type::has_encoder(&list_api_version, &list_kind);
+    let filter = ListFilter::new(&group, &plural, &label_pairs, &field_selector, None);
     if !pom && !table && !wants_real_protobuf {
         let body = stream_list_json(
             &meta.kind,
             &group,
             &version,
-            &plural,
             list_revision,
             &resp.items,
-            &label_pairs,
-            &field_selector,
-            None,
+            &filter,
             resp.continue_key,
             resp.remaining_count,
             &state.continue_token_key,
@@ -3355,16 +3324,7 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
             .into_response());
     }
 
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        super::defaults::apply_defaults(&group, &plural, &mut v);
-        items.push(v);
-    }
-
-    let items = apply_label_selector(items, &label_pairs);
-    let items = field_selector.filter(items);
+    let items = filter.select_all(&resp.items)?;
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
     if pom {

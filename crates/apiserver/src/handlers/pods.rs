@@ -236,17 +236,17 @@ pub(crate) async fn list_pods<S: Store>(
     // streaming path when the client isn't going to get real protobuf anyway.
     let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
         && crate::content_type::has_encoder("v1", "PodList");
+    let on_item = tracing::enabled!(target: "u7s::apiserver::pod_lifecycle", tracing::Level::DEBUG)
+        .then_some(log_pod_list_entry as fn(&serde_json::Value));
+    let filter = ListFilter::new("", "pods", &label_pairs, &field_selector, on_item);
     if !pom && !table && !wants_real_protobuf {
         let body = super::resource::stream_list_json(
             "Pod",
             "",
             "v1",
-            "pods",
             resp.revision,
             &resp.items,
-            &label_pairs,
-            &field_selector,
-            Some(log_pod_list_entry),
+            &filter,
             resp.continue_key,
             resp.remaining_count,
             &state.continue_token_key,
@@ -259,20 +259,8 @@ pub(crate) async fn list_pods<S: Store>(
             .into_response());
     }
 
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        items.push(parsed);
-    }
-
-    let items = field_selector.filter(items);
-    let items = super::generic::apply_label_selector(items, &label_pairs);
+    let items = filter.select_all(&resp.items)?;
     tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
-
-    for pod in &items {
-        log_pod_list_entry(pod);
-    }
 
     if pom {
         let pom_items: Vec<serde_json::Value> = items
@@ -1780,6 +1768,7 @@ pub(crate) async fn patch_pod<S: Store>(
     }
 }
 
+use super::list_items::ListFilter;
 use crate::util::utc_now_rfc3339;
 
 /// POST /api/v1/namespaces/{ns}/pods/{name}/eviction

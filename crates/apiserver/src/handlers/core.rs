@@ -17,11 +17,9 @@ use u7s_store::{ListOptions, Store};
 use crate::{auth::UserInfo, state::AppState, status::Status};
 
 use super::field_selector::FieldSelector;
-use super::generic::{
-    apply_label_selector, build_list_response, decode_continue, parse_label_selector,
-    CollectionQuery,
-};
+use super::generic::{build_list_response, decode_continue, parse_label_selector, CollectionQuery};
 use super::json_patch::{CreateQuery, PatchQuery, ReplaceQuery};
+use super::list_items::ListFilter;
 use super::resource::{
     create_namespaced_resource, create_resource, delete_collection_namespaced_resource,
     delete_collection_resource, delete_namespaced_resource, delete_resource,
@@ -168,17 +166,15 @@ pub(crate) async fn core_list_resource<S: Store>(
         // the streaming path when the client isn't going to get real protobuf anyway.
         let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
             && crate::content_type::has_encoder("v1", "PodList");
+        let filter = ListFilter::new("", "pods", &label_pairs, &field_selector, None);
         if !pom && !table && !wants_real_protobuf {
             let body = super::resource::stream_list_json(
                 "Pod",
                 "",
                 "v1",
-                "pods",
                 list_revision,
                 &resp.items,
-                &label_pairs,
-                &field_selector,
-                None,
+                &filter,
                 resp.continue_key,
                 resp.remaining_count,
                 &state.continue_token_key,
@@ -191,14 +187,7 @@ pub(crate) async fn core_list_resource<S: Store>(
                 .into_response());
         }
 
-        let mut items = Vec::with_capacity(resp.items.len());
-        for obj in &resp.items {
-            let v: serde_json::Value =
-                serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-            items.push(v);
-        }
-        let items = field_selector.filter(items);
-        let items = apply_label_selector(items, &label_pairs);
+        let items = filter.select_all(&resp.items)?;
         tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
 
         if pom {

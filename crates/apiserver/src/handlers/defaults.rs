@@ -130,6 +130,13 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     }
 }
 
+/// Whether `apply_defaults` can rewrite `metadata.labels` for this kind. Only a
+/// ReplicationController does (it inherits the template's labels), so LIST may not match label
+/// selectors against its stored bytes.
+pub fn defaults_may_alter_labels(group: &str, plural: &str) -> bool {
+    matches!((group, plural), ("", "replicationcontrollers"))
+}
+
 /// Returns true when the group/plural pair is a workload resource that KCM
 /// reconciles via metadata.generation.
 ///

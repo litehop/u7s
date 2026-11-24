@@ -22,6 +22,7 @@ mod field_selector_tests;
 pub mod generic;
 pub mod json_patch;
 pub(crate) mod jsonpath;
+pub(crate) mod list_items;
 pub mod metrics;
 pub mod namespaces;
 #[cfg(test)]
