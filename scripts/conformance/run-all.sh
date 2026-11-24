@@ -547,6 +547,13 @@ fi
 DHAT_HEAP_FILE=""
 DHAT_HEAP_MISMATCH=0
 SONOBUOY_RC=0
+# Cargo features of the apiserver binary under test, stamped into run-meta by 06.
+# shellcheck source=scripts/conformance/_lib.sh
+source "$DIR/_lib.sh"
+_PREBUILT=0; [ -z "$BINARY" ] || _PREBUILT=1
+_PKI=0; [ -z "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION$PKI_TEST_INTERMEDIATE" ] || _PKI=1
+U7S_RIG_BUILD_FEATURES="$(rig_build_features "$_PREBUILT" "$PROFILE" "$_PKI")"
+export U7S_RIG_BUILD_FEATURES
 if [ "$PROFILE" -eq 1 ]; then
   banner "Profile: rebuilding u7s-apiserver with --features dhat"
   # 01-build.sh builds u7s-apiserver and u7s-scheduler together with no
@@ -617,6 +624,14 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
 bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG}
+
+# Label every rig-only add-on (metrics-server and external-snapshotter applied above,
+# kube-network-policies by lima-start.sh) exactly as install-bringup.sh does.
+source "$DIR/_lib.sh"
+banner "Labelling rig-only add-ons ($RIG_ONLY_LABEL): $RIG_ONLY_ADDONS"
+for addon in ${RIG_ONLY_ADDONS//,/ }; do
+  kubectl --kubeconfig="$KUBECONFIG" label --overwrite -f "$REPO/scripts/conformance/manifests/${addon}.yaml" "$RIG_ONLY_LABEL" >/dev/null
+done
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
