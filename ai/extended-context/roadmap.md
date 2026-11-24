@@ -41,7 +41,7 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle; closed the silent-decode-drop bug class. |
 
 **Rewrite decision (`mayor-vc844`, operator 2026-11-24):** port KCM first
-(design `mayor-w9xt5`). Kubelet is revisited after the `mayor-jedol`
+(design `mayor-w9xt5`). For the port, sonobuoy Conformance and upstream parity must stay a reliable guardrail, and the design must be memory-efficiency-driven from step 1. Kubelet is revisited after the `mayor-jedol`
 data. No clean flag lever remains; rewrite-only residual (2026-10-21, loaded
 1 GiB node): ~10-22 MB KCM, ~19-24 MB kubelet.
 
@@ -67,7 +67,7 @@ InflightLayer backpressure is a deliberate minimal APF subset (bd memory
 `u7s-inflight-backpressure-is-deliberate-minimal-apf-subset`).
 
 ### Gate 4 — Perf (ACTIVE since 2026-07-24)
-Method: audit → bead → measure before/after → land. Wins: `dashboard.md`.
+Method: audit → bead → measure before/after → land.
 Current focus: apiserver hot request paths (audit `mayor-f7ym1`).
 
 **Aspiration, blocks nothing:** host-level control-plane processes (pods
@@ -77,7 +77,7 @@ excluded) under 128 MiB. Peak PSS 2026-10-15: kubelet 82-114 MiB, KCM
 ### Release gate — 20-pod burst on 1 GiB / 1 vCPU
 Releases must pass the 1 GiB / 1 vCPU no-swap burst test: WordPress +
 MariaDB, then a 20-pod burst. Lowered to 20 pods by the operator on
-2026-11-05 (from 40/50; 20 passed 4/4 on GCP, 40 and 50 passed 0/3). Harness: `scripts/release-gate/`
+2026-11-05. Harness: `scripts/release-gate/`
 (`mayor-6uez9`); noisy hosts yield an INVALID verdict that `--confirm`
 re-runs.
 
@@ -87,7 +87,7 @@ the CHANGELOG cites (`mayor-jedol`). Evidence (`mayor-pzhtd`, two GCP runs):
 a kubepods memory cap does not make a 1 GiB / 1 vCPU node recover.
 
 The authoritative gate runs on a real 1-vCPU GCP VM (n1-custom-1-1024,
-operator 2026-11-04); Mac Lima is an optional pre-check. Not fully built:
+operator 2026-11-04); Not fully built:
 `mayor-p3ktl` is in progress and `mayor-6uez9` is open-partial. Operator
 2026-10-23: no rush to cut a release. Cert rotation (`mayor-xdw6u.11`)
 blocks a release (operator 2026-10-20).
