@@ -101,6 +101,19 @@ struct Held {
     timed_out: AtomicBool,
 }
 
+/// Request extension on metered requests that lets a handler give its body bytes back
+/// before the response is returned. Proxy handlers call it once the upstream has the
+/// request body and has answered with headers, so a long or buffered response never holds
+/// budget that only the request body needs.
+#[derive(Clone)]
+pub struct BodyBudgetRelease(Arc<Held>);
+
+impl BodyBudgetRelease {
+    pub fn release(&self) {
+        self.0.permit.lock().unwrap().take();
+    }
+}
+
 fn meter(body: Body, budget: Arc<Semaphore>, held: Arc<Held>) -> Body {
     let frames = futures_util::stream::unfold(
         (body.into_data_stream(), budget, held),
@@ -162,8 +175,10 @@ where
         });
         let req = if is_metered(&req) {
             let budget = Arc::clone(&self.budget);
-            let held = Arc::clone(&held);
-            req.map(|b| meter(b, budget, held))
+            let mut req = req.map(|b| meter(b, budget, Arc::clone(&held)));
+            req.extensions_mut()
+                .insert(BodyBudgetRelease(Arc::clone(&held)));
+            req
         } else {
             req
         };

@@ -2501,8 +2501,10 @@ pub async fn resolve_node_proxy_target<S: Store>(
 }
 
 /// Buffer a proxied request body, capped at `MAX_BODY_BYTES`. Proxy subresources are
-/// long-running and skip `DefaultBodyLimit`/the inflight body deadline, so the cap must be
-/// enforced here or one request can hold unbounded memory before the upstream dial.
+/// long-running and skip `DefaultBodyLimit`, so the cap must be enforced here or one
+/// request can hold unbounded memory before the upstream dial. The inflight body-read
+/// deadline still applies and surfaces as a read error that the body-budget layer turns
+/// into 504.
 async fn read_proxy_request_body(body: Body) -> Result<bytes::Bytes, crate::status::StatusError> {
     axum::body::to_bytes(body, crate::MAX_BODY_BYTES)
         .await
@@ -2535,9 +2537,21 @@ pub async fn node_proxy<S: Store>(
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
 
+    let budget = req
+        .extensions()
+        .get::<crate::body_budget::BodyBudgetRelease>()
+        .cloned();
     let body_bytes = read_proxy_request_body(req.into_body()).await?;
 
-    forward_to_kubelet(&client, method, &kubelet_url, body_bytes).await
+    forward_to_kubelet(
+        &client,
+        method,
+        &kubelet_url,
+        body_bytes,
+        PROXY_RESPONSE_HEADER_TIMEOUT,
+        budget.as_ref(),
+    )
+    .await
 }
 
 /// Send the already address-checked request to the kubelet and relay its status,
@@ -2547,27 +2561,18 @@ async fn forward_to_kubelet(
     method: reqwest::Method,
     kubelet_url: &str,
     body_bytes: bytes::Bytes,
+    header_timeout_after: std::time::Duration,
+    budget: Option<&crate::body_budget::BodyBudgetRelease>,
 ) -> Result<Response, crate::status::StatusError> {
-    let kubelet_resp = client
-        .request(method, kubelet_url)
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("kubelet unreachable: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+    let kubelet_resp = send_with_header_timeout(
+        "kubelet",
+        header_timeout_after,
+        client.request(method, kubelet_url).body(body_bytes).send(),
+    )
+    .await?;
+    if let Some(budget) = budget {
+        budget.release();
+    }
 
     let kubelet_status = kubelet_resp.status();
     let upstream_headers = kubelet_resp.headers().clone();
@@ -2981,6 +2986,155 @@ pub(crate) fn build_pod_proxy_client(
     builder.build().unwrap_or_default()
 }
 
+/// How long a proxied upstream may take to send its response headers after the request has
+/// been written: the same 60s every other request gets. Upstream exempts proxy requests
+/// as long-running; here the bound keeps an upstream that accepts a request and never
+/// answers from pinning the request's body-budget bytes. Once headers arrive the budget is
+/// released and a non-HTML response body streams with no time limit.
+const PROXY_RESPONSE_HEADER_TIMEOUT: std::time::Duration = crate::inflight::MUTATING_BODY_TIMEOUT;
+
+/// Konnectivity dial and TLS handshake bounds. These are the values upstream's proxy
+/// transport inherits from Go's `http.DefaultTransport` via `SetTransportDefaults` in
+/// `apimachinery/pkg/util/net/http.go`: `net.Dialer{Timeout: 30s}` and
+/// `TLSHandshakeTimeout: 10s`.
+const PROXY_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PROXY_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bound on reading an HTML proxy response into memory for link rewriting.
+const PROXY_HTML_BUFFER_TIMEOUT: std::time::Duration = crate::inflight::MUTATING_BODY_TIMEOUT;
+
+fn header_timeout(upstream: &str, after: std::time::Duration) -> crate::status::StatusError {
+    Status::gateway_timeout(format!(
+        "Timeout: {upstream} did not send response headers within {}s",
+        after.as_secs()
+    ))
+}
+
+fn upstream_unreachable(
+    upstream: &str,
+    via_tunnel: bool,
+    e: impl std::fmt::Display,
+) -> crate::status::StatusError {
+    let via = if via_tunnel { " via konnectivity" } else { "" };
+    crate::status::StatusError(
+        axum::http::StatusCode::BAD_GATEWAY,
+        crate::status::Status {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            message: format!("{upstream} unreachable{via}: {e}"),
+            reason: "BadGateway",
+            code: 502,
+            metadata: None,
+            details: None,
+        },
+    )
+}
+
+/// Await an upstream request that resolves once response headers are in. The single place
+/// that bounds the wait and maps it to 504 (timeout) or 502 (failure).
+async fn send_with_header_timeout<T, E: std::fmt::Display>(
+    upstream: &str,
+    timeout: std::time::Duration,
+    send: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, crate::status::StatusError> {
+    match tokio::time::timeout(timeout, send).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(upstream_unreachable(upstream, false, e)),
+        Err(_) => Err(header_timeout(upstream, timeout)),
+    }
+}
+
+#[derive(Debug)]
+enum TunnelError {
+    HeaderTimeout(std::time::Duration),
+    Failed(String),
+}
+
+impl From<String> for TunnelError {
+    fn from(s: String) -> Self {
+        TunnelError::Failed(s)
+    }
+}
+
+impl From<&str> for TunnelError {
+    fn from(s: &str) -> Self {
+        TunnelError::Failed(s.to_owned())
+    }
+}
+
+fn tunnel_error(e: TunnelError, upstream: &str) -> crate::status::StatusError {
+    match e {
+        TunnelError::HeaderTimeout(after) => header_timeout(upstream, after),
+        TunnelError::Failed(e) => upstream_unreachable(upstream, true, e),
+    }
+}
+
+/// Bound a tunnel setup step; expiry is a plain failure (502) naming the step.
+async fn tunnel_step<T, E: std::fmt::Display>(
+    what: &str,
+    timeout: std::time::Duration,
+    step: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, TunnelError> {
+    match tokio::time::timeout(timeout, step).await {
+        Ok(r) => r.map_err(|e| format!("{what}: {e}").into()),
+        Err(_) => Err(TunnelError::Failed(format!(
+            "{what}: timed out after {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
+
+/// Everything the proxy handlers do once an upstream has answered with headers: give the
+/// request body's budget back, then either stream the body or, for HTML, buffer it under
+/// a size cap and time bound and rewrite its links.
+async fn relay_upstream_response(
+    upstream: &str,
+    status: axum::http::StatusCode,
+    mut headers: axum::http::HeaderMap,
+    body: Body,
+    proxy_base: &str,
+    budget: Option<&crate::body_budget::BodyBudgetRelease>,
+    html_buffer_timeout: std::time::Duration,
+) -> Result<Response, crate::status::StatusError> {
+    if let Some(budget) = budget {
+        budget.release();
+    }
+    let body = if is_html_content_type(&headers) {
+        let raw = tokio::time::timeout(
+            html_buffer_timeout,
+            buffer_capped(body.into_data_stream(), crate::MAX_BODY_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            Status::gateway_timeout(format!(
+                "Timeout: {upstream} did not finish its HTML response within {}s",
+                html_buffer_timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("{upstream} proxy response body: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                    details: None,
+                },
+            )
+        })?;
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        Body::from(rewrite_html_body(raw, proxy_base))
+    } else {
+        body
+    };
+    proxied_response(status, &headers, body)
+}
+
 /// A tunnel byte stream: either the plain konnectivity-to-pod tunnel, or (when the proxy
 /// target uses the `https:` scheme) that same tunnel wrapped in a second TLS session
 /// dialed to the pod/endpoint itself. Boxing erases the two concrete stream types so the
@@ -3008,8 +3162,8 @@ async fn pod_proxy_via_connect_tunnel(
     ca_ders: Option<&[Vec<u8>]>,
     client_identity_pem: Option<&[u8]>,
     is_https: bool,
-) -> Result<(u16, axum::http::HeaderMap, bytes::Bytes), String> {
-    use http_body_util::BodyExt as _;
+    header_timeout_after: std::time::Duration,
+) -> Result<(u16, axum::http::HeaderMap, Body), TunnelError> {
     use hyper_util::rt::TokioIo;
     use rustls::pki_types::ServerName;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3026,53 +3180,63 @@ async fn pod_proxy_via_connect_tunnel(
     let connector = TlsConnector::from(tls_config);
 
     // 3. Open a TCP connection to konnectivity-server.
-    let tcp = TcpStream::connect((kconn_host.as_str(), kconn_port))
-        .await
-        .map_err(|e| format!("konnectivity TCP connect: {e}"))?;
+    let tcp = tunnel_step(
+        "konnectivity TCP connect",
+        PROXY_DIAL_TIMEOUT,
+        TcpStream::connect((kconn_host.as_str(), kconn_port)),
+    )
+    .await?;
 
     let server_name = ServerName::try_from(kconn_host.as_str())
         .map(|n| n.to_owned())
         .map_err(|e| format!("invalid konnectivity server name '{kconn_host}': {e}"))?;
-    let mut tls_stream = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| format!("konnectivity TLS handshake: {e}"))?;
+    let mut tls_stream = tunnel_step(
+        "konnectivity TLS handshake",
+        PROXY_TLS_HANDSHAKE_TIMEOUT,
+        connector.connect(server_name, tcp),
+    )
+    .await?;
 
-    // 4. Send HTTP CONNECT to ask konnectivity to tunnel to pod_ip:port.
-    //    konnectivity-server (proxy-agent v0.35.0) accepts CONNECT only.
+    // 4-5. Send HTTP CONNECT to ask konnectivity to tunnel to pod_ip:port
+    //    (konnectivity-server, proxy-agent v0.35.0, accepts CONNECT only) and read its
+    //    response line, "HTTP/1.1 200 Connection established\r\n\r\n". The answer is a
+    //    response-header wait, so it gets the header timeout.
     let connect_req = connect_request(pod_ip, port);
-    tls_stream
-        .write_all(connect_req.as_bytes())
-        .await
-        .map_err(|e| format!("CONNECT write: {e}"))?;
-
-    // 5. Read the CONNECT response line. konnectivity returns "HTTP/1.1 200 Connection established\r\n\r\n".
-    let mut resp_buf = [0u8; 256];
-    let mut total = 0usize;
-    loop {
-        if total >= resp_buf.len() {
-            return Err("CONNECT response too large".into());
-        }
-        let n = tls_stream
-            .read(&mut resp_buf[total..])
+    tokio::time::timeout(header_timeout_after, async {
+        tls_stream
+            .write_all(connect_req.as_bytes())
             .await
-            .map_err(|e| format!("CONNECT read: {e}"))?;
-        if n == 0 {
-            return Err("konnectivity closed connection during CONNECT".into());
+            .map_err(|e| format!("CONNECT write: {e}"))?;
+        let mut resp_buf = [0u8; 256];
+        let mut total = 0usize;
+        loop {
+            if total >= resp_buf.len() {
+                return Err("CONNECT response too large".to_owned());
+            }
+            let n = tls_stream
+                .read(&mut resp_buf[total..])
+                .await
+                .map_err(|e| format!("CONNECT read: {e}"))?;
+            if n == 0 {
+                return Err("konnectivity closed connection during CONNECT".to_owned());
+            }
+            total += n;
+            // Look for the end of the HTTP response headers (\r\n\r\n).
+            if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
         }
-        total += n;
-        // Look for the end of the HTTP response headers (\r\n\r\n).
-        if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+        let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap_or("");
+        if !resp_str.starts_with("HTTP/1.1 200") {
+            return Err(format!(
+                "CONNECT rejected: {}",
+                resp_str.lines().next().unwrap_or("")
+            ));
         }
-    }
-    let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap_or("");
-    if !resp_str.starts_with("HTTP/1.1 200") {
-        return Err(format!(
-            "CONNECT rejected: {}",
-            resp_str.lines().next().unwrap_or("")
-        ));
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|_| TunnelError::HeaderTimeout(header_timeout_after))??;
 
     // 6. The tunnel is open. For an https-scheme target, dial a second TLS session to the
     //    pod over the tunnel before speaking HTTP — pod/workload certs are self-signed or
@@ -3086,10 +3250,12 @@ async fn pod_proxy_via_connect_tunnel(
         let pod_server_name = ServerName::try_from(pod_ip)
             .map(|n| n.to_owned())
             .map_err(|e| format!("invalid pod server name '{pod_ip}': {e}"))?;
-        let pod_tls_stream = pod_connector
-            .connect(pod_server_name, tls_stream)
-            .await
-            .map_err(|e| format!("pod TLS handshake over tunnel: {e}"))?;
+        let pod_tls_stream = tunnel_step(
+            "pod TLS handshake over tunnel",
+            PROXY_TLS_HANDSHAKE_TIMEOUT,
+            pod_connector.connect(pod_server_name, tls_stream),
+        )
+        .await?;
         Box::new(pod_tls_stream)
     } else {
         Box::new(tls_stream)
@@ -3115,23 +3281,15 @@ async fn pod_proxy_via_connect_tunnel(
         .body(axum::body::Body::from(body_bytes))
         .map_err(|e| format!("build pod request: {e}"))?;
 
-    let hyper_resp = sender
-        .send_request(hyper_req)
-        .await
-        .map_err(|e| format!("pod request over tunnel: {e}"))?;
+    let hyper_resp =
+        match tokio::time::timeout(header_timeout_after, sender.send_request(hyper_req)).await {
+            Ok(r) => r.map_err(|e| format!("pod request over tunnel: {e}"))?,
+            Err(_) => return Err(TunnelError::HeaderTimeout(header_timeout_after)),
+        };
 
     let status = hyper_resp.status().as_u16();
     let headers = hyper_resp.headers().clone();
-    // Every konnectivity-proxied response is collected here, HTML or not — unlike the
-    // direct-dial leg it has no separate streaming path — so this is the only cap on this
-    // leg (see buffer_capped's doc comment for why an uncapped read is a memory-exhaustion
-    // vector).
-    let collected = http_body_util::Limited::new(hyper_resp.into_body(), crate::MAX_BODY_BYTES)
-        .collect()
-        .await
-        .map_err(|e| format!("read pod response body: {e}"))?;
-
-    Ok((status, headers, collected.to_bytes()))
+    Ok((status, headers, Body::new(hyper_resp.into_body())))
 }
 
 /// Merge the inbound request's query string (if any) onto the forwarded proxy path.
@@ -3267,6 +3425,7 @@ async fn pod_proxy_dispatch<S: Store>(
     pod_name: &str,
     path_suffix: &str,
     req: axum::http::Request<Body>,
+    header_timeout_after: std::time::Duration,
 ) -> Result<Response, crate::status::StatusError> {
     let (pod_ip, port, proxy_addr, is_https) =
         resolve_pod_proxy_target(state, ns, pod_name).await?;
@@ -3278,13 +3437,17 @@ async fn pod_proxy_dispatch<S: Store>(
 
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
+    let budget = req
+        .extensions()
+        .get::<crate::body_budget::BodyBudgetRelease>()
+        .cloned();
     let body_bytes = read_proxy_request_body(req.into_body()).await?;
     let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
         // Route through konnectivity via an explicit CONNECT tunnel.
         // konnectivity-server accepts CONNECT only; a plain forward-proxy GET returns 405.
-        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &pod_ip,
             port,
@@ -3298,33 +3461,23 @@ async fn pod_proxy_dispatch<S: Store>(
                 .as_deref()
                 .map(|v| v.as_slice()),
             is_https,
+            header_timeout_after,
         )
         .await
-        .map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("pod unreachable via konnectivity: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+        .map_err(|e| tunnel_error(e, "pod"))?;
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let body = if is_html_content_type(&headers) {
-            headers.remove(axum::http::header::CONTENT_LENGTH);
-            rewrite_html_body(body, &proxy_base)
-        } else {
-            body
-        };
-        return proxied_response(status, &headers, Body::from(body));
+        return relay_upstream_response(
+            "pod",
+            status,
+            headers,
+            body,
+            &proxy_base,
+            budget.as_ref(),
+            PROXY_HTML_BUFFER_TIMEOUT,
+        )
+        .await;
     }
 
     // No konnectivity proxy — direct connection to pod IP.
@@ -3343,54 +3496,28 @@ async fn pod_proxy_dispatch<S: Store>(
         is_https,
     );
 
-    let pod_resp = client
-        .request(reqwest_method, &target_url)
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("pod unreachable: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+    let pod_resp = send_with_header_timeout(
+        "pod",
+        header_timeout_after,
+        client
+            .request(reqwest_method, &target_url)
+            .body(body_bytes)
+            .send(),
+    )
+    .await?;
 
     let pod_status = pod_resp.status();
-    let mut upstream_headers = pod_resp.headers().clone();
-    let body = if is_html_content_type(&upstream_headers) {
-        let raw = buffer_capped(pod_resp.bytes_stream(), crate::MAX_BODY_BYTES)
-            .await
-            .map_err(|e| {
-                crate::status::StatusError(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    crate::status::Status {
-                        kind: "Status",
-                        api_version: "v1",
-                        status: "Failure",
-                        message: format!("pod proxy response body: {e}"),
-                        reason: "BadGateway",
-                        code: 502,
-                        metadata: None,
-                        details: None,
-                    },
-                )
-            })?;
-        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
-        Body::from(rewrite_html_body(raw, &proxy_base))
-    } else {
-        Body::from_stream(pod_resp.bytes_stream())
-    };
-
-    proxied_response(pod_status, &upstream_headers, body)
+    let upstream_headers = pod_resp.headers().clone();
+    relay_upstream_response(
+        "pod",
+        pod_status,
+        upstream_headers,
+        Body::from_stream(pod_resp.bytes_stream()),
+        &proxy_base,
+        budget.as_ref(),
+        PROXY_HTML_BUFFER_TIMEOUT,
+    )
+    .await
 }
 
 /// Proxy a request to the pod's IP and containerPort (with sub-path).
@@ -3406,7 +3533,15 @@ pub async fn pod_proxy<S: Store>(
     Path((ns, pod_name, path_suffix)): Path<(String, String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    pod_proxy_dispatch(&state, &ns, &pod_name, &path_suffix, req).await
+    pod_proxy_dispatch(
+        &state,
+        &ns,
+        &pod_name,
+        &path_suffix,
+        req,
+        PROXY_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await
 }
 
 /// Upstream kube-apiserver 301-redirects a bare `.../proxy` GET/HEAD (no trailing slash)
@@ -3451,7 +3586,15 @@ pub async fn pod_proxy_root<S: Store>(
     if let Some(redirect) = redirect_bare_proxy_root(&req) {
         return Ok(redirect);
     }
-    pod_proxy_dispatch(&state, &ns, &pod_name, "", req).await
+    pod_proxy_dispatch(
+        &state,
+        &ns,
+        &pod_name,
+        "",
+        req,
+        PROXY_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3635,6 +3778,7 @@ async fn service_proxy_dispatch<S: Store>(
     svc_name: &str,
     path_suffix: &str,
     req: axum::http::Request<Body>,
+    header_timeout_after: std::time::Duration,
 ) -> Result<Response, crate::status::StatusError> {
     let (ep_ip, port, proxy_addr, is_https) =
         resolve_service_proxy_target(state, ns, svc_name).await?;
@@ -3646,11 +3790,15 @@ async fn service_proxy_dispatch<S: Store>(
     // when configured, or directly otherwise.
     let method = req.method().clone();
     let query = req.uri().query().map(str::to_owned);
+    let budget = req
+        .extensions()
+        .get::<crate::body_budget::BodyBudgetRelease>()
+        .cloned();
     let body_bytes = read_proxy_request_body(req.into_body()).await?;
     let path_with_query = append_query(&encode_proxy_tail(path_suffix)?, query.as_deref());
 
     if let Some(addr) = proxy_addr.as_deref() {
-        let (status, mut headers, body) = pod_proxy_via_connect_tunnel(
+        let (status, headers, body) = pod_proxy_via_connect_tunnel(
             addr,
             &ep_ip,
             port,
@@ -3664,33 +3812,23 @@ async fn service_proxy_dispatch<S: Store>(
                 .as_deref()
                 .map(|v| v.as_slice()),
             is_https,
+            header_timeout_after,
         )
         .await
-        .map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("service endpoint unreachable via konnectivity: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+        .map_err(|e| tunnel_error(e, "service endpoint"))?;
 
         let status = axum::http::StatusCode::from_u16(status)
             .map_err(|e| Status::internal(e.to_string()))?;
-        let body = if is_html_content_type(&headers) {
-            headers.remove(axum::http::header::CONTENT_LENGTH);
-            rewrite_html_body(body, &proxy_base)
-        } else {
-            body
-        };
-        return proxied_response(status, &headers, Body::from(body));
+        return relay_upstream_response(
+            "service endpoint",
+            status,
+            headers,
+            body,
+            &proxy_base,
+            budget.as_ref(),
+            PROXY_HTML_BUFFER_TIMEOUT,
+        )
+        .await;
     }
 
     let scheme = if is_https { "https" } else { "http" };
@@ -3708,54 +3846,28 @@ async fn service_proxy_dispatch<S: Store>(
         is_https,
     );
 
-    let ep_resp = client
-        .request(reqwest_method, &target_url)
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::status::StatusError(
-                axum::http::StatusCode::BAD_GATEWAY,
-                crate::status::Status {
-                    kind: "Status",
-                    api_version: "v1",
-                    status: "Failure",
-                    message: format!("service endpoint unreachable: {e}"),
-                    reason: "BadGateway",
-                    code: 502,
-                    metadata: None,
-                    details: None,
-                },
-            )
-        })?;
+    let ep_resp = send_with_header_timeout(
+        "service endpoint",
+        header_timeout_after,
+        client
+            .request(reqwest_method, &target_url)
+            .body(body_bytes)
+            .send(),
+    )
+    .await?;
 
     let ep_status = ep_resp.status();
-    let mut upstream_headers = ep_resp.headers().clone();
-    let body = if is_html_content_type(&upstream_headers) {
-        let raw = buffer_capped(ep_resp.bytes_stream(), crate::MAX_BODY_BYTES)
-            .await
-            .map_err(|e| {
-                crate::status::StatusError(
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    crate::status::Status {
-                        kind: "Status",
-                        api_version: "v1",
-                        status: "Failure",
-                        message: format!("service proxy response body: {e}"),
-                        reason: "BadGateway",
-                        code: 502,
-                        metadata: None,
-                        details: None,
-                    },
-                )
-            })?;
-        upstream_headers.remove(axum::http::header::CONTENT_LENGTH);
-        Body::from(rewrite_html_body(raw, &proxy_base))
-    } else {
-        Body::from_stream(ep_resp.bytes_stream())
-    };
-
-    proxied_response(ep_status, &upstream_headers, body)
+    let upstream_headers = ep_resp.headers().clone();
+    relay_upstream_response(
+        "service endpoint",
+        ep_status,
+        upstream_headers,
+        Body::from_stream(ep_resp.bytes_stream()),
+        &proxy_base,
+        budget.as_ref(),
+        PROXY_HTML_BUFFER_TIMEOUT,
+    )
+    .await
 }
 
 /// Proxy a request to a Service-backing endpoint (with sub-path).
@@ -3769,7 +3881,15 @@ pub async fn service_proxy<S: Store>(
     Path((ns, svc_name, path_suffix)): Path<(String, String, String)>,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    service_proxy_dispatch(&state, &ns, &svc_name, &path_suffix, req).await
+    service_proxy_dispatch(
+        &state,
+        &ns,
+        &svc_name,
+        &path_suffix,
+        req,
+        PROXY_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await
 }
 
 /// Proxy a request to a Service-backing endpoint (no sub-path form).
@@ -3784,7 +3904,15 @@ pub async fn service_proxy_root<S: Store>(
     if let Some(redirect) = redirect_bare_proxy_root(&req) {
         return Ok(redirect);
     }
-    service_proxy_dispatch(&state, &ns, &svc_name, "", req).await
+    service_proxy_dispatch(
+        &state,
+        &ns,
+        &svc_name,
+        "",
+        req,
+        PROXY_RESPONSE_HEADER_TIMEOUT,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -10117,6 +10245,7 @@ mod tests {
             Some(std::slice::from_ref(&cert_der)),
             None,
             false,
+            PROXY_RESPONSE_HEADER_TIMEOUT,
         )
         .await;
 
@@ -10138,6 +10267,7 @@ mod tests {
             status, 200,
             "pod response must be 200, not the konnectivity 405 that the old code produced"
         );
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"hello");
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
@@ -10234,6 +10364,7 @@ mod tests {
                 Some(std::slice::from_ref(&outer_cert_der)),
                 None,
                 true,
+                PROXY_RESPONSE_HEADER_TIMEOUT,
             ),
         )
         .await
@@ -10249,6 +10380,7 @@ mod tests {
             result.err()
         );
         let (status, _headers, body) = result.unwrap();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         assert_eq!(
             status, 200,
             "the pod's TLS response must reach the caller as-is"
@@ -10812,6 +10944,8 @@ mod tests {
             reqwest::Method::GET,
             &format!("http://127.0.0.1:{port}/pods"),
             bytes::Bytes::new(),
+            PROXY_RESPONSE_HEADER_TIMEOUT,
+            None,
         )
         .await
         .unwrap();
@@ -10825,6 +10959,523 @@ mod tests {
             "node_proxy dropped the kubelet's Content-Type — a protobuf-preferring \
              client falls back to its own default and fails to decode this JSON body"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Upstream stalls and the shared request-body budget
+    //
+    // Proxy handlers hold their request body's bytes in the 6 MiB budget. An upstream
+    // that stalls must neither keep those bytes forever (header wait) nor after it has
+    // answered (streamed or buffered response body), or two stalled proxy calls would
+    // answer every other write 429.
+    // -----------------------------------------------------------------------
+
+    const MIB: usize = 1024 * 1024;
+    const STALL_PROXY_URI: &str = "/api/v1/namespaces/default/pods/p/proxy/x";
+
+    #[derive(Clone, Copy)]
+    enum Upstream {
+        /// Accept the request and never answer.
+        Silent,
+        /// Answer 200 with a huge declared body once the request has arrived, send none of it.
+        HeadersThenStall(&'static str),
+    }
+
+    async fn serve_after_request<S>(mut stream: S, mode: Upstream)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut seen, mut answered) = (0usize, false);
+        let mut head = Vec::new();
+        let mut expected: Option<usize> = None;
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    seen += n;
+                    if expected.is_none() {
+                        head.extend_from_slice(&buf[..n]);
+                        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let text = String::from_utf8_lossy(&head[..end]).to_lowercase();
+                            let len = text
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            expected = Some(end + 4 + len);
+                        }
+                    }
+                }
+                _ => return,
+            }
+            if let Upstream::HeadersThenStall(content_type) = mode {
+                if !answered && expected.is_some_and(|e| seen >= e) {
+                    answered = true;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: 100000000\r\n\r\n"
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                }
+            }
+        }
+    }
+
+    async fn spawn_plain_upstream(ip: std::net::IpAddr, mode: Upstream) -> u16 {
+        let listener = tokio::net::TcpListener::bind((ip, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(serve_after_request(stream, mode));
+            }
+        });
+        port
+    }
+
+    /// A TLS konnectivity mock. With `answer_connect` false it reads the CONNECT and never
+    /// replies.
+    async fn spawn_konnectivity_mock(mode: Upstream, answer_connect: bool) -> (String, Vec<u8>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert_der.clone())],
+                PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 512];
+                    if stream.read(&mut buf).await.is_err() {
+                        return;
+                    }
+                    if answer_connect {
+                        stream
+                            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                    serve_after_request(stream, mode).await;
+                });
+            }
+        });
+        (addr, cert_der)
+    }
+
+    type ProxyFn = Arc<
+        dyn Fn(
+                axum::http::Request<Body>,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<Response, crate::status::StatusError>>
+                        + Send,
+                >,
+            > + Send
+            + Sync,
+    >;
+
+    /// The proxy route plus a plain write route, both under the shared body budget.
+    fn budgeted_router(proxy: ProxyFn) -> axum::Router {
+        use axum::routing::post;
+        axum::Router::new()
+            .route(
+                STALL_PROXY_URI,
+                post(move |req: axum::http::Request<Body>| {
+                    let proxy = proxy.clone();
+                    async move { proxy(req).await }
+                }),
+            )
+            .route(
+                "/api/v1/configmaps",
+                post(|req: axum::http::Request<Body>| async move {
+                    read_proxy_request_body(req.into_body())
+                        .await
+                        .map(|_| StatusCode::OK)
+                }),
+            )
+            .layer(crate::body_budget::BodyBudgetLayer::new())
+    }
+
+    fn post_3mib(uri: &str) -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::from(vec![b'a'; 3 * MIB]))
+            .unwrap()
+    }
+
+    /// Two concurrent maximum-size writes only both succeed when the whole 6 MiB budget is
+    /// free.
+    async fn assert_budget_free(router: &axum::Router, why: &str) {
+        use tower::ServiceExt as _;
+        let calls: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(router.clone().oneshot(post_3mib("/api/v1/configmaps"))))
+            .collect();
+        for call in calls {
+            let resp = call.await.unwrap().unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{why}");
+        }
+    }
+
+    async fn assert_silent_upstream_gets_504_and_frees_budget(router: axum::Router) {
+        use tower::ServiceExt as _;
+        // The second round only fits if the first round's 6 MiB came back.
+        for round in 0..2 {
+            let calls: Vec<_> = (0..2)
+                .map(|_| tokio::spawn(router.clone().oneshot(post_3mib(STALL_PROXY_URI))))
+                .collect();
+            for call in calls {
+                let resp = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+                    .await
+                    .expect(
+                        "proxy request to a never-responding upstream hung past the header timeout",
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "round {round}: a never-responding upstream must end in 504"
+                );
+            }
+        }
+        assert_budget_free(
+            &router,
+            "a stalled upstream must not leave request-body bytes held after its 504",
+        )
+        .await;
+    }
+
+    /// Two proxied requests whose responses have started but never finish must not hold
+    /// the budget: the request bodies are long since delivered.
+    async fn assert_streamed_response_frees_budget(router: axum::Router) {
+        use tower::ServiceExt as _;
+        let calls: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(router.clone().oneshot(post_3mib(STALL_PROXY_URI))))
+            .collect();
+        let mut responses = Vec::new();
+        for call in calls {
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+                .await
+                .expect("proxy did not return response headers while the upstream body stalls")
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            responses.push(resp);
+        }
+        assert_budget_free(
+            &router,
+            "response bodies still streaming must not hold the request-body budget",
+        )
+        .await;
+        drop(responses);
+    }
+
+    const STALL_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+    async fn pod_state_for(ip: std::net::IpAddr, port: u16) -> AppState {
+        let state = make_state();
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": port}]}]
+            },
+            "status": {"podIP": ip.to_string()}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        seed_node_with_pod_cidr(&state, "node-1", "0.0.0.0/0").await;
+        state
+    }
+
+    fn pod_proxy_fn(state: AppState, header_timeout_after: std::time::Duration) -> ProxyFn {
+        Arc::new(move |req| {
+            let state = state.clone();
+            Box::pin(async move {
+                pod_proxy_dispatch(&state, "default", "mypod", "x", req, header_timeout_after).await
+            })
+        })
+    }
+
+    async fn tunnel_state(konnectivity_addr: String, cert_der: Vec<u8>) -> AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 80}]}],
+                "hostNetwork": true
+            },
+            "status": {"podIP": "10.0.0.1", "hostIP": "10.0.0.1"}
+        });
+        store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_keys: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_ders: Some(vec![cert_der]),
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: Some(konnectivity_addr),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pod_proxy_direct_silent_upstream_gets_504_and_frees_budget() {
+        let ip = test_backend_ip();
+        let port = spawn_plain_upstream(ip, Upstream::Silent).await;
+        let state = pod_state_for(ip, port).await;
+        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(pod_proxy_fn(
+            state,
+            STALL_HEADER_TIMEOUT,
+        )))
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn service_proxy_direct_silent_upstream_gets_504_and_frees_budget() {
+        let ip = test_backend_ip();
+        let port = spawn_plain_upstream(ip, Upstream::Silent).await;
+        let state = make_state();
+        let svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1", "kind": "EndpointSlice",
+            "metadata": {"name": "my-svc-abc", "namespace": "default", "resourceVersion": "1",
+                         "labels": {"kubernetes.io/service-name": "my-svc"}},
+            "addressType": "IPv4",
+            "endpoints": [endpoint_for_pod(&state, &ip.to_string()).await],
+            "ports": [{"name": "", "port": port, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let proxy: ProxyFn = Arc::new(move |req| {
+            let state = state.clone();
+            Box::pin(async move {
+                service_proxy_dispatch(&state, "default", "my-svc", "x", req, STALL_HEADER_TIMEOUT)
+                    .await
+            })
+        });
+        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(proxy)).await;
+    }
+
+    fn node_proxy_fn(port: u16, header_timeout_after: std::time::Duration) -> ProxyFn {
+        Arc::new(move |req| {
+            Box::pin(async move {
+                let budget = req
+                    .extensions()
+                    .get::<crate::body_budget::BodyBudgetRelease>()
+                    .cloned();
+                let body = read_proxy_request_body(req.into_body()).await?;
+                forward_to_kubelet(
+                    &reqwest::Client::new(),
+                    reqwest::Method::POST,
+                    &format!("http://127.0.0.1:{port}/"),
+                    body,
+                    header_timeout_after,
+                    budget.as_ref(),
+                )
+                .await
+            })
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_proxy_silent_upstream_gets_504_and_frees_budget() {
+        let port = spawn_plain_upstream("127.0.0.1".parse().unwrap(), Upstream::Silent).await;
+        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(node_proxy_fn(
+            port,
+            STALL_HEADER_TIMEOUT,
+        )))
+        .await;
+    }
+
+    /// Long downloads must not keep the request-body budget: headers have arrived and the
+    /// request body is delivered, so only the response body is still in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn node_proxy_streamed_response_does_not_hold_body_budget() {
+        let port = spawn_plain_upstream(
+            "127.0.0.1".parse().unwrap(),
+            Upstream::HeadersThenStall("text/plain"),
+        )
+        .await;
+        assert_streamed_response_frees_budget(budgeted_router(node_proxy_fn(
+            port,
+            PROXY_RESPONSE_HEADER_TIMEOUT,
+        )))
+        .await;
+    }
+
+    /// The konnectivity-tunnel path: the pod answers nothing after the CONNECT succeeded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tunnel_proxy_silent_upstream_gets_504_and_frees_budget() {
+        let (addr, cert_der) = spawn_konnectivity_mock(Upstream::Silent, true).await;
+        let state = tunnel_state(addr, cert_der).await;
+        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(pod_proxy_fn(
+            state,
+            STALL_HEADER_TIMEOUT,
+        )))
+        .await;
+    }
+
+    /// A konnectivity-server that takes the CONNECT and never answers is a header wait: it
+    /// must end in 504 instead of holding the request forever.
+    #[tokio::test]
+    async fn stalled_konnectivity_connect_response_times_out() {
+        let (addr, cert_der) = spawn_konnectivity_mock(Upstream::Silent, false).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pod_proxy_via_connect_tunnel(
+                &addr,
+                "10.0.0.1",
+                80,
+                "/",
+                axum::http::Method::GET,
+                bytes::Bytes::new(),
+                Some(std::slice::from_ref(&cert_der)),
+                None,
+                false,
+                STALL_HEADER_TIMEOUT,
+            ),
+        )
+        .await
+        .expect("a CONNECT that is never answered must not hang the proxy request");
+        assert!(
+            matches!(result, Err(TunnelError::HeaderTimeout(_))),
+            "unanswered CONNECT must be reported as a header timeout (504), got {:?}",
+            result.map(|(s, _, _)| s)
+        );
+    }
+
+    /// The tunnel leg streams its response too; it used to collect the whole body before
+    /// answering, holding the budget for as long as the pod kept the body open.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tunnel_proxy_streamed_response_does_not_hold_body_budget() {
+        let (addr, cert_der) =
+            spawn_konnectivity_mock(Upstream::HeadersThenStall("text/plain"), true).await;
+        let state = tunnel_state(addr, cert_der).await;
+        assert_streamed_response_frees_budget(budgeted_router(pod_proxy_fn(
+            state,
+            PROXY_RESPONSE_HEADER_TIMEOUT,
+        )))
+        .await;
+    }
+
+    /// HTML responses are buffered for link rewriting. The budget must be given back before
+    /// that wait, and the wait must end in 504 when the upstream never finishes the body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn html_buffering_releases_budget_and_times_out() {
+        use tower::ServiceExt as _;
+        let port = spawn_plain_upstream(
+            "127.0.0.1".parse().unwrap(),
+            Upstream::HeadersThenStall("text/html"),
+        )
+        .await;
+        let proxy: ProxyFn = Arc::new(move |req| {
+            Box::pin(async move {
+                let budget = req
+                    .extensions()
+                    .get::<crate::body_budget::BodyBudgetRelease>()
+                    .cloned();
+                let body = read_proxy_request_body(req.into_body()).await?;
+                let resp = send_with_header_timeout(
+                    "pod",
+                    PROXY_RESPONSE_HEADER_TIMEOUT,
+                    reqwest::Client::new()
+                        .post(format!("http://127.0.0.1:{port}/"))
+                        .body(body)
+                        .send(),
+                )
+                .await?;
+                let (status, headers) = (resp.status(), resp.headers().clone());
+                relay_upstream_response(
+                    "pod",
+                    status,
+                    headers,
+                    Body::from_stream(resp.bytes_stream()),
+                    "/proxy",
+                    budget.as_ref(),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+            })
+        });
+        let router = budgeted_router(proxy);
+        let calls: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(router.clone().oneshot(post_3mib(STALL_PROXY_URI))))
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert_budget_free(
+            &router,
+            "a handler buffering an HTML response must not hold the request-body budget",
+        )
+        .await;
+        for call in calls {
+            let resp = call.await.unwrap().unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "an HTML body that never finishes must hit the buffering time bound"
+            );
+        }
     }
 
     /// The `node_proxy` handler itself (address check, then forward). A non-loopback node
@@ -13593,7 +14244,7 @@ mod tests {
 
     /// Every proxy entry point must reject a request body over `MAX_BODY_BYTES` with 413
     /// before dialing the backend. Proxy subresources are long-running requests that skip
-    /// `DefaultBodyLimit` and the inflight body deadline, so without a cap in the handler
+    /// `DefaultBodyLimit`, so without a cap in the handler
     /// any user with pods/proxy, services/proxy or nodes/proxy can force the apiserver to
     /// buffer an unbounded body in RAM.
     #[tokio::test]
