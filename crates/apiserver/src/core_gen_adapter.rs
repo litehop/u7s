@@ -2942,10 +2942,7 @@ pub(crate) fn json_to_managed_fields_proto(
 }
 
 pub(crate) fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::ObjectMeta {
-    let meta = obj
-        .get("metadata")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let meta = obj.get("metadata").unwrap_or(&serde_json::Value::Null);
     let owner_references = meta
         .get("ownerReferences")
         .and_then(|a| a.as_array())
@@ -2963,33 +2960,30 @@ pub(crate) fn json_to_object_meta_proto(obj: &serde_json::Value) -> meta_v1::Obj
         })
         .unwrap_or_default();
     meta_v1::ObjectMeta {
-        name: jstr(&meta, "name"),
-        generate_name: jstr(&meta, "generateName"),
-        namespace: jstr(&meta, "namespace"),
-        uid: jstr(&meta, "uid"),
-        resource_version: jstr(&meta, "resourceVersion"),
-        generation: ji64(&meta, "generation"),
-        creation_timestamp: jtime(&meta, "creationTimestamp"),
-        deletion_timestamp: jtime(&meta, "deletionTimestamp"),
-        deletion_grace_period_seconds: ji64(&meta, "deletionGracePeriodSeconds"),
-        labels: jstrmap(&meta, "labels"),
-        annotations: jstrmap(&meta, "annotations"),
+        name: jstr(meta, "name"),
+        generate_name: jstr(meta, "generateName"),
+        namespace: jstr(meta, "namespace"),
+        uid: jstr(meta, "uid"),
+        resource_version: jstr(meta, "resourceVersion"),
+        generation: ji64(meta, "generation"),
+        creation_timestamp: jtime(meta, "creationTimestamp"),
+        deletion_timestamp: jtime(meta, "deletionTimestamp"),
+        deletion_grace_period_seconds: ji64(meta, "deletionGracePeriodSeconds"),
+        labels: jstrmap(meta, "labels"),
+        annotations: jstrmap(meta, "annotations"),
         owner_references,
-        finalizers: jstrs(&meta, "finalizers"),
+        finalizers: jstrs(meta, "finalizers"),
         managed_fields: json_to_managed_fields_proto(&meta),
         ..Default::default()
     }
 }
 
 pub(crate) fn json_to_list_meta_proto(v: &serde_json::Value) -> meta_v1::ListMeta {
-    let meta = v
-        .get("metadata")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let meta = v.get("metadata").unwrap_or(&serde_json::Value::Null);
     meta_v1::ListMeta {
-        resource_version: jstr(&meta, "resourceVersion"),
-        r#continue: jstr(&meta, "continue"),
-        remaining_item_count: ji64(&meta, "remainingItemCount"),
+        resource_version: jstr(meta, "resourceVersion"),
+        r#continue: jstr(meta, "continue"),
+        remaining_item_count: ji64(meta, "remainingItemCount"),
         ..Default::default()
     }
 }
