@@ -231,88 +231,23 @@ pub(crate) async fn list_pods<S: Store>(
         .transpose()?
         .unwrap_or_default();
 
-    // See resource.rs's list_resource for why this checks has_encoder rather than
-    // wants_protobuf alone; Pod/PodList has a registered encoder, so this only takes the
-    // streaming path when the client isn't going to get real protobuf anyway.
-    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
-        && crate::content_type::has_encoder("v1", "PodList");
-    if !pom && !table && !wants_real_protobuf {
-        let body = super::resource::stream_list_json(
-            "Pod",
-            "",
-            "v1",
-            "pods",
-            resp.revision,
-            &resp.items,
-            &label_pairs,
-            &field_selector,
-            Some(log_pod_list_entry),
-            resp.continue_key,
-            resp.remaining_count,
-            &state.continue_token_key,
-        )?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            body,
-        )
-            .into_response());
-    }
-
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        items.push(parsed);
-    }
-
-    let items = field_selector.filter(items);
-    let items = super::generic::apply_label_selector(items, &label_pairs);
-    tracing::debug!(prefix = %prefix, filtered_count = items.len(), "list: filtered");
-
-    for pod in &items {
-        log_pod_list_entry(pod);
-    }
-
-    if pom {
-        let pom_items: Vec<serde_json::Value> = items
-            .iter()
-            .map(super::watch::to_partial_object_metadata)
-            .collect();
-        let body = serde_json::json!({
-            "apiVersion": "meta.k8s.io/v1",
-            "kind": "PartialObjectMetadataList",
-            "metadata": { "resourceVersion": resp.revision.to_string() },
-            "items": pom_items
-        });
-        return Ok(Json(body).into_response());
-    }
-
-    // Return Table format when as=Table;v=v1 or v=v1beta1 is requested (anything else was
-    // rejected above).
-    if table {
-        let api_version = super::table::table_api_version(accept);
-        let continue_token = resp.continue_key.map(|key| {
-            super::generic::encode_continue(&key, resp.revision, &state.continue_token_key)
-        });
-        let built = super::table::build_table("", "pods", items);
-        return Ok(Json(super::table::finalize_table(
-            built,
-            &api_version,
-            Some(&resp.revision.to_string()),
-            continue_token,
-        ))
-        .into_response());
-    }
-
-    let body = serde_json::json!({
-        "kind": "PodList",
-        "apiVersion": "v1",
-        "metadata": { "resourceVersion": resp.revision.to_string() },
-        "items": items
-    });
-
-    Ok(crate::content_type::negotiated_response(accept, body))
+    let on_item = tracing::enabled!(target: "u7s::apiserver::pod_lifecycle", tracing::Level::DEBUG)
+        .then_some(log_pod_list_entry as fn(&serde_json::Value));
+    let filter = ListFilter::new("", "pods", &label_pairs, &field_selector, on_item);
+    // Table when as=Table;v=v1 or v=v1beta1 is requested (anything else was rejected above).
+    let format = ListFormat::negotiate(accept, pom, table, "", "v1", "Pod");
+    filter.respond(
+        format,
+        &resp.items,
+        ListEnvelope {
+            kind: "Pod",
+            version: "v1",
+            revision: resp.revision,
+            continue_key: resp.continue_key,
+            remaining_count: resp.remaining_count,
+            signing_key: &state.continue_token_key,
+        },
+    )
 }
 
 pub(crate) async fn create_pod<S: Store>(
@@ -1780,6 +1715,7 @@ pub(crate) async fn patch_pod<S: Store>(
     }
 }
 
+use super::list_items::{ListEnvelope, ListFilter, ListFormat};
 use crate::util::utc_now_rfc3339;
 
 /// POST /api/v1/namespaces/{ns}/pods/{name}/eviction

@@ -77,7 +77,7 @@ pub fn finalize_table(
 pub fn build_table(
     group: &str,
     plural: &str,
-    objects: Vec<serde_json::Value>,
+    objects: impl IntoIterator<Item = serde_json::Value>,
 ) -> serde_json::Value {
     match (group, plural) {
         ("", "pods") => build_pod_table(objects),
@@ -121,7 +121,7 @@ fn wide_col(name: &str, description: &str, typ: &str) -> serde_json::Value {
 
 // ── Pods ──────────────────────────────────────────────────────────────────────
 
-fn build_pod_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_pod_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the pod", "string"),
         col("Ready", "Fraction of containers that are ready", "string"),
@@ -281,7 +281,7 @@ fn pod_display_status(
 
 // ── Nodes ─────────────────────────────────────────────────────────────────────
 
-fn build_node_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_node_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the node", "string"),
         col("Status", "Node readiness status", "string"),
@@ -427,7 +427,9 @@ fn node_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Deployments ───────────────────────────────────────────────────────────────
 
-fn build_deployment_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_deployment_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the deployment", "string"),
         col("Ready", "Ready/desired replicas", "string"),
@@ -550,7 +552,7 @@ fn deployment_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Services ──────────────────────────────────────────────────────────────────
 
-fn build_service_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_service_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the service", "string"),
         col("Type", "Service type", "string"),
@@ -669,7 +671,9 @@ fn service_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── ReplicaSets ───────────────────────────────────────────────────────────────
 
-fn build_replicaset_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_replicaset_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the replicaset", "string"),
         col("Desired", "Desired replicas", "integer"),
@@ -714,7 +718,9 @@ fn replicaset_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── StatefulSets ──────────────────────────────────────────────────────────────
 
-fn build_statefulset_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_statefulset_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the statefulset", "string"),
         col("Ready", "Ready/desired replicas", "string"),
@@ -755,7 +761,9 @@ fn statefulset_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── DaemonSets ────────────────────────────────────────────────────────────────
 
-fn build_daemonset_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_daemonset_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the daemonset", "string"),
         col("Desired", "Desired number scheduled", "integer"),
@@ -824,7 +832,9 @@ fn daemonset_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Namespaces ────────────────────────────────────────────────────────────────
 
-fn build_namespace_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_namespace_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the namespace", "string"),
         col("Status", "Phase of the namespace", "string"),
@@ -860,7 +870,9 @@ fn namespace_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── PriorityClasses ───────────────────────────────────────────────────────────
 
-fn build_priorityclass_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_priorityclass_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name must be unique within a namespace. Is required when creating resources, although some resources may allow a client to request the generation of an appropriate name automatically. Name is primarily intended for creation idempotence and configuration definition. Cannot be updated. More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names", "string"),
         col("Value", "value represents the integer value of this priority class. This is the actual priority that pods receive when they have the name of this class in their pod spec.", "integer"),
@@ -893,7 +905,9 @@ fn priorityclass_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── ConfigMaps ────────────────────────────────────────────────────────────────
 
-fn build_configmap_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_configmap_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the configmap", "string"),
         col("Data", "Number of data keys", "integer"),
@@ -933,7 +947,7 @@ fn configmap_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Secrets ───────────────────────────────────────────────────────────────────
 
-fn build_secret_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_secret_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the secret", "string"),
         col("Type", "Secret type", "string"),
@@ -973,7 +987,9 @@ fn secret_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── ServiceAccounts ───────────────────────────────────────────────────────────
 
-fn build_serviceaccount_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_serviceaccount_table(
+    objects: impl IntoIterator<Item = serde_json::Value>,
+) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the serviceaccount", "string"),
         col("Secrets", "Number of secrets", "integer"),
@@ -1009,7 +1025,7 @@ fn serviceaccount_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 
-fn build_job_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_job_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the job", "string"),
         col("Status", "Job status", "string"),
@@ -1099,7 +1115,7 @@ fn job_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── CronJobs ──────────────────────────────────────────────────────────────────
 
-fn build_cronjob_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_cronjob_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the cronjob", "string"),
         col("Schedule", "Cron schedule", "string"),
@@ -1164,7 +1180,7 @@ fn cronjob_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── PersistentVolumeClaims ───────────────────────────────────────────────────
 
-fn build_pvc_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_pvc_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the persistentvolumeclaim", "string"),
         col("Status", "Phase the claim is in", "string"),
@@ -1271,7 +1287,7 @@ fn pvc_row(obj: serde_json::Value) -> serde_json::Value {
 
 // ── PersistentVolumes ─────────────────────────────────────────────────────────
 
-fn build_pv_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_pv_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the persistentvolume", "string"),
         col("Capacity", "Size of the volume", "string"),
@@ -1438,7 +1454,7 @@ fn access_modes_short_string(modes: &[String]) -> String {
 
 // ── CertificateSigningRequests ────────────────────────────────────────────────
 
-fn build_csr_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_csr_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the resource", "string"),
         col("Age", "Time since creation", "string"),
@@ -1564,7 +1580,7 @@ fn human_duration(secs: i64) -> String {
     format!("{}y", hours / 24 / 365)
 }
 
-fn build_generic_table(objects: Vec<serde_json::Value>) -> serde_json::Value {
+fn build_generic_table(objects: impl IntoIterator<Item = serde_json::Value>) -> serde_json::Value {
     let columns = vec![
         col("Name", "Name of the resource", "string"),
         col("Age", "Time since creation", "string"),

@@ -130,6 +130,57 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     }
 }
 
+/// Whether `apply_defaults` has any arm for this kind. When false it is a no-op on every
+/// object, so a stored object is already exactly what a read serves. MUST list every kind
+/// `apply_defaults` handles; `kinds_without_defaults_are_untouched_by_apply_defaults` pins it.
+pub fn defaults_apply(group: &str, plural: &str) -> bool {
+    is_workload_resource(group, plural)
+        || is_endpointslice(group, plural)
+        || matches!(
+            (group, plural),
+            ("", "services")
+                | ("", "endpoints")
+                | ("", "persistentvolumeclaims")
+                | ("", "persistentvolumes")
+                | ("", "nodes")
+                | ("", "secrets")
+                | ("", "namespaces")
+                | ("", "limitranges")
+                | ("", "replicationcontrollers")
+                | ("certificates.k8s.io", "podcertificaterequests")
+                | ("storage.k8s.io", "csidrivers")
+                | ("storage.k8s.io", "storageclasses")
+                | ("scheduling.k8s.io", "priorityclasses")
+                | ("coordination.k8s.io", "leases")
+                | ("autoscaling", "horizontalpodautoscalers")
+                | ("networking.k8s.io", "networkpolicies")
+                | ("resource.k8s.io", "resourceclaims")
+                | ("resource.k8s.io", "resourceclaimtemplates")
+                | ("resource.k8s.io", "devicetaintrules")
+        )
+        || (plural == "events" && (group.is_empty() || group == "events.k8s.io"))
+        || (group == "rbac.authorization.k8s.io"
+            && (plural == "rolebindings" || plural == "clusterrolebindings"))
+}
+
+/// Whether `apply_defaults` could change this stored object, decided without parsing it. A
+/// Secret only defaults when `stringData` is present, and the store's serialization writes that
+/// key verbatim, so a byte search has no false negatives; every other kind with a defaulting arm
+/// is treated as always changing.
+pub fn defaults_may_change(group: &str, plural: &str, raw: &[u8]) -> bool {
+    match (group, plural) {
+        ("", "secrets") => raw.windows(12).any(|w| w == b"\"stringData\""),
+        _ => defaults_apply(group, plural),
+    }
+}
+
+/// Whether `apply_defaults` can rewrite `metadata.labels` for this kind. Only a
+/// ReplicationController does (it inherits the template's labels), so LIST may not match label
+/// selectors against its stored bytes.
+pub fn defaults_may_alter_labels(group: &str, plural: &str) -> bool {
+    matches!((group, plural), ("", "replicationcontrollers"))
+}
+
 /// Returns true when the group/plural pair is a workload resource that KCM
 /// reconciles via metadata.generation.
 ///
