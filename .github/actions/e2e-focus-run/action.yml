@@ -227,7 +227,8 @@ runs:
       shell: bash
       run: |
         mkdir -p ~/crio-debs
-        cp /var/cache/apt/archives/cri-o_*.deb /var/cache/apt/archives/crun_*.deb /var/cache/apt/archives/conmon_*.deb ~/crio-debs/
+        # crun and conmon are already on the runner image, so only cri-o is downloaded.
+        cp /var/cache/apt/archives/cri-o_*.deb ~/crio-debs/
         ls -l ~/crio-debs
 
     - name: Save cri-o .deb cache
