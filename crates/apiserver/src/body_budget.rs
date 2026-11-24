@@ -5,29 +5,31 @@
 // its body size, not with the request count the inflight pools bound. This layer:
 //   - rejects a declared Content-Length above MAX_BODY_BYTES with 413 before any body
 //     byte is read;
-//   - reserves the declared length (MAX_BODY_BYTES when the length is unknown) from a
-//     shared byte budget for the life of the request, and answers 429 + Retry-After
-//     when the budget is exhausted;
+//   - reserves body bytes from a shared budget incrementally, as each chunk arrives, and
+//     holds them for the life of the request; a slow client therefore holds only what it
+//     has sent. When the budget is exhausted mid-body the request is answered 429 +
+//     Retry-After;
 //   - turns the bare-text 413 that axum's body extractors (and several handlers) emit
 //     into the Status object kubectl and client-go expect.
 //
-// Long-running requests (proxy, exec, attach, log, portforward, watch) carry streamed
-// bodies that outlive the handler's buffering, so they are not reserved.
+// Streamed bodies (exec, attach, log, portforward, watch) are not metered. Proxy
+// requests are: their handlers buffer the whole body before dialling upstream.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::body::HttpBody as _;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
 use axum::response::IntoResponse as _;
-use tokio::sync::Semaphore;
+use futures_util::StreamExt as _;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 use tower_service::Service;
 
-use crate::auth::is_long_running_request;
+use crate::auth::{is_long_running_request, is_proxy_request};
 use crate::status::Status;
 
 /// Bytes of request body that may be buffered across all in-flight requests: two
@@ -76,22 +78,47 @@ fn declared_length(req: &Request<Body>) -> Option<usize> {
         .ok()
 }
 
-/// Bytes this request may buffer: the declared length, MAX_BODY_BYTES when a body is
-/// coming with no declared length (chunked), zero when there is no body.
-fn reservation(req: &Request<Body>) -> usize {
-    if is_long_running_request(req.method(), req.uri().path(), req.uri().query()) {
-        return 0;
-    }
-    match declared_length(req) {
-        Some(n) => n,
-        None if req.body().is_end_stream() => 0,
-        None => crate::MAX_BODY_BYTES,
-    }
+fn is_metered(req: &Request<Body>) -> bool {
+    !is_long_running_request(req.method(), req.uri().path(), req.uri().query())
+        || is_proxy_request(req.uri().path())
 }
 
 fn too_large(limit: usize) -> Response<Body> {
     Status::request_entity_too_large(format!("Request entity too large: limit is {limit} bytes"))
         .into_response()
+}
+
+/// Budget bytes one request has taken so far. Shared by the body stream (which adds to it)
+/// and the request future (which outlives the stream's last read), so the bytes return to
+/// the budget only when both are gone: handler finished, timed out, or client disconnected.
+struct Held {
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    exhausted: AtomicBool,
+}
+
+fn meter(body: Body, budget: Arc<Semaphore>, held: Arc<Held>) -> Body {
+    let frames = futures_util::stream::unfold(
+        (body.into_data_stream(), budget, held),
+        |(mut s, budget, held)| async move {
+            let item = s.next().await?;
+            let item = item.and_then(|chunk| {
+                let Ok(p) = Arc::clone(&budget).try_acquire_many_owned(chunk.len() as u32) else {
+                    held.exhausted.store(true, Ordering::SeqCst);
+                    return Err(axum::Error::new(std::io::Error::other(
+                        "request body budget exhausted",
+                    )));
+                };
+                let mut slot = held.permit.lock().unwrap();
+                match slot.as_mut() {
+                    Some(have) => have.merge(p),
+                    None => *slot = Some(p),
+                }
+                Ok(chunk)
+            });
+            Some((item.map_err(axum::BoxError::from), (s, budget, held)))
+        },
+    );
+    Body::from_stream(frames)
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -118,34 +145,39 @@ where
             return Box::pin(async move { Ok(resp) });
         }
 
-        let want = reservation(&req);
-        let permit = if want == 0 {
-            None
+        let held = Arc::new(Held {
+            permit: Mutex::new(None),
+            exhausted: AtomicBool::new(false),
+        });
+        let req = if is_metered(&req) {
+            let budget = Arc::clone(&self.budget);
+            let held = Arc::clone(&held);
+            req.map(|b| meter(b, budget, held))
         } else {
-            match Arc::clone(&self.budget).try_acquire_many_owned(want as u32) {
-                Ok(p) => Some(p),
-                Err(_) => {
-                    crate::metrics::INFLIGHT_REJECTED_TOTAL
-                        .with_label_values(&["body_bytes"])
-                        .inc();
-                    let resp =
-                        Status::too_many_requests_retry_after("Too many requests".to_owned(), 1)
-                            .into_response();
-                    return Box::pin(async move { Ok(resp) });
-                }
-            }
+            req
         };
 
         Box::pin(async move {
-            let _permit = permit;
-            let mut resp = inner.call(req).await?;
-            if resp.status() == StatusCode::PAYLOAD_TOO_LARGE
-                && resp.headers().get(header::CONTENT_TYPE)
-                    != Some(&HeaderValue::from_static("application/json"))
-            {
-                resp = too_large(crate::MAX_BODY_BYTES);
+            let mut resp = inner.call(req).await;
+            if held.exhausted.load(Ordering::SeqCst) {
+                crate::metrics::INFLIGHT_REJECTED_TOTAL
+                    .with_label_values(&["body_bytes"])
+                    .inc();
+                return Ok(Status::too_many_requests_retry_after(
+                    "Too many requests".to_owned(),
+                    1,
+                )
+                .into_response());
             }
-            Ok(resp)
+            if let Ok(r) = resp.as_mut() {
+                if r.status() == StatusCode::PAYLOAD_TOO_LARGE
+                    && r.headers().get(header::CONTENT_TYPE)
+                        != Some(&HeaderValue::from_static("application/json"))
+                {
+                    *r = too_large(crate::MAX_BODY_BYTES);
+                }
+            }
+            resp
         })
     }
 }
@@ -289,5 +321,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    type Trickle = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+    /// A request whose body arrives only as the returned sender feeds it, as a slow client
+    /// would, claiming `declared` bytes up front.
+    fn trickle_req(uri: &str, declared: usize) -> (Request<Body>, Trickle) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|c| (c, rx))
+        }));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_LENGTH, declared)
+            .body(body)
+            .unwrap();
+        (req, tx)
+    }
+
+    const CM: &str = "/api/v1/namespaces/default/configmaps";
+
+    async fn settle_until(layer: &BodyBudgetLayer, held: usize) {
+        for _ in 0..200 {
+            if layer.budget.available_permits() == BODY_BUDGET_BYTES - held {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!(
+            "budget never reached {held} held bytes (available {})",
+            layer.budget.available_permits()
+        );
+    }
+
+    /// Two clients that each declare a maximum-size body but have sent only a KiB must
+    /// hold a KiB each. If the declared length were reserved up front, two slow-loris
+    /// connections would pin the whole budget and every honest write would get 429.
+    #[tokio::test]
+    async fn slow_clients_hold_only_the_bytes_they_have_sent() {
+        let (router, layer) = app();
+        let mut senders = Vec::new();
+        let mut pending = Vec::new();
+        for _ in 0..2 {
+            let (req, tx) = trickle_req(CM, crate::MAX_BODY_BYTES);
+            tx.send(Ok(Bytes::from(vec![b'a'; 1024]))).await.unwrap();
+            pending.push(tokio::spawn(router.clone().oneshot(req)));
+            senders.push(tx);
+        }
+        settle_until(&layer, 2048).await;
+
+        let n = 1024 * 1024;
+        let resp = router
+            .clone()
+            .oneshot(post_req(Body::from(vec![b'a'; n]), Some(n)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a normal write was shed while slow clients had sent only 2 KiB"
+        );
+        drop(senders);
+        for p in pending {
+            let _ = p.await;
+        }
+    }
+
+    /// A client that vanishes mid-body (connection reset) drops the request future; the
+    /// bytes it had sent must return to the budget or disconnects would leak it dry.
+    #[tokio::test]
+    async fn client_disconnect_mid_body_releases_its_reservation() {
+        let (router, layer) = app();
+        let (req, tx) = trickle_req(CM, 4096);
+        tx.send(Ok(Bytes::from(vec![b'a'; 4096 / 2])))
+            .await
+            .unwrap();
+        let task = tokio::spawn(router.oneshot(req));
+        settle_until(&layer, 2048).await;
+
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            layer.budget.available_permits(),
+            BODY_BUDGET_BYTES,
+            "disconnected client kept its body bytes reserved"
+        );
+        drop(tx);
+    }
+
+    /// A body that stalls past the mutating body deadline must fail the request and give
+    /// its bytes back; otherwise a client that sends a little and goes quiet pins budget
+    /// and an inflight seat indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_body_times_out_and_releases_its_budget() {
+        let layer = BodyBudgetLayer::new();
+        let router = Router::new()
+            .route(CM, post(echo_len))
+            .layer(layer.clone())
+            .layer(crate::inflight::InflightLayer::new());
+        let (req, tx) = trickle_req(CM, crate::MAX_BODY_BYTES);
+        tx.send(Ok(Bytes::from(vec![b'a'; 1024]))).await.unwrap();
+        let task = tokio::spawn(router.oneshot(req));
+        settle_until(&layer, 1024).await;
+
+        assert!(
+            crate::inflight::MUTATING_BODY_TIMEOUT <= std::time::Duration::from_secs(34),
+            "body deadline must not exceed upstream's 34s mutating-request bound"
+        );
+        tokio::time::advance(
+            crate::inflight::MUTATING_BODY_TIMEOUT + std::time::Duration::from_secs(1),
+        )
+        .await;
+        let resp = task.await.unwrap().unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "stalled body must fail");
+        assert_eq!(
+            layer.budget.available_permits(),
+            BODY_BUDGET_BYTES,
+            "timed-out body kept its bytes reserved"
+        );
+        drop(tx);
+    }
+
+    /// Proxy handlers buffer the request body up to the limit, so it must draw on the same
+    /// budget; if proxy were exempt, concurrent proxied POSTs would bypass the cap entirely.
+    #[tokio::test]
+    async fn proxy_bodies_are_metered_and_shed_with_429() {
+        let layer = BodyBudgetLayer::new();
+        let router = Router::new()
+            .fallback(echo_len)
+            .layer(layer.clone())
+            .layer(DefaultBodyLimit::max(crate::MAX_BODY_BYTES));
+        let _held = Arc::clone(&layer.budget)
+            .try_acquire_many_owned((BODY_BUDGET_BYTES - 100) as u32)
+            .unwrap();
+
+        let mut req = post_req(Body::from(vec![b'a'; 200]), Some(200));
+        *req.uri_mut() = "/api/v1/namespaces/default/pods/p/proxy/x".parse().unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

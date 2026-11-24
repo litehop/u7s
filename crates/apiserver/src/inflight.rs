@@ -81,10 +81,11 @@ const USER_MAP_PRUNE_AT: usize = 1024;
 const MUTATING_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max time a non-long-running mutating request may take to deliver its body once
-/// admitted. Matches kube-apiserver's default 60s request timeout, which bounds every
-/// non-long-running request (and so releases its max-in-flight seat). Only the body read
-/// is bounded here, not the handler.
-const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// admitted. Matches kube-apiserver's `requestTimeoutUpperBound` (34s) that its
+/// create/update/patch/delete handlers apply to the whole mutating request, body read
+/// included. Only the body read is bounded here, not the handler. A shorter bound keeps a
+/// trickling client from holding a seat and its body bytes for a full minute.
+pub(crate) const MUTATING_BODY_TIMEOUT: Duration = Duration::from_secs(34);
 
 /// Max number of mutating requests allowed to queue for a permit at once.
 ///
@@ -948,7 +949,7 @@ mod tests {
         }
 
         // Join late enough that its queue wait outlives the body deadline.
-        tokio::time::sleep(Duration::from_secs(40)).await;
+        tokio::time::sleep(MUTATING_BODY_TIMEOUT - Duration::from_secs(10)).await;
         assert_eq!(
             mutating.shared.available_permits(),
             0,
