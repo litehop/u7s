@@ -116,8 +116,6 @@ check "a rig NIC MTU of 1460 renders 1386, not a hard-coded value" \
   "1" "$(cat "$(stage 0 1460)/flannel.yaml" | grep -cE '^ +"mtu": 1386,$')"
 check "no unresolved placeholder in either rig flannel render (an unrendered \"mtu\" breaks every pod's CNI setup)" \
   "0" "$(printf '%s\n%s\n' "$flannel_dual" "$flannel_single" | grep -cE '__[A-Z_]+__' || true)"
-check "the CI action renders flannel through the shared render, not its own sed" \
-  "1" "$(grep -cF 'render_flannel_for_nic "$NIC"' "$ROOT/.github/actions/e2e-focus-run/action.yml")"
 ci_render=$(cd "$ROOT" && bash -c '. scripts/lib/flannel-render.sh; render_flannel_for_nic eth0 1500 10.244.0.0/16 "" < manifests/flannel.yaml')
 check "the CI action's render call leaves no placeholder and carries a numeric mtu" \
   "1" "$(printf '%s\n' "$ci_render" | grep -cE '^ +"mtu": 1426,$')"

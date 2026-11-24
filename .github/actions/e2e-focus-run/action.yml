@@ -1,12 +1,13 @@
 name: e2e-focus-run
 description: >-
-  Bring up a single-node u7s stack (apiserver, kubelet, kube-proxy, KCM,
-  scheduler) on a plain ubuntu runner and run one sonobuoy --e2e-focus pass
-  against it, asserting an exact spec count. Shared by the baseline e2e-focus
-  job and the sensitive-e2e-guard job so both exercise identical bring-up.
+  Install a single-node u7s cluster on a plain ubuntu runner by running the
+  checkout's real scripts/install.sh against the build job's binaries, then run
+  one sonobuoy --e2e-focus pass against it, asserting an exact spec count.
+  Shared by the baseline e2e-focus job and the sensitive-e2e-guard job so both
+  exercise the identical install.
 inputs:
   k8s_version:
-    description: Kubernetes version for kubelet/kubectl/kube-proxy/KCM + the conformance image, e.g. 1.37.1.
+    description: Kubernetes version for kubelet/kubectl/KCM + the conformance image, e.g. 1.37.1.
     required: true
   focus:
     description: ginkgo --e2e-focus regex passed to sonobuoy.
@@ -35,93 +36,44 @@ runs:
         mkdir -p ~/bin
         echo "$HOME/bin" >> "$GITHUB_PATH"
 
-    - name: Cache kubelet and kubectl ${{ inputs.k8s_version }}
-      id: cache-kubelet
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    - name: Restore Kubernetes binaries cache ${{ inputs.k8s_version }}
+      id: cache-k8s-bins
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: |
-          ~/bin/kubelet
-          ~/bin/kubectl
-        key: kubelet-kubectl-${{ inputs.k8s_version }}-${{ runner.arch }}
+        path: ~/k8s-bins
+        key: k8s-bins-${{ inputs.k8s_version }}-amd64
 
-    - name: Install kubelet and kubectl ${{ inputs.k8s_version }}
-      if: steps.cache-kubelet.outputs.cache-hit != 'true'
+    - name: Fetch Kubernetes binaries ${{ inputs.k8s_version }}
+      # kube-proxy is not fetched: install.sh runs it as a DaemonSet from
+      # manifests/kube-proxy.yaml, not as a host binary. No cosign in CI, so
+      # the dl.k8s.io .sha256 sidecar is the check; a failed fetch exits before
+      # the cache save below, so a bad download is never cached.
+      if: steps.cache-k8s-bins.outputs.cache-hit != 'true'
       env:
         K8S_VERSION: ${{ inputs.k8s_version }}
       shell: bash
       run: |
-        MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-        curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
-          | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
-          | sudo tee /etc/apt/sources.list.d/kubernetes.list
-        sudo apt-get update -qq
-        sudo apt-get install -y --allow-downgrades "kubelet=$K8S_VERSION-*" "kubectl=$K8S_VERSION-*"
-        sudo apt-mark hold kubelet kubectl
-        sudo systemctl disable --now kubelet
-        mkdir -p ~/bin
-        cp /usr/bin/kubelet ~/bin/kubelet
-        cp /usr/bin/kubectl ~/bin/kubectl
-
-    - name: Install cri-o apt keyring + source list
-      # Can't delegate this to awalsh128/cache-apt-pkgs-action's own
-      # add-repository input -- its validation rejects the bracket/space
-      # characters required by `deb [signed-by=...] <url> /`.
-      env:
-        K8S_VERSION: ${{ inputs.k8s_version }}
-      shell: bash
-      run: |
-        MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
-        curl -fsSL --max-time 30 "https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
-          | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-        echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://slc-mirror.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
-          | sudo tee /etc/apt/sources.list.d/cri-o.list
-        # The action resolves package versions from apt's cached metadata
-        # (/var/lib/apt/lists), not by hitting the network itself -- its own
-        # update_apt_lists_if_stale is a no-op outside nektos/act, so on a
-        # real GitHub Actions runner it never refreshes this on its own.
-        # Without this update the newly-added repo's package list isn't
-        # loaded yet, so the action can't resolve cri-o and treats the
-        # package list as empty (confirmed live in run 32234489918).
-        # Acquire::http::Timeout=30 bounds each per-URL read at 30s;
-        # Acquire::Retries=3 tries each URL up to 3 times. Worst-case for
-        # an OpenSUSE hang: ~90s then step fails cleanly (vs the previous
-        # 15-min silent hang).
-        sudo apt-get -o Acquire::http::Timeout=30 -o Acquire::Retries=3 update -qq
-
-    - name: Install cri-o
-      # actions/cache's own attempt at this (removed) never actually
-      # worked: /var/cache/apt/archives is root-owned, so actions/cache's
-      # tar can't read it as the runner user and every save silently
-      # failed with "Cannot open: Permission denied" -- every "cache not
-      # found" was a save failure, not a wrong key. This action caches to
-      # a runner-user-writable path instead. `version` only discriminates
-      # the cache key per matrix branch (the actual installed version
-      # comes from which per-minor repo was added above) -- it does not
-      # pin an apt package version string.
-      uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-      with:
-        packages: cri-o
-        version: ${{ inputs.k8s_version }}
-
-    - name: Configure and start cri-o
-      # Always runs regardless of cache hit/miss. The cri-o package ships a
-      # default 10-crio-bridge.conf(list) that gives this node its own
-      # independent, uncoordinated bridge with no CNI conflist Flannel's own
-      # DaemonSet installs (10-flannel.conflist) once it lands further below
-      # -- must be disabled up front, since CRI-O picks whichever conflist
-      # sorts first alphabetically in this directory and "10-crio-bridge"
-      # would otherwise keep winning over "10-flannel" forever. Mirrors
-      # scripts/install.sh:692-696 / lima-start.sh's matching disable step.
-      shell: bash
-      run: |
-        sudo mkdir -p /etc/cni/net.d
-        for f in 10-crio-bridge.conf 10-crio-bridge.conflist; do
-          if [ -f "/etc/cni/net.d/$f" ]; then
-            sudo mv "/etc/cni/net.d/$f" "/etc/cni/net.d/$f.disabled"
+        . scripts/lib/release-fetch.sh
+        mkdir -p ~/k8s-bins
+        for bin in kubelet kube-controller-manager kubectl; do
+          url="https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/${bin}"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused -o "$HOME/k8s-bins/$bin" "$url"
+          expected="$(curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-connrefused "${url}.sha256")"
+          actual="$(sha256_of "$HOME/k8s-bins/$bin")"
+          if [ "$expected" != "$actual" ]; then
+            echo "error: checksum mismatch for $bin: expected $expected, got $actual" >&2
+            exit 1
           fi
+          chmod +x "$HOME/k8s-bins/$bin"
+          echo "$bin: sha256 $actual verified"
         done
-        sudo systemctl enable --now crio
+
+    - name: Save Kubernetes binaries cache
+      if: steps.cache-k8s-bins.outputs.cache-hit != 'true' && success()
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/k8s-bins
+        key: k8s-bins-${{ inputs.k8s_version }}-amd64
 
     - name: Resolve pinned CNI plugins version
       id: cni-version
@@ -165,14 +117,6 @@ runs:
         done
         exit 1
 
-    - name: Install CNI plugins
-      shell: bash
-      run: |
-        sudo install -d -m 0755 /opt/cni/bin
-        for p in bridge host-local loopback portmap; do
-          sudo install -m 0755 "$HOME/cni-plugins/$p" /opt/cni/bin/
-        done
-
     - name: Cache sonobuoy CLI
       id: cache-sonobuoy
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -204,8 +148,7 @@ runs:
       # A failed pull must never populate the cache below -- per the
       # postmortem, caching a failed/partial pull would make the
       # registry.k8s.io CDN-staleness failure deterministic forever
-      # instead of self-healing on the next run (same reasoning as the
-      # release-bin-cache split above).
+      # instead of self-healing on the next run.
       if: steps.cache-conformance-image.outputs.cache-hit != 'true'
       shell: bash
       run: |
@@ -220,6 +163,48 @@ runs:
         path: /tmp/conformance-image-${{ inputs.k8s_version }}.tar
         key: conformance-image-${{ inputs.k8s_version }}-${{ runner.arch }}
 
+    - name: Rig-only prerequisites
+      # Everything the CI node does that install.sh does not, recorded in
+      # run-meta (topology=install). Docker, pre-installed and running on the
+      # runner, sets the iptables FORWARD policy to DROP and opens it only for
+      # its own bridges, so direct pod-to-pod traffic over cni0 (e.g.
+      # sonobuoy's worker reporting to the aggregator) times out.
+      shell: bash
+      run: |
+        echo "runner kernel: $(uname -r)"
+        sudo iptables -P FORWARD ACCEPT
+        mkdir -p temp/u7s
+        {
+          echo "topology=install"
+          echo "k8s_version=${{ inputs.k8s_version }}"
+          echo "kernel=$(uname -r)"
+          echo "rig_only_setup=iptables-forward-accept,conformance-image-preload"
+        } | tee temp/u7s/run-meta >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Assemble install tree
+      # install.sh finds each binary by name anywhere in this tree; the layout
+      # mirrors build-release-tarball.sh. The u7s binaries are the build job's
+      # artifact, the rest come from the sha-verified caches above.
+      shell: bash
+      run: |
+        TREE="$RUNNER_TEMP/u7s-tree"
+        mkdir -p "$TREE/cni-plugins" "$TREE/manifests"
+        cp target/release/u7s-apiserver target/release/u7s-scheduler "$TREE/"
+        cp "$HOME"/k8s-bins/* "$TREE/"
+        cp "$HOME"/cni-plugins/* "$TREE/cni-plugins/"
+        cp manifests/*.yaml "$TREE/manifests/"
+        echo "U7S_TREE=$TREE" >> "$GITHUB_ENV"
+
+    - name: Run scripts/install.sh
+      shell: bash
+      run: sudo scripts/install.sh --tarball-dir "$U7S_TREE"
+
+    - name: Expose admin kubeconfig
+      shell: bash
+      run: |
+        sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" /var/lib/u7s/kubeconfig temp/u7s/kubeconfig
+        KUBECONFIG="$PWD/temp/u7s/kubeconfig" kubectl get nodes -o wide
+
     - name: Load conformance image into cri-o storage
       # Writes straight into the containers/storage graph cri-o's image
       # service reads from (same mechanism as `podman load`), so the
@@ -233,506 +218,21 @@ runs:
           "docker-archive:/tmp/conformance-image-${{ inputs.k8s_version }}.tar" \
           "containers-storage:registry.k8s.io/conformance:v${{ inputs.k8s_version }}"
 
-    - name: Start apiserver
-      env:
-        RUST_LOG: info
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        mkdir -p "$WORKDIR"
-        E2E_TOKEN="e2e-focus-admin-token-$(date +%s)"
-        echo "$E2E_TOKEN,e2e-focus-admin,uid0,system:masters" > "$WORKDIR/token-auth.csv"
-        # CoreDNS moved off its compiled-in include_bytes! bundle onto
-        # bootstrap_apply::apply_well_known_manifest_dir (mayor-fiq79), which only
-        # applies manifests it finds on disk in --manifest-dir -- unlike
-        # scripts/install.sh (the production release-tarball path), this workflow
-        # never staged anything there, so CoreDNS silently stopped being applied
-        # and sonobuoy's preflight failed with "no dns pods found" (run 32922063667).
-        # Stage just the one vendored manifest this single-node runner needs
-        # in --manifest-dir; kube-proxy runs as its own binary below (not via
-        # a manifest), and Flannel is applied via a separate kubectl apply
-        # step further down once the node has registered, not staged here.
-        mkdir -p "$WORKDIR/manifests"
-        cp manifests/coredns.yaml "$WORKDIR/manifests/"
-        # No --konnectivity-proxy-addr: apiserver and kubelet are co-located on
-        # this same runner
-        ./target/release/u7s-apiserver \
-          --db "$WORKDIR/state.db" \
-          --kubeconfig "$WORKDIR/kubeconfig" \
-          --sa-key "$WORKDIR/sa.key" \
-          --sa-pub "$WORKDIR/sa.pub" \
-          --ca-key "$WORKDIR/ca.key" \
-          --ca-cert "$WORKDIR/ca.crt" \
-          --token-auth-file "$WORKDIR/token-auth.csv" \
-          --advertise-address https://127.0.0.1:6443 \
-          --service-cluster-ip-range "10.96.0.0/12" \
-          --kubelet-preferred-address 127.0.0.1 \
-          --manifest-dir "$WORKDIR/manifests" \
-          >"$WORKDIR/apiserver.log" 2>&1 &
-        echo "SERVER_PID=$!" >> "$GITHUB_ENV"
-        for i in $(seq 1 30); do
-          nc -z 127.0.0.1 6443 2>/dev/null && break
-          sleep 1
-        done
-        nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$WORKDIR/apiserver.log"; exit 1; }
-        CA_FILE=$(awk '/certificate-authority:/ {print $2}' "$WORKDIR/kubeconfig")
-        echo "E2E_TOKEN=$E2E_TOKEN" >> "$GITHUB_ENV"
-        printf '%s\n' \
-          'apiVersion: v1' \
-          'kind: Config' \
-          'clusters:' \
-          '- cluster:' \
-          '    server: https://127.0.0.1:6443' \
-          "    certificate-authority: $CA_FILE" \
-          '  name: u7s' \
-          'contexts:' \
-          '- context:' \
-          '    cluster: u7s' \
-          '    user: e2e-focus-admin' \
-          '  name: u7s' \
-          'current-context: u7s' \
-          'users:' \
-          '- name: e2e-focus-admin' \
-          '  user:' \
-          "    token: $E2E_TOKEN" \
-          > "$WORKDIR/kubeconfig"
-
-    - name: Issue kubelet node identity
-      # The kubelet authenticates as system:node:ci-node, as on a real node: its
-      # serverTLSBootstrap serving CSR is approved only for that requestor.
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        openssl x509 -in "$WORKDIR/ca.crt" -inform DER -out "$WORKDIR/ca.pem" -outform PEM
-        sudo cp "$WORKDIR/ca.pem" /etc/kubelet-ca.crt
-        sudo chmod 644 /etc/kubelet-ca.crt
-        openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/kubelet-client.key"
-        openssl req -new -key "$WORKDIR/kubelet-client.key" \
-          -subj "/O=system:nodes/CN=system:node:ci-node" -sha256 \
-          -out "$WORKDIR/kubelet-client.csr"
-        openssl x509 -req -in "$WORKDIR/kubelet-client.csr" \
-          -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
-          -CAcreateserial -days 365 -sha256 \
-          -extfile <(printf 'extendedKeyUsage=clientAuth\n') \
-          -out "$WORKDIR/kubelet-client.crt"
-        sudo cp "$WORKDIR/kubelet-client.crt" /etc/kubelet-client.crt
-        sudo cp "$WORKDIR/kubelet-client.key" /etc/kubelet-client.key
-        sudo chmod 644 /etc/kubelet-client.crt
-        sudo chmod 600 /etc/kubelet-client.key
-        printf '%s\n' \
-          'apiVersion: v1' \
-          'kind: Config' \
-          'clusters:' \
-          '- cluster:' \
-          '    server: https://127.0.0.1:6443' \
-          '    certificate-authority: /etc/kubelet-ca.crt' \
-          '  name: u7s' \
-          'contexts:' \
-          '- context:' \
-          '    cluster: u7s' \
-          '    user: system:node:ci-node' \
-          '  name: u7s' \
-          'current-context: u7s' \
-          'users:' \
-          '- name: system:node:ci-node' \
-          '  user:' \
-          '    client-certificate: /etc/kubelet-client.crt' \
-          '    client-key: /etc/kubelet-client.key' \
-          > "$WORKDIR/kubelet-kubeconfig"
-
-    - name: Start kubelet
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        sudo mkdir -p /tmp/kubelet-pods
-        sudo cp "$WORKDIR/kubelet-kubeconfig" /etc/kubelet-kubeconfig
-        sudo chmod 644 /etc/kubelet-kubeconfig
-        sudo cp .github/workflows/e2e-focus-resources/kubelet-config.yaml /etc/kubelet-config.yaml
-        # kubeadm-style resolvConf: the runner's /etc/resolv.conf is the
-        # systemd-resolved stub (127.0.0.53); "" gives CoreDNS a self-forward loop.
-        sudo scripts/set-kubelet-resolvconf.sh /etc/kubelet-config.yaml
-        sudo "$HOME/bin/kubelet" \
-          --config=/etc/kubelet-config.yaml \
-          --kubeconfig=/etc/kubelet-kubeconfig \
-          --hostname-override=ci-node \
-          --logging-format=text \
-          --v=2 \
-          >"$WORKDIR/kubelet.log" 2>&1 &
-
-    - name: Assert node registers
-      env:
-        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-      shell: bash
-      run: |
-        FOUND=0
-        for i in $(seq 1 90); do
-          if kubectl get nodes 2>/dev/null | grep -q "ci-node"; then
-            FOUND=1
-            break
-          fi
-          sleep 1
-        done
-        if [ "$FOUND" -eq 0 ]; then
-          echo "ERROR: ci-node did not appear in kubectl get nodes within 90s"
-          echo "--- apiserver log ---"
-          cat "$PWD/temp/u7s/apiserver.log"
-          echo "--- kubelet log ---"
-          cat "$PWD/temp/u7s/kubelet.log"
-          exit 1
-        fi
-        echo "Node registered:"
-        kubectl get nodes
-
-    - name: Apply flannel CNI
-      # Renders manifests/flannel.yaml the same way scripts/install.sh
-      # (919-932) and scripts/conformance/lima-start.sh (949-959) do --
-      # __IFACE__ substituted with this runner's primary NIC, __POD_CLUSTER_CIDR_IPV4__
-      # matching kube-controller-manager's node-ipam-controller default
-      # elsewhere in this repo. node-ipam-controller stays enabled in this
-      # workflow's --controllers set below so it assigns ci-node's
-      # spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute its
-      # lease (full rationale at the kube-controller-manager step below and
-      # the "Wait for flannel ready" step further down).
-      env:
-        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-      shell: bash
-      run: |
-        FLANNEL_RENDERED="$(mktemp)"
-        . scripts/lib/flannel-render.sh
-        NIC="$(ip -o route show default | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-        [ -n "$NIC" ] || { echo "ERROR: no default-route interface on this runner" >&2; exit 1; }
-        render_flannel_for_nic "$NIC" "$(cat "/sys/class/net/$NIC/mtu")" 10.244.0.0/16 "" \
-          < manifests/flannel.yaml > "$FLANNEL_RENDERED"
-        kubectl apply --validate=false -f "$FLANNEL_RENDERED"
-        rm -f "$FLANNEL_RENDERED"
-
-    - name: Assert kubelet not crash-looping
-      # Checks every second instead of one sleep-then-check: an immediate
-      # crash fails right away instead of waiting out the full window first.
-      shell: bash
-      run: |
-        for i in $(seq 1 5); do
-          pgrep -f "bin/kubelet --config=/etc/kubelet-config.yaml" >/dev/null || {
-            echo "ERROR: kubelet exited"
-            cat "$PWD/temp/u7s/kubelet.log"
-            exit 1
-          }
-          sleep 1
-        done
-
-    - name: Create kube-proxy RBAC and token
-      # The sonobuoy aggregator (and every in-cluster client using client-go's
-      # InClusterConfig, i.e. anything with a projected SA token) reaches the
-      # apiserver via the "kubernetes" Service ClusterIP (10.96.0.1:443),
-      # which needs a real Service dataplane to route -- see kube-proxy below.
-      env:
-        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-      shell: bash
-      run: |
-        kubectl create serviceaccount kube-proxy -n kube-system \
-          --dry-run=client -o yaml | kubectl apply --validate=false -f -
-        kubectl apply --validate=false -f - <<'RBACEOF'
-        apiVersion: rbac.authorization.k8s.io/v1
-        kind: ClusterRole
-        metadata:
-          name: kube-proxy
-        rules:
-        - apiGroups: [""]
-          resources: [nodes, services, endpoints]
-          verbs: [get, list, watch]
-        - apiGroups: [""]
-          resources: [events]
-          verbs: [create, patch, update]
-        - apiGroups: [discovery.k8s.io]
-          resources: [endpointslices]
-          verbs: [get, list, watch]
-        - apiGroups: [networking.k8s.io]
-          resources: [servicecidrs]
-          verbs: [get, list, watch]
-        ---
-        apiVersion: rbac.authorization.k8s.io/v1
-        kind: ClusterRoleBinding
-        metadata:
-          name: kube-proxy
-        roleRef:
-          apiGroup: rbac.authorization.k8s.io
-          kind: ClusterRole
-          name: kube-proxy
-        subjects:
-        - kind: ServiceAccount
-          name: kube-proxy
-          namespace: kube-system
-        RBACEOF
-        KUBE_PROXY_TOKEN=$(kubectl create token kube-proxy -n kube-system --duration=8760h)
-        echo "KUBE_PROXY_TOKEN=$KUBE_PROXY_TOKEN" >> "$GITHUB_ENV"
-
-    - name: Download kube-proxy
-      env:
-        K8S_VERSION: ${{ inputs.k8s_version }}
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-proxy" \
-          -o "$WORKDIR/kube-proxy"
-        chmod +x "$WORKDIR/kube-proxy"
-
-    - name: Start kube-proxy
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        sudo mkdir -p /etc/kube-proxy
-        sudo tee /etc/kube-proxy/kubeconfig.conf >/dev/null <<KUBEEOF
-        apiVersion: v1
-        kind: Config
-        clusters:
-        - cluster:
-            server: https://127.0.0.1:6443
-            certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
-          name: default
-        contexts:
-        - context:
-            cluster: default
-            user: default
-          name: default
-        current-context: default
-        users:
-        - name: default
-          user:
-            token: ${KUBE_PROXY_TOKEN}
-        KUBEEOF
-        # iptables mode, not lima's ipvs -- GH Actions runners have the full
-        # iptables userspace extensions available (unlike the cut-down Lima
-        # VM image that forced ipvs mode there; see
-        # scripts/conformance/lima-start.sh's own comment on why), so the
-        # simpler mode needs no ipset/kernel-module dependencies beyond
-        # br_netfilter below.
-        sudo tee /etc/kube-proxy/config.conf >/dev/null <<'CONFEOF'
-        apiVersion: kubeproxy.config.k8s.io/v1alpha1
-        kind: KubeProxyConfiguration
-        mode: iptables
-        clusterCIDR: 10.88.0.0/16
-        clientConnection:
-          kubeconfig: /etc/kube-proxy/kubeconfig.conf
-        CONFEOF
-        # Required so bridge (pod-to-pod / pod-to-host) traffic passes through
-        # netfilter hooks -- without it, kube-proxy's DNAT for ClusterIP
-        # services never fires for traffic originating from pods, which is
-        # exactly how the sonobuoy aggregator reaches the apiserver.
-        sudo modprobe br_netfilter
-        sudo sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1
-        # GH Actions runners have Docker pre-installed and running, which
-        # sets the iptables FORWARD chain's default policy to DROP and only
-        # opens it for its own managed bridges (docker0 etc) -- our
-        # separately-created "cni0" bridge is left blocked. This breaks
-        # direct pod-to-pod traffic specifically (e.g. sonobuoy's own
-        # worker sidecar reporting results to the aggregator pod, confirmed
-        # live via "dial tcp <pod-ip>:8080: connect: connection timed out"),
-        # while pod-to-host traffic still works because kube-proxy's DNAT
-        # targets are local addresses delivered via INPUT, not FORWARD.
-        # Safe to open unconditionally here: this is a single-tenant,
-        # ephemeral CI runner with no other traffic to isolate.
-        sudo iptables -P FORWARD ACCEPT
-        sudo tee /etc/systemd/system/kube-proxy.service >/dev/null <<SVCEOF
-        [Unit]
-        Description=Kubernetes Kube Proxy
-        After=network.target
-
-        [Service]
-        ExecStart=$WORKDIR/kube-proxy \\
-          --config=/etc/kube-proxy/config.conf \\
-          --hostname-override=ci-node \\
-          --v=2
-        Restart=always
-        RestartSec=5
-        LimitNOFILE=1048576
-
-        [Install]
-        WantedBy=multi-user.target
-        SVCEOF
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now kube-proxy
-
-    - name: Assert kube-proxy active
-      shell: bash
-      run: |
-        STATUS=""
-        for i in $(seq 1 15); do
-          STATUS=$(systemctl is-active kube-proxy 2>&1 || true)
-          [ "$STATUS" = "active" ] && break
-          sleep 1
-        done
-        if [ "$STATUS" != "active" ]; then
-          echo "ERROR: kube-proxy failed to reach active state (last status: $STATUS)"
-          sudo journalctl -u kube-proxy --no-pager -n 50
-          exit 1
-        fi
-        # systemd reporting "active" only means the process started -- it
-        # says nothing about whether kube-proxy's first watch-sync has
-        # actually programmed the DNAT rule anything dialing the
-        # "kubernetes" ClusterIP (10.96.0.1:443, incl. the sonobuoy
-        # aggregator) needs. Poll for that rule directly instead of a blind
-        # settle-time sleep.
-        RULE_READY=0
-        for i in $(seq 1 15); do
-          if sudo iptables -t nat -S KUBE-SERVICES 2>/dev/null | grep -q "10\.96\.0\.1"; then
-            RULE_READY=1
-            break
-          fi
-          sleep 1
-        done
-        if [ "$RULE_READY" -eq 0 ]; then
-          echo "ERROR: kube-proxy did not program a DNAT rule for 10.96.0.1 within 15s"
-          sudo iptables -t nat -S KUBE-SERVICES 2>/dev/null || true
-          sudo journalctl -u kube-proxy --no-pager -n 50
-          exit 1
-        fi
-        echo "kube-proxy is active and has programmed the kubernetes Service rule"
-
-    - name: Download kube-controller-manager
-      env:
-        K8S_VERSION: ${{ inputs.k8s_version }}
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-controller-manager" \
-          -o "$WORKDIR/kube-controller-manager"
-        chmod +x "$WORKDIR/kube-controller-manager"
-
-    - name: Start kube-controller-manager
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        # The wildcard controller set matches scripts/install.sh's u7s-kcm.service
-        # --controllers set exactly (see its rationale there for
-        # -clusterrole-aggregation-controller,
-        # and for why cloud-node-lifecycle-controller / node-route-controller /
-        # service-lb-controller are deliberately NOT excluded)
-        # -- real upstream e2e specs depend on controllers this workflow's
-        # narrower smoke/perf-test peers never needed (e.g. the namespace
-        # controller finalizing each test's ephemeral namespace).
-        # kcm-supervisor.sh restarts kcm on crash instead of silently
-        # blacking out the control plane for the rest of the run.
-        # node-ipam-controller must stay enabled (unlike an earlier version of
-        # this workflow that excluded it): it is the only thing that ever sets
-        # Node.spec.podCIDR, which flanneld's --kube-subnet-mgr reads to compute
-        # this node's lease before it will write /run/flannel/subnet.env --
-        # without it flannel never becomes ready and every pod sandbox creation
-        # fails with "failed to load flannel 'subnet.env' file".
-        # --cluster-cidr matches manifests/flannel.yaml's net-conf.json Network
-        # (10.244.0.0/16, substituted into the same literal above).
-        setsid bash scripts/conformance/kcm-supervisor.sh \
-          "$WORKDIR/kube-controller-manager" "$WORKDIR/kcm.log" \
-          --kubeconfig="$WORKDIR/kcm-kubeconfig" \
-          --cluster-signing-cert-file="$WORKDIR/intermediate-cert.pem" \
-          --cluster-signing-key-file="$WORKDIR/intermediate.key" \
-          --cluster-signing-duration=8760h \
-          --root-ca-file="$WORKDIR/ca.pem" \
-          --controllers='*,-clusterrole-aggregation-controller,-service-cidr-controller' \
-          --allocate-node-cidrs=true \
-          --cluster-cidr=10.244.0.0/16 \
-          --node-cidr-mask-size=24 \
-          --use-service-account-credentials=true \
-          --leader-elect=false \
-          --bind-address=127.0.0.1 \
-          --kube-api-content-type=application/json \
-          >/tmp/kcm-supervisor.log 2>&1 &
-
-    - name: Start u7s-scheduler
-      shell: bash
-      run: |
-        WORKDIR="$PWD/temp/u7s"
-        # Launched right after kcm, before kcm's own alive-check below --
-        # kube-controller-manager and u7s-scheduler are independent apiserver
-        # clients with no startup-order dependency on each other (unscheduled
-        # pods just stay Pending until the scheduler is up), so there is
-        # nothing to gain from serializing their launches.
-        ./target/release/u7s-scheduler \
-          --kubeconfig "$WORKDIR/kubeconfig-scheduler" \
-          >"$WORKDIR/scheduler.log" 2>&1 &
-        echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
-
-    - name: Wait for kube-controller-manager to be alive
-      shell: bash
-      run: |
-        for i in $(seq 1 30); do
-          pgrep -f "kube-controller-manager --kubeconfig=" >/dev/null 2>&1 && break
-          sleep 1
-        done
-        pgrep -f "kube-controller-manager --kubeconfig=" >/dev/null 2>&1 || {
-          echo "kube-controller-manager failed to start"
-          cat "$PWD/temp/u7s/kcm.log" 2>/dev/null || true
-          cat /tmp/kcm-supervisor.log
-          exit 1
-        }
-
-    - name: Assert scheduler alive
-      # Checks every second instead of one sleep-then-check: an immediate
-      # crash fails right away instead of waiting out the full window first.
-      shell: bash
-      run: |
-        for i in $(seq 1 2); do
-          kill -0 "$SCHEDULER_PID" 2>/dev/null || {
-            echo "u7s-scheduler exited"
-            cat "$PWD/temp/u7s/scheduler.log"
-            exit 1
-          }
-          sleep 1
-        done
-
-    - name: Wait for flannel ready
-      # The kube-flannel DS pod (applied earlier, above) needed the scheduler
-      # (just started) to place it on ci-node before it could even run --
-      # its main container then needs kube-controller-manager's
-      # node-ipam-controller to have assigned ci-node a spec.podCIDR before
-      # --kube-subnet-mgr can compute a lease and write
-      # /run/flannel/subnet.env. Waiting for that file here, before sonobuoy
-      # starts, turns a silent multi-minute CNI failure deep inside the e2e
-      # run into a fast, clearly-diagnosed one right at bring-up.
-      env:
-        KUBECONFIG: ${{ github.workspace }}/temp/u7s/kubeconfig
-      shell: bash
-      run: |
-        FOUND=0
-        for i in $(seq 1 90); do
-          if [ -f /run/flannel/subnet.env ]; then
-            FOUND=1
-            break
-          fi
-          sleep 1
-        done
-        if [ "$FOUND" -eq 0 ]; then
-          echo "ERROR: /run/flannel/subnet.env did not appear within 90s"
-          echo "--- kube-flannel pods -o wide ---"
-          kubectl -n kube-flannel get pods -o wide || true
-          echo "--- kube-flannel pod logs ---"
-          kubectl -n kube-flannel logs -l app=flannel --all-containers --prefix || true
-          echo "--- /etc/cni/net.d ---"
-          ls -la /etc/cni/net.d || true
-          exit 1
-        fi
-        echo "flannel ready:"
-        cat /run/flannel/subnet.env
-
     - name: Sample baseline RSS
       shell: bash
       run: |
         sleep 5
-        APISERVER_PID=$(pgrep -f "target/release/u7s-apiserver --db" | head -1)
+        APISERVER_PID=$(systemctl show -p MainPID --value u7s-apiserver)
         APISERVER_RSS=$(ps -o rss= -p "$APISERVER_PID" | tr -d ' ')
-        SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
-        COMBINED_RSS=$(( APISERVER_RSS + SCHEDULER_RSS ))
         echo "BASELINE_APISERVER_RSS_KB=$APISERVER_RSS" >> "$GITHUB_ENV"
-        echo "BASELINE_SCHEDULER_RSS_KB=$SCHEDULER_RSS" >> "$GITHUB_ENV"
         read -r MEM_TOTAL MEM_USED MEM_FREE <<< "$(free -m | awk '/^Mem:/{print $2, $3, $4}')"
         {
           echo "### RSS baseline (k8s ${{ inputs.k8s_version }}, before sonobuoy)"
-          echo "- apiserver RSS: ${APISERVER_RSS} kB"
-          echo "- scheduler RSS: ${SCHEDULER_RSS} kB"
-          echo "- combined RSS: ${COMBINED_RSS} kB (threshold: 65536 kB)"
+          echo "- apiserver RSS (scheduler embedded): ${APISERVER_RSS} kB (threshold: 65536 kB)"
           echo "- runner memory (free -m): total=${MEM_TOTAL}MB used=${MEM_USED}MB free=${MEM_FREE}MB"
         } | tee -a "$GITHUB_STEP_SUMMARY"
-        if [ "$COMBINED_RSS" -gt 65536 ]; then
-          echo "FAIL: baseline combined RSS ${COMBINED_RSS} kB exceeds 65536 kB (64 MB)" | tee -a "$GITHUB_STEP_SUMMARY"
+        if [ "$APISERVER_RSS" -gt 65536 ]; then
+          echo "FAIL: baseline apiserver RSS ${APISERVER_RSS} kB exceeds 65536 kB (64 MB)" | tee -a "$GITHUB_STEP_SUMMARY"
           exit 1
         fi
 
@@ -852,10 +352,11 @@ runs:
         echo "=== metrics-server describe ==="
         kubectl describe pod -n kube-system -l k8s-app=metrics-server || true
 
-        echo "=== kube-proxy systemd status ==="
-        sudo systemctl status kube-proxy --no-pager || true
-        echo "=== kube-proxy journal (last 50 lines) ==="
-        sudo journalctl -u kube-proxy --no-pager -n 50 || true
+        echo "=== kube-proxy pod logs ==="
+        kubectl logs -n kube-system -l k8s-app=kube-proxy --tail=50 || true
+        for unit in u7s-apiserver u7s-kcm kubelet crio; do
+          sudo journalctl -u "$unit" --no-pager --utc > "temp/u7s/$unit.log" 2>&1 || true
+        done
         echo "=== iptables nat rules (KUBE-SERVICES/KUBE-SVC chains) ==="
         sudo iptables -t nat -S | grep -i "10.96.0.1\|KUBE-SERVICES\|KUBE-SVC" || true
 
@@ -937,18 +438,14 @@ runs:
     - name: Sample peak RSS
       shell: bash
       run: |
-        APISERVER_PID=$(pgrep -f "target/release/u7s-apiserver --db" | head -1)
+        APISERVER_PID=$(systemctl show -p MainPID --value u7s-apiserver)
         APISERVER_RSS=$(ps -o rss= -p "$APISERVER_PID" | tr -d ' ')
-        SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
-        COMBINED_RSS=$(( APISERVER_RSS + SCHEDULER_RSS ))
-        BASELINE_COMBINED=$(( BASELINE_APISERVER_RSS_KB + BASELINE_SCHEDULER_RSS_KB ))
-        DELTA=$(( COMBINED_RSS - BASELINE_COMBINED ))
+        DELTA=$(( APISERVER_RSS - BASELINE_APISERVER_RSS_KB ))
         read -r MEM_TOTAL MEM_USED MEM_FREE <<< "$(free -m | awk '/^Mem:/{print $2, $3, $4}')"
         {
           echo "### RSS peak (k8s ${{ inputs.k8s_version }}, after sonobuoy)"
-          echo "- apiserver RSS: ${APISERVER_RSS} kB (baseline ${BASELINE_APISERVER_RSS_KB} kB)"
-          echo "- scheduler RSS: ${SCHEDULER_RSS} kB (baseline ${BASELINE_SCHEDULER_RSS_KB} kB)"
-          echo "- combined RSS: ${COMBINED_RSS} kB (delta vs. baseline: ${DELTA} kB, threshold: 10240 kB)"
+          echo "- apiserver RSS (scheduler embedded): ${APISERVER_RSS} kB (baseline ${BASELINE_APISERVER_RSS_KB} kB)"
+          echo "- delta vs. baseline: ${DELTA} kB, threshold: 10240 kB"
           echo "- runner memory (free -m): total=${MEM_TOTAL}MB used=${MEM_USED}MB free=${MEM_FREE}MB"
         } | tee -a "$GITHUB_STEP_SUMMARY"
         if [ "$DELTA" -gt 10240 ]; then
@@ -960,12 +457,7 @@ runs:
       if: always()
       shell: bash
       run: |
-        [ -n "${SCHEDULER_PID:-}" ] && kill "$SCHEDULER_PID" 2>/dev/null || true
-        pkill -f "kcm-supervisor.sh" 2>/dev/null || true
-        pkill -f "kube-controller-manager --kubeconfig=" 2>/dev/null || true
-        sudo systemctl stop kube-proxy 2>/dev/null || true
-        sudo pkill -f "bin/kubelet --config=/etc/kubelet-config.yaml" 2>/dev/null || true
-        pkill -f "target/release/u7s-apiserver --db" 2>/dev/null || true
+        sudo systemctl stop kubelet u7s-kcm u7s-apiserver 2>/dev/null || true
 
     - name: Upload logs on failure
       # cancelled() too -- confirmed live that a manual `gh run cancel`
@@ -978,11 +470,11 @@ runs:
       with:
         name: ${{ inputs.run_label }}-logs-${{ inputs.k8s_version }}
         path: |
-          temp/u7s/apiserver.log
-          temp/u7s/scheduler.log
+          temp/u7s/run-meta
+          temp/u7s/u7s-apiserver.log
+          temp/u7s/u7s-kcm.log
           temp/u7s/kubelet.log
-          temp/u7s/kcm.log
-          /tmp/kcm-supervisor.log
+          temp/u7s/crio.log
           /tmp/sonobuoy-results.tar.gz
           /tmp/sonobuoy-aggregator.log
           /tmp/sonobuoy-e2e-container.log
