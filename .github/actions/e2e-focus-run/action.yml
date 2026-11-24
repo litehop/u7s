@@ -202,7 +202,8 @@ runs:
     - name: Expose admin kubeconfig
       shell: bash
       run: |
-        sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" /var/lib/u7s/kubeconfig temp/u7s/kubeconfig
+        sudo kubectl --kubeconfig=/var/lib/u7s/kubeconfig config view --raw --flatten > temp/u7s/kubeconfig
+        chmod 600 temp/u7s/kubeconfig
         KUBECONFIG="$PWD/temp/u7s/kubeconfig" kubectl get nodes -o wide
 
     - name: Load conformance image into cri-o storage
