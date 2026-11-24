@@ -10,7 +10,6 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LIMA_START="$DIR/lima-start.sh"
-SET_ROTATE="$DIR/../set-kubelet-rotate-certificates.sh"
 
 PASS=0
 FAIL=0
@@ -36,38 +35,22 @@ assert "the kubelet's kubeconfig user is its client cert files, so kubelet's cer
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-printf 'kind: KubeletConfiguration\nfailSwapOn: false\n' > "$WORK/missing.yaml"
-bash "$SET_ROTATE" "$WORK/missing.yaml"
-assert "rotateCertificates is added when the baked kubelet config lacks it (without it the node cert expires and the node drops off the cluster)" \
-  "$(grep -qx 'rotateCertificates: true' "$WORK/missing.yaml" && echo 1 || echo 0)"
-
-printf 'kind: KubeletConfiguration\nrotateCertificates: false\n' > "$WORK/off.yaml"
-bash "$SET_ROTATE" "$WORK/off.yaml"
-assert "rotateCertificates: false is flipped to true" \
-  "$(grep -qx 'rotateCertificates: true' "$WORK/off.yaml" && ! grep -q 'false' "$WORK/off.yaml" && echo 1 || echo 0)"
-
-bash "$SET_ROTATE" "$WORK/off.yaml"
-assert "re-running is idempotent (lima-start.sh runs on every invocation)" \
-  "$([ "$(grep -c '^rotateCertificates:' "$WORK/off.yaml")" -eq 1 ] && echo 1 || echo 0)"
-
-SET_TLS_BOOTSTRAP="$DIR/../set-kubelet-server-tls-bootstrap.sh"
-printf 'kind: KubeletConfiguration\nfailSwapOn: false\n' > "$WORK/notls.yaml"
-bash "$SET_TLS_BOOTSTRAP" "$WORK/notls.yaml"
-assert "serverTLSBootstrap is added when the baked kubelet config lacks it (without it the kubelet serves a self-signed cert the apiserver rejects, breaking kubectl logs/exec)" \
-  "$(grep -qx 'serverTLSBootstrap: true' "$WORK/notls.yaml" && echo 1 || echo 0)"
-printf 'kind: KubeletConfiguration\nserverTLSBootstrap: false\n' > "$WORK/tlsoff.yaml"
-bash "$SET_TLS_BOOTSTRAP" "$WORK/tlsoff.yaml"
-bash "$SET_TLS_BOOTSTRAP" "$WORK/tlsoff.yaml"
-assert "serverTLSBootstrap: false is flipped to true, once, however often lima-start.sh re-runs" \
-  "$([ "$(grep -c '^serverTLSBootstrap:' "$WORK/tlsoff.yaml")" -eq 1 ] && grep -qx 'serverTLSBootstrap: true' "$WORK/tlsoff.yaml" && echo 1 || echo 0)"
-assert "lima-start.sh applies serverTLSBootstrap to the VM's kubelet config" \
-  "$(grep -qF 'set-kubelet-server-tls-bootstrap.sh' "$LIMA_START" && echo 1 || echo 0)"
+source "$DIR/_lib.sh"
+mkdir -p "$WORK/bin" "$WORK/etc"
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/systemctl"
+chmod +x "$WORK/bin/systemctl"
+rig_kubelet_config_script 10.96.0.10 "$DIR/../install.sh" | sed -e "s#/etc/#$WORK/etc/#g" > "$WORK/render.sh"
+PATH="$WORK/bin:$PATH" bash "$WORK/render.sh"
+RENDERED="$WORK/etc/u7s-rig/kubelet-config.yaml"
+assert "the rig kubelet config rotates its client cert (without it the node cert expires and the node drops off the cluster)" \
+  "$(grep -qx 'rotateCertificates: true' "$RENDERED" && echo 1 || echo 0)"
+assert "the rig kubelet config bootstraps its serving cert through the CSR API (without it the kubelet serves a self-signed cert the apiserver rejects, breaking kubectl logs/exec)" \
+  "$(grep -qx 'serverTLSBootstrap: true' "$RENDERED" && echo 1 || echo 0)"
 assert "lima-start.sh no longer pins a static kubelet serving cert (a file nothing renews would expire under a running rig)" \
   "$(grep -qE -- '--tls-cert-file|--tls-private-key-file|kubelet-tls\.crt' "$LIMA_START" && echo 0 || echo 1)"
 assert "the kubelet's RotateKubeletServerCertificate gate stays on in the rig (serverTLSBootstrap needs it)" \
   "$(grep -q 'RotateKubeletServerCertificate' "$LIMA_START" && echo 0 || echo 1)"
 
-source "$DIR/_lib.sh"
 ca_key() { openssl ecparam -genkey -name prime256v1 -noout -out "$1"; openssl req -x509 -new -key "$1" -subj "/CN=$2" -days 2 -out "$3" 2>/dev/null; }
 ca_key "$WORK/ca1.key" ca1 "$WORK/ca1.pem"
 ca_key "$WORK/ca2.key" ca2 "$WORK/ca2.pem"
