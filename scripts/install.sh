@@ -115,10 +115,14 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  install.sh [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--pod-mtu <mtu>] [--manifest-output-dir <path>] [--allow-service-external-ips]
+  install.sh [--tarball <path> | --tarball-dir <dir> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]] [--service-cidr <cidr>] [--cluster-cidr <cidr>] [--cluster-dns <ip>] [--pod-mtu <mtu>] [--manifest-output-dir <path>] [--allow-service-external-ips]
   install.sh --mint-join-token
   install.sh --join <url> [--token <token> | --token -] --ca-cert-hash sha256:<hash> [--tarball <path> | --tarball-url <url>] [--node-name <name>] [--iface <iface>] [--node-ip <ip>[,<ip>]]
 
+  --tarball-dir <dir>   An already-unpacked release tree (same layout as the tarball),
+                         read in place and never removed. NOT signature-verified:
+                         for CI/dev trees you built yourself. Exclusive with
+                         --tarball and --tarball-url.
   --tarball <path>     Path to an already-downloaded u7s release tarball. NOT
                          signature-verified: the file is trusted as supplied.
                          Overrides the release URL baked into this copy.
@@ -203,6 +207,7 @@ SERVICE_CIDR_IPV4=""; SERVICE_CIDR_IPV6=""
 POD_CLUSTER_CIDR_IPV4=""; POD_CLUSTER_CIDR_IPV6=""
 MANIFEST_OUTPUT_DIR="${U7S_MANIFEST_OUTPUT_DIR:-/etc/u7s/manifests}"
 TARBALL=""
+TARBALL_DIR=""
 TARBALL_URL="$DEFAULT_TARBALL_URL"
 # Only an operator-passed --tarball-url conflicts with --tarball; a released
 # copy always has a non-empty default, so emptiness cannot distinguish them.
@@ -237,6 +242,7 @@ while [ $# -gt 0 ]; do
     --pod-mtu) POD_MTU="$2"; shift 2 ;;
     --manifest-output-dir) MANIFEST_OUTPUT_DIR="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
+    --tarball-dir) TARBALL_DIR="$2"; shift 2 ;;
     --tarball-url) TARBALL_URL="$2"; TARBALL_URL_EXPLICIT=1; shift 2 ;;
     --allow-service-external-ips) ALLOW_SERVICE_EXTERNAL_IPS=1; shift ;;
     --mint-join-token) MINT_JOIN_TOKEN=1; shift ;;
@@ -254,6 +260,10 @@ NODE_IP="${NODE_IP//[[:space:]]/}"
 
 if [ -n "$TARBALL" ] && [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; then
   echo "error: --tarball and --tarball-url are mutually exclusive -- pass a local path or a URL to fetch, not both" >&2
+  exit 1
+fi
+if [ -n "$TARBALL_DIR" ] && { [ -n "$TARBALL" ] || [ "$TARBALL_URL_EXPLICIT" -eq 1 ]; }; then
+  echo "error: --tarball-dir is mutually exclusive with --tarball and --tarball-url -- pass one payload source" >&2
   exit 1
 fi
 
@@ -1976,7 +1986,7 @@ if [ "$JOIN_MODE" -eq 1 ] || [ "$EXISTING_WORKER" -eq 1 ]; then
   WORKER_MODE=1
 fi
 
-if [ -z "$TARBALL" ] && [ -z "$TARBALL_URL" ]; then
+if [ -z "$TARBALL" ] && [ -z "$TARBALL_DIR" ] && [ -z "$TARBALL_URL" ]; then
   # Only a checkout copy reaches this: a released one always has a baked URL,
   # so name that case rather than repeating usage's "one of these is required".
   echo "error: this copy of install.sh has no release URL baked into it (DEFAULT_TARBALL_URL is empty)," >&2
@@ -1989,13 +1999,17 @@ if [ -n "$TARBALL" ] && [ ! -f "$TARBALL" ]; then
   echo "error: tarball not found: $TARBALL" >&2
   exit 1
 fi
+if [ -n "$TARBALL_DIR" ] && [ ! -d "$TARBALL_DIR" ]; then
+  echo "error: tarball directory not found: $TARBALL_DIR" >&2
+  exit 1
+fi
 
 # Download before apt installs and starts CRI-O, so a wrong or unreachable URL
 # leaves the host untouched rather than half-configured -- a likely failure
 # while the stable /install.sh URL still 404s. --tarball wins over both
 # --tarball-url and the baked default, so an operator already holding the bytes
 # never triggers a download.
-if [ -z "$TARBALL" ]; then
+if [ -z "$TARBALL" ] && [ -z "$TARBALL_DIR" ]; then
   trap 'rm -rf ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
   fetch_tarball "$TARBALL_URL"
 fi
@@ -2364,14 +2378,19 @@ systemctl restart crio
 # (docs/decisions/upstream-component-shipping-shape.md). Binaries are located
 # by name anywhere in the extracted tree rather than at a fixed path, so the
 # tarball's internal layout is not load-bearing. --join needs only kubelet.
-STAGE_DIR="$(mktemp_disk_dir)"
-# Replaces the download-only trap above, so it must still cover $DOWNLOAD_DIR.
-# ${DOWNLOAD_DIR:+...} expands to nothing when --tarball gave a local path.
-trap 'rm -rf "$STAGE_DIR" ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
+if [ -n "$TARBALL_DIR" ]; then
+  # An operator-owned tree is read in place and never removed.
+  STAGE_DIR="$TARBALL_DIR"
+else
+  STAGE_DIR="$(mktemp_disk_dir)"
+  # Replaces the download-only trap above, so it must still cover $DOWNLOAD_DIR.
+  # ${DOWNLOAD_DIR:+...} expands to nothing when --tarball gave a local path.
+  trap 'rm -rf "$STAGE_DIR" ${DOWNLOAD_DIR:+"$DOWNLOAD_DIR"}' EXIT
 
-if ! tar -xzf "$TARBALL" -C "$STAGE_DIR"; then
-  echo "error: failed to extract $TARBALL into $STAGE_DIR -- check free disk space on /var/tmp (df -h /var/tmp)" >&2
-  exit 1
+  if ! tar -xzf "$TARBALL" -C "$STAGE_DIR"; then
+    echo "error: failed to extract $TARBALL into $STAGE_DIR -- check free disk space on /var/tmp (df -h /var/tmp)" >&2
+    exit 1
+  fi
 fi
 
 install -d -m 0755 "$BIN_DIR"
