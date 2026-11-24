@@ -97,7 +97,7 @@ assert "the CSR is CN=system:node:<name>, O=system:nodes (KCM auto-approves only
 assert "the CSR is self-signed correctly" \
   "$(openssl req -in "$TMP/state/k.csr" -noout -verify >/dev/null 2>&1 && echo 1 || echo 0)"
 assert "the node key is private (0600)" \
-  "$([ "$(stat -f %Lp "$TMP/state/k.key" 2>/dev/null || stat -c %a "$TMP/state/k.key")" = 600 ] && echo 1 || echo 0)"
+  "$([ "$(stat -c %a "$TMP/state/k.key" 2>/dev/null || stat -f %Lp "$TMP/state/k.key")" = 600 ] && echo 1 || echo 0)"
 assert "the CSR key is a 256-bit EC key like install.sh's tool (the approver's usage set depends on the key type)" \
   "$(openssl pkey -in "$TMP/state/k.key" -noout -text 2>/dev/null | drain_grep -qF '(256 bit)' && echo 1 || echo 0)"
 assert "the base64 shim accepts GNU's -w0 and emits one line (macOS base64 has no -w0)" \
