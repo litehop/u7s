@@ -10,6 +10,7 @@ mod args;
 mod auth;
 mod autoscaling_gen_adapter;
 mod batch_gen_adapter;
+mod body_budget;
 mod bootstrap_apply;
 mod bootstrap_rbac;
 #[cfg(test)]
@@ -84,6 +85,7 @@ use u7s_store::SqliteStore;
 pub use admission::{build_review, AdmissionContext, AdmissionReview};
 pub use args::Args;
 use auth::AuthLayer;
+use body_budget::BodyBudgetLayer;
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 pub use metrics::record_request_total;
@@ -93,9 +95,10 @@ pub use util::resolve_dhat_backtrace_depth;
 
 /// Maximum request body size in bytes. Applied as the outermost layer so
 /// unauthenticated requests are rejected before auth processing, preventing
-/// OOM attacks via large unauthenticated bodies. 4 MiB gives headroom above
-/// etcd's 1.5 MiB object limit while staying well below OOM risk.
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// OOM attacks via large unauthenticated bodies. Matches upstream's
+/// `MaxRequestBodyBytes` default (3 MiB, twice etcd's 1.5 MiB object limit), which
+/// applies to custom resources too.
+const MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 /// Target soft `RLIMIT_NOFILE`. macOS defaults to a soft limit of 256, which
 /// sustained load — one FD per persistent watch stream, per in-flight TLS
@@ -809,9 +812,10 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     //     on the authenticated identity. That leaves authentication itself outside the
     //     pools, so its store reads and signature checks are bounded by a separate
     //     try-acquire guard (`MAX_PRE_AUTH_VERIFICATIONS`, 429 + Retry-After when busy).
-    //     4 MiB matches etcd's practical limit (~1.5 MiB) with headroom for kubectl manifests.
+    //     BodyBudgetLayer sits inside inflight so only admitted requests reserve body bytes.
     let app = build_router(state.clone())
         .layer(ContentTypeLayer)
+        .layer(BodyBudgetLayer::new())
         .layer(InflightLayer::new())
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
@@ -10618,7 +10622,7 @@ mod tests {
 
     /// The body size limit must be at least 1 MiB (to accommodate real kubectl
     /// manifests and ConfigMaps) and at most 8 MiB (to prevent OOM from a single
-    /// large unauthenticated request). The current limit is 4 MiB.
+    /// large unauthenticated request). The current limit is 3 MiB.
     ///
     /// Without a body limit, an unauthenticated attacker can POST an arbitrarily
     /// large body to any endpoint and cause the server to OOM before auth runs.
@@ -12931,6 +12935,99 @@ mod tests {
                 "GET {path} must return kind={expected_kind}"
             );
         }
+    }
+
+    /// A custom resource whose body is exactly the request-size limit must be created, and
+    /// one byte more must get 413: a lower cap on custom resources than on built-ins would
+    /// reject large CRs that upstream (and etcd's 1.5 MiB object limit) accepts.
+    #[tokio::test]
+    async fn custom_resource_at_the_body_limit_is_created_and_one_byte_more_is_413() {
+        use axum::http::{header, Method, Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let state = state::AppState::new(
+            std::sync::Arc::new(make_store()),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let router = build_router(state)
+            .layer(body_budget::BodyBudgetLayer::new())
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
+        };
+        let post = |uri: &str, body: String| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len())
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            req.extensions_mut().insert(admin.clone());
+            req
+        };
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": { "plural": "widgets", "singular": "widget", "kind": "Widget", "listKind": "WidgetList" },
+                "scope": "Cluster",
+                "versions": [{
+                    "name": "v1", "served": true, "storage": true,
+                    "schema": { "openAPIV3Schema": { "type": "object", "x-kubernetes-preserve-unknown-fields": true } }
+                }]
+            }
+        });
+        let resp = router
+            .clone()
+            .oneshot(post(
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                crd.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let cr_of_len = |name: &str, len: usize| {
+            let empty = serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": { "name": name }, "spec": { "blob": "" }
+            })
+            .to_string()
+            .len();
+            serde_json::json!({
+                "apiVersion": "example.io/v1", "kind": "Widget",
+                "metadata": { "name": name }, "spec": { "blob": "a".repeat(len - empty) }
+            })
+            .to_string()
+        };
+        let at_limit = cr_of_len("at-limit", MAX_BODY_BYTES);
+        assert_eq!(at_limit.len(), MAX_BODY_BYTES);
+        let resp = router
+            .clone()
+            .oneshot(post("/apis/example.io/v1/widgets", at_limit))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a CR exactly at the body limit must be accepted"
+        );
+
+        let over = cr_of_len("over-limit", MAX_BODY_BYTES + 1);
+        let resp = router
+            .oneshot(post("/apis/example.io/v1/widgets", over))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// PATCH /apis/{group}/{version}/{resource}/{name}/status for a cluster-scoped CRD
