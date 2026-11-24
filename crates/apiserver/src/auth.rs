@@ -882,6 +882,11 @@ fn decode_query_component(s: &str) -> Option<String> {
 /// body deadline. Mirrors kube-apiserver's `LongRunningFunc`: verb `watch` (collection GET
 /// asking for a watch) or one of the subresources `proxy`, `attach`, `exec`, `log`,
 /// `portforward`.
+pub(crate) fn is_proxy_request(path: &str) -> bool {
+    let parsed = parse_path(path);
+    !parsed.resource.is_empty() && parsed.subresource == "proxy"
+}
+
 pub(crate) fn is_long_running_request(
     method: &axum::http::Method,
     path: &str,
