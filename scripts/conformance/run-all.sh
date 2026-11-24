@@ -548,10 +548,11 @@ DHAT_HEAP_FILE=""
 DHAT_HEAP_MISMATCH=0
 SONOBUOY_RC=0
 # Cargo features of the apiserver binary under test, stamped into run-meta by 06.
-U7S_RIG_BUILD_FEATURES="rig-test-knobs"
-[ -z "$BINARY" ] || U7S_RIG_BUILD_FEATURES="prebuilt-binary"
-[ "$PROFILE" -ne 1 ] || U7S_RIG_BUILD_FEATURES="rig-test-knobs,dhat"
-[ -z "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION$PKI_TEST_INTERMEDIATE" ] || U7S_RIG_BUILD_FEATURES="rig-test-knobs,pki-test-knobs"
+# shellcheck source=scripts/conformance/_lib.sh
+source "$DIR/_lib.sh"
+_PREBUILT=0; [ -z "$BINARY" ] || _PREBUILT=1
+_PKI=0; [ -z "$PKI_TEST_LIFETIME$PKI_TEST_SA_ROTATION$PKI_TEST_INTERMEDIATE" ] || _PKI=1
+U7S_RIG_BUILD_FEATURES="$(rig_build_features "$_PREBUILT" "$PROFILE" "$_PKI")"
 export U7S_RIG_BUILD_FEATURES
 if [ "$PROFILE" -eq 1 ]; then
   banner "Profile: rebuilding u7s-apiserver with --features dhat"

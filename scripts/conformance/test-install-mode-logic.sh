@@ -65,10 +65,20 @@ token_anchor sonobuoy-aggregator-limitrange scripts/conformance/06-run-sonobuoy.
 token_anchor vm-nfs-common scripts/conformance/lima-start.sh 'install -y nfs-common'
 token_anchor vm-journald-limits scripts/conformance/lima-start.sh 'journald.conf.d/conformance.conf'
 token_anchor vm-logrotate-interval scripts/conformance/lima-start.sh 'logrotate.timer.d'
-token_anchor host-side-apiserver scripts/conformance/02-start-apiserver.sh 'u7s-apiserver'
-token_anchor konnectivity-agent scripts/conformance/lima-start.sh 'konnectivity-agent'
-token_anchor konnectivity-server scripts/u7s-start.sh 'konnectivity'
+token_anchor host-side-apiserver scripts/conformance/02-start-apiserver.sh 'bash "$REPO/scripts/u7s-start.sh" --background'
+token_anchor konnectivity-agent scripts/conformance/lima-start.sh 'name: konnectivity-agent${NODE_SUFFIX}'
+token_anchor konnectivity-server scripts/u7s-start.sh '--mode=http-connect'
 token_anchor rig-build-features scripts/conformance/01-build.sh 'rig-test-knobs'
+
+# Both profiling and PKI knobs alter the binary under test; recording only one hides the other.
+assert_eq "default rig build is rig-test-knobs only" "$(rig_build_features 0 0 0)" "rig-test-knobs"
+assert_eq "dhat build is recorded" "$(rig_build_features 0 1 0)" "rig-test-knobs,dhat"
+assert_eq "pki build is recorded" "$(rig_build_features 0 0 1)" "rig-test-knobs,pki-test-knobs"
+assert_eq "dhat and pki together are both recorded, neither overrides the other" "$(rig_build_features 0 1 1)" "rig-test-knobs,dhat,pki-test-knobs"
+assert_eq "a prebuilt binary's features are unknowable, never claimed as rig-test-knobs" "$(rig_build_features 1 0 0)" "prebuilt-binary"
+grep -qF 'rig_build_features "$_PREBUILT" "$PROFILE" "$_PKI"' "$REPO/scripts/conformance/run-all.sh" \
+  && ok "run-all.sh derives U7S_RIG_BUILD_FEATURES through rig_build_features" \
+  || bad "run-all.sh does not use rig_build_features: run-meta would not match the build"
 
 # Add-ons are derived from the manifests dir: a new rig-only manifest without an add-on
 # entry (and so without the label) fails here.

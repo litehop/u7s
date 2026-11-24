@@ -777,6 +777,16 @@ rig_apply_apparmor_rig_setup() {
   fi
 }
 
+# Cargo features of the host-rig apiserver binary. Args: <prebuilt 0|1> <profile 0|1>
+# <pki-knobs 0|1>. Every enabled feature is listed; a prebuilt binary's features are unknown.
+rig_build_features() {
+  if [ "$1" = 1 ]; then echo "prebuilt-binary"; return; fi
+  local f="rig-test-knobs"
+  [ "$2" != 1 ] || f="$f,dhat"
+  [ "$3" != 1 ] || f="$f,pki-test-knobs"
+  echo "$f"
+}
+
 # Topology a run archive was produced on. "host-rig": apiserver on the Mac, kubelet-only
 # VM. "install": the real scripts/install.sh on the VM (the release sign-off path).
 # A host-rig PASS is not a delivered-behaviour PASS, so every archive says which it is.
