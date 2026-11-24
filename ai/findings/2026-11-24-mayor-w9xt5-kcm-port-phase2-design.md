@@ -3,7 +3,7 @@
 Bead: mayor-w9xt5
 Date: 2026-11-24 (main a1b0a1e0)
 
-Sources: Phase 1 audit (`2026-09-16-mayor-vc844-...`), mayor-w898x memory decomposition (branch `871d58e7`), roadmap Gate 4, `scripts/install.sh:2712`, `scripts/conformance/*`, `.github/workflows/e2e-focus.yaml`, upstream v1.35.0 `test/e2e/apps` and `test/integration` listings (`gh api`, `temp/research/`).
+Sources: Phase 1 audit (`2026-09-16-mayor-vc844-...`), mayor-w898x memory decomposition (branch `871d58e7`), roadmap Gate 4, `scripts/install.sh:2712`, `scripts/conformance/*`, `.github/workflows/e2e-focus.yaml`, upstream v1.35.0 `test/e2e/apps` and `test/integration` listings (`gh api`, `temp/research/`; to be re-derived from release-1.37 (1.37.1) in Phase 0).
 
 **Recommendation:** port KCM as a separate Rust process that runs alongside upstream KCM, one controller group at a time, where every phase must clear a total-KCM-side memory ceiling (hybrid phases included, no higher than today's shipped Go KCM, and cumulatively no higher than the trimmed-Go baseline) and a sonobuoy gate (identical executed spec-name set, no new failures, zero KCM restarts) before it merges. The Rust process talks to the apiserver over loopback HTTP with per-controller identities, and each phase has an `--controllers` kill switch back to Go. Phase 0 is the measurement harness plus a validated Go trim, which funds the Rust process's fixed memory cost.
 
@@ -112,7 +112,7 @@ Order is by risk (stateless, small, deterministic) and coverage (breakage is lou
 
 | Phase | Controllers | Why here | Main coverage |
 |---|---|---|---|
-| 0 | none. Harness, PSS-anon sampler, leave-one-out table, trim validation, client spike | Funds later phases; no port risk | n/a |
+| 0 | none. Harness, PSS-anon sampler, leave-one-out table, trim validation, client spike, re-derive the spec-to-controller mapping from upstream release-1.37 (1.37.1) e2e and integration listings | Funds later phases; no port risk | n/a |
 | 1 | root-ca-cert-publisher, serviceaccount (default SA), ttl-after-finished, pod-gc | Small; failures are loud; measures Rust fixed cost | SA/`kube-root-ca.crt` e2e, `ttl_after_finished`, integration `podgc`/`serviceaccount`/`ttlcontroller` |
 | 2 | endpoint, endpointslice, endpointslice-mirroring | Output is a pure function of Service+Pod; shadow mode applies; heavy Services conformance | sig-network e2e, integration `endpoints*` |
 | 3 | replicaset, replicationcontroller, deployment, then statefulset, daemonset, job, cronjob | Core workload; RC/Job already in the sensitive registry; owns the Pod cache decision | `apps` e2e, integration per controller |
@@ -128,9 +128,13 @@ One source of truth renders both unit files: an env file (for example `/etc/u7s/
 
 ## 5. Rust building blocks
 
-Loopback HTTP, separate process, own identities is **recommended**: RBAC, admission, validation and audit see controller traffic, as with Go KCM, at the cost of a cache copy and JSON parse. In-process store access (like an embedded controller in the apiserver) has the lowest memory but the worst verification: writes bypass authn, RBAC, admission and audit, an apiserver bug can be masked, hybrid phases (Go over HTTP) differ from the final shape, and restarts couple. Rejected for now. Client candidates: kube-rs full, kube-rs runtime plus narrow own types, or the scheduler's hyper client plus a small own informer (decision 2).
+Two independent axes.
 
-Precedent: the scheduler went embedded but still dials the apiserver over loopback TLS with its own `system:kube-scheduler` kubeconfig (`crates/apiserver/src/lib.rs`, step 10h). It uses plain hyper with its own caches and has no kube-rs dependency.
+**(a) Access path: loopback HTTP with own identities (required).** RBAC, admission, validation and audit see controller traffic, as with Go KCM, at the cost of a cache copy and JSON parse. Direct store access has the lowest memory but the worst verification: writes bypass authn, RBAC, admission and audit, an apiserver bug can be masked, hybrid phases (Go over HTTP) differ from the final shape, and restarts couple. Rejected. Client candidates: kube-rs full, kube-rs runtime plus narrow own types, or the scheduler's hyper client plus a small own informer (decision 2).
+
+**(b) Process placement: separate process (decided); embedded in the apiserver is the measured alternative.** Precedent: the scheduler is embedded but still dials the apiserver over loopback TLS with its own `system:kube-scheduler` kubeconfig (`crates/apiserver/src/lib.rs`, step 10h), using plain hyper with its own caches and no kube-rs. Trade-off: embedding saves the Rust fixed cost (runtime, TLS, allocator, binary); a separate process gives fault isolation, independent restarts, CPU separation and easy memory attribution.
+
+**Measurement requirement.** Phase 0 and every phase end record (i) the separate process's fixed cost and (ii) the estimated embedded delta, i.e. the growth in apiserver anon if the same controllers were embedded. Both are measured on the production-like install (`--install` mode on the release-gate VM shape, not the dev rig) with the 5-run protocol of section 1. **Revisit trigger (TARGET):** if the embedded estimate saves at least 4 MiB of total KCM-side plus apiserver anon at a phase end (the 3 MiB noise band plus a 1 MiB margin), raise it for an operator decision.
 
 Phase 0 spike: build the same Pod+ReplicaSet informer three ways and record idle anon and bytes/pod at 10k pods. That choice follows from the numbers.
 
@@ -149,6 +153,7 @@ Phase 0 spike: build the same Pod+ReplicaSet informer three ways and record idle
 
 - **Terminal verdict per SHA.** The 5-run result is final for a commit SHA; all runs are retained in the committed result record; a retry needs a new SHA, except for a run void under the infra-abort exception (section 1), capped at 2 voids per SHA.
 - **Cumulative cap.** Total KCM-side memory at every phase end stays at or below the Phase 0 trimmed-Go baseline, 5 runs each (section 1 arithmetic).
+- **Process model.** The Rust KCM runs as a separate process for now, over loopback HTTP with its own identity. Embedded in the apiserver (like the scheduler, still over loopback HTTP) stays a live alternative, measured at Phase 0 and every phase end on the production-like install (`--install`, release-gate VM shape); revisit if the embedded estimate saves at least 4 MiB (TARGET) of total KCM-side plus apiserver anon (section 5).
 - **Pin scope.** The projection script, `kcm-mem.json` and N sit under `guard.sha256`; sign-off via CODEOWNERS or a required-reviewer rule, not a label.
 
 ## Open risks and not verified
