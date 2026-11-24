@@ -69,11 +69,18 @@ assert "the staging sequence leaves a non-empty coredns.yaml in the manifest dir
 # stages the same file AND actually points u7s-apiserver's --manifest-dir at it
 # -- staging alone is not enough if the flag pointing the scanner there is missing.
 # ---------------------------------------------------------------------------
-assert "the e2e-focus composite action stages manifests/coredns.yaml into its apiserver's manifest dir" \
-  "$(grep -qF 'cp manifests/coredns.yaml "$WORKDIR/manifests/"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
+assert "the e2e-focus composite action copies manifests/*.yaml (CoreDNS included) into the <tree>/manifests it hands install.sh" \
+  "$(grep -qF 'cp manifests/*.yaml "$TREE/manifests/"' "$E2E_FOCUS_ACTION" \
+    && grep -qF 'echo "U7S_TREE=$TREE" >> "$GITHUB_ENV"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
 
-assert "the e2e-focus composite action passes --manifest-dir to u7s-apiserver so the staged file is scanned" \
-  "$(grep -qF -- '--manifest-dir "$WORKDIR/manifests"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
+assert "the e2e-focus manifests/*.yaml glob matches coredns.yaml" \
+  "$([ -n "$(cd "$REPO" && for f in manifests/*.yaml; do [ "$f" = manifests/coredns.yaml ] && echo "$f"; done)" ] && echo 1 || echo 0)"
+
+assert "the e2e-focus composite action runs install.sh on that tree via --tarball-dir so the real installer stages the manifests" \
+  "$(grep -qF -- 'scripts/install.sh --tarball-dir "$U7S_TREE"' "$E2E_FOCUS_ACTION" && echo 1 || echo 0)"
+
+assert "install.sh copies the tarball tree's manifests/*.yaml into the apiserver's manifest output dir" \
+  "$(grep -qF 'cp "$TARBALL_MANIFEST_DIR"/*.yaml "$MANIFEST_OUTPUT_DIR/"' "$REPO/scripts/install.sh" && echo 1 || echo 0)"
 
 echo ""
 echo "Results: ${PASS} passed, ${FAIL} failed"
