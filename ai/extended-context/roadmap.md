@@ -41,8 +41,7 @@ State: **NATIVE** (u7s Rust) · **UPSTREAM** (real binary) · **HYBRID**
 | **Sentinel / sentinel-derive** | NATIVE (test infra) | n/a | KEEP | Proto-descriptor oracle; closed the silent-decode-drop bug class. |
 
 **Rewrite decision (`mayor-vc844`, operator 2026-11-24):** port KCM first
-(design `mayor-w9xt5`). Sonobuoy Conformance and upstream parity stay a
-reliable guardrail throughout. Kubelet is revisited after the `mayor-jedol`
+(design `mayor-w9xt5`). Kubelet is revisited after the `mayor-jedol`
 data. No clean flag lever remains; rewrite-only residual (2026-10-21, loaded
 1 GiB node): ~10-22 MB KCM, ~19-24 MB kubelet.
 
@@ -60,7 +59,7 @@ Any regression preempts perf.
 
 ### Gate 2 — Measurement baseline — DONE
 Per-process RSS per component under 2-node conformance (`mayor-jnk90`) and
-real k3s (`mayor-5x0kh`). Re-measure after non-trivial perf changes.
+real k3s (`mayor-5x0kh`).
 
 ### Gate 3 — Correctness infrastructure ✓ SUBSTANTIALLY DONE
 Proto-descriptor oracle, filter-is-empty bug class fixed, observability EPIC.
@@ -78,8 +77,7 @@ excluded) under 128 MiB. Peak PSS 2026-10-15: kubelet 82-114 MiB, KCM
 ### Release gate — 20-pod burst on 1 GiB / 1 vCPU
 Releases must pass the 1 GiB / 1 vCPU no-swap burst test: WordPress +
 MariaDB, then a 20-pod burst. Lowered to 20 pods by the operator on
-2026-11-05 (from 40/50; 20 passed 4/4 on GCP, 40 and 50 passed 0/3); all
-releases so far were tested against it. Harness: `scripts/release-gate/`
+2026-11-05 (from 40/50; 20 passed 4/4 on GCP, 40 and 50 passed 0/3). Harness: `scripts/release-gate/`
 (`mayor-6uez9`); noisy hosts yield an INVALID verdict that `--confirm`
 re-runs.
 
@@ -89,12 +87,14 @@ the CHANGELOG cites (`mayor-jedol`). Evidence (`mayor-pzhtd`, two GCP runs):
 a kubepods memory cap does not make a 1 GiB / 1 vCPU node recover.
 
 The authoritative gate runs on a real 1-vCPU GCP VM (n1-custom-1-1024,
-operator 2026-11-04); Mac Lima is an optional pre-check. Cert rotation
-(`mayor-xdw6u.11`) blocks a release (operator 2026-10-20).
+operator 2026-11-04); Mac Lima is an optional pre-check. Not fully built:
+`mayor-p3ktl` is in progress and `mayor-6uez9` is open-partial. Operator
+2026-10-23: no rush to cut a release. Cert rotation (`mayor-xdw6u.11`)
+blocks a release (operator 2026-10-20).
 
 ### Gate 5 — Correctness beyond Conformance (ongoing, opportunistic)
 Representative workloads (WordPress+MariaDB, GPU-request, Argo CD) and
-upstream e2e subsets (multi-node, CSI).
+non-Conformance upstream e2e subsets (multi-node, CSI).
 
 ### Gate 6 — Packaging & distribution (local-install MVP shipped 2026-08-21)
 End-game: k3s-style one-shell-script install; settled in ADRs
@@ -117,7 +117,7 @@ awaits operator confirmation.
 
 ### Gate 7 — Migration story (STARTED)
 MVP epic `mayor-te4sn`: single-node k3s → u7s via `u7s migrate`, API-based
-export/import (UID/resourceVersion loss accepted). Decisions: `mayor-ffgal`.
+export/import (UID/resourceVersion loss accepted). Export dry-run landed. Decisions: `mayor-ffgal`.
 
 ### Gate 8 — Security (ACTIVE)
 Epic `mayor-qap3i`: audit run-1 (30 confirmed findings, 4 leads), filed
