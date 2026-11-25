@@ -280,16 +280,10 @@ fn is_storage_version_migration(group: &str, plural: &str) -> bool {
 pub async fn get_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    // Same as get_resource; status is embedded in the object. Table format is a
-    // `kubectl get <resource>` concern, not applicable to the /status subresource, so
-    // no Accept header is forwarded here.
-    get_resource(
-        State(state),
-        Path((group, version, plural, name)),
-        HeaderMap::new(),
-    )
-    .await
+    // Same as get_resource; status is embedded in the object.
+    get_resource(State(state), Path((group, version, plural, name)), headers).await
 }
 
 pub async fn put_resource_status<S: Store>(
@@ -629,14 +623,13 @@ async fn to_storage_object<S: Store>(
 pub async fn get_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    // Same as get_namespaced_resource; status is embedded in the object. Table format is a
-    // `kubectl get <resource>` concern, not applicable to the /status subresource, so
-    // no Accept header is forwarded here.
+    // Same as get_namespaced_resource; status is embedded in the object.
     get_namespaced_resource(
         State(state),
         Path((group, version, ns, plural, name)),
-        HeaderMap::new(),
+        headers,
     )
     .await
 }
@@ -1223,6 +1216,7 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            Default::default(),
         )
         .await;
         let err = match result {
@@ -1266,6 +1260,7 @@ mod tests {
                 "csinodes".into(),
                 "worker-1".into(),
             )),
+            Default::default(),
         )
         .await;
         let resp = match result {
@@ -1778,6 +1773,7 @@ mod tests {
                 "leases".into(),
                 "node-x".into(),
             )),
+            Default::default(),
         )
         .await;
         let resp = match result {
@@ -1800,6 +1796,7 @@ mod tests {
                 "leases".into(),
                 "nonexistent".into(),
             )),
+            Default::default(),
         )
         .await;
         let err = match result {

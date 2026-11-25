@@ -350,6 +350,8 @@ pub async fn list_csr<S: Store>(
     // Lookup is infallible for the built-in CSR resource type.
     let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
     let kind = meta.kind.clone();
+    let accept = accept_header(&headers);
+    let pom = super::generic::negotiate_builtin_collection(accept, query.watch, GROUP, &kind)?;
     let prefix = group_list_prefix(GROUP, PLURAL, None);
     let field_selector = FieldSelector::parse(query.field_selector.as_deref(), GROUP, PLURAL)?;
 
@@ -367,8 +369,16 @@ pub async fn list_csr<S: Store>(
             state,
             WatchConfig {
                 prefix,
-                api_version: format!("{GROUP}/{VERSION}"),
-                kind,
+                api_version: if pom {
+                    "meta.k8s.io/v1".to_string()
+                } else {
+                    format!("{GROUP}/{VERSION}")
+                },
+                kind: if pom {
+                    "PartialObjectMetadata".to_string()
+                } else {
+                    kind
+                },
                 from_revision: from_rv,
                 initial_items: initial,
                 explicit_no_initial_events: query.send_initial_events == Some(false),
@@ -376,7 +386,7 @@ pub async fn list_csr<S: Store>(
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                 username: user.username,
-                as_partial_object_metadata: false,
+                as_partial_object_metadata: pom,
                 group: GROUP.to_string(),
                 plural: PLURAL.to_string(),
                 timeout_seconds: query.timeout_seconds,
@@ -423,7 +433,6 @@ pub async fn list_csr<S: Store>(
         items
     };
 
-    let accept = accept_header(&headers);
     if super::table::wants_table(accept) {
         let continue_token = resp.continue_key.map(|key| {
             super::generic::encode_continue(&key, list_revision, &state.continue_token_key)
@@ -448,6 +457,11 @@ pub async fn list_csr<S: Store>(
         resp.remaining_count,
         &state.continue_token_key,
     );
+    let body = if pom {
+        super::generic::to_partial_object_metadata_list(body)
+    } else {
+        body
+    };
     Ok(Json(body).into_response())
 }
 
@@ -471,6 +485,8 @@ pub async fn get_csr<S: Store>(
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
+    let accept = accept_header(&headers);
+    let pom = super::generic::negotiate_builtin_object(accept, GROUP, "CertificateSigningRequest")?;
     let key = group_object_key(GROUP, PLURAL, None, &name);
     let stored = state
         .store
@@ -479,7 +495,11 @@ pub async fn get_csr<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
 
-    let accept = accept_header(&headers);
+    if pom {
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
     if super::table::wants_table(accept) {
         let obj: serde_json::Value = serde_json::from_slice(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
