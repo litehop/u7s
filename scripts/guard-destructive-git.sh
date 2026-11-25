@@ -7,7 +7,9 @@
 # the target repo is on branch `main` or is the mayor checkout. This is a
 # string-match guardrail, not a sandbox. It also refuses HEAD-moving git
 # (checkout/switch to a ref other than main, reset, rebase, cherry-pick,
-# revert, am, non-ff merge/pull) in the mayor checkout itself.
+# revert, am, non-ff merge/pull) in the mayor checkout itself, and the gh
+# commands that run those git operations internally (pr checkout, issue
+# develop --checkout, local repo sync).
 #
 # Hook input arrives as JSON on stdin: {cwd, tool_input: {command, ...}}.
 # Missing/unparseable input fails OPEN (exit 0) so a hook bug can never
@@ -216,6 +218,39 @@ is_head_moving_args() {
   esac
 }
 
+is_head_moving_gh_args() {
+  # is_head_moving_gh_args <args> -- <args> is everything after `gh`. True for
+  # gh subcommands that run git against the local checkout and move HEAD or the
+  # index: `pr checkout` (alias `co`), `issue develop -c/--checkout`, and
+  # `repo sync` with no destination repository (its default destination is the
+  # local repo; `-b/-s` take a value, so those values are not destinations).
+  local -a toks
+  local tok skip=0 npos=0
+  read -ra toks <<< "$1"
+  case "${toks[0]:-} ${toks[1]:-}" in
+    "pr checkout"|"co "*) return 0 ;;
+    "issue develop")
+      for tok in "${toks[@]:2}"; do
+        case "$tok" in -c|--checkout) return 0 ;; esac
+      done
+      return 1
+      ;;
+    "repo sync")
+      for tok in "${toks[@]:2}"; do
+        if [ "$skip" = 1 ]; then skip=0; continue; fi
+        case "$tok" in
+          -b|--branch|-s|--source) skip=1 ;;
+          -*) ;;
+          *) npos=$(( npos + 1 )) ;;
+        esac
+      done
+      [ "$npos" = 0 ]
+      return
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 BLOCK_MSG_TEMPLATE='BLOCKED: destructive git command against a protected branch/checkout.
   command: %s
   target : %s
@@ -298,6 +333,14 @@ check_command() {
     done
 
     seg=$(strip_wrappers "$seg")
+    if [[ "$seg" == gh\ * ]]; then
+      if is_head_moving_gh_args "${seg#gh }" && is_mayor_checkout "$current_dir"; then
+        # shellcheck disable=SC2059
+        printf "$HEAD_MSG_TEMPLATE" "$seg" "$current_dir" >&2
+        return 2
+      fi
+      continue
+    fi
     [[ "$seg" == git\ * ]] || continue
 
     rest="${seg#git }"

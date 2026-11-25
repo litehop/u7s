@@ -574,6 +574,59 @@ for cmd in "command -p git checkout pr-ref" "bash --norc -c 'git checkout pr-ref
 done
 
 # ---------------------------------------------------------------------------
+# 19. gh commands that run git internally. A reviewer's `gh pr checkout 2262
+#     --detach` in the mayor checkout detached its HEAD; the guard only saw `gh`.
+# ---------------------------------------------------------------------------
+declare -a GH_BLOCKED=(
+  "gh pr checkout 2262"
+  "gh pr checkout 2262 --detach"
+  "gh pr checkout 2262 -b review --force"
+  "gh co 2262"
+  "gh issue develop 5 --checkout"
+  "gh issue develop 5 -c"
+  "gh repo sync"
+  "gh repo sync --force"
+  "gh repo sync -b v1"
+  "gh pr checkout 1; ls"
+  "cd $MAIN && gh pr checkout 1"
+  "ls && gh pr checkout 1 --detach"
+  "env FOO=1 gh pr checkout 1"
+  "bash -c 'gh pr checkout 1'"
+)
+for cmd in "${GH_BLOCKED[@]}"; do
+  assert "'$cmd' in the mayor checkout is refused -- reviewer checkout must not detach the mayor's HEAD" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "$cmd" "$MAIN")"
+done
+assert "'gh pr checkout 1' from a worker cwd after 'cd <mayor>' is refused -- cd retargets the command at the mayor checkout" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" blocked "cd $MAIN && gh pr checkout 1" "$WORKER")"
+assert "'gh pr checkout' message carries the scratch-worktree hint -- the blocked reviewer needs the supported alternative" \
+  "$(grep -q 'git worktree add temp/review-scratch' "$ERR_FILE" && grep -q 'gh pr diff' "$ERR_FILE" && echo 1 || echo 0)"
+
+declare -a GH_ALLOWED=(
+  "gh pr diff 2262"
+  "gh pr view 2262"
+  "gh pr list"
+  "gh api repos/o/r/pulls/1"
+  "gh pr merge 1 --merge"
+  "gh issue develop 5 --list"
+  "gh repo sync owner/fork"
+  "gh repo sync owner/repo --source o2/r2"
+  "gh repo sync -b v1 owner/fork"
+)
+for cmd in "${GH_ALLOWED[@]}"; do
+  assert "'$cmd' in the mayor checkout is allowed -- it does not move the local HEAD or index" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$MAIN")"
+done
+for cmd in "gh pr checkout 2262 --detach" "gh co 2262" "gh repo sync"; do
+  assert "'$cmd' inside a worker worktree is allowed -- reviewers and workers legitimately check out PRs in scratch/worker worktrees" \
+    "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "$cmd" "$WORKER")"
+done
+SCRATCH="$MAIN/temp/review-scratch/pr"
+git -C "$MAIN" worktree add -q --detach "$SCRATCH" main
+assert "'gh pr checkout 2262 --detach' inside temp/review-scratch is allowed -- the prescribed place to check out PR code" \
+  "$(CLAUDE_PROJECT_DIR="$MAIN" allowed "gh pr checkout 2262 --detach" "$SCRATCH")"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
