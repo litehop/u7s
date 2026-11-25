@@ -12,6 +12,7 @@ on:
     paths:
       - Cargo.lock
       - '**/Cargo.toml'
+      - '!spikes/**'
       - rust-toolchain.toml
       - .cargo/config.toml
       - .github/workflows/test.yaml
