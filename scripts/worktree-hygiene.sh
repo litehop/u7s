@@ -798,11 +798,12 @@ step_f_orphaned_origin_branches() {
 }
 
 # ---------------------------------------------------------------------------
-# STEP G -- fix-round worktrees on non-worker branch names.
+# STEP G -- finished worktrees, whatever their branch name.
 #
 # A fix-round worker checks out an existing PR branch as a local branch such
-# as fix-<PR>, so STEP C (worker/agent-* names only) never considers its
-# worktree and STEP D skips a checked-out branch. Reaped here once the
+# as fix-<PR>, and STEP C/D skip any branch that is checked out or has a
+# worktree dir -- which includes every worker/agent-<id> branch whose
+# worktree was never removed. Reaped here once the
 # worker is gone: agent-id not live, worktree clean, HEAD already reachable
 # from a remote ref (nothing unpushed to lose), and no open PR matching the
 # local branch name, the upstream branch, or HEAD's sha (the local name of a
@@ -818,7 +819,7 @@ step_g_fix_round_worktrees() {
     agent_id_is_live "$agent_id" "$LIVE_AGENTS" && continue
     branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
     case "$branch" in
-      ""|HEAD|worker/agent-*) continue ;;
+      ""|HEAD) continue ;;
     esac
     has_open_pr "$branch" "$OPEN_PR_BRANCHES" && continue
     has_open_pr "$(git -C "$path" rev-parse HEAD 2>/dev/null)" "$OPEN_PR_OIDS" && continue
