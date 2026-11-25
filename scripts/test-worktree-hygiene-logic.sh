@@ -1107,6 +1107,27 @@ assert "STEP G keeps going after a failed branch delete -- one undeletable branc
 assert "...and returns nonzero so the failed branch delete counts as an anomaly" \
   "$([ "$G_RC" -ne 0 ] && echo 1 || echo 0)"
 
+# A finished worker's worker/agent-<id> branch stays checked out in its
+# worktree, so STEP C skips it; STEP G must reap it or it lingers forever.
+for id in wdone wlive wdirty wunpushed; do
+  git -C "$G" branch "worker/agent-$id" main
+  git -C "$G" worktree add -q "$G/ai/worktrees/agent-$id" "worker/agent-$id"
+done
+printf 'wip\n' > "$G/ai/worktrees/agent-wdirty/wip.txt"
+git -C "$G/ai/worktrees/agent-wdirty" add wip.txt
+git -C "$G/ai/worktrees/agent-wunpushed" config user.email test@example.com
+git -C "$G/ai/worktrees/agent-wunpushed" config user.name Test
+git -C "$G/ai/worktrees/agent-wunpushed" commit -q --allow-empty -m "local only"
+LIVE_AGENTS="wlive" WORKTREE_HYGIENE_REPO_ROOT="$G" call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G reaps a finished worker/agent-<id> worktree (clean, nothing unpushed, not live) -- otherwise every completed worker leaves a worktree and branch behind" \
+  "$([ ! -d "$G/ai/worktrees/agent-wdone" ] && ! git -C "$G" rev-parse --verify -q refs/heads/worker/agent-wdone >/dev/null && echo 1 || echo 0)"
+assert "STEP G keeps a worker/agent-<id> worktree whose id is live -- reaping pulls the checkout from under a running worker" \
+  "$([ -d "$G/ai/worktrees/agent-wlive" ] && echo 1 || echo 0)"
+assert "STEP G keeps a dirty worker/agent-<id> worktree -- uncommitted work exists nowhere else" \
+  "$([ -d "$G/ai/worktrees/agent-wdirty" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worker/agent-<id> worktree with unpushed commits -- reaping destroys unshipped work" \
+  "$([ -d "$G/ai/worktrees/agent-wunpushed" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # STEP H: main's audit status. A red main audit is otherwise invisible
 # (the audit is non-blocking for PRs), so the verdict and exit code are what
