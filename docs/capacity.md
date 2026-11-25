@@ -64,3 +64,22 @@ headroom and the largest passing burst. Only the 20-pod burst gates a release;
 the rest is documentation. A Lima artefact is labelled
 `provider=lima (non-authoritative)`. `--memory 2` (Lima) measures the 2 GiB row.
 Release timing: [releasing.md](releasing.md).
+
+### KCM memory A/B (local)
+
+```bash
+scripts/bench/kcm-mem-ab.sh --vm <vm> --port <port> --kubelet-port <port>
+```
+
+Compares the shipped Go KCM (R) with the same KCM minus 11 candidate controllers (T, applied by
+`scripts/conformance/kcm-mode.sh` as a systemd drop-in; install.sh is untouched). Runs R, T, R, T, R, T on
+one VM, each from a fresh `install.sh`, and records `Pss_Anon` of the KCM and apiserver processes at an idle
+and a WordPress + MariaDB stage. Writes `docs/benchmarks/<date>-<sha8>-lima-kcm-mem/` with one `kcm-mem.json`
+per run plus `summary.json` and `summary.md` (medians, and the Phase 0 verdict `median(R) - median(T) >= 5` MiB
+on the KCM process at every stage). Lima only, non-authoritative, not part of any release gate. The driver
+restores mode R on exit (including INT/TERM), and install teardown removes `u7s-kcm.service.d`.
+
+The checked-in run `2026-11-25-64b81227-lima-kcm-mem` is **exploratory and non-authoritative** (local Lima,
+n=3 per mode). T is the unvalidated 11-controller trim and has NOT passed conformance (mayor-rh8y3.3). The
+tree was dirty (`git_dirty=1`) and the stamped SHA differs from the code that ran: two fixes were made after
+the run, a lint fix (`head -1` to `sed -n 1p`) and diff rounding.

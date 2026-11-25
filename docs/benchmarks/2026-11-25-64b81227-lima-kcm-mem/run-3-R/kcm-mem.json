@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "kcm_mode": "R",
+  "ported_controllers": [],
+  "kcm_controllers": "--controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller",
+  "kcm_restarts": 0,
+  "git_sha": "64b812275854527a49b4eea1d98bc5a60ddeea56",
+  "git_dirty": true,
+  "date": "2026-11-25",
+  "vm": {
+    "name": "lima-node-3",
+    "kernel": "7.0.0-44-generic",
+    "vcpus": 8,
+    "mem_total_kb": 8103492,
+    "arch": "aarch64"
+  },
+  "host": {
+    "os": "Darwin 27.0.0",
+    "ncpu": 12
+  },
+  "stages": {
+    "idle": {
+      "kcm_mib": 42.32,
+      "apiserver_mib": 20.31,
+      "samples_mib": {
+        "kcm": [
+          41.07,
+          42.32,
+          43.00
+        ],
+        "apiserver": [
+          20.31,
+          20.31,
+          20.31
+        ]
+      }
+    },
+    "wordpress": {
+      "kcm_mib": 47.07,
+      "apiserver_mib": 20.91,
+      "samples_mib": {
+        "kcm": [
+          47.05,
+          47.07,
+          47.08
+        ],
+        "apiserver": [
+          20.91,
+          20.91,
+          20.93
+        ]
+      }
+    }
+  }
+}
