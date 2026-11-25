@@ -15940,14 +15940,17 @@ mod tests {
 
     /// A CRD rule is evaluated on every write, so the deepest rule compilation accepts must
     /// run to completion on the evaluation thread: "created fine, aborts the apiserver on
-    /// the first write" is the failure. The rule is 249 `+ 1` terms, one under the
-    /// 250-level cap, and a thread's default stack in a debug build cannot hold it.
+    /// the first write" is the failure. The rule nests exactly to the
+    /// cap, and a thread's default stack in a debug build cannot hold it.
     #[test]
     fn deepest_accepted_crd_rule_evaluates_on_the_budgeted_thread() {
         static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
-        let rule = format!("1{} > 0", "+1".repeat(248));
+        let rule = format!(
+            "1{} > 0",
+            "+1".repeat(crate::cel_runtime::MAX_RECURSION_DEPTH - 2)
+        );
         let program = std::sync::Arc::new(
-            crate::cel_runtime::compile_program(&rule).expect("one under the cap compiles"),
+            crate::cel_runtime::compile_program(&rule).expect("a rule at the cap compiles"),
         );
         let result = execute_cel_with_budget(
             &program,
@@ -16055,7 +16058,7 @@ mod tests {
                     .find(|(_, rule, _)| crate::cel_runtime::compile_program(rule).is_ok())
                     .expect(shape);
                 assert!(
-                    depth >= 80,
+                    depth >= crate::cel_runtime::MAX_RECURSION_DEPTH / 4,
                     "{shape}: accepted only to {depth}, not deep enough to matter"
                 );
 

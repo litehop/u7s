@@ -31,7 +31,7 @@ pub(crate) use parse::{check_syntax_with_stack, MAX_RECURSION_DEPTH, PARSE_COUNT
 pub(crate) use value::Value;
 
 /// Stack for a dedicated thread that runs a CRD rule's evaluation or cost replay, which
-/// recurse once per AST level (at most the 250 compilation accepts) in frames that are
+/// recurse once per AST level (at most the 96 compilation accepts) in frames that are
 /// several KiB in a debug build.
 pub(crate) const EVAL_STACK_SIZE: usize = 32 << 20;
 

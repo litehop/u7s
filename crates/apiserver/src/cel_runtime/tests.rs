@@ -583,54 +583,87 @@ fn nesting_shapes(n: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A rule nested past cel-go's `MaxRecursionDepth` must be rejected at compile time with
-/// upstream's text. Without the bound it is accepted, and evaluating or dropping it
-/// recurses once per level on a request thread's 512 KiB stack: the process aborts.
+const TOO_DEEP: &str = "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded";
+
+/// A rule nested past the limit must be rejected at compile time with upstream's text, on
+/// both the policy and the CRD path. Without the bound it is accepted, and evaluating or
+/// dropping it recurses once per level on a request thread's 512 KiB stack: the process
+/// aborts.
 #[test]
-fn expression_nesting_past_upstream_limit_is_rejected_with_upstream_message() {
+fn expression_nesting_past_the_limit_is_rejected_with_upstream_message() {
     for (shape, expr) in nesting_shapes(1000) {
-        let err = super::parse::parse(&expr).expect_err(shape);
-        assert!(
-            err.contains("max recursion depth exceeded") || err.contains("Recursion limit"),
-            "{shape}: {err}"
+        assert_eq!(
+            super::parse::parse(&expr).expect_err(shape),
+            TOO_DEEP,
+            "{shape}"
         );
-        let err = super::compile_program(&expr).expect_err(shape);
-        assert!(
-            err.contains("max recursion depth exceeded") || err.contains("Recursion limit"),
-            "{shape} (CRD path): {err}"
+        assert_eq!(
+            super::compile_program(&expr).expect_err(shape),
+            TOO_DEEP,
+            "{shape} (CRD path)"
         );
     }
-    let err =
-        super::compile_program(&format!("'x'{}", ".lowerAscii()".repeat(300))).expect_err("depth");
-    assert_eq!(
-        err,
-        "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded"
-    );
+}
+
+/// The `cel` parser's own cap reports "Recursion limit of 96 exceeded" for operator and
+/// member chains. A user who writes 97 levels must still see upstream's message, so the
+/// library's error has to be mapped on both paths; leaking it would tell kubectl users
+/// about a Rust crate instead of the CEL limit they hit.
+#[test]
+fn chains_one_level_past_the_limit_get_upstream_message_not_the_librarys() {
+    let limit = super::parse::MAX_RECURSION_DEPTH;
+    let shapes = |levels: usize| {
+        [
+            ("member chain", format!("a{}", ".b".repeat(levels - 1))),
+            ("operator chain", format!("x{}", " + x".repeat(levels - 1))),
+        ]
+    };
+    for (shape, over) in shapes(limit + 1) {
+        assert_eq!(
+            super::parse::parse(&over).expect_err(shape),
+            TOO_DEEP,
+            "{shape}"
+        );
+        assert_eq!(
+            super::compile_program(&over).expect_err(shape),
+            TOO_DEEP,
+            "{shape} (CRD path)"
+        );
+    }
+    for (shape, at) in shapes(limit) {
+        assert!(
+            super::parse::parse(&at).is_ok(),
+            "{shape} at the limit (policy)"
+        );
+        assert!(
+            super::compile_program(&at).is_ok(),
+            "{shape} at the limit (CRD)"
+        );
+    }
 }
 
 /// Policies evaluate under a stack budget a 250-level expression exceeds in release builds
 /// (call chain 205, index chain 188); accepting them would store a policy that denies all
-/// matching traffic under `failurePolicy: Fail`. The limit is a policy-only divergence from
-/// cel-go's 250, which CRD rules (big-stack evaluation) keep.
+/// matching traffic under `failurePolicy: Fail`. CRD rules share the limit because the
+/// `cel` parser caps `Program::compile` at the same depth.
 #[test]
-fn policy_expressions_are_rejected_one_level_past_the_policy_limit() {
-    let limit = super::parse::MAX_POLICY_RECURSION_DEPTH;
-    let message = "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded";
+fn expressions_are_rejected_one_level_past_the_limit_on_both_paths() {
+    let limit = super::parse::MAX_RECURSION_DEPTH;
     // a call chain of n calls is n + 1 levels deep: `'x'` is the innermost
     let at = format!("'x'{}", ".lowerAscii()".repeat(limit - 1));
     assert!(super::parse::parse(&at).is_ok(), "limit itself must pass");
+    assert!(
+        super::compile_program(&at).is_ok(),
+        "limit itself must pass (CRD)"
+    );
     let over = format!("'x'{}", ".lowerAscii()".repeat(limit));
-    assert_eq!(super::parse::parse(&over).expect_err("over"), message);
+    assert_eq!(super::parse::parse(&over).expect_err("over"), TOO_DEEP);
     assert_eq!(
         super::check_syntax(&over, &[]).expect_err("over"),
-        message,
+        TOO_DEEP,
         "the create-time check must reject what evaluation would refuse"
     );
-    let crd_deep = format!("'x'{}", ".lowerAscii()".repeat(limit));
-    assert!(
-        super::compile_program(&crd_deep).is_ok(),
-        "CRD rules keep cel-go's 250 limit"
-    );
+    assert_eq!(super::compile_program(&over).expect_err("over"), TOO_DEEP);
 }
 
 /// cel-go counts code points, not bytes: a 100k-character rule of 3-byte characters is
@@ -655,7 +688,7 @@ fn expression_size_limit_counts_code_points_like_upstream() {
 #[test]
 fn deepest_accepted_expression_evaluates_on_a_production_sized_stack() {
     for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
-        let deepest = (1..=super::parse::MAX_POLICY_RECURSION_DEPTH)
+        let deepest = (1..=super::parse::MAX_RECURSION_DEPTH)
             .rev()
             .map(|n| nesting_shapes(n).swap_remove(i).1)
             .find(|e| super::parse::parse(e).is_ok())
@@ -741,7 +774,7 @@ async fn waiting_for_a_busy_lane_does_not_block_the_runtime() {
 fn every_depth_the_compiler_accepts_evaluates_in_release() {
     let mut failures = Vec::new();
     for (i, (shape, _)) in nesting_shapes(0).into_iter().enumerate() {
-        for n in 1..=super::parse::MAX_POLICY_RECURSION_DEPTH + 1 {
+        for n in 1..=super::parse::MAX_RECURSION_DEPTH + 1 {
             let expr = nesting_shapes(n).swap_remove(i).1;
             if super::parse::parse(&expr).is_err() {
                 continue;
