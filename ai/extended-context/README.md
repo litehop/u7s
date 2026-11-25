@@ -20,6 +20,7 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 | [cert-rotation-and-release-gate-state.md](cert-rotation-and-release-gate-state.md) | Release-gate state as of 2026-11-04 (main NOT release-ready: n1-custom-1-1024 gate FAILs 0/3 at 40 and 50 pods from page-cache thrash; gate shape decision, kutwm cause, open #2039/headroom beads, harness, operator rules), cert rotation status, `w898x` memory bound, working rules |
 | [networking-l7-ingress-state.md](networking-l7-ingress-state.md) | Ingress/TLS initiative as of 2026-10-30: Traefik cleartext landed, cert-manager TLS next (1 GiB wedge first), CRD bugs, undecided phases |
 | [dual-stack-state.md](dual-stack-state.md) | Dual-stack/IPv6 epic `mayor-8w6at` as of 2026-11-03: dual-stack verified on GCP (v0.4.3-snapshot.2), what made it pass, GCP/Lima harness notes, open beads (IPv6-only next) |
+| [kcm-rust-port-state.md](kcm-rust-port-state.md) | KCM Rust port initiative as of 2026-11-25: phase plan and per-controller ordering, memory gates, sonobuoy verification protocol, open items with beads, kubelet status (undecided). Decision: `docs/decisions/kcm-rust-port-local-first-separate-process.md` |
 | [e2e-focus-conformance-image-pull-postmortem-2026-08-25.md](e2e-focus-conformance-image-pull-postmortem-2026-08-25.md) | Postmortem: `e2e-focus.yaml` CI timeouts caused by CDN edge-cache misses on infrequently-pulled conformance-image tags, not a code regression |
 
 ## Frontmatter convention
