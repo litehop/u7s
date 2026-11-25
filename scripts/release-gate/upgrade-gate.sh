@@ -79,8 +79,9 @@ mkdir -p "$OUT"
 VM="u7s-upg-${STAMP:4:4}${STAMP:9:6}-$(rg_nonce)"
 VMS=""; PENDING=0
 cleanup() {
-  # shellcheck disable=SC2046
-  kill $(jobs -p) 2>/dev/null
+  # The ssh/limactl client sits below the backgrounded shell function, so kill whole trees.
+  local jobpids; jobpids="$(jobs -p | tr '\n' ' ')"
+  [ -z "${jobpids// /}" ] || rg_kill_tree "$jobpids"
   if [ "$PENDING" = 1 ]; then
     vm_copy_from "$VM" /var/tmp/rg/out "$OUT/out" 2>/dev/null || true
   fi
@@ -91,6 +92,11 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Runs a VM operation as a background job and waits for it, keeping its exit status: bash defers
+# a trap until a foreground command ends, so a signal during a long limactl start / gcloud call
+# would otherwise leave the VM running (and billing) until that call returned.
+vm_bg() { "$@" & local bg_pid=$!; wait "$bg_pid"; }
 
 STAGE="$OUT/stage"; mkdir -p "$STAGE"
 COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
@@ -130,13 +136,13 @@ printf 'PREV_INSTALL=%q\nCAND_INSTALL=%q\nCAND_EXPECT=%q\n' "$PREV_INSTALL" "$CA
 echo "==== upgrade $FROM -> ${RELEASE:-$CAND_EXPECT} on $BACKEND: VM $VM ===="
 VMS="$VM"
 status=""
-if vm_create "$VM" "$OUT"; then
-  vm_trim "$VM" >"$OUT/trim.log" 2>&1 || echo "warning: could not trim $VM (see $OUT/trim.log)" >&2
-  vm_shell "$VM" sudo install -d -m 0777 /var/tmp/rg
-  vm_copy_to "$VM" /var/tmp/rg "$STAGE"/* || echo "warning: could not copy the gate scripts to $VM" >&2
+if vm_bg vm_create "$VM" "$OUT"; then
+  vm_bg vm_trim "$VM" >"$OUT/trim.log" 2>&1 || echo "warning: could not trim $VM (see $OUT/trim.log)" >&2
+  vm_bg vm_shell "$VM" sudo install -d -m 0777 /var/tmp/rg
+  vm_bg vm_copy_to "$VM" /var/tmp/rg "$STAGE"/* || echo "warning: could not copy the gate scripts to $VM" >&2
   if [ "$BACKEND" = gcp ]; then
     for pair in "prev-install.sh|$FROM" "cand-install.sh|$RELEASE"; do
-      vm_shell "$VM" curl -fsSL "https://u7s.dekiru.tech/${pair#*|}/install.sh" -o "/var/tmp/rg/${pair%%|*}" \
+      vm_bg vm_shell "$VM" curl -fsSL "https://u7s.dekiru.tech/${pair#*|}/install.sh" -o "/var/tmp/rg/${pair%%|*}" \
         || echo "warning: could not fetch install.sh for ${pair#*|} from the mirror" >&2
     done
   fi
