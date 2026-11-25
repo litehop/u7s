@@ -589,6 +589,8 @@ const TOO_DEEP: &str = "compilation failed: ERROR: <input>:-1:0: max recursion d
 /// both the policy and the CRD path. Without the bound it is accepted, and evaluating or
 /// dropping it recurses once per level on a request thread's 512 KiB stack: the process
 /// aborts.
+// At 1000 levels every shape trips the `cel` parser's own recursion cap before our AST
+// check runs, so this pins the library-error-to-upstream-text mapping.
 #[test]
 fn expression_nesting_past_the_limit_is_rejected_with_upstream_message() {
     for (shape, expr) in nesting_shapes(1000) {
@@ -642,7 +644,7 @@ fn chains_one_level_past_the_limit_get_upstream_message_not_the_librarys() {
     }
 }
 
-/// Policies evaluate under a stack budget a 250-level expression exceeds in release builds
+/// Policies evaluate under a stack budget a 250-level expression (cel-go's cap) exceeds in release builds
 /// (call chain 205, index chain 188); accepting them would store a policy that denies all
 /// matching traffic under `failurePolicy: Fail`. CRD rules share the limit because the
 /// `cel` parser caps `Program::compile` at the same depth.

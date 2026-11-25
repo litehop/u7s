@@ -1856,7 +1856,7 @@ fn run_within_budget<T: Send + 'static>(
     let (tx, rx) = std::sync::mpsc::channel();
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
     // The interpreter and cost replay recurse once per level of the rule's AST, which
-    // compilation bounds at cel-go's 250 levels; the default 2 MiB thread stack is not
+    // compilation bounds at `MAX_RECURSION_DEPTH` levels; the default 2 MiB thread stack is not
     // sized for that, so size it explicitly.
     let guard_key = crd.to_string();
     let thread_state = std::sync::Arc::clone(&state);
@@ -16057,9 +16057,24 @@ mod tests {
                     .map(at)
                     .find(|(_, rule, _)| crate::cel_runtime::compile_program(rule).is_ok())
                     .expect(shape);
-                assert!(
-                    depth >= crate::cel_runtime::MAX_RECURSION_DEPTH / 4,
-                    "{shape}: accepted only to {depth}, not deep enough to matter"
+                // Exact nestings that fit under the limit: chains cost one level per
+                // nesting, comprehensions two to three. A drop of even one nesting means
+                // legitimate rules cel-go accepts start being rejected at create.
+                let (plain, with_old_self) = match shape {
+                    "sum chain" | "call chain" | "index chain" | "ternary" | "list" | "map" => {
+                        (92, 91)
+                    }
+                    "in chain" => (90, 89),
+                    "parens" => (94, 94),
+                    "all" => (46, 45),
+                    "exists" => (45, 45),
+                    "map comprehension" => (30, 30),
+                    other => panic!("no depth floor for shape {other}"),
+                };
+                assert_eq!(
+                    depth,
+                    if transition { with_old_self } else { plain },
+                    "{shape} (oldSelf rule {transition}): deepest accepted nesting changed"
                 );
 
                 let schemas = [

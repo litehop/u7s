@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-11-25
+**Supersedes:** [cel-policy-recursion-depth-128.md](cel-policy-recursion-depth-128.md)
 
 ## Context
 
