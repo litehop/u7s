@@ -1,0 +1,6 @@
+4416
+# N = ceil(1.25 * B_chosen) rounded up to a multiple of 64 bytes/pod.
+# B_chosen = 3508: option C (hyper client + narrow informer), median of 3 runs of
+# Pss_Anon delta / 10011 pods after list+watch sync (includes 1003 ReplicaSets and
+# allocator overhead). 1.25 * 3508 = 4385 -> 69 * 64 = 4416.
+# Allocator-only live bytes were 1845/pod.
