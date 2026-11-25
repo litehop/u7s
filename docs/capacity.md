@@ -5,9 +5,14 @@ stamped benchmarks (date, git SHA, VM shape) under `docs/benchmarks/`, one per
 minor release, cited from the [CHANGELOG](../CHANGELOG.md). u7s is alpha: the
 envelope below is what is measured, not a promise beyond it.
 
-**Latest stamped benchmark:** none committed yet. The first one is produced by
-`scripts/release-gate/capacity-benchmark.sh` ([how to run it](#running-the-benchmark)).
-Until a release cites one, treat every figure here as indicative.
+**Latest stamped benchmark:**
+[2026-11-25 @ d9e45502 (v0.4.7), GCP n1-custom-1-1024](benchmarks/2026-11-25-d9e45502-gcp/benchmark.md):
+idle PSS 361 MiB, 445 MiB `MemAvailable` idle, and bursts of 20 to 60 pods
+all Ready within 6 to 20 s with WordPress and MariaDB resident (largest pass
+60, the top of the ramp; the lowest `MemAvailable` was 107 MiB at 60 pods).
+It is a single run (n=1) of the published v0.4.7 release, not of current main.
+Produced by `scripts/release-gate/capacity-benchmark.sh`
+([how to run it](#running-the-benchmark)).
 
 ## The envelope
 
