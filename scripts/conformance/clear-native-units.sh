@@ -20,7 +20,7 @@ for u in $units; do
   systemctl disable --now "$u" 2>/dev/null || true
   rm -f "$unit_dir/$u"
 done
-rm -rf "$unit_dir/u7s-apiserver.service.d"
+rm -rf "$unit_dir/u7s-apiserver.service.d" "$unit_dir/u7s-kcm.service.d"
 if grep -qs 'u7s-apiserver.service' "$unit_dir/kubelet.service"; then
   found="$found kubelet.service"
   systemctl stop kubelet.service 2>/dev/null || true

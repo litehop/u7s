@@ -56,6 +56,15 @@ kcm_mode_apply() {
   limactl shell "$vm" sudo systemctl show -p ExecStart u7s-kcm.service | grep -oE -- '--controllers=[^ ;]+' | sed -n 1p
 }
 
+# Restores mode R on shell exit, including INT/TERM, so a driver that last ran T does not leave
+# the trimmed drop-in on the VM for the next install.sh to boot.
+kcm_mode_revert_on_exit() {
+  KCM_REVERT_VM="$1"
+  trap 'trap - EXIT; kcm_mode_apply "$KCM_REVERT_VM" R >/dev/null || echo "kcm-mode: revert to R failed on $KCM_REVERT_VM" >&2' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   VM=""; MODE=""
   while [ $# -gt 0 ]; do

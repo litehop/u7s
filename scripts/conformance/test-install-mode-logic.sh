@@ -303,6 +303,11 @@ printf '[Service]\nExecStart=/usr/bin/kubelet\n' > "$UD/kubelet.service"
 U7S_UNIT_DIR="$UD" STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/clear-native-units.sh" >/dev/null 2>&1
 ! grep -qF "kubelet.service" "$CALLS" && ok "a kubelet.service that does not require u7s-apiserver is left alone" \
   || bad "bring-up removed a kubelet.service that is not install.sh's"
+: > "$CALLS"
+U7S_UNIT_DIR="$UD" STUB_CALLS="$CALLS" PATH="$STUBS:$PATH" bash "$REPO/scripts/conformance/clear-native-units.sh" >/dev/null 2>&1
+grep -qF "$UD/u7s-kcm.service.d" "$CALLS" \
+  && ok "teardown removes the u7s-kcm.service.d drop-in dir" \
+  || bad "teardown leaves u7s-kcm.service.d, so the next install.sh boots a KCM left trimmed by the A/B harness"
 grep -q 'clear-native-units.sh' "$REPO/scripts/conformance/lima-start.sh" \
   && ok "lima-start.sh runs the leftover-unit clearing" || bad "lima-start.sh never clears leftover native units, so a post-install slot breaks the rig bring-up"
 grep -q 'clear-native-units.sh' "$REPO/scripts/conformance/install-teardown.sh" \

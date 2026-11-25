@@ -34,6 +34,8 @@ done
 
 # shellcheck source=scripts/bench/kcm-mem-lib.sh
 . "$HERE/kcm-mem-lib.sh"
+# shellcheck source=scripts/conformance/kcm-mode.sh
+. "$ROOT/scripts/conformance/kcm-mode.sh"
 
 sha="$(git -C "$ROOT" rev-parse HEAD)"
 DIR="$OUT_ROOT/$(date -u +%Y-%m-%d)-${sha:0:8}-lima-kcm-mem"
@@ -44,6 +46,7 @@ rm -rf "$RAW"; mkdir -p "$RAW"
 ARTIFACTS="$WORKDIR/install-artifacts"
 bash "$ROOT/scripts/release-gate/build-arm64-tarball.sh" "$ARTIFACTS"
 
+kcm_mode_revert_on_exit "$VM"
 for i in $(seq 1 "$RUNS"); do
   for mode in R T; do
     echo "==== run $i/$RUNS mode $mode ===="

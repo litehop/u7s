@@ -81,5 +81,27 @@ check "T excludes HPA and TTL, the controllers the trim exists to drop" "2" \
 printf '%s\n' "$golden" | kcm_mode_dropin X >/dev/null 2>&1
 check "an unknown mode is rejected" "2" "$?"
 
-echo "kcm-mem logic: $PASS passed, $FAIL failed"
+# Exit-time revert: a fake VM whose drop-in is a file under $T. The stubbed limactl maps the
+# drop-in path into $T and ignores everything else (systemctl).
+FAKE_VM="$T/vm"; mkdir -p "$FAKE_VM"
+kcm_revert_probe() { # signal|exit
+  rm -rf "$FAKE_VM"; mkdir -p "$FAKE_VM"
+  (
+    limactl() { shift 2; [ "$1" = sudo ] && shift; [ "$1" = rm ] && rm -f "$FAKE_VM/dropin"; return 0; }
+    KCM_DROPIN=/x
+    kcm_mode_revert_on_exit fakevm
+    : > "$FAKE_VM/dropin"
+    [ "$1" = signal ] && kill -TERM $BASHPID
+    exit 0
+  ) 2>/dev/null
+  [ -e "$FAKE_VM/dropin" ] && echo present || echo absent
+}
+check "an A/B run that ends normally leaves no KCM drop-in (mode R), so the next install.sh boots the shipped KCM" \
+  absent "$(kcm_revert_probe exit)"
+check "an A/B run killed by TERM leaves no KCM drop-in (mode R), so an interrupted run cannot leak the trim" \
+  absent "$(kcm_revert_probe signal)"
+grep -q '^kcm_mode_revert_on_exit "\$VM"$' "$REPO/scripts/bench/kcm-mem-ab.sh"
+check "kcm-mem-ab.sh installs the revert before its first run" "0" "$?"
+
+echo "kcm-mem logic:$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
