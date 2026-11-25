@@ -151,7 +151,7 @@ pub(crate) struct RingShard {
     channels: std::sync::Mutex<Channels>,
     /// Flipped to `true` when the shard is torn down because its resource type no longer exists,
     /// so every attached stream ends and its client relists. Channel closure cannot signal this:
-    /// each stream's `ShardWatcherGuard` keeps the shard, and so `tx`, alive.
+    /// each stream's `ShardWatcherGuard` keeps the shard, and so its channels, alive.
     closed: tokio::sync::watch::Sender<bool>,
 }
 
@@ -9198,6 +9198,134 @@ mod tests {
         assert!(
             shard.scoped_sender(ns_prefix).is_none(),
             "the namespace channel must be freed as soon as its last watcher drops"
+        );
+    }
+
+    /// Open one watch per namespace (a distinct sub-channel each), publishing between opens.
+    /// Each watcher must see its own namespace's event first.
+    async fn open_namespace_watches(
+        store: &SqliteStore,
+        n: usize,
+    ) -> Vec<futures_util::stream::BoxStream<'static, WatchEvent>> {
+        use futures_util::StreamExt;
+        let mut streams = Vec::with_capacity(n);
+        for i in 0..n {
+            streams.push(
+                store
+                    .watch(&format!("/registry/pods/ns-{i}/"), 0)
+                    .await
+                    .expect("watch")
+                    .boxed(),
+            );
+            store
+                .put(
+                    &format!("/registry/pods/ns-{i}/p"),
+                    scoped_value("Pod", "p", Some(&format!("ns-{i}"))),
+                    None,
+                )
+                .await
+                .expect("put");
+        }
+        for (i, stream) in streams.iter_mut().enumerate() {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                    Ok(Some(WatchEvent::Added(obj))) => {
+                        assert_eq!(
+                            obj.key,
+                            format!("/registry/pods/ns-{i}/p"),
+                            "a namespace watcher must receive its own namespace's event first"
+                        );
+                        break;
+                    }
+                    Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                    other => panic!("watcher {i} got no event: {other:?}"),
+                }
+            }
+        }
+        streams
+    }
+
+    /// A long-lived apiserver on a 1 GiB node sees namespaces come and go; every idle
+    /// namespace watch channel left behind is a leaked 1024-slot buffer.
+    #[tokio::test]
+    async fn idle_namespace_channels_are_all_freed_after_many_namespace_watches() {
+        const N: usize = 1000;
+        let store = SqliteStore::new(":memory:").expect("store");
+        let all = store.watch("/registry/pods/", 0).await.expect("watch all");
+        let streams = open_namespace_watches(&store, N).await;
+        let shard = store.shard_for_test("/registry/pods/p", None);
+        assert_eq!(
+            shard.channels.lock().unwrap().scoped.len(),
+            N,
+            "each namespace watch must have its own sub-channel while open"
+        );
+
+        drop(streams);
+
+        assert!(
+            shard.channels.lock().unwrap().scoped.is_empty(),
+            "idle namespace channels must be freed or a long-lived apiserver on a 1 GiB node \
+             leaks per-namespace buffers"
+        );
+        drop(all);
+        assert!(shard.root_sender().is_none());
+    }
+
+    /// The whole-shard channel is allocated by the first whole-shard watcher; once the last
+    /// leaves it must go too, or every watched resource type keeps a 1024-slot buffer forever.
+    #[tokio::test]
+    async fn root_channel_is_freed_when_last_whole_shard_watcher_drops() {
+        let store = SqliteStore::new(":memory:").expect("store");
+        let first = store.watch("/registry/pods/", 0).await.expect("watch");
+        let second = store.watch("/registry/pods/", 0).await.expect("watch");
+        store
+            .put(
+                "/registry/pods/ns/p",
+                scoped_value("Pod", "p", Some("ns")),
+                None,
+            )
+            .await
+            .expect("put");
+        let shard = store.shard_for_test("/registry/pods/p", None);
+        assert!(shard.root_sender().is_some());
+
+        drop(first);
+        assert!(
+            shard.root_sender().is_some(),
+            "one whole-shard watcher is still attached; the root channel must survive"
+        );
+        drop(second);
+        assert!(
+            shard.root_sender().is_none(),
+            "idle root channel must be freed or each watched type pins a buffer on a 1 GiB node"
+        );
+    }
+
+    /// Namespace watchers and whole-shard watchers hold independent channels: pruning one kind
+    /// must not free (and so silently deafen) the other.
+    #[tokio::test]
+    async fn pruning_namespace_channels_leaves_root_until_last_whole_shard_watcher_drops() {
+        const N: usize = 50;
+        let store = SqliteStore::new(":memory:").expect("store");
+        let all = store.watch("/registry/pods/", 0).await.expect("watch all");
+        let streams = open_namespace_watches(&store, N).await;
+        let shard = store.shard_for_test("/registry/pods/p", None);
+        assert_eq!(shard.channels.lock().unwrap().scoped.len(), N);
+
+        drop(streams);
+        assert!(
+            shard.channels.lock().unwrap().scoped.is_empty(),
+            "namespace channels must be freed once their watchers are gone"
+        );
+        assert!(
+            shard.root_sender().is_some(),
+            "the whole-shard watcher is still attached; its root channel must survive"
+        );
+
+        drop(all);
+        assert!(
+            shard.root_sender().is_none(),
+            "the root channel must be freed when the last whole-shard watcher drops"
         );
     }
 
