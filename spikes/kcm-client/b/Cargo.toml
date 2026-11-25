@@ -1,0 +1,12 @@
+[package]
+name = "spike-b"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+spike-common = { path = "../common" }
+kube = { version = "5.2", features = ["runtime"] }
+k8s-openapi = { version = "*", features = ["latest"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }

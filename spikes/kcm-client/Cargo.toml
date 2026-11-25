@@ -1,0 +1,6 @@
+[workspace]
+members = ["common", "a", "b", "c"]
+resolver = "2"
+
+[profile.release]
+debug = false
