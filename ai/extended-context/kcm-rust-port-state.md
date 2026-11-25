@@ -13,7 +13,7 @@ exists; Phase 0 is not started. Original design: `git show 900097c6:ai/findings/
 
 Operator: no high-risk KCM operations; start small with a scalable design;
 verify locally; deliver to releases or `install.sh` only once verification
-shows a performance benefit and conformance parity, and not soon. The mapping below is the mayor's reading of it. The gates and phases
+shows a performance benefit and conformance parity, and not soon. The mapping below is the mayor's reading of it (the operator may correct it). The gates and phases
 below are the local verification regime, not a shipping plan.
 
 | # | Question | Status |
@@ -28,7 +28,7 @@ below are the local verification regime, not a shipping plan.
 | D8 | Cadence | Local phases merge on `--focus` plus unit gates; full 2-node suite before shipping |
 
 Ship gate: measured benefit versus the shipped Go KCM and full 2-node
-conformance. Until then nothing is wired into `install.sh` or releases.
+conformance. Until then nothing ships in `install.sh` or releases.
 
 ## Numbers (MiB; all measured by the memory decomposition, branch `871d58e7`)
 
@@ -60,13 +60,13 @@ almost nothing in Go while adding a second Pod cache and watch.
 | 5 | PV binder, attach-detach, expand, protection, ephemeral-volume, CSR approving/signing, bootstrap-signer, token-cleaner, resource-claim, HPA if kept | storage and security, thin single-node e2e; CSR signing is on the join path |
 | 6 | remove Go KCM (ship-time only) | the 50 MiB binary and Go runtime go |
 
-Phases 1-5 are expected memory-neutral or slightly negative.
+Phases 1-5: expected memory-neutral or slightly negative.
 
 ## Memory gate (per phase)
 
 Metric: `Pss_Anon` from `smaps_rollup` for KCM-Go, KCM-Rust and the apiserver,
 in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
-50-pod burst). The sampler records `ps` RSS today; the PSS-anon column and
+50-pod burst). The sampler records `ps` RSS today; PSS-anon and
 `kcm-mem.json` are Phase 0 work, and run-meta must record `kcm_mode` and the ported-controller list (`mayor-rh8y3`).
 
 - Gate on the per-stage total, not per controller (per-port savings are
@@ -107,10 +107,10 @@ Sonobuoy stays authoritative via these invariants:
 
 Layers: L0 `cargo test` reconcile tables from upstream unit cases; L1 local
 `--focus` entries; L2 local 2-node full suite (`run-all.sh --install`, 20-25
-min, required before shipping); L3 differential corpus; L4 memory gate.
-Modes: A/B (needs a rig knob that does not exist), read-only shadow for
+min, needed to ship); L3 differential corpus; L4 memory gate.
+Modes: A/B (needs a nonexistent rig knob), read-only shadow for
 deterministic controllers, sequential corpus diff. Never run Go and Rust
-copies of the same controller simultaneously.
+copies of one controller simultaneously.
 
 Rollback: one env file renders Go's `--controllers=*,-<ported>` and Rust's
 `--controllers=<ported>`; an empty file is pure Go. A logic test asserts the
@@ -132,7 +132,7 @@ two sets are disjoint and their union is the full set.
 
 ## Kubelet
 
-Not decided. The Phase 1 audit judged a Rust kubelet not viable: about 139k non-test LOC, no Rust prior art for the real CRI path,
+Not decided. The Phase 1 audit judged a Rust kubelet not viable absent new evidence: about 139k non-test LOC, no Rust prior art for the real CRI path,
 and it would forfeit the unmodified-kubelet conformance-oracle role. Revisit
 after the capacity benchmark data (`mayor-jedol`). The eval also cites the unmodified-kubelet node-rejoin story; the reduced-gate conformance prerequisite is tracked in `mayor-omxmp`. Audit:
 `git show 900097c6:ai/findings/2026-09-16-mayor-vc844-kubelet-kcm-rust-eval.md`.
