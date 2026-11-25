@@ -83,7 +83,7 @@ kcm_aggregate() {
           R: {kcm_mib: med($all; "R"; $s; "kcm_mib"), apiserver_mib: med($all; "R"; $s; "apiserver_mib")},
           T: {kcm_mib: med($all; "T"; $s; "kcm_mib"), apiserver_mib: med($all; "T"; $s; "apiserver_mib")}}}) | from_entries)
       }
-    | .stages |= with_entries(.value.kcm_diff_mib = (.value.R.kcm_mib - .value.T.kcm_mib))
+    | .stages |= with_entries(.value.kcm_diff_mib = ((.value.R.kcm_mib - .value.T.kcm_mib) * 100 | round / 100))
     | .min_diff_mib = $min
     | .phase0_pass = ([.stages[].kcm_diff_mib >= $min] | all)
   ' "$@"

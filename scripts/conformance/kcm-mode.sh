@@ -53,7 +53,7 @@ kcm_mode_apply() {
   done
   limactl shell "$vm" sudo systemctl is-active --quiet u7s-kcm.service \
     || { echo "kcm-mode: u7s-kcm is not active after switching to $mode" >&2; return 1; }
-  limactl shell "$vm" sudo systemctl show -p ExecStart u7s-kcm.service | grep -oE -- '--controllers=[^ ;]+' | head -1
+  limactl shell "$vm" sudo systemctl show -p ExecStart u7s-kcm.service | grep -oE -- '--controllers=[^ ;]+' | sed -n 1p
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "kcm_mode": "T",
+  "ported_controllers": [],
+  "kcm_controllers": "--controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller,-ttl-controller,-legacy-serviceaccount-token-cleaner-controller,-validatingadmissionpolicy-status-controller,-storage-version-migrator-controller,-storageversion-garbage-collector-controller,-kube-apiserver-serving-clustertrustbundle-publisher-controller,-podcertificaterequest-cleaner-controller,-podgroup-protection-controller,-resourcepoolstatusrequest-controller,-volumeattributesclass-protection-controller,-horizontal-pod-autoscaler-controller",
+  "kcm_restarts": 0,
+  "git_sha": "64b812275854527a49b4eea1d98bc5a60ddeea56",
+  "git_dirty": true,
+  "date": "2026-11-25",
+  "vm": {
+    "name": "lima-node-3",
+    "kernel": "7.0.0-44-generic",
+    "vcpus": 8,
+    "mem_total_kb": 8103492,
+    "arch": "aarch64"
+  },
+  "host": {
+    "os": "Darwin 27.0.0",
+    "ncpu": 12
+  },
+  "stages": {
+    "idle": {
+      "kcm_mib": 35.07,
+      "apiserver_mib": 19.93,
+      "samples_mib": {
+        "kcm": [
+          34.63,
+          35.07,
+          35.11
+        ],
+        "apiserver": [
+          19.92,
+          19.93,
+          19.93
+        ]
+      }
+    },
+    "wordpress": {
+      "kcm_mib": 35.51,
+      "apiserver_mib": 20.64,
+      "samples_mib": {
+        "kcm": [
+          35.48,
+          35.51,
+          35.51
+        ],
+        "apiserver": [
+          20.64,
+          20.64,
+          20.64
+        ]
+      }
+    }
+  }
+}
