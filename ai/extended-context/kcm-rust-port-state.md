@@ -86,7 +86,7 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
   only if it ended before any stage metric or spec report, with a harness or
   VM log naming an external cause, ruled before the replacement run. At most
   2 voids per SHA. Failures, flakes, OOM kills and restarts are never void.
-- N = ceil(1.25 x B_chosen) rounded up to 64, from a 10k-pod allocator spike,
+- N = ceil(1.25 x B_chosen) rounded up to 64, from 10k-pod spike Pss_Anon delta,
   in `scripts/conformance/kcm-pod-bytes.txt`.
 
 ## Verification protocol
