@@ -303,8 +303,14 @@ pub(crate) async fn core_delete_collection_resource<S: Store>(
 pub(crate) async fn core_get_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    get_resource_status(State(state), Path(("".into(), "v1".into(), plural, name))).await
+    get_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+    )
+    .await
 }
 
 pub(crate) async fn core_put_resource_status<S: Store>(
@@ -467,10 +473,12 @@ pub(crate) async fn core_patch_namespaced_resource<S: Store>(
 pub(crate) async fn core_get_namespaced_resource_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     get_namespaced_resource_status(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
     )
     .await
 }

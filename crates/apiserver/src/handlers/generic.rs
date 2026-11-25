@@ -59,8 +59,9 @@ pub(crate) enum PomForm {
 /// `as` conversion the server does not offer (anything but Table or PartialObjectMetadata[List]
 /// in meta.k8s.io v1/v1beta1) are skipped. `None` means the winner asks for no
 /// PartialObjectMetadata conversion.
-fn requested_pom_form(accept: &str) -> Option<PomForm> {
+fn requested_pom_form(accept: &str) -> Result<Option<PomForm>, crate::status::StatusError> {
     let mut best: Option<((u32, u8, usize), Option<PomForm>)> = None;
+    let mut skipped_conversion = false;
     for entry in accept.split(',') {
         let mut parts = entry.split(';');
         let media = parts.next().unwrap_or("").trim();
@@ -93,13 +94,17 @@ fn requested_pom_form(accept: &str) -> Option<PomForm> {
             None => None,
             Some(kind) => {
                 if g != Some("meta.k8s.io") || !matches!(v, Some("v1" | "v1beta1")) {
+                    skipped_conversion = true;
                     continue;
                 }
                 match kind {
                     "PartialObjectMetadata" => Some(PomForm::Object),
                     "PartialObjectMetadataList" => Some(PomForm::List),
                     "Table" => None,
-                    _ => continue,
+                    _ => {
+                        skipped_conversion = true;
+                        continue;
+                    }
                 }
             }
         };
@@ -113,7 +118,13 @@ fn requested_pom_form(accept: &str) -> Option<PomForm> {
             best = Some((key, form));
         }
     }
-    best.and_then(|(_, form)| form)
+    match best {
+        Some((_, form)) => Ok(form),
+        None if skipped_conversion => Err(Status::not_acceptable(
+            "only the following media types are accepted: application/json, application/yaml, application/vnd.kubernetes.protobuf".to_string(),
+        )),
+        None => Ok(None),
+    }
 }
 
 /// The one PartialObjectMetadata negotiation point for GET, LIST and WATCH. `served` is the
@@ -126,7 +137,7 @@ pub(crate) fn negotiate_partial_object_metadata(
     served: PomForm,
     go_type: impl FnOnce() -> String,
 ) -> Result<bool, crate::status::StatusError> {
-    match (requested_pom_form(accept), served) {
+    match (requested_pom_form(accept)?, served) {
         (None, _) => Ok(false),
         (Some(PomForm::Object), PomForm::Object) | (Some(PomForm::List), PomForm::List) => Ok(true),
         (Some(PomForm::List), PomForm::Object) => Err(Status::not_acceptable(format!(
@@ -147,6 +158,93 @@ pub(crate) fn collection_pom_form(watch: Option<bool>) -> PomForm {
     } else {
         PomForm::List
     }
+}
+
+/// `negotiate_partial_object_metadata` for a single built-in object (GET, or one watch event
+/// stream element of `group`/`kind`).
+pub(crate) fn negotiate_builtin_object(
+    accept: &str,
+    group: &str,
+    kind: &str,
+) -> Result<bool, crate::status::StatusError> {
+    negotiate_partial_object_metadata(accept, PomForm::Object, || {
+        builtin_go_type(group, kind, PomForm::Object)
+    })
+}
+
+/// `negotiate_partial_object_metadata` for a built-in collection endpoint (LIST or WATCH).
+pub(crate) fn negotiate_builtin_collection(
+    accept: &str,
+    watch: Option<bool>,
+    group: &str,
+    kind: &str,
+) -> Result<bool, crate::status::StatusError> {
+    let served = collection_pom_form(watch);
+    negotiate_partial_object_metadata(accept, served, || builtin_go_type(group, kind, served))
+}
+
+/// The `Accept` header value, or `""` when absent or not UTF-8.
+pub(crate) fn accept_str(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// The 200 response for a GET that returns a stored built-in object verbatim, projected to
+/// `PartialObjectMetadata` when the client negotiated it.
+pub(crate) fn stored_object_response(
+    accept: &str,
+    group: &str,
+    kind: &str,
+    raw: bytes::Bytes,
+) -> Result<axum::response::Response, crate::status::StatusError> {
+    use axum::response::IntoResponse;
+    if negotiate_builtin_object(accept, group, kind)? {
+        let obj: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(axum::Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
+    Ok((
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        raw,
+    )
+        .into_response())
+}
+
+/// The 200 response for a GET that builds a built-in object in memory (e.g. Scale), projected
+/// to `PartialObjectMetadata` when the client negotiated it.
+pub(crate) fn object_value_response(
+    accept: &str,
+    go_type: impl FnOnce() -> String,
+    obj: serde_json::Value,
+) -> Result<axum::response::Response, crate::status::StatusError> {
+    use axum::response::IntoResponse;
+    let obj = if negotiate_partial_object_metadata(accept, PomForm::Object, go_type)? {
+        super::watch::to_partial_object_metadata(&obj)
+    } else {
+        obj
+    };
+    Ok(axum::Json(obj).into_response())
+}
+
+/// Projects a built full list to a `PartialObjectMetadataList`, keeping its list metadata
+/// (resourceVersion, continue, remainingItemCount).
+pub(crate) fn to_partial_object_metadata_list(mut list: serde_json::Value) -> serde_json::Value {
+    let items = list["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(super::watch::to_partial_object_metadata)
+                .collect()
+        })
+        .unwrap_or_default();
+    list["apiVersion"] = "meta.k8s.io/v1".into();
+    list["kind"] = "PartialObjectMetadataList".into();
+    list["items"] = serde_json::Value::Array(items);
+    list
 }
 
 /// Upstream's Go `%T` of a built-in object, e.g. `*core.Pod`, `*apps.DeploymentList`.
@@ -5191,14 +5289,29 @@ mod escalation_tests {
     #[test]
     fn negotiation_parses_params_instead_of_substring_matching() {
         for accept in [
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1;q=0",
+            "application/json;x=as=PartialObjectMetadata",
+            "application/json;as=PartialObjectMetadata;g=example.com;v=v1,application/json",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v2,*/*",
+        ] {
+            assert!(!negotiate(accept, PomForm::Object).unwrap(), "{accept:?}");
+        }
+    }
+
+    /// An Accept whose only entries ask for an `as=` conversion the server does not offer has
+    /// nothing acceptable left, which upstream answers with 406 rather than full objects the
+    /// client cannot decode.
+    #[test]
+    fn negotiation_lone_unsupported_conversion_is_406() {
+        for accept in [
             "application/json;as=PartialObjectMetadata;g=example.com;v=v1",
             "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v2",
             "application/json;as=PartialObjectMetadata",
             "application/json;as=PartialObjectMetadataFoo;g=meta.k8s.io;v=v1",
-            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1;q=0",
-            "application/json;x=as=PartialObjectMetadata",
         ] {
-            assert!(!negotiate(accept, PomForm::Object).unwrap(), "{accept:?}");
+            let err = negotiate(accept, PomForm::Object).unwrap_err();
+            assert_eq!(err.0, axum::http::StatusCode::NOT_ACCEPTABLE, "{accept:?}");
+            assert_eq!(err.1.reason, "NotAcceptable", "{accept:?}");
         }
     }
 

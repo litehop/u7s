@@ -48,7 +48,14 @@ pub(crate) async fn list_namespaces<S: Store>(
     State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    let pom = super::generic::negotiate_builtin_collection(
+        super::generic::accept_str(&headers),
+        query.watch,
+        "",
+        "Namespace",
+    )?;
     let prefix = cluster_list_prefix("namespaces");
     let field_selector = super::field_selector::FieldSelector::parse(
         query.field_selector.as_deref(),
@@ -69,8 +76,13 @@ pub(crate) async fn list_namespaces<S: Store>(
             state,
             super::watch::WatchConfig {
                 prefix,
-                api_version: "v1".to_string(),
-                kind: "Namespace".to_string(),
+                api_version: if pom { "meta.k8s.io/v1" } else { "v1" }.to_string(),
+                kind: if pom {
+                    "PartialObjectMetadata"
+                } else {
+                    "Namespace"
+                }
+                .to_string(),
                 from_revision: query.resource_version.unwrap_or(0),
                 initial_items: initial,
                 explicit_no_initial_events: query.send_initial_events == Some(false),
@@ -78,7 +90,7 @@ pub(crate) async fn list_namespaces<S: Store>(
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                 username: user.username,
-                as_partial_object_metadata: false,
+                as_partial_object_metadata: pom,
                 group: "".to_string(),
                 plural: "namespaces".to_string(),
                 timeout_seconds: query.timeout_seconds,
@@ -110,12 +122,15 @@ pub(crate) async fn list_namespaces<S: Store>(
         }
     }
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "kind": "NamespaceList",
         "apiVersion": "v1",
         "metadata": { "resourceVersion": resp.revision.to_string() },
         "items": items
     });
+    if pom {
+        body = super::generic::to_partial_object_metadata_list(body);
+    }
 
     Ok(Json(body).into_response())
 }
@@ -286,7 +301,13 @@ pub(crate) async fn seed_root_ca_configmap<S: Store>(state: &AppState<S>, name: 
 pub(crate) async fn get_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    let pom = super::generic::negotiate_builtin_object(
+        super::generic::accept_str(&headers),
+        "",
+        "Namespace",
+    )?;
     let key = cluster_object_key("namespaces", &name);
     let stored = state
         .store
@@ -294,6 +315,12 @@ pub(crate) async fn get_namespace<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("", "namespaces", &name))?;
+
+    if pom {
+        let obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -787,8 +814,9 @@ pub(crate) async fn finalize_namespace<S: Store>(
 pub(crate) async fn get_namespace_status<S: Store>(
     state: State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    get_namespace(state, Path(name)).await
+    get_namespace(state, Path(name), headers).await
 }
 
 /// PUT /api/v1/namespaces/{name}/status
@@ -1372,6 +1400,7 @@ mod tests {
                 groups: vec![],
                 extra: Default::default(),
             }),
+            Default::default(),
         )
         .await
         {
@@ -1454,7 +1483,7 @@ mod tests {
             timeout_seconds: None,
         };
 
-        let resp = list_namespaces(State(state), Query(query), test_user())
+        let resp = list_namespaces(State(state), Query(query), test_user(), Default::default())
             .await
             .expect("list with a valid field selector must not error");
 
@@ -3037,6 +3066,7 @@ mod tests {
                 groups: vec![],
                 extra: Default::default(),
             }),
+            Default::default(),
         )
         .await
         {
@@ -3115,6 +3145,7 @@ mod tests {
                 groups: vec![],
                 extra: Default::default(),
             }),
+            Default::default(),
         )
         .await
         {
@@ -3142,7 +3173,13 @@ mod tests {
             "create must succeed"
         );
 
-        let resp = match get_namespace(State(state.clone()), Path("get-ns".to_string())).await {
+        let resp = match get_namespace(
+            State(state.clone()),
+            Path("get-ns".to_string()),
+            Default::default(),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("get must not error"),
         };
@@ -3160,7 +3197,12 @@ mod tests {
     async fn get_namespace_returns_404_for_missing() {
         let state = make_state();
 
-        let result = get_namespace(State(state.clone()), Path("no-such-ns".to_string())).await;
+        let result = get_namespace(
+            State(state.clone()),
+            Path("no-such-ns".to_string()),
+            Default::default(),
+        )
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
@@ -4573,9 +4615,13 @@ mod tests {
             "create must succeed"
         );
 
-        let resp = get_namespace_status(State(state.clone()), Path("status-get-ns".to_string()))
-            .await
-            .expect("get_namespace_status must not error");
+        let resp = get_namespace_status(
+            State(state.clone()),
+            Path("status-get-ns".to_string()),
+            Default::default(),
+        )
+        .await
+        .expect("get_namespace_status must not error");
 
         assert_eq!(
             resp.status(),
@@ -6297,6 +6343,7 @@ mod tests {
                 groups: vec![],
                 extra: Default::default(),
             }),
+            Default::default(),
         )
         .await
         {
