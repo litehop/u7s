@@ -32,10 +32,6 @@ release ends with a `### Benchmark` line linking its stamped
   `controllerrevisions`, which were previously reported as not served.
   (#2184)
 
-### Benchmark
-
-- Capacity benchmark (2026-11-25, d9e45502): [benchmark.md](docs/benchmarks/2026-11-25-d9e45502-gcp/benchmark.md)
-
 ## [0.4.6] - 2026-11-18
 
 ### Added
