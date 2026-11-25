@@ -52,7 +52,7 @@ url         = "2"
 reqwest     = { version = "0.13", features = ["stream", "rustls"], default-features = false }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 boon            = "0.6"
-# =0.16.0: 0.16.1 caps Program::compile nesting at 96 with no public knob; CRD rules must accept cel-go's 250
+# =0.16.0: 0.16.1 counts operator/member chains toward a fixed parser depth of 96 (no public knob); k8s CRD rules allow 250
 cel             = { version = "=0.16.0", default-features = false, features = ["json", "chrono", "ext_encoders"] }
 yaml-rust2      = "0.13"
 prost           = "0.14"
