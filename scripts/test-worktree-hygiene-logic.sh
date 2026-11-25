@@ -1128,6 +1128,57 @@ assert "STEP G keeps a dirty worker/agent-<id> worktree -- uncommitted work exis
 assert "STEP G keeps a worker/agent-<id> worktree with unpushed commits -- reaping destroys unshipped work" \
   "$([ -d "$G/ai/worktrees/agent-wunpushed" ] && echo 1 || echo 0)"
 
+# Closed-unmerged PR whose origin branch STEP F deleted: its commits survive
+# only at refs/pull/<N>/head. Branches are never pushed, so `--remotes`
+# alone sees nothing.
+git -C "$G" config user.email test@example.com
+git -C "$G" config user.name Test
+git -C "$G" branch pr-base main
+git -C "$G" worktree add -q "$G/ai/worktrees/agent-pbase" pr-base
+git -C "$G/ai/worktrees/agent-pbase" commit -q --allow-empty -m "pr base"
+PR_BASE_SHA=$(git -C "$G/ai/worktrees/agent-pbase" rev-parse HEAD)
+git -C "$G/ai/worktrees/agent-pbase" commit -q --allow-empty -m "pr tip"
+PR_TIP_SHA=$(git -C "$G/ai/worktrees/agent-pbase" rev-parse HEAD)
+git -C "$G" push -q origin "$PR_TIP_SHA:refs/pull/7001/head"
+for id in pclosed popen pancestor pdirty pbeyond; do
+  git -C "$G" worktree add -q --detach "$G/ai/worktrees/agent-$id" "$PR_TIP_SHA"
+  git -C "$G/ai/worktrees/agent-$id" checkout -q -b "local-$id"
+done
+git -C "$G" worktree remove --force "$G/ai/worktrees/agent-pbase"
+git -C "$G" branch -D pr-base >/dev/null
+git -C "$G/ai/worktrees/agent-pancestor" reset -q --hard "$PR_BASE_SHA"
+printf 'wip\n' > "$G/ai/worktrees/agent-pdirty/wip.txt"
+git -C "$G/ai/worktrees/agent-pdirty" add wip.txt
+git -C "$G/ai/worktrees/agent-pbeyond" commit -q --allow-empty -m "after the pull ref"
+
+STUB_GH_PULL="$SANDBOX_ROOT/stub-gh-pull"
+mkdir -p "$STUB_GH_PULL"
+cat > "$STUB_GH_PULL/gh" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${STUB_OPEN_OID:-}" ] || printf 'unrelated-name %s\n' "$STUB_OPEN_OID"
+EOF
+chmod +x "$STUB_GH_PULL/gh"
+
+# Open PR: the same tip is now an open PR's head, so only the open-PR
+# exclusion protects worktrees reachable from it.
+STUB_OPEN_OID="$PR_TIP_SHA" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$G" PATH="$STUB_GH_PULL:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G keeps a worktree whose HEAD is an open PR's head even though refs/pull/<N>/head holds it -- reaping closes review state under a PR still being worked" \
+  "$([ -d "$G/ai/worktrees/agent-popen" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree whose HEAD is merely an ancestor of an open PR's pull-ref tip -- an open PR's pull ref must not count as a closed-PR safety net" \
+  "$([ -d "$G/ai/worktrees/agent-pancestor" ] && echo 1 || echo 0)"
+
+STUB_OPEN_OID="" LIVE_AGENTS="" WORKTREE_HYGIENE_REPO_ROOT="$G" PATH="$STUB_GH_PULL:$PATH" \
+  call step_g_fix_round_worktrees >/dev/null 2>&1
+assert "STEP G reaps a clean worktree at the pull-ref tip of a closed PR whose origin branch is gone -- GitHub still holds the commits, so keeping it strands the worktree forever" \
+  "$([ ! -d "$G/ai/worktrees/agent-pclosed" ] && ! git -C "$G" rev-parse --verify -q refs/heads/local-pclosed >/dev/null && echo 1 || echo 0)"
+assert "STEP G reaps a worktree whose HEAD is an ancestor of the closed PR's tip -- a review-fix checkout behind the tip loses nothing" \
+  "$([ ! -d "$G/ai/worktrees/agent-pancestor" ] && echo 1 || echo 0)"
+assert "STEP G keeps a dirty worktree even when its HEAD is at a closed PR's tip -- uncommitted changes are on no ref" \
+  "$([ -d "$G/ai/worktrees/agent-pdirty" ] && echo 1 || echo 0)"
+assert "STEP G keeps a worktree with a commit beyond the closed PR's pull-ref tip -- that commit is on no remote and no pull ref" \
+  "$([ -d "$G/ai/worktrees/agent-pbeyond" ] && echo 1 || echo 0)"
+
 # ---------------------------------------------------------------------------
 # STEP H: main's audit status. A red main audit is otherwise invisible
 # (the audit is non-blocking for PRs), so the verdict and exit code are what

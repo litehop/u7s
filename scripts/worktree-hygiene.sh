@@ -809,9 +809,42 @@ step_f_orphaned_origin_branches() {
 # local branch name, the upstream branch, or HEAD's sha (the local name of a
 # fix-round checkout need not equal the PR head).
 # ---------------------------------------------------------------------------
+#
+# STEP F deletes a closed-unmerged PR's origin branch, after which HEAD is on
+# no remote ref; GitHub still holds its commits at refs/pull/<N>/head, so a
+# HEAD reachable from a non-open PR's pull-ref tip counts as pushed too.
+# (Chosen over reaping inside STEP F: this keeps every guard in one place and
+# also catches review-fix worktrees on differently named local branches and
+# worktrees stranded by earlier runs.)
+
+# Tips of refs/pull/<N>/head on origin, fetched once per run. A failed
+# ls-remote leaves the list empty, which only keeps worktrees.
+PULL_REF_TIPS=""
+PULL_REF_TIPS_LOADED=0
+load_pull_ref_tips() {
+  [ "$PULL_REF_TIPS_LOADED" = 1 ] && return 0
+  PULL_REF_TIPS=$(git -C "$REPO_ROOT" ls-remote origin 'refs/pull/*/head' 2>/dev/null | awk '{print $1}' || true)
+  PULL_REF_TIPS_LOADED=1
+}
+
+# True (exit 0) iff `sha` equals or is an ancestor of the tip of a closed PR's
+# pull ref. Open PRs' tips are excluded: their review state lives on the
+# branch, not just the commits. A tip missing locally fails the ancestry
+# check, so the worktree is kept.
+reachable_from_closed_pr() {
+  local sha="$1" tip
+  while IFS= read -r tip; do
+    [ -n "$tip" ] || continue
+    grep -qxF "$tip" <<<"$OPEN_PR_OIDS" && continue
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$sha" "$tip" 2>/dev/null && return 0
+  done <<<"$PULL_REF_TIPS"
+  return 1
+}
+
 step_g_fix_round_worktrees() {
   local path branch upstream agent_id rc=0
   load_open_prs || return 1
+  load_pull_ref_tips
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     agent_id=$(agent_id_from_worktree_path "$path" || true)
@@ -826,7 +859,9 @@ step_g_fix_round_worktrees() {
     upstream=$(git -C "$path" rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || true)
     [ -n "$upstream" ] && has_open_pr "${upstream#*/}" "$OPEN_PR_BRANCHES" && continue
     [ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ] || continue
-    [ -z "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ] || continue
+    if [ -n "$(git -C "$path" rev-list HEAD --not --remotes 2>/dev/null)" ]; then
+      reachable_from_closed_pr "$(git -C "$path" rev-parse HEAD)" || continue
+    fi
     echo "worktree-hygiene: STEP G: removing worktree $path and branch $branch"
     if ! run_cmd git -C "$REPO_ROOT" worktree remove "$path"; then
       echo "worktree-hygiene: STEP G could not remove $path (locked?); keeping branch $branch" >&2
