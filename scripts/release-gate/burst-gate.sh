@@ -233,8 +233,9 @@ pull_pending_evidence() {
 cleanup() {
   pull_pending_evidence
   [ -z "${RUN_OUT:-}" ] || touch "$RUN_OUT/quiet.stop"
-  # shellcheck disable=SC2046
-  kill $(jobs -p) 2>/dev/null
+  # The ssh/limactl client sits below the backgrounded shell function, so kill whole trees.
+  local jobpids; jobpids="$(jobs -p | tr '\n' ' ')"
+  [ -z "${jobpids// /}" ] || rg_kill_tree "$jobpids"
   [ "$KEEP" = 1 ] && return
   local vm
   for vm in $VMS; do vm_delete "$vm"; done
@@ -336,9 +337,11 @@ while [ "$valid" -lt "$RUNS" ] && [ $((invalid + preempted)) -lt "$MAX_INVALID_R
       echo "pre-flight: host not quiet, no VM created:"; rg_contention_reasons "$RUN_OUT/quiet.log" /dev/null
     fi
   fi
+  # vm_create runs in the background: a foreground limactl start would defer the TERM trap (and the
+  # VM delete) until the start finished.
   if [ -n "$status" ]; then
     :
-  elif VMS="$VMS $VM"; vm_create "$VM" "$RUN_OUT"; then
+  elif VMS="$VMS $VM"; vm_create "$VM" "$RUN_OUT" & vc_pid=$!; wait "$vc_pid"; then
     if [ "$BACKEND" = gcp ]; then
       PLATFORM="$(cat "$RUN_OUT/platform.txt")"
       echo "$PLATFORM" | tee -a "$RUN_OUT/host.txt"

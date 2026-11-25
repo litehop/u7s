@@ -130,5 +130,47 @@ rm -f "$TMP/run-meta.env"
 assert "from-run: a run without run-meta cannot be stamped" \
   "$(no_if "$HERE/capacity-benchmark.sh" --from-run "$TMP" --ramp 20,30,40 --out-root "$TMP/o2")"
 
+# --- a signal to the wrapper mid-run must reach the gate so its VM is deleted ---
+BIN="$TMP/bin-sig"; mkdir -p "$BIN"
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
+  '  "config configurations describe"*) exit 0 ;;' \
+  '  "config get-value project") echo p-x ;;' \
+  '  "config get-value compute/zone") echo z-1 ;;' \
+  '  "compute instances create"*) echo created ;;' \
+  '  "compute instances describe"*"disks[0].source"*) echo "https://www.googleapis.com/compute/v1/projects/p-x/zones/z-1/disks/attached-boot-disk" ;;' \
+  '  "compute instances describe"*) echo 1 ;;' \
+  '  "compute ssh"*vm-gate.sh*) echo $$ > "$GCLOUD_HANG_PID"; exec sleep 300 ;;' \
+  '  "compute disks describe attached-boot-disk"*) echo "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2604-resolute-amd64-v20261021" ;;' \
+  '  "compute ssh"*"uname -r"*) echo 7.0.0-1017-gcp ;;' \
+  '  "compute ssh"*) exit 0 ;;' \
+  'esac' 'exit 0' > "$BIN/gcloud"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *rev-parse*--verify*) echo 0123456789abcdef0123456789abcdef01234567; exit 0 ;; esac' \
+  "exec $(command -v git) \"\$@\"" > "$BIN/git"
+chmod +x "$BIN/gcloud" "$BIN/git"
+export GCLOUD_CALLS="$TMP/gcloud-calls" GCLOUD_HANG_PID="$TMP/hang.pid" GCP_SSH_TRIES=1 GCP_SSH_SLEEP=0 GCP_DELETE_SLEEP=0
+CAP_RUNS="$(cd "$HERE/../.." && pwd)/temp/release-gate"
+for sigspec in TERM:143 INT:130; do
+  sig="${sigspec%%:*}"; want="${sigspec##*:}"
+  rm -f "$GCLOUD_HANG_PID"; : > "$GCLOUD_CALLS"
+  before="$(ls "$CAP_RUNS" 2>/dev/null || true)"
+  set -m; PATH="$BIN:$PATH" "$HERE/capacity-benchmark.sh" --backend gcp --release v9.9.9-test --out-root "$TMP/o-sig" >/dev/null 2>&1 & wp=$!; set +m
+  ready=0
+  for _ in $(seq 1 120); do [ ! -e "$GCLOUD_HANG_PID" ] || { ready=1; break; }; kill -0 "$wp" 2>/dev/null || break; sleep 0.25; done
+  kill "-$sig" "$wp" 2>/dev/null
+  ended=0; rc=0
+  for _ in $(seq 1 120); do kill -0 "$wp" 2>/dev/null || { ended=1; break; }; sleep 0.25; done
+  if [ "$ended" = 1 ]; then wait "$wp" || rc=$?; else pkill -KILL -P "$wp" 2>/dev/null; kill -KILL "$wp" 2>/dev/null; wait "$wp" 2>/dev/null || true; fi
+  hp="$(cat "$GCLOUD_HANG_PID" 2>/dev/null || true)"
+  alive=0; [ -z "$hp" ] || ! kill -0 "$hp" 2>/dev/null || { alive=1; kill "$hp" 2>/dev/null || true; }
+  vmname="$(grep 'instances create' "$GCLOUD_CALLS" | head -1 | sed -E 's/.*instances create (u7s-rg-[^ ]*) .*/\1/')"
+  for d in $(ls "$CAP_RUNS" 2>/dev/null); do case "$before" in *"$d"*) ;; *) rm -rf "${CAP_RUNS:?}/$d" ;; esac; done
+  assert "wrapper $sig mid-run reached the run phase (the signal must land after the VM exists)" \
+    "$([ "$ready" = 1 ] && [ -n "$vmname" ] && echo 1 || echo 0)"
+  assert "wrapper $sig mid-run exits $want within the bound" "$([ "$ended" = 1 ] && [ "$rc" = "$want" ] && echo 1 || echo 0)"
+  assert "wrapper $sig mid-run forwards to the gate, which deletes the VM exactly once before the wrapper exits (a benchmark VM left up after Ctrl-C keeps billing for up to 16 h)" \
+    "$([ -n "$vmname" ] && [ "$(grep -c "instances delete $vmname " "$GCLOUD_CALLS")" = 1 ] && echo 1 || echo 0)"
+  assert "wrapper $sig mid-run leaves no orphaned ssh client" "$([ "$alive" = 0 ] && echo 1 || echo 0)"
+done
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
