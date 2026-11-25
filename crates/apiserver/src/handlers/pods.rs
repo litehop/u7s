@@ -144,7 +144,10 @@ pub(crate) async fn list_pods<S: Store>(
     // rejects the typed Pod/PodList response and the informer never populates (metrics-server
     // silently returns empty PodMetrics for every labelSelector-filtered query, which is
     // exactly what the HPA controller always issues).
-    let pom = super::generic::wants_partial_object_metadata(accept);
+    let served = super::generic::collection_pom_form(query.watch);
+    let pom = super::generic::negotiate_partial_object_metadata(accept, served, || {
+        super::generic::builtin_go_type("", "Pod", served)
+    })?;
     let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
@@ -555,7 +558,11 @@ pub(crate) async fn get_pod<S: Store>(
     // (garbagecollector.go's isDangling); without this, it receives a typed Pod object it
     // can't decode and retries the owner-check forever, so newly-orphaned dependents are
     // never identified as dangling and never collected.
-    if super::generic::wants_partial_object_metadata(accept) {
+    if super::generic::negotiate_partial_object_metadata(
+        accept,
+        super::generic::PomForm::Object,
+        || super::generic::builtin_go_type("", "Pod", super::generic::PomForm::Object),
+    )? {
         let pod: serde_json::Value =
             serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
         return Ok(Json(super::watch::to_partial_object_metadata(&pod)).into_response());
@@ -17221,7 +17228,7 @@ mod handler_tests {
             .uri("/api/v1/namespaces/default/pods")
             .header(
                 "accept",
-                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
             )
             .body(Body::empty())
             .unwrap();
@@ -17257,6 +17264,58 @@ mod handler_tests {
             "POM items must strip spec/status — leaking them defeats the metadata-only \
              informer this fix exists to unblock"
         );
+    }
+
+    /// A client asking for the list form on a single Pod GET, or the object form on a Pod LIST,
+    /// gets 406 as upstream does; answering 200 hides a client bug and serves a shape the
+    /// client did not negotiate.
+    #[tokio::test]
+    async fn pod_get_and_list_reject_mismatched_partial_object_metadata_form_with_406() {
+        use axum::http::method::Method;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "pod-a", serde_json::json!({})).await;
+        let user = crate::auth::UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        for (uri, accept, message) in [
+            (
+                "/api/v1/namespaces/default/pods/pod-a",
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+                "you requested PartialObjectMetadataList, but the requested object is not a list (*core.Pod)",
+            ),
+            (
+                "/api/v1/namespaces/default/pods",
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                "you requested PartialObjectMetadata, but the requested object is a list (*core.PodList)",
+            ),
+        ] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("accept", accept)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_ACCEPTABLE, "{uri} {accept}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["reason"], "NotAcceptable");
+            assert_eq!(v["code"], 406);
+            assert_eq!(v["message"], message);
+        }
     }
 
     /// GET /pods with a field selector must filter pods by nodeName.

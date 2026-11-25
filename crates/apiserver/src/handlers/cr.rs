@@ -2978,24 +2978,6 @@ fn apply_cr_field_validation(
 // Cluster-scoped CR handlers
 // ---------------------------------------------------------------------------
 
-/// Detect whether the Accept header requests PartialObjectMetadata or PartialObjectMetadataList.
-/// The kcm metadatainformer sends Accept headers like:
-///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
-///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
-fn wants_partial_object_metadata(accept: &str) -> bool {
-    accept.contains("as=PartialObjectMetadata")
-}
-
-/// Strip spec/status from a full CR object, returning a PartialObjectMetadata-shaped value.
-/// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
-fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "PartialObjectMetadata",
-        "metadata": obj.get("metadata").cloned().unwrap_or_default()
-    })
-}
-
 pub async fn list_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
@@ -3041,7 +3023,11 @@ pub async fn list_cr<S: Store>(
                 && query.watch == Some(true)
                 && query.send_initial_events == Some(true)
             {
-                let pom = wants_partial_object_metadata(accept);
+                let pom = super::generic::negotiate_partial_object_metadata(
+                    accept,
+                    super::generic::PomForm::Object,
+                    || super::generic::cr_go_type(super::generic::PomForm::Object),
+                )?;
                 let (watch_api_version, watch_kind) = if pom {
                     (
                         "meta.k8s.io/v1".to_string(),
@@ -3087,7 +3073,12 @@ pub async fn list_cr<S: Store>(
         &ctx.selectable_fields,
     )?;
 
-    let pom = wants_partial_object_metadata(accept);
+    let pom = {
+        let served = super::generic::collection_pom_form(query.watch);
+        super::generic::negotiate_partial_object_metadata(accept, served, || {
+            super::generic::cr_go_type(served)
+        })?
+    };
 
     if query.watch == Some(true) {
         let (watch_api_version, watch_kind) = if pom {
@@ -3214,8 +3205,10 @@ pub async fn list_cr<S: Store>(
     items.retain(|item| field_selector.matches(item));
 
     if pom {
-        let pom_items: Vec<serde_json::Value> =
-            items.iter().map(to_partial_object_metadata).collect();
+        let pom_items: Vec<serde_json::Value> = items
+            .iter()
+            .map(super::watch::to_partial_object_metadata)
+            .collect();
         let body = serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
             "kind": "PartialObjectMetadataList",
@@ -3281,7 +3274,11 @@ pub async fn get_cr<S: Store>(
             )));
         }
     }
-    let pom = wants_partial_object_metadata(accept);
+    let pom = super::generic::negotiate_partial_object_metadata(
+        accept,
+        super::generic::PomForm::Object,
+        || super::generic::cr_go_type(super::generic::PomForm::Object),
+    )?;
 
     let key = cr_store_key(&group, &plural, None, &name);
     let stored = state
@@ -3313,7 +3310,9 @@ pub async fn get_cr<S: Store>(
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
             if pom {
-                return Ok(Json(to_partial_object_metadata(&converted_obj)).into_response());
+                return Ok(
+                    Json(super::watch::to_partial_object_metadata(&converted_obj)).into_response(),
+                );
             }
             if super::table::wants_table(accept) {
                 let resource_version = converted_obj["metadata"]["resourceVersion"]
@@ -3349,7 +3348,7 @@ pub async fn get_cr<S: Store>(
     // can't decode and retries the owner-check forever, so newly-orphaned dependents are
     // never identified as dangling and never collected.
     if pom {
-        return Ok(Json(to_partial_object_metadata(&obj)).into_response());
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
     }
     if super::table::wants_table(accept) {
         let resource_version = obj["metadata"]["resourceVersion"]
@@ -4119,7 +4118,11 @@ pub async fn list_cr_namespaced<S: Store>(
                 && query.watch == Some(true)
                 && query.send_initial_events == Some(true)
             {
-                let pom = wants_partial_object_metadata(accept);
+                let pom = super::generic::negotiate_partial_object_metadata(
+                    accept,
+                    super::generic::PomForm::Object,
+                    || super::generic::cr_go_type(super::generic::PomForm::Object),
+                )?;
                 let (watch_api_version, watch_kind) = if pom {
                     (
                         "meta.k8s.io/v1".to_string(),
@@ -4166,7 +4169,12 @@ pub async fn list_cr_namespaced<S: Store>(
         &ctx.selectable_fields,
     )?;
 
-    let pom = wants_partial_object_metadata(accept);
+    let pom = {
+        let served = super::generic::collection_pom_form(query.watch);
+        super::generic::negotiate_partial_object_metadata(accept, served, || {
+            super::generic::cr_go_type(served)
+        })?
+    };
 
     if query.watch == Some(true) {
         let (watch_api_version, watch_kind) = if pom {
@@ -4293,8 +4301,10 @@ pub async fn list_cr_namespaced<S: Store>(
     items.retain(|item| field_selector.matches(item));
 
     if pom {
-        let pom_items: Vec<serde_json::Value> =
-            items.iter().map(to_partial_object_metadata).collect();
+        let pom_items: Vec<serde_json::Value> = items
+            .iter()
+            .map(super::watch::to_partial_object_metadata)
+            .collect();
         let body = serde_json::json!({
             "apiVersion": "meta.k8s.io/v1",
             "kind": "PartialObjectMetadataList",
@@ -4361,7 +4371,11 @@ pub async fn get_cr_namespaced<S: Store>(
             )));
         }
     }
-    let pom = wants_partial_object_metadata(accept);
+    let pom = super::generic::negotiate_partial_object_metadata(
+        accept,
+        super::generic::PomForm::Object,
+        || super::generic::cr_go_type(super::generic::PomForm::Object),
+    )?;
 
     let key = cr_store_key(&group, &plural, Some(&ns), &name);
     let stored = state
@@ -4393,7 +4407,9 @@ pub async fn get_cr_namespaced<S: Store>(
                 apply_crd_schema_defaults(schema, &mut converted_obj);
             }
             if pom {
-                return Ok(Json(to_partial_object_metadata(&converted_obj)).into_response());
+                return Ok(
+                    Json(super::watch::to_partial_object_metadata(&converted_obj)).into_response(),
+                );
             }
             if super::table::wants_table(accept) {
                 let resource_version = converted_obj["metadata"]["resourceVersion"]
@@ -4429,7 +4445,7 @@ pub async fn get_cr_namespaced<S: Store>(
     // can't decode and retries the owner-check forever, so newly-orphaned dependents are
     // never identified as dangling and never collected.
     if pom {
-        return Ok(Json(to_partial_object_metadata(&obj)).into_response());
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
     }
     if super::table::wants_table(accept) {
         let resource_version = obj["metadata"]["resourceVersion"]
@@ -21065,66 +21081,6 @@ mod tests {
     // PartialObjectMetadata media type negotiation
     // ---------------------------------------------------------------------------
 
-    /// wants_partial_object_metadata must detect the kcm metadatainformer Accept header.
-    /// The GC sends: application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
-    ///               application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
-    /// Without this detection the reflector gets full CR objects it can't decode as PartialObjectMetadata,
-    /// causing it to restart without ever receiving the initial-events-end BOOKMARK.
-    #[test]
-    fn wants_pom_detects_partial_object_metadata_accept_header() {
-        // Real kcm metadatainformer Accept header.
-        let accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json";
-        assert!(
-            wants_partial_object_metadata(accept),
-            "must detect as=PartialObjectMetadata in kcm metadatainformer Accept header"
-        );
-    }
-
-    #[test]
-    fn wants_pom_detects_partial_object_metadata_list() {
-        let accept = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
-        assert!(
-            wants_partial_object_metadata(accept),
-            "must detect as=PartialObjectMetadataList"
-        );
-    }
-
-    #[test]
-    fn wants_pom_returns_false_for_plain_json() {
-        assert!(
-            !wants_partial_object_metadata("application/json"),
-            "plain application/json must NOT trigger POM transformation"
-        );
-    }
-
-    /// to_partial_object_metadata must strip spec/status and set the correct apiVersion/kind.
-    /// The GC needs metadata (ownerReferences, finalizers) but not spec/status — sending full
-    /// objects causes the reflector to fail decoding and never receive the initial-events-end BOOKMARK.
-    #[test]
-    fn to_pom_strips_spec_and_sets_correct_kind() {
-        let full_cr = serde_json::json!({
-            "apiVersion": "example.io/v1",
-            "kind": "Widget",
-            "metadata": { "name": "w1", "uid": "abc", "ownerReferences": [] },
-            "spec": { "color": "blue" },
-            "status": { "ready": true }
-        });
-        let pom = to_partial_object_metadata(&full_cr);
-        assert_eq!(pom["apiVersion"], "meta.k8s.io/v1");
-        assert_eq!(pom["kind"], "PartialObjectMetadata");
-        assert_eq!(pom["metadata"]["name"], "w1");
-        assert_eq!(pom["metadata"]["uid"], "abc");
-        // spec and status must be absent — GC does not need them.
-        assert!(
-            pom.get("spec").is_none() || pom["spec"].is_null(),
-            "spec must be absent in POM"
-        );
-        assert!(
-            pom.get("status").is_none() || pom["status"].is_null(),
-            "status must be absent in POM"
-        );
-    }
-
     /// LIST with as=PartialObjectMetadataList Accept header must return PartialObjectMetadataList
     /// with each item as PartialObjectMetadata (no spec). This is the critical path for the kcm
     /// garbage collector — it lists resources using this media type.
@@ -25928,6 +25884,186 @@ mod tests {
              CR is deleted via that version — without this, the k8s conformance helper \
              isWatchCachePrimed times out and all 5 FieldValidation tests fail with \
              'cannot create crd gave up waiting for watch event'; body={body_str:?}"
+        );
+    }
+
+    fn pom_accept(kind: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            format!("application/json;as={kind};g=meta.k8s.io;v=v1,application/json")
+                .parse()
+                .unwrap(),
+        );
+        h
+    }
+
+    /// Metadata informers must never receive a full custom resource on delete: a DELETED event
+    /// carrying spec/status leaks data the client declared it does not want and breaks decoders
+    /// that reject unknown fields on PartialObjectMetadata.
+    #[tokio::test]
+    async fn cr_pom_watch_deleted_event_carries_metadata_only() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        let path = || {
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            ))
+        };
+        let created = create_cr(
+            State(state.clone()),
+            path(),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("doomed"),
+        )
+        .await
+        .expect("create");
+        let created = axum::body::to_bytes(created.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+        let rv: u64 = created["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(rv),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: Some(2),
+        };
+        let resp = list_cr(
+            State(state.clone()),
+            path(),
+            pom_accept("PartialObjectMetadata"),
+            query,
+            "test-user".to_string(),
+        )
+        .await
+        .expect("watch");
+        delete_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "doomed".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete");
+        let body = tokio::time::timeout(
+            tokio::time::Duration::from_secs(15),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream closes")
+        .unwrap();
+        let deleted: serde_json::Value = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["type"] == "DELETED")
+            .expect("DELETED event must be delivered");
+        let mut keys: Vec<_> = deleted["object"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["apiVersion", "kind", "metadata"],
+            "metadata informers must never receive full objects on delete: {deleted}"
+        );
+        assert_eq!(deleted["object"]["kind"], "PartialObjectMetadata");
+    }
+
+    /// A client that asks for the list form on a single-object GET (or the object form on a
+    /// LIST) is told 406 like upstream, instead of silently getting a different shape than it
+    /// asked for.
+    #[tokio::test]
+    async fn cr_pom_form_mismatch_is_406_on_get_and_list() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+        create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            widget_body("w"),
+        )
+        .await
+        .expect("create");
+
+        let err = expect_err_status(
+            get_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "w".to_string(),
+                )),
+                pom_accept("PartialObjectMetadataList"),
+            )
+            .await,
+            "GET with list form",
+        );
+        assert_eq!(err.0, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            err.1.message,
+            "you requested PartialObjectMetadataList, but the requested object is not a list (*unstructured.Unstructured)"
+        );
+
+        let query = super::super::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        };
+        let err = expect_err_status(
+            list_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                pom_accept("PartialObjectMetadata"),
+                query,
+                "test-user".to_string(),
+            )
+            .await,
+            "LIST with object form",
+        );
+        assert_eq!(err.0, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            err.1.message,
+            "you requested PartialObjectMetadata, but the requested object is a list (*unstructured.UnstructuredList)"
         );
     }
 

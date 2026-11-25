@@ -304,6 +304,7 @@ fn finish_deleted_event(
     revision: u64,
     api_version: &str,
     kind: &str,
+    as_partial_object_metadata: bool,
 ) -> Bytes {
     // Set metadata.resourceVersion via ObjectMeta's own field-name mapping instead of a raw
     // string index, merging just this one field into the existing metadata object rather than
@@ -324,6 +325,9 @@ fn finish_deleted_event(
     match &mut obj["metadata"] {
         serde_json::Value::Object(metadata) => metadata.extend(fields),
         _ => unreachable!("stored object metadata is always a JSON object"),
+    }
+    if as_partial_object_metadata {
+        return ndjson_event_value("DELETED", &take_partial_object_metadata(obj));
     }
     stamp_type_meta_if_changed(&mut obj, api_version, kind);
     ndjson_event_value("DELETED", &obj)
@@ -400,7 +404,13 @@ pub(crate) fn encode_watch_event(
                         // the watch's ResultChan — RetryWatcher reconnects (without ever having
                         // extracted a resourceVersion from the failed event) and repeats forever,
                         // wedging any caller waiting on a DELETED event.
-                        return Some(finish_deleted_event(obj, *revision, api_version, kind));
+                        return Some(finish_deleted_event(
+                            obj,
+                            *revision,
+                            api_version,
+                            kind,
+                            as_partial_object_metadata,
+                        ));
                     }
                 }
             }
@@ -1541,6 +1551,7 @@ async fn watch_generic_impl<S: Store>(
                                                             *revision,
                                                             &api_version,
                                                             &kind,
+                                                            as_partial_object_metadata,
                                                         ));
                                                     }
                                                     matches
@@ -1909,6 +1920,44 @@ mod tests {
             "finish_deleted_event must still stamp the deletion revision alongside the \
              untouched fields above"
         );
+    }
+
+    /// Metadata informers must never receive full objects on delete: upstream transforms every
+    /// watch event (including DELETED) to PartialObjectMetadata, and a DELETED event that still
+    /// carries spec/status leaks fields the client declared it does not want.
+    #[test]
+    fn deleted_watch_event_is_metadata_only_for_partial_object_metadata_watch() {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "p", "namespace": "ns", "generation": 3 },
+            "spec": { "nodeName": "n1" },
+            "status": { "phase": "Running" }
+        });
+        let event = WatchEvent::Deleted {
+            key: "/registry/pods/ns/p".into(),
+            revision: 7,
+            body: Some(bytes::Bytes::from(serde_json::to_vec(&body).unwrap())),
+        };
+        let chunk = encode_watch_event(&event, "meta.k8s.io/v1", "PartialObjectMetadata", true)
+            .expect("DELETED with body must encode");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+        let object = decoded["object"].as_object().unwrap();
+        let mut keys: Vec<_> = object.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["apiVersion", "kind", "metadata"],
+            "metadata informers must never receive full objects on delete: {decoded}"
+        );
+        assert_eq!(decoded["object"]["kind"], "PartialObjectMetadata");
+        assert_eq!(decoded["object"]["apiVersion"], "meta.k8s.io/v1");
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "7",
+            "the deletion revision must still be stamped so reflectors advance their RV"
+        );
+        assert_eq!(decoded["object"]["metadata"]["generation"], 3);
     }
 
     /// Historical-wedge regression, ADDED counterpart: mirrors

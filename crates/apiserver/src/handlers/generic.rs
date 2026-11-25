@@ -47,12 +47,123 @@ pub struct CollectionQuery {
 // Accept header helpers
 // ---------------------------------------------------------------------------
 
-/// Detect whether the Accept header requests PartialObjectMetadata.
-/// The kcm metadatainformer sends Accept headers like:
-///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
-///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
-pub(crate) fn wants_partial_object_metadata(accept: &str) -> bool {
-    accept.contains("as=PartialObjectMetadata")
+/// Which PartialObjectMetadata form an Accept header asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PomForm {
+    Object,
+    List,
+}
+
+/// The winning media type of an Accept header, resolved the way upstream's negotiation does:
+/// highest q, then most specific type, then most parameters, then header order. Entries whose
+/// `as` conversion the server does not offer (anything but Table or PartialObjectMetadata[List]
+/// in meta.k8s.io v1/v1beta1) are skipped. `None` means the winner asks for no
+/// PartialObjectMetadata conversion.
+fn requested_pom_form(accept: &str) -> Option<PomForm> {
+    let mut best: Option<((u32, u8, usize), Option<PomForm>)> = None;
+    for entry in accept.split(',') {
+        let mut parts = entry.split(';');
+        let media = parts.next().unwrap_or("").trim();
+        if media.is_empty() {
+            continue;
+        }
+        let (mut q, mut as_, mut g, mut v, mut params) = (1000u32, None, None, None, 0usize);
+        for param in parts {
+            let Some((k, val)) = param.split_once('=') else {
+                continue;
+            };
+            let (k, val) = (k.trim(), val.trim().trim_matches('"'));
+            match k {
+                "q" => {
+                    q = val
+                        .parse::<f32>()
+                        .map_or(0, |f| (f.clamp(0.0, 1.0) * 1000.0) as u32)
+                }
+                "as" => as_ = Some(val),
+                "g" => g = Some(val),
+                "v" => v = Some(val),
+                _ => {}
+            }
+            params += 1;
+        }
+        if q == 0 {
+            continue;
+        }
+        let form = match as_ {
+            None => None,
+            Some(kind) => {
+                if g != Some("meta.k8s.io") || !matches!(v, Some("v1" | "v1beta1")) {
+                    continue;
+                }
+                match kind {
+                    "PartialObjectMetadata" => Some(PomForm::Object),
+                    "PartialObjectMetadataList" => Some(PomForm::List),
+                    "Table" => None,
+                    _ => continue,
+                }
+            }
+        };
+        let specificity = match media {
+            "*/*" => 0,
+            m if m.ends_with("/*") => 1,
+            _ => 2,
+        };
+        let key = (q, specificity, params);
+        if best.as_ref().is_none_or(|(b, _)| key > *b) {
+            best = Some((key, form));
+        }
+    }
+    best.and_then(|(_, form)| form)
+}
+
+/// The one PartialObjectMetadata negotiation point for GET, LIST and WATCH. `served` is the
+/// form of the object the endpoint produces (`Object` for GET/WATCH, `List` for LIST). Returns
+/// whether the response must be projected to metadata only; a form that does not match what
+/// the endpoint serves is a 406, as upstream's `asPartialObjectMetadata[List]` returns.
+/// `go_type` names the upstream Go type of the served object, for the error message.
+pub(crate) fn negotiate_partial_object_metadata(
+    accept: &str,
+    served: PomForm,
+    go_type: impl FnOnce() -> String,
+) -> Result<bool, crate::status::StatusError> {
+    match (requested_pom_form(accept), served) {
+        (None, _) => Ok(false),
+        (Some(PomForm::Object), PomForm::Object) | (Some(PomForm::List), PomForm::List) => Ok(true),
+        (Some(PomForm::List), PomForm::Object) => Err(Status::not_acceptable(format!(
+            "you requested PartialObjectMetadataList, but the requested object is not a list ({})",
+            go_type()
+        ))),
+        (Some(PomForm::Object), PomForm::List) => Err(Status::not_acceptable(format!(
+            "you requested PartialObjectMetadata, but the requested object is a list ({})",
+            go_type()
+        ))),
+    }
+}
+
+/// The form a collection endpoint serves: a watch streams single objects, a LIST a list.
+pub(crate) fn collection_pom_form(watch: Option<bool>) -> PomForm {
+    if watch == Some(true) {
+        PomForm::Object
+    } else {
+        PomForm::List
+    }
+}
+
+/// Upstream's Go `%T` of a built-in object, e.g. `*core.Pod`, `*apps.DeploymentList`.
+pub(crate) fn builtin_go_type(group: &str, kind: &str, form: PomForm) -> String {
+    let pkg = match group.split('.').next() {
+        Some("") | None => "core",
+        Some(g) => g,
+    };
+    let list = if form == PomForm::List { "List" } else { "" };
+    format!("*{pkg}.{kind}{list}")
+}
+
+pub(crate) fn cr_go_type(form: PomForm) -> String {
+    match form {
+        PomForm::Object => "*unstructured.Unstructured".to_string(),
+        PomForm::List => "*unstructured.UnstructuredList".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5041,38 +5152,95 @@ mod escalation_tests {
         .is_ok());
     }
 
-    // -- wants_partial_object_metadata --
+    // -- negotiate_partial_object_metadata --
 
-    use super::wants_partial_object_metadata;
+    use super::{builtin_go_type, negotiate_partial_object_metadata, PomForm};
 
-    /// kcm's metadatainformer sends Accept headers containing "as=PartialObjectMetadata".
-    /// wants_partial_object_metadata must return true for these so that watch_generic
-    /// produces BOOKMARK events with apiVersion=meta.k8s.io/v1, kind=PartialObjectMetadata.
-    /// Without this, GC cannot complete its initial sync because client-go's reflector
-    /// does not recognise the initial-events-end BOOKMARK.
+    const KCM_OBJECT_ACCEPT: &str = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json";
+    const KCM_LIST_ACCEPT: &str = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json";
+
+    fn negotiate(accept: &str, served: PomForm) -> Result<bool, crate::status::StatusError> {
+        negotiate_partial_object_metadata(accept, served, || "*core.Pod".to_string())
+    }
+
+    /// The GC's metadata informer must get a metadata-only projection when it asks for the
+    /// form the endpoint serves; otherwise its decoder rejects typed objects and never syncs.
     #[test]
-    fn wants_pom_detects_metadatainformer_accept_header() {
-        // Full kcm Accept header (protobuf variant)
-        let accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json";
-        assert!(
-            wants_partial_object_metadata(accept),
-            "kcm metadatainformer Accept header must be detected as PartialObjectMetadata"
+    fn negotiation_accepts_matching_form_for_gc_informer_headers() {
+        assert!(negotiate(KCM_OBJECT_ACCEPT, PomForm::Object).unwrap());
+        assert!(negotiate(KCM_LIST_ACCEPT, PomForm::List).unwrap());
+    }
+
+    /// Clients that do not ask for metadata-only (or are not parsed correctly) must keep
+    /// receiving full objects.
+    #[test]
+    fn negotiation_leaves_plain_accepts_untouched() {
+        for accept in [
+            "",
+            "application/json",
+            "*/*",
+            "application/json;as=Table;g=meta.k8s.io;v=v1",
+        ] {
+            assert!(!negotiate(accept, PomForm::Object).unwrap(), "{accept:?}");
+            assert!(!negotiate(accept, PomForm::List).unwrap(), "{accept:?}");
+        }
+    }
+
+    /// A substring match would treat any header mentioning the text as a request; upstream only
+    /// honors a well-formed `as`/`g`/`v` triple, so a foreign group or kind must not convert.
+    #[test]
+    fn negotiation_parses_params_instead_of_substring_matching() {
+        for accept in [
+            "application/json;as=PartialObjectMetadata;g=example.com;v=v1",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v2",
+            "application/json;as=PartialObjectMetadata",
+            "application/json;as=PartialObjectMetadataFoo;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1;q=0",
+            "application/json;x=as=PartialObjectMetadata",
+        ] {
+            assert!(!negotiate(accept, PomForm::Object).unwrap(), "{accept:?}");
+        }
+    }
+
+    /// q-values and specificity pick the winner, so a preferred plain entry must beat a
+    /// lower-q conversion entry.
+    #[test]
+    fn negotiation_honors_q_values() {
+        let accept = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1;q=0.5,application/json;q=0.9";
+        assert!(!negotiate(accept, PomForm::Object).unwrap());
+    }
+
+    /// Upstream answers 406 NotAcceptable, not 200, when the requested form does not match
+    /// what the endpoint serves.
+    #[test]
+    fn negotiation_form_mismatch_is_406_with_upstream_message() {
+        let crate::status::StatusError(code, status) =
+            negotiate(KCM_LIST_ACCEPT, PomForm::Object).unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(status.reason, "NotAcceptable");
+        assert_eq!(
+            status.message,
+            "you requested PartialObjectMetadataList, but the requested object is not a list (*core.Pod)"
+        );
+        let crate::status::StatusError(code, status) =
+            negotiate(KCM_OBJECT_ACCEPT, PomForm::List).unwrap_err();
+        assert_eq!(code, axum::http::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(
+            status.message,
+            "you requested PartialObjectMetadata, but the requested object is a list (*core.Pod)"
         );
     }
 
     #[test]
-    fn wants_pom_returns_false_for_plain_json() {
-        assert!(
-            !wants_partial_object_metadata("application/json"),
-            "plain application/json must not be detected as PartialObjectMetadata"
+    fn builtin_go_type_uses_internal_package_names() {
+        assert_eq!(builtin_go_type("", "Pod", PomForm::Object), "*core.Pod");
+        assert_eq!(
+            builtin_go_type("apps", "Deployment", PomForm::List),
+            "*apps.DeploymentList"
         );
-    }
-
-    #[test]
-    fn wants_pom_returns_false_for_empty() {
-        assert!(
-            !wants_partial_object_metadata(""),
-            "empty Accept must not be detected as PartialObjectMetadata"
+        assert_eq!(
+            builtin_go_type("rbac.authorization.k8s.io", "Role", PomForm::Object),
+            "*rbac.Role"
         );
     }
 }
