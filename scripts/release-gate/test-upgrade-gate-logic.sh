@@ -148,5 +148,68 @@ rc=0; ug_run_status "$nrbad" || rc=$?
 assert "a node that never returns Ready fails the run" "$(yes_if [ "$rc" = 1 ])"
 assert "the verdict table names the node check" "$(yes_if grep -q '^FAIL  node Ready' <<<"$(ug_verdict "$nrbad")")"
 
+# ---- a signal during VM start must delete the VM ----
+# vm_create is the longest step (limactl start, IAP ssh retries); a foreground one defers the
+# TERM/INT trap until it returns, so a cancelled run kept a VM billing for up to 16 h.
+# Runs "$@" in the background, waits (bounded) for $marker, sends SIG, waits (bounded) for exit.
+# Sets hs_ready (marker appeared), hs_ended (exited by itself within the bound), hs_rc.
+hold_and_signal() { # sig marker cmd...
+  local sig="$1" marker="$2" p i; shift 2
+  set -m; "$@" >/dev/null 2>&1 & p=$!; set +m
+  hs_ready=0; hs_ended=0; hs_rc=0
+  for i in $(seq 1 80); do [ ! -e "$marker" ] || { hs_ready=1; break; }; kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+  kill "-$sig" "$p" 2>/dev/null || true
+  for i in $(seq 1 120); do kill -0 "$p" 2>/dev/null || { hs_ended=1; break; }; sleep 0.25; done
+  if [ "$hs_ended" = 1 ]; then wait "$p" || hs_rc=$?; else pkill -KILL -P "$p" 2>/dev/null || true; kill -KILL "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true; fi
+}
+pid_alive() { local p; p="$(cat "$1" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+reap_hang() { local p; p="$(cat "$1" 2>/dev/null || true)"; [ -z "$p" ] || kill "$p" 2>/dev/null || true; }
+
+export GCLOUD_CALLS="$TMP/gcloud-calls" LIMA_CALLS="$TMP/lima-calls" GCP_SSH_TRIES=1 GCP_SSH_SLEEP=0 GCP_OPS_SLEEP=0 GCP_DELETE_SLEEP=0
+export GCLOUD_HANG_PID="$TMP/gcloud-hang.pid" LIMA_HANG_PID="$TMP/lima-hang.pid"
+mkdir -p "$TMP/bin-hold" "$TMP/prev" "$TMP/cand"
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
+  '  "config configurations describe"*) exit 0 ;;' \
+  '  "config get-value project") echo p-secret ;;' \
+  '  "config get-value compute/zone") echo z-1 ;;' \
+  '  "compute instances create"*) echo created ;;' \
+  '  "compute ssh"*) echo $$ > "$GCLOUD_HANG_PID"; exec sleep 300 ;;' \
+  'esac' 'exit 0' > "$TMP/bin-hold/gcloud"
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$LIMA_CALLS"' \
+  'case "$1" in list) exit 0 ;; start) echo $$ > "$LIMA_HANG_PID"; exec sleep 300 ;; esac' 'exit 0' > "$TMP/bin-hold/limactl"
+chmod +x "$TMP/bin-hold/gcloud" "$TMP/bin-hold/limactl"
+for d in prev cand; do : > "$TMP/$d/u7s-gate-x.tar.gz"; : > "$TMP/$d/u7s-gate-x.tar.gz.sha256"; : > "$TMP/$d/install.sh"; done
+
+for sigspec in TERM:143 INT:130; do
+  sig="${sigspec%%:*}"; want="${sigspec##*:}"
+  rm -f "$GCLOUD_HANG_PID"; : > "$GCLOUD_CALLS"; rm -rf "$TMP/out-gsig"
+  hold_and_signal "$sig" "$GCLOUD_HANG_PID" env PATH="$TMP/bin-hold:$PATH" \
+    "$HERE/upgrade-gate.sh" --backend gcp --from v0.0.1 --release v0.0.2-snapshot.1 --out "$TMP/out-gsig"
+  vmname="$(grep 'instances create' "$GCLOUD_CALLS" | head -1 | sed -E 's/.*instances create (u7s-upg-[^ ]*) .*/\1/')"
+  alive=0; ! pid_alive "$GCLOUD_HANG_PID" || alive=1; reap_hang "$GCLOUD_HANG_PID"
+  assert "gcp $sig during VM start reached the start phase (the signal must land after create, or the test proves nothing)" \
+    "$(yes_if [ "$hs_ready" = 1 ] && [ -n "$vmname" ])"
+  assert "gcp $sig during VM start exits $want within the bound (a deferred trap leaves the VM billing until start returns)" \
+    "$(yes_if [ "$hs_ended" = 1 ] && [ "$hs_rc" = "$want" ])"
+  assert "gcp $sig during VM start deletes the VM exactly once (a gate VM left up after Ctrl-C keeps billing for up to 16 h)" \
+    "$(yes_if [ -n "$vmname" ] && [ "$(grep -c "instances delete $vmname " "$GCLOUD_CALLS")" = 1 ])"
+  assert "gcp $sig during VM start leaves no orphaned ssh client (it would hold the IAP session open)" \
+    "$(yes_if [ "$alive" = 0 ])"
+
+  rm -f "$LIMA_HANG_PID"; : > "$LIMA_CALLS"; rm -rf "$TMP/out-lsig"
+  hold_and_signal "$sig" "$LIMA_HANG_PID" env PATH="$TMP/bin-hold:$PATH" \
+    "$HERE/upgrade-gate.sh" --from v0.0.1 --prev-dir "$TMP/prev" --cand-dir "$TMP/cand" --out "$TMP/out-lsig"
+  vmname="$(grep '^create ' "$LIMA_CALLS" | head -1 | sed -E 's/.*--name ([^ ]+) .*/\1/')"
+  alive=0; ! pid_alive "$LIMA_HANG_PID" || alive=1; reap_hang "$LIMA_HANG_PID"
+  assert "lima $sig during VM start reached the start phase (the signal must land after create)" \
+    "$(yes_if [ "$hs_ready" = 1 ] && [ -n "$vmname" ])"
+  assert "lima $sig during VM start exits $want within the bound" \
+    "$(yes_if [ "$hs_ended" = 1 ] && [ "$hs_rc" = "$want" ])"
+  assert "lima $sig during VM start deletes the VM exactly once (a stranded Lima VM holds the host's RAM and disk until someone notices)" \
+    "$(yes_if [ -n "$vmname" ] && [ "$(grep -c "^delete -f $vmname\$" "$LIMA_CALLS")" = 1 ])"
+  assert "lima $sig during VM start leaves no orphaned limactl child" \
+    "$(yes_if [ "$alive" = 0 ])"
+done
+
 echo "---- $PASS passed, $FAIL failed ----"
 [ "$FAIL" = 0 ]
