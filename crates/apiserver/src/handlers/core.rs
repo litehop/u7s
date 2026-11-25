@@ -61,7 +61,10 @@ pub(crate) async fn core_list_resource<S: Store>(
         // rejects the typed Pod/PodList response and the informer never populates (metrics-server
         // silently returns empty PodMetrics for every labelSelector-filtered query, which is
         // exactly what the HPA controller always issues).
-        let pom = super::generic::wants_partial_object_metadata(accept);
+        let served = super::generic::collection_pom_form(query.watch);
+        let pom = super::generic::negotiate_partial_object_metadata(accept, served, || {
+            super::generic::builtin_go_type("", "Pod", served)
+        })?;
         let table = super::table::wants_table(accept);
 
         let prefix = crate::keys::cluster_list_prefix("pods");
@@ -1014,7 +1017,7 @@ mod tests {
             .uri("/api/v1/pods")
             .header(
                 "accept",
-                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+                "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
             )
             .body(Body::empty())
             .unwrap();

@@ -75,14 +75,6 @@ fn restore_or_strip_status(
 // Cluster-scoped handlers  (group/version/resource)
 // ---------------------------------------------------------------------------
 
-/// Detect whether the Accept header requests PartialObjectMetadata.
-/// The kcm metadatainformer (GC) sends headers like:
-///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
-///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
-fn wants_partial_object_metadata(accept: &str) -> bool {
-    accept.contains("as=PartialObjectMetadata")
-}
-
 pub(crate) async fn list_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
@@ -120,7 +112,10 @@ pub(crate) async fn list_resource<S: Store>(
             )));
         }
     }
-    let pom = wants_partial_object_metadata(accept);
+    let served = super::generic::collection_pom_form(query.watch);
+    let pom = super::generic::negotiate_partial_object_metadata(accept, served, || {
+        super::generic::builtin_go_type(&group, &meta.kind, served)
+    })?;
     let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
@@ -269,7 +264,11 @@ pub(crate) async fn get_resource<S: Store>(
     // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
     // decode and retries the owner-check forever, so newly-orphaned dependents are never
     // identified as dangling and never collected.
-    if wants_partial_object_metadata(accept) {
+    if super::generic::negotiate_partial_object_metadata(
+        accept,
+        super::generic::PomForm::Object,
+        || super::generic::builtin_go_type(&group, &meta.kind, super::generic::PomForm::Object),
+    )? {
         return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
     }
 
@@ -3077,7 +3076,10 @@ pub(crate) async fn list_namespaced_resource<S: Store>(
             )));
         }
     }
-    let pom = wants_partial_object_metadata(accept);
+    let served = super::generic::collection_pom_form(query.watch);
+    let pom = super::generic::negotiate_partial_object_metadata(accept, served, || {
+        super::generic::builtin_go_type(&group, &meta.kind, served)
+    })?;
     let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
@@ -3231,7 +3233,11 @@ pub(crate) async fn get_namespaced_resource<S: Store>(
     // (garbagecollector.go's isDangling); without this, it receives a typed object it can't
     // decode and retries the owner-check forever, so newly-orphaned dependents are never
     // identified as dangling and never collected.
-    if wants_partial_object_metadata(accept) {
+    if super::generic::negotiate_partial_object_metadata(
+        accept,
+        super::generic::PomForm::Object,
+        || super::generic::builtin_go_type(&group, &meta.kind, super::generic::PomForm::Object),
+    )? {
         return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
     }
 
@@ -14097,6 +14103,18 @@ mod tests {
         h
     }
 
+    fn pom_list_accept_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,\
+                 application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json",
+            ),
+        );
+        h
+    }
+
     /// Regression: list_namespaced_resource with POM Accept must return PartialObjectMetadataList.
     /// The GC does a list before opening a watch. If the list returns a DeploymentList instead of
     /// PartialObjectMetadataList, the GC cannot parse the response and will fail to populate its
@@ -14155,7 +14173,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
-            pom_accept_headers(),
+            pom_list_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
                 username: "test".into(),
                 uid: String::new(),
@@ -15144,33 +15162,6 @@ mod tests {
             "namespaced key format must match the RBAC index expected path"
         );
     }
-
-    /// wants_partial_object_metadata detects the GC's Accept header correctly.
-    /// This is the predicate that gates POM mode — if it returns false for the GC's header,
-    /// the GC gets wrong apiVersion/kind in all events and can never sync.
-    #[test]
-    fn wants_partial_object_metadata_detects_gc_accept_header() {
-        // Real header sent by kube-controller-manager's metadatainformer.
-        let gc_accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;\
-                         g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;\
-                         g=meta.k8s.io;v=v1,application/json";
-        assert!(
-            wants_partial_object_metadata(gc_accept),
-            "GC's Accept header must be detected as POM; if not, GC informers get wrong \
-             apiVersion/kind and can never sync"
-        );
-
-        // Non-POM accept must return false.
-        assert!(
-            !wants_partial_object_metadata("application/json"),
-            "plain JSON Accept must not be detected as POM"
-        );
-        assert!(
-            !wants_partial_object_metadata(""),
-            "empty Accept must not be detected as POM"
-        );
-    }
-
     // -- is_seeded_rbac_object --
 
     #[test]

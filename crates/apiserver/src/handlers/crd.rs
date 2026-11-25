@@ -710,7 +710,11 @@ pub async fn list_crds<S: Store>(
             .get(axum::http::header::ACCEPT)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let pom = super::generic::wants_partial_object_metadata(accept);
+        let pom = super::generic::negotiate_partial_object_metadata(
+            accept,
+            super::generic::PomForm::Object,
+            || super::generic::builtin_go_type(GROUP, KIND, super::generic::PomForm::Object),
+        )?;
         let (watch_api_version, watch_kind) = if pom {
             (
                 "meta.k8s.io/v1".to_string(),
