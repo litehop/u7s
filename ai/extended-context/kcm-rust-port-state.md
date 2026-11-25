@@ -7,16 +7,14 @@ kind: initiative-state
 
 **AS OF 2026-11-25.** Decision record:
 `docs/decisions/kcm-rust-port-local-first-separate-process.md`. No port code
-exists; Phase 0 is not started. Full original design: `git show 900097c6:ai/findings/2026-11-24-mayor-w9xt5-kcm-port-phase2-design.md`.
+exists; Phase 0 is not started. Original design: `git show 900097c6:ai/findings/2026-11-24-mayor-w9xt5-kcm-port-phase2-design.md`.
 
 ## Operator decision (2026-11-25) and what follows
 
-Operator: no high-risk KCM operations; start small with a solid, scalable
-design; verify locally; deliver to releases or `install.sh` only once
-verification shows a performance benefit and conformance parity, and not
-soon. The mapping below is the mayor's reading of it (the operator may
-correct it). The gates and phases below are the local verification regime,
-not a shipping plan.
+Operator: no high-risk KCM operations; start small with a scalable design;
+verify locally; deliver to releases or `install.sh` only once verification
+shows a performance benefit and conformance parity, and not soon. The mapping below is the mayor's reading of it. The gates and phases
+below are the local verification regime, not a shipping plan.
 
 | # | Question | Status |
 |---|---|---|
@@ -29,9 +27,8 @@ not a shipping plan.
 | D7 | Multi-node specs | Lima, locally; no CI investment yet |
 | D8 | Cadence | Local phases merge on `--focus` plus unit gates; full 2-node suite before shipping |
 
-Ship gate: measured benefit versus the shipped Go KCM and full conformance
-including the 2-node suite. Until then nothing is wired into `install.sh` or
-releases.
+Ship gate: measured benefit versus the shipped Go KCM and full 2-node
+conformance. Until then nothing is wired into `install.sh` or releases.
 
 ## Numbers (MiB; all measured by the memory decomposition, branch `871d58e7`)
 
@@ -70,17 +67,17 @@ Phases 1-5 are expected memory-neutral or slightly negative.
 Metric: `Pss_Anon` from `smaps_rollup` for KCM-Go, KCM-Rust and the apiserver,
 in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 50-pod burst). The sampler records `ps` RSS today; the PSS-anon column and
-`kcm-mem.json` are Phase 0 work.
+`kcm-mem.json` are Phase 0 work, and run-meta must record `kcm_mode` and the ported-controller list (`mayor-rh8y3`).
 
-- Gate on the total per stage, not per controller (savings per port are
-  below the noise).
+- Gate on the per-stage total, not per controller (per-port savings are
+  noise).
 - R = shipped Go-only, H = phase build. Three interleaved runs each, same VM,
   same day, medians. PASS if `median(H) - median(R) <= 0`; INCONCLUSIVE if
   0 to 3, extend to 5 runs and pass only if `<= 0`; FAIL if above 3 on 3 runs
   or above 0 on 5.
 - Cumulative cap: at each phase end, 5 interleaved runs of H_k and trimmed Go
   (T); KCM-side anon (Go + Rust, apiserver excluded) of H_k must be at most T
-  at every stage. So the Rust fixed cost must come out of the trim headroom.
+  at every stage. So Rust fixed cost must come out of trim headroom.
 - Phase 0 passes if `median(R) - median(T) >= 5`.
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
   the projection `P = F + sum(m_c)` is at most 33.4 (script
@@ -94,7 +91,7 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 
 ## Verification protocol
 
-Sonobuoy stays authoritative through these invariants:
+Sonobuoy stays authoritative via these invariants:
 
 1. `scripts/conformance/guard.sha256` pins the e2e binary, plugin config,
    skip/focus lists, focus registry, projection script, `kcm-mem.json` and N.
@@ -126,8 +123,8 @@ two sets are disjoint and their union is the full set.
 - Trim validity (HPA, TTL): unproven. `mayor-rh8y3`.
 - Embedded-in-apiserver alternative: re-measure each phase end; raise to the
   operator if the estimated saving is at least 4 MiB.
-- Whether upstream integration tests can target an external apiserver, and
-  whether audit shows per-controller identity: `mayor-anvu2`.
+- Can upstream integration tests target an external apiserver; does audit
+  show per-controller identity: `mayor-anvu2`.
 - Wedged-but-alive controller detection: `mayor-n6njd`.
 - Nightly multi-node job: `mayor-iv2yg`, deferred until the ship gate.
 - Spec-to-controller mapping is from directory listings only; re-derive from
@@ -135,8 +132,7 @@ two sets are disjoint and their union is the full set.
 
 ## Kubelet
 
-Not decided. The Phase 1 audit judged a Rust kubelet not viable absent new
-evidence: about 139k non-test LOC, no Rust prior art for the real CRI path,
+Not decided. The Phase 1 audit judged a Rust kubelet not viable: about 139k non-test LOC, no Rust prior art for the real CRI path,
 and it would forfeit the unmodified-kubelet conformance-oracle role. Revisit
-after the capacity benchmark data (`mayor-jedol`). Full audit:
+after the capacity benchmark data (`mayor-jedol`). The eval also cites the unmodified-kubelet node-rejoin story; the reduced-gate conformance prerequisite is tracked in `mayor-omxmp`. Audit:
 `git show 900097c6:ai/findings/2026-09-16-mayor-vc844-kubelet-kcm-rust-eval.md`.
