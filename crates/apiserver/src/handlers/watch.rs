@@ -157,45 +157,6 @@ pub fn prepare_live_event(
     ))
 }
 
-/// Mirrors `defaults::apply_defaults`'s dispatch conditions closely enough to answer "could
-/// this resource type ever be mutated by apply_defaults" without a parsed `Value` to check
-/// against. MUST stay in sync with `apply_defaults`: a type added there without a matching arm
-/// here would silently drop its defaulting on every plain (no-selector) live watch event —
-/// `defaults_may_mutate_matches_apply_defaults_reaches_this_watch_regression` below pins the
-/// two together for the field this project has already hit a real bug on (Service
-/// ipFamilyPolicy).
-fn defaults_may_mutate(group: &str, plural: &str) -> bool {
-    super::defaults::is_workload_resource(group, plural)
-        || super::defaults::is_endpointslice(group, plural)
-        || matches!(
-            (group, plural),
-            ("apps", "deployments")
-                | ("apps", "replicasets")
-                | ("apps", "statefulsets")
-                | ("apps", "daemonsets")
-                | ("batch", "jobs")
-                | ("batch", "cronjobs")
-                | ("", "services")
-                | ("", "endpoints")
-                | ("", "persistentvolumeclaims")
-                | ("", "persistentvolumes")
-                | ("", "secrets")
-                | ("storage.k8s.io", "csidrivers")
-                | ("storage.k8s.io", "storageclasses")
-                | ("", "namespaces")
-                | ("coordination.k8s.io", "leases")
-                | ("", "replicationcontrollers")
-                | ("autoscaling", "horizontalpodautoscalers")
-                | ("networking.k8s.io", "networkpolicies")
-                | ("resource.k8s.io", "resourceclaims")
-                | ("resource.k8s.io", "resourceclaimtemplates")
-                | ("resource.k8s.io", "devicetaintrules")
-        )
-        || (plural == "events" && (group.is_empty() || group == "events.k8s.io"))
-        || (group == "rbac.authorization.k8s.io"
-            && (plural == "rolebindings" || plural == "clusterrolebindings"))
-}
-
 /// Cheap projection used only to decide whether the stored bytes already carry the exact
 /// apiVersion/kind this watch is serving — deserializes just those two fields (serde skips
 /// everything else without building a `Value` for it), so checking is far cheaper than a full
@@ -231,7 +192,7 @@ fn prepare_fast_live_event(
     kind: &str,
     as_partial_object_metadata: bool,
 ) -> Option<Bytes> {
-    if as_partial_object_metadata || defaults_may_mutate(group, plural) {
+    if as_partial_object_metadata || super::defaults::defaults_apply(group, plural) {
         return prepare_live_event(
             raw,
             event_type,
@@ -2384,22 +2345,101 @@ mod tests {
     /// Regression pin for the exact bug this project already hit once: apply_defaults sets
     /// Service.spec.ipFamilyPolicy, so a Service watched with no selector must NOT take the
     /// zero-parse raw path (which never runs apply_defaults) — it must fall back to
-    /// prepare_live_event. If defaults_may_mutate is ever missing an arm apply_defaults has,
+    /// prepare_live_event. If defaults_apply is ever missing an arm apply_defaults has,
     /// a client watching that resource type silently stops seeing server-side defaults on
     /// live events (see watch_generic_service_added_event_has_ip_family_defaults, which reaches
     /// this same gate through the full watch_generic_impl stream).
     #[test]
-    fn defaults_may_mutate_matches_apply_defaults_reaches_this_watch_regression() {
+    fn defaults_apply_matches_apply_defaults_reaches_this_watch_regression() {
         assert!(
-            defaults_may_mutate("", "services"),
+            super::super::defaults::defaults_apply("", "services"),
             "apply_defaults has a Service arm (default_service sets ipFamilyPolicy); \
-             defaults_may_mutate must say so or the watch fast path skips it silently"
+             defaults_apply must say so or the watch fast path skips it silently"
         );
         assert!(
-            !defaults_may_mutate("", "configmaps"),
-            "apply_defaults has no ConfigMap arm; defaults_may_mutate returning true here would \
+            !super::super::defaults::defaults_apply("", "configmaps"),
+            "apply_defaults has no ConfigMap arm; defaults_apply returning true here would \
              just cost performance (forces the slow path), not correctness, but pins the \
              expected fast-path-eligible case this whole optimization targets"
+        );
+    }
+
+    /// Watch events for a kind must carry the same defaulted body a GET/LIST of it returns: a
+    /// client that sees a field absent on watch but present on list (preemptionPolicy,
+    /// podCIDRs, ...) diverges from upstream. Walks the whole registry so a kind dropped from
+    /// the shared defaulting gate fails here, and pins four kinds whose defaults the
+    /// hand-copied watch list once missed.
+    #[test]
+    fn watch_and_list_must_present_identically_defaulted_objects_to_clients() {
+        let state = crate::handlers::test_support::make_state_with_store(std::sync::Arc::new(
+            u7s_store::SqliteStore::new(":memory:").unwrap(),
+        ));
+        let fast = |group: &str, plural: &str, raw: &serde_json::Value| {
+            let mut stored = raw.clone();
+            stored["apiVersion"] = "v1".into();
+            stored["kind"] = "X".into();
+            let bytes = serde_json::to_vec(&stored).unwrap();
+            let out = prepare_fast_live_event(&bytes, "ADDED", group, plural, "v1", "X", false)
+                .expect("valid json");
+            let ev: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            ev["object"].clone()
+        };
+        let defaulted = |group: &str, plural: &str, raw: &serde_json::Value| {
+            let mut v = raw.clone();
+            super::super::defaults::apply_defaults(group, plural, &mut v);
+            v["apiVersion"] = "v1".into();
+            v["kind"] = "X".into();
+            v
+        };
+        let pinned = [
+            (
+                "scheduling.k8s.io",
+                "priorityclasses",
+                serde_json::json!({"metadata": {"name": "p"}, "value": 5}),
+            ),
+            (
+                "",
+                "nodes",
+                serde_json::json!({"metadata": {"name": "n"}, "spec": {"podCIDR": "10.0.0.0/24"}}),
+            ),
+            (
+                "",
+                "limitranges",
+                serde_json::json!({"metadata": {"name": "l", "namespace": "d"},
+                    "spec": {"limits": [{"type": "Container", "max": {"cpu": "1"}}]}}),
+            ),
+            (
+                "certificates.k8s.io",
+                "podcertificaterequests",
+                serde_json::json!({"metadata": {"name": "c", "namespace": "d"}, "spec": {}}),
+            ),
+        ];
+        for (group, plural, raw) in &pinned {
+            let want = defaulted(group, plural, raw);
+            assert_ne!(&want, raw, "{plural} sample must exercise a default");
+            assert_eq!(
+                fast(group, plural, raw),
+                want,
+                "{group}/{plural}: watch event must equal the defaulted object LIST serves"
+            );
+        }
+        let bare = serde_json::json!({"metadata": {"name": "n", "namespace": "ns"}});
+        let mut defaulting = 0;
+        for key in state.resource_registry.keys() {
+            if super::super::defaults::defaults_apply(&key.group, &key.plural) {
+                defaulting += 1;
+            }
+            assert_eq!(
+                fast(&key.group, &key.plural, &bare),
+                defaulted(&key.group, &key.plural, &bare),
+                "{}/{}: watch and list disagree on the defaulted object",
+                key.group,
+                key.plural
+            );
+        }
+        assert!(
+            defaulting > 10,
+            "registry walk found {defaulting} defaulting kinds"
         );
     }
 
