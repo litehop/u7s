@@ -688,7 +688,7 @@ printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$GCLOUD_CALLS"' 'case "$*" in' \
   '  "compute operations list"*) [ "${GCLOUD_OPS_ERR:-0}" = 1 ] && { echo "ERROR: operations denied for p-secret" >&2; exit 1; }; [ "${GCLOUD_PREEMPTED:-0}" = 1 ] && echo op-1; exit 0 ;;' \
   '  "compute instances describe"*"disks[0].source"*) echo "https://www.googleapis.com/compute/v1/projects/p-secret/zones/z-1/disks/attached-boot-disk" ;;' \
   '  "compute instances describe"*) [ "${GCLOUD_DESCRIBE_ERR:-0}" = 1 ] && exit 1; echo 1 ;;' \
-  '  "compute ssh"*vm-gate.sh*) [ "${GCLOUD_SSH_HANG:-0}" = 1 ] || exit 0; sleep 300 & echo $! > "$GCLOUD_HANG_PID"; wait ;;' \
+  '  "compute ssh"*vm-gate.sh*) [ "${GCLOUD_SSH_HANG:-0}" = 1 ] || exit 0; echo $$ > "$GCLOUD_HANG_PID"; exec sleep 300 ;;' \
   '  "compute disks describe attached-boot-disk"*) [ "${GCLOUD_NO_IMAGE:-0}" = 1 ] || echo "https://www.googleapis.com/compute/v1/projects/ubuntu-os-cloud/global/images/ubuntu-2604-resolute-amd64-v20261021"; exit 0 ;;' \
   '  "compute ssh"*"uname -r"*) [ "${GCLOUD_NO_KERNEL:-0}" = 1 ] || echo 7.0.0-1017-gcp; exit 0 ;;' \
   '  "compute ssh"*) echo "ERROR: ssh to x.c.p-secret.internal failed" >&2; [ "${GCLOUD_SSH_OK:-0}" = 1 ] && exit 0; exit 1 ;;' \
@@ -810,6 +810,62 @@ alive=0; [ -z "$hang_pid" ] || ! kill -0 "$hang_pid" 2>/dev/null || alive=1
 assert "the wall-clock watchdog kills the ssh client under the redaction pipe, so a hung run ends instead of waiting forever" \
   "$([ -n "$hang_pid" ] && [ "$alive" = 0 ] && [ "$gate_ended" = 1 ] && grep -q 'wall-clock cap 2s hit' "$TMP/out-ghang.out" && echo 1 || echo 0)"
 unset GCLOUD_SSH_OK
+
+# --- a signal after the VM exists must still delete it ---
+# Runs "$@" in the background, waits (bounded) for $marker, sends SIG, waits (bounded) for exit.
+# Sets hs_ready (marker appeared), hs_ended (exited by itself within the bound), hs_rc.
+hold_and_signal() { # sig marker cmd...
+  local sig="$1" marker="$2" p i; shift 2
+  set -m; "$@" >/dev/null 2>&1 & p=$!; set +m
+  hs_ready=0; hs_ended=0; hs_rc=0
+  for i in $(seq 1 80); do [ ! -e "$marker" ] || { hs_ready=1; break; }; kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
+  kill "-$sig" "$p" 2>/dev/null
+  for i in $(seq 1 120); do kill -0 "$p" 2>/dev/null || { hs_ended=1; break; }; sleep 0.25; done
+  if [ "$hs_ended" = 1 ]; then wait "$p" || hs_rc=$?; else pkill -KILL -P "$p" 2>/dev/null; kill -KILL "$p" 2>/dev/null; wait "$p" 2>/dev/null || true; fi
+}
+pid_alive() { local p; p="$(cat "$1" 2>/dev/null || true)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+reap_hang() { local p; p="$(cat "$1" 2>/dev/null || true)"; [ -z "$p" ] || kill "$p" 2>/dev/null || true; }
+
+for sigspec in TERM:143 INT:130; do
+  sig="${sigspec%%:*}"; want="${sigspec##*:}"
+  rm -f "$GCLOUD_HANG_PID"; : > "$GCLOUD_CALLS"; : > "$LIMA_CALLS"; rm -rf "$TMP/out-gsig"
+  hold_and_signal "$sig" "$GCLOUD_HANG_PID" env GCLOUD_SSH_HANG=1 GCLOUD_SSH_OK=1 \
+    "$HERE/burst-gate.sh" --backend gcp --release v9.9.9-test --out "$TMP/out-gsig" --runs 1
+  vmname="$(grep 'instances create' "$GCLOUD_CALLS" | head -1 | sed -E 's/.*instances create (u7s-rg-[^ ]*) .*/\1/')"
+  alive=0; ! pid_alive "$GCLOUD_HANG_PID" || alive=1; reap_hang "$GCLOUD_HANG_PID"
+  assert "gcp $sig mid-run reached the run phase (the signal must land after the VM exists, or the test proves nothing)" \
+    "$([ "$hs_ready" = 1 ] && [ -n "$vmname" ] && echo 1 || echo 0)"
+  assert "gcp $sig mid-run exits $want within the bound (a trap that never fires leaves the VM up)" \
+    "$([ "$hs_ended" = 1 ] && [ "$hs_rc" = "$want" ] && echo 1 || echo 0)"
+  assert "gcp $sig mid-run deletes the VM exactly once (a gate VM left up after Ctrl-C keeps billing for up to 16 h)" \
+    "$([ -n "$vmname" ] && [ "$(grep -c "instances delete $vmname " "$GCLOUD_CALLS")" = 1 ] && echo 1 || echo 0)"
+  assert "gcp $sig mid-run leaves no orphaned ssh child (a surviving client keeps the IAP session and the run output open)" \
+    "$([ "$alive" = 0 ] && echo 1 || echo 0)"
+done
+
+# limactl start is the long foreground step on Lima; a signal during it must still delete the VM.
+mkdir -p "$TMP/bin-lima-hold"
+printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$LIMA_CALLS"' \
+  'case "$1" in list) exit 0 ;; start) echo $$ > "$LIMA_HANG_PID"; exec sleep 300 ;; delete) kill "$(cat "$LIMA_HANG_PID")" 2>/dev/null ;; esac' 'exit 0' > "$TMP/bin-lima-hold/limactl"
+chmod +x "$TMP/bin-lima-hold/limactl"
+export LIMA_HANG_PID="$TMP/lima-hang.pid"
+for sigspec in TERM:143 INT:130; do
+  sig="${sigspec%%:*}"; want="${sigspec##*:}"
+  rm -f "$LIMA_HANG_PID"; : > "$LIMA_CALLS"; rm -rf "$TMP/out-lsig"
+  hold_and_signal "$sig" "$LIMA_HANG_PID" env PATH="$TMP/bin-lima-hold:$PATH" \
+    "$HERE/burst-gate.sh" --runs 1 --tarball-dir "$TMP/tb" --out "$TMP/out-lsig"
+  vmname="$(grep '^create ' "$LIMA_CALLS" | head -1 | sed -E 's/.*--name ([^ ]+) .*/\1/')"
+  alive=0; ! pid_alive "$LIMA_HANG_PID" || alive=1; reap_hang "$LIMA_HANG_PID"
+  assert "lima $sig during VM start reached the start phase (the signal must land after create)" \
+    "$([ "$hs_ready" = 1 ] && [ -n "$vmname" ] && echo 1 || echo 0)"
+  assert "lima $sig during VM start exits $want within the bound" \
+    "$([ "$hs_ended" = 1 ] && [ "$hs_rc" = "$want" ] && echo 1 || echo 0)"
+  assert "lima $sig during VM start deletes the VM exactly once (a stranded Lima VM holds the host's RAM and disk until someone notices)" \
+    "$([ -n "$vmname" ] && [ "$(grep -c "^delete -f $vmname\$" "$LIMA_CALLS")" = 1 ] && echo 1 || echo 0)"
+  assert "lima $sig during VM start leaves no orphaned limactl child" \
+    "$([ "$alive" = 0 ] && echo 1 || echo 0)"
+done
+export GCLOUD_SSH_OK=1
 
 # --- experiment mode: an unpublished tarball must never be mistaken for a release verdict ---
 XP="$TMP/xp"; mkdir -p "$XP"
