@@ -846,7 +846,7 @@ done
 # limactl start is the long foreground step on Lima; a signal during it must still delete the VM.
 mkdir -p "$TMP/bin-lima-hold"
 printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$LIMA_CALLS"' \
-  'case "$1" in list) exit 0 ;; start) echo $$ > "$LIMA_HANG_PID"; exec sleep 300 ;; delete) kill "$(cat "$LIMA_HANG_PID")" 2>/dev/null ;; esac' 'exit 0' > "$TMP/bin-lima-hold/limactl"
+  'case "$1" in list) exit 0 ;; start) echo $$ > "$LIMA_HANG_PID"; exec sleep 300 ;; esac' 'exit 0' > "$TMP/bin-lima-hold/limactl"
 chmod +x "$TMP/bin-lima-hold/limactl"
 export LIMA_HANG_PID="$TMP/lima-hang.pid"
 for sigspec in TERM:143 INT:130; do
