@@ -26,7 +26,7 @@ const MAX_DEPTH: u32 = 512;
 /// Most stack an evaluation may use below its `Evaluator`. Evaluation runs on request and
 /// blocking threads of 512 KiB; the frames already on the stack take part of that. A
 /// release build evaluates every shape to at least 187 levels within this budget, which
-/// is why compilation stops at `MAX_POLICY_RECURSION_DEPTH`; a debug build's larger frames
+/// is why compilation stops at `MAX_RECURSION_DEPTH`; a debug build's larger frames
 /// may refuse deep expressions. Counting levels cannot bound the stack itself, as frame
 /// sizes differ per node kind and build profile, and a stack overflow aborts the process.
 const MAX_STACK_BYTES: usize = 192 * 1024;

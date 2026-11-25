@@ -1856,7 +1856,7 @@ fn run_within_budget<T: Send + 'static>(
     let (tx, rx) = std::sync::mpsc::channel();
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(EVAL_RUNNING));
     // The interpreter and cost replay recurse once per level of the rule's AST, which
-    // compilation bounds at cel-go's 250 levels; the default 2 MiB thread stack is not
+    // compilation bounds at `MAX_RECURSION_DEPTH` levels; the default 2 MiB thread stack is not
     // sized for that, so size it explicitly.
     let guard_key = crd.to_string();
     let thread_state = std::sync::Arc::clone(&state);
@@ -15940,14 +15940,17 @@ mod tests {
 
     /// A CRD rule is evaluated on every write, so the deepest rule compilation accepts must
     /// run to completion on the evaluation thread: "created fine, aborts the apiserver on
-    /// the first write" is the failure. The rule is 249 `+ 1` terms, one under the
-    /// 250-level cap, and a thread's default stack in a debug build cannot hold it.
+    /// the first write" is the failure. The rule nests exactly to the
+    /// cap, and a thread's default stack in a debug build cannot hold it.
     #[test]
     fn deepest_accepted_crd_rule_evaluates_on_the_budgeted_thread() {
         static GATE: ConcurrencyGate = ConcurrencyGate::new(1);
-        let rule = format!("1{} > 0", "+1".repeat(248));
+        let rule = format!(
+            "1{} > 0",
+            "+1".repeat(crate::cel_runtime::MAX_RECURSION_DEPTH - 2)
+        );
         let program = std::sync::Arc::new(
-            crate::cel_runtime::compile_program(&rule).expect("one under the cap compiles"),
+            crate::cel_runtime::compile_program(&rule).expect("a rule at the cap compiles"),
         );
         let result = execute_cel_with_budget(
             &program,
@@ -16054,9 +16057,24 @@ mod tests {
                     .map(at)
                     .find(|(_, rule, _)| crate::cel_runtime::compile_program(rule).is_ok())
                     .expect(shape);
-                assert!(
-                    depth >= 80,
-                    "{shape}: accepted only to {depth}, not deep enough to matter"
+                // Exact nestings that fit under the limit: chains cost one level per
+                // nesting, comprehensions two to three. A drop of even one nesting means
+                // legitimate rules cel-go accepts start being rejected at create.
+                let (plain, with_old_self) = match shape {
+                    "sum chain" | "call chain" | "index chain" | "ternary" | "list" | "map" => {
+                        (92, 91)
+                    }
+                    "in chain" => (90, 89),
+                    "parens" => (94, 94),
+                    "all" => (46, 45),
+                    "exists" => (45, 45),
+                    "map comprehension" => (30, 30),
+                    other => panic!("no depth floor for shape {other}"),
+                };
+                assert_eq!(
+                    depth,
+                    if transition { with_old_self } else { plain },
+                    "{shape} (oldSelf rule {transition}): deepest accepted nesting changed"
                 );
 
                 let schemas = [

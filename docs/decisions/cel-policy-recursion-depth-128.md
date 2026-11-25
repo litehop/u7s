@@ -1,6 +1,6 @@
 # CEL expression depth: 128 for policies, 250 for CRD rules
 
-**Status:** Accepted
+**Status:** Superseded by [cel-expression-depth-96.md](cel-expression-depth-96.md)
 **Date:** 2026-10-30
 
 ## Context

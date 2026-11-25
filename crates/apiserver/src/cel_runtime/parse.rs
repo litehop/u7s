@@ -26,16 +26,12 @@ thread_local! {
     pub(crate) static PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// cel-go's default `MaxRecursionDepth`; Kubernetes does not override it. Applies to CRD
-/// rules, which evaluate on a dedicated big-stack thread.
-pub(crate) const MAX_RECURSION_DEPTH: usize = 250;
-
-/// Deepest policy (VAP/MAP/authorization) expression accepted. Policies evaluate on a
-/// 512 KiB request thread under a stack budget; in a release build the worst shape measured
-/// (index chain) evaluates to 187 levels, so 128 leaves ~45% headroom for frames larger
-/// than any measured. Lower than cel-go's 250 on purpose: an accepted-but-unevaluable
-/// policy would deny all matching traffic under `failurePolicy: Fail`.
-pub(crate) const MAX_POLICY_RECURSION_DEPTH: usize = 128;
+/// Deepest expression accepted, for CRD rules and policies alike. 96 is the `cel` crate
+/// parser's fixed cap (`Program::compile` cannot change it); cel-go allows 250. Our check
+/// counts every AST level, a superset of what the library counts, and `parse_bounded` maps
+/// the library's own recursion error to upstream's message. Policies evaluate on a 512 KiB request thread whose stack
+/// budget fits 187 levels of the worst shape in a release build, so 96 leaves headroom.
+pub(crate) const MAX_RECURSION_DEPTH: usize = 96;
 
 /// cel-go's default `ExpressionSizeCodePointLimit`; Kubernetes does not override it.
 const MAX_EXPRESSION_CODE_POINTS: usize = 100_000;
@@ -67,11 +63,16 @@ pub(crate) fn parse_bounded<T: Send>(
         ));
     }
     let run = move || {
-        let parsed = parse()?;
+        let too_deep = || "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded";
+        let parsed = parse().map_err(|e| {
+            if e.contains("Recursion limit of") || e.contains("recursion limit exceeded") {
+                too_deep().to_string()
+            } else {
+                e
+            }
+        })?;
         if depth_exceeds(ast(&parsed), max_depth) {
-            return Err(
-                "compilation failed: ERROR: <input>:-1:0: max recursion depth exceeded".into(),
-            );
+            return Err(too_deep().into());
         }
         Ok(parsed)
     };
@@ -201,10 +202,10 @@ fn parse_with_stack(expr: &str, stack_size: usize) -> Result<IdedExpr, String> {
     PARSE_COUNT.with(|c| c.set(c.get() + 1));
     parse_bounded(
         expr,
-        (stack_size, MAX_POLICY_RECURSION_DEPTH),
+        (stack_size, MAX_RECURSION_DEPTH),
         || {
             cel::parser::Parser::new()
-                .max_recursion_depth(MAX_POLICY_RECURSION_DEPTH as u16)
+                .max_recursion_depth(MAX_RECURSION_DEPTH as u16)
                 .enable_optional_syntax(true)
                 .enable_ident_escape_syntax(true)
                 .parse(expr)
