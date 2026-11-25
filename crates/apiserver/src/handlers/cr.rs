@@ -6131,6 +6131,7 @@ pub async fn put_cr_status<S: Store>(
 pub async fn get_cr_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     use crate::types::ResourceKey;
 
@@ -6151,13 +6152,10 @@ pub async fn get_cr_status<S: Store>(
         if group == "apiregistration.k8s.io" && plural == "apiservices" {
             super::aggregation::ensure_availability_checked(&state, &name).await;
         }
-        // Delegate to the generic get handler for registry resources. Table format is a
-        // `kubectl get <resource>` concern, not applicable to the /status subresource, so
-        // no Accept header is forwarded here.
         return super::resource::get_resource(
             State(state),
             Path((group, version, plural, name)),
-            HeaderMap::new(),
+            headers,
         )
         .await;
     }
@@ -6179,7 +6177,11 @@ pub async fn get_cr_status<S: Store>(
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
     obj["kind"] = serde_json::Value::String(ctx.kind.clone());
-    Ok(Json(obj).into_response())
+    super::generic::object_value_response(
+        super::generic::accept_str(&headers),
+        || super::generic::cr_go_type(super::generic::PomForm::Object),
+        obj,
+    )
 }
 
 /// PATCH /apis/{group}/{version}/{plural}/{name}/status
@@ -6469,6 +6471,7 @@ async fn cr_scale_get_impl<S: Store>(
     state: &AppState<S>,
     ctx: &CrContext,
     target: CrScaleTarget<'_>,
+    headers: &HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     let scale_cfg = ctx.scale.as_ref().ok_or_else(Status::route_not_found)?;
 
@@ -6495,15 +6498,18 @@ async fn cr_scale_get_impl<S: Store>(
         .unwrap_or("")
         .to_string();
 
-    Ok(Json(super::scale::build_scale(
-        target.name,
-        target.ns.unwrap_or(""),
-        spec_replicas,
-        status_replicas,
-        &rv,
-        selector,
-    ))
-    .into_response())
+    super::generic::object_value_response(
+        super::generic::accept_str(headers),
+        || super::generic::builtin_go_type("autoscaling", "Scale", super::generic::PomForm::Object),
+        super::scale::build_scale(
+            target.name,
+            target.ns.unwrap_or(""),
+            spec_replicas,
+            status_replicas,
+            &rv,
+            selector,
+        ),
+    )
 }
 
 /// Run admission for a CRD scale write and return the replica count to store.
@@ -6805,6 +6811,7 @@ async fn cr_scale_patch_impl<S: Store>(
 pub async fn get_cr_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -6818,7 +6825,7 @@ pub async fn get_cr_scale<S: Store>(
         ns: None,
         name: &name,
     };
-    cr_scale_get_impl(&state, &ctx, target).await
+    cr_scale_get_impl(&state, &ctx, target, &headers).await
 }
 
 /// PUT /apis/{group}/{version}/{plural}/{name}/scale (cluster-scoped)
@@ -6887,6 +6894,7 @@ pub async fn patch_cr_scale<S: Store>(
 pub async fn get_cr_namespaced_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("namespace", &ns)?;
     validate_path_segment("name", &name)?;
@@ -6901,7 +6909,7 @@ pub async fn get_cr_namespaced_scale<S: Store>(
         ns: Some(&ns),
         name: &name,
     };
-    cr_scale_get_impl(&state, &ctx, target).await
+    cr_scale_get_impl(&state, &ctx, target, &headers).await
 }
 
 /// PUT /apis/{group}/{version}/namespaces/{ns}/{plural}/{name}/scale
@@ -17246,9 +17254,13 @@ mod tests {
                 .unwrap();
         }
         let crd_obj = {
-            let resp = crd::get_crd(State(state.clone()), Path("widgets.example.io".into()))
-                .await
-                .expect("get crd");
+            let resp = crd::get_crd(
+                State(state.clone()),
+                Path("widgets.example.io".into()),
+                Default::default(),
+            )
+            .await
+            .expect("get crd");
             let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -18026,11 +18038,16 @@ mod tests {
             "create must succeed"
         );
 
-        let resp =
-            match get_cr_status(State(state.clone()), Path((group, version, plural, name))).await {
-                Ok(r) => r,
-                Err(_) => panic!("get_cr_status must succeed for existing cluster-scoped CR"),
-            };
+        let resp = match get_cr_status(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            Default::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get_cr_status must succeed for existing cluster-scoped CR"),
+        };
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -18053,6 +18070,7 @@ mod tests {
                     "widgets".to_string(),
                     "nonexistent".to_string(),
                 )),
+                Default::default(),
             )
             .await,
             "get_cr_status on missing object must return 404",
@@ -18079,6 +18097,7 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                Default::default(),
             )
             .await,
             "get_cr_status with namespaced CRD must return 404",
@@ -18385,10 +18404,14 @@ mod tests {
             "a scalar status must be rejected with 422, matching upstream schema validation"
         );
 
-        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
-            .await
-            .expect("get_cr_status must still succeed")
-            .into_response();
+        let resp = get_cr_status(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            Default::default(),
+        )
+        .await
+        .expect("get_cr_status must still succeed")
+        .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -18458,10 +18481,14 @@ mod tests {
             "a scalar status must be rejected with 422, matching the merge-patch behavior"
         );
 
-        let resp = get_cr_status(State(state.clone()), Path((group, version, plural, name)))
-            .await
-            .expect("get_cr_status must still succeed")
-            .into_response();
+        let resp = get_cr_status(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            Default::default(),
+        )
+        .await
+        .expect("get_cr_status must still succeed")
+        .into_response();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -28852,6 +28879,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            Default::default(),
         )
         .await
         .expect(
@@ -29256,6 +29284,7 @@ mod tests {
         let result = get_cr_namespaced_scale(
             State(state.clone()),
             Path((group, version, ns, plural, name)),
+            Default::default(),
         )
         .await;
 

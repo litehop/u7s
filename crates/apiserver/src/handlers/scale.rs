@@ -414,6 +414,7 @@ async fn scale_get_impl<S: Store>(
     resource: &str,
     ns: &str,
     name: &str,
+    headers: &HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("namespace", ns)?;
     validate_path_segment("name", name)?;
@@ -436,15 +437,11 @@ async fn scale_get_impl<S: Store>(
         .unwrap_or("")
         .to_string();
 
-    Ok(Json(build_scale(
-        name,
-        ns,
-        spec_replicas,
-        status_replicas,
-        &rv,
-        &selector,
-    ))
-    .into_response())
+    super::generic::object_value_response(
+        super::generic::accept_str(headers),
+        || super::generic::builtin_go_type("autoscaling", "Scale", super::generic::PomForm::Object),
+        build_scale(name, ns, spec_replicas, status_replicas, &rv, &selector),
+    )
 }
 
 /// Write `new_replicas` into the stored workload's `spec.replicas`, bumping
@@ -824,9 +821,10 @@ async fn scale_patch_impl<S: Store>(
 pub async fn get_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     require_scale_resource(&resource)?;
-    scale_get_impl(state, "apps", &resource, &ns, &name).await
+    scale_get_impl(state, "apps", &resource, &ns, &name, &headers).await
 }
 
 /// PUT /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -901,8 +899,9 @@ pub async fn patch_scale<S: Store>(
 pub async fn get_rc_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    scale_get_impl(state, "", "replicationcontrollers", &ns, &name).await
+    scale_get_impl(state, "", "replicationcontrollers", &ns, &name, &headers).await
 }
 
 /// PUT /api/v1/namespaces/:ns/replicationcontrollers/:name/scale

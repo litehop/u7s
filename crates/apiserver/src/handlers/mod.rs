@@ -29,6 +29,8 @@ pub mod namespaces;
 mod object_meta_write_tests;
 pub mod oidc;
 pub mod pods;
+#[cfg(test)]
+mod pom_coverage_tests;
 pub mod proxy;
 pub mod resource;
 pub mod scale;

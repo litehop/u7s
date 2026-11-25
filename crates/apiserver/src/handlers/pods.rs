@@ -2638,6 +2638,7 @@ mod label_selector_tests {
 pub(crate) async fn get_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -2650,12 +2651,12 @@ pub(crate) async fn get_pod_status<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("", "pods", &name))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+    super::generic::stored_object_response(
+        super::generic::accept_str(&headers),
+        "",
+        "Pod",
         stored.value,
     )
-        .into_response())
 }
 
 pub(crate) async fn replace_pod_status<S: Store>(
@@ -3690,6 +3691,7 @@ pub(crate) async fn patch_pod_resize<S: Store>(
 pub(crate) async fn get_pod_resize<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -3702,12 +3704,12 @@ pub(crate) async fn get_pod_resize<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("", "pods", &name))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+    super::generic::stored_object_response(
+        super::generic::accept_str(&headers),
+        "",
+        "Pod",
         stored.value,
     )
-        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -3938,6 +3940,7 @@ fn validate_ephemeral_containers_update(
 pub(crate) async fn get_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -3950,12 +3953,12 @@ pub(crate) async fn get_ephemeral_containers<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found("", "pods", &name))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
+    super::generic::stored_object_response(
+        super::generic::accept_str(&headers),
+        "",
+        "Pod",
         stored.value,
     )
-        .into_response())
 }
 
 pub(crate) async fn patch_ephemeral_containers<S: Store>(

@@ -698,6 +698,12 @@ pub async fn list_crds<S: Store>(
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
+    let pom = super::generic::negotiate_builtin_collection(
+        super::generic::accept_str(&headers),
+        query.watch,
+        GROUP,
+        KIND,
+    )?;
     let prefix = list_prefix();
     let field_selector = super::field_selector::FieldSelector::parse(
         query.field_selector.as_deref(),
@@ -706,15 +712,6 @@ pub async fn list_crds<S: Store>(
     )?;
 
     if query.watch == Some(true) {
-        let accept = headers
-            .get(axum::http::header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let pom = super::generic::negotiate_partial_object_metadata(
-            accept,
-            super::generic::PomForm::Object,
-            || super::generic::builtin_go_type(GROUP, KIND, super::generic::PomForm::Object),
-        )?;
         let (watch_api_version, watch_kind) = if pom {
             (
                 "meta.k8s.io/v1".to_string(),
@@ -780,12 +777,15 @@ pub async fn list_crds<S: Store>(
         items
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "kind": "CustomResourceDefinitionList",
         "apiVersion": API_VERSION,
         "metadata": { "resourceVersion": resp.revision.to_string() },
         "items": items,
     });
+    if pom {
+        body = super::generic::to_partial_object_metadata_list(body);
+    }
     Ok(Json(body).into_response())
 }
 
@@ -917,7 +917,13 @@ pub async fn create_crd<S: Store>(
 pub async fn get_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    let pom = super::generic::negotiate_builtin_object(
+        super::generic::accept_str(&headers),
+        GROUP,
+        KIND,
+    )?;
     let key = store_key(&name);
     let stored = state
         .store
@@ -925,6 +931,12 @@ pub async fn get_crd<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(GROUP, PLURAL, &name))?;
+
+    if pom {
+        let obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok(Json(super::watch::to_partial_object_metadata(&obj)).into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -1876,8 +1888,9 @@ pub async fn patch_crd<S: Store>(
 pub async fn get_crd_status<S: Store>(
     state: State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
-    get_crd(state, Path(name)).await
+    get_crd(state, Path(name), headers).await
 }
 
 async fn admit_crd_status<S: Store>(
@@ -2456,7 +2469,7 @@ mod tests {
             "create must succeed"
         );
 
-        let resp = match get_crd(State(state), Path(name.to_string())).await {
+        let resp = match get_crd(State(state), Path(name.to_string()), Default::default()).await {
             Ok(r) => r,
             Err(_) => panic!("get must succeed after create"),
         };
@@ -2492,7 +2505,13 @@ mod tests {
     #[tokio::test]
     async fn get_missing_returns_404() {
         let state = make_state();
-        let err = match get_crd(State(state), Path("missing.example.com".to_string())).await {
+        let err = match get_crd(
+            State(state),
+            Path("missing.example.com".to_string()),
+            Default::default(),
+        )
+        .await
+        {
             Ok(_) => panic!("expected 404 error"),
             Err(e) => e,
         };
@@ -3107,15 +3126,23 @@ mod tests {
         );
 
         assert!(
-            get_crd(State(state.clone()), Path("foos.example.io".to_string()))
-                .await
-                .is_err(),
+            get_crd(
+                State(state.clone()),
+                Path("foos.example.io".to_string()),
+                Default::default()
+            )
+            .await
+            .is_err(),
             "the labeled CRD must be deleted"
         );
         assert!(
-            get_crd(State(state), Path("bars.example.io".to_string()))
-                .await
-                .is_ok(),
+            get_crd(
+                State(state),
+                Path("bars.example.io".to_string()),
+                Default::default()
+            )
+            .await
+            .is_ok(),
             "the non-matching CRD must survive a label-scoped delete collection"
         );
     }
@@ -3986,7 +4013,7 @@ mod tests {
         );
 
         // Persisted, not just echoed back — get_crd must independently observe the new CRD.
-        let stored = get_crd(State(state), Path(name.to_string())).await.expect(
+        let stored = get_crd(State(state), Path(name.to_string()), Default::default()).await.expect(
             "the SSA-created CRD must be durably persisted, not merely returned in the response",
         );
         assert_eq!(stored.status(), StatusCode::OK);
@@ -4014,9 +4041,13 @@ mod tests {
         .await
         .expect("create must succeed");
 
-        let existing = get_crd(State(state.clone()), Path(name.to_string()))
-            .await
-            .expect("get after create must succeed");
+        let existing = get_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            Default::default(),
+        )
+        .await
+        .expect("get after create must succeed");
         let existing_body = axum::body::to_bytes(existing.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4103,7 +4134,7 @@ mod tests {
             .await
             .expect("create must succeed");
 
-        let resp = get_crd_status(State(state), Path(name.to_string()))
+        let resp = get_crd_status(State(state), Path(name.to_string()), Default::default())
             .await
             .expect(
                 "get status must succeed — before the fix this fell through to the \
@@ -4129,9 +4160,13 @@ mod tests {
             .await
             .expect("create must succeed");
 
-        let get_resp = get_crd(State(state.clone()), Path(name.to_string()))
-            .await
-            .expect("get must succeed");
+        let get_resp = get_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            Default::default(),
+        )
+        .await
+        .expect("get must succeed");
         let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4169,7 +4204,7 @@ mod tests {
         );
 
         // Verify the update actually persisted, not just echoed in the response.
-        let reget = get_crd(State(state), Path(name.to_string()))
+        let reget = get_crd(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get must succeed after status update");
         let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
@@ -4191,9 +4226,13 @@ mod tests {
             .await
             .expect("create must succeed");
 
-        let get_resp = get_crd(State(state.clone()), Path(name.to_string()))
-            .await
-            .expect("get must succeed");
+        let get_resp = get_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            Default::default(),
+        )
+        .await
+        .expect("get must succeed");
         let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -4232,7 +4271,7 @@ mod tests {
         // create_crd stamps exactly two conditions (Established + NamesAccepted, see
         // build_new_crd). The dry-run PUT body above replaces status wholesale with a
         // single-entry array — if that were persisted, NamesAccepted would be gone.
-        let reget = get_crd(State(state), Path(name.to_string()))
+        let reget = get_crd(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get must succeed after dry-run");
         let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
@@ -4428,7 +4467,7 @@ mod tests {
             "dry-run response must show the would-be patched condition"
         );
 
-        let reget = get_crd(State(state), Path(name.to_string()))
+        let reget = get_crd(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get must succeed after dry-run");
         let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
@@ -4487,7 +4526,7 @@ mod tests {
             "a scalar status must be rejected with 422, matching upstream schema validation"
         );
 
-        let resp = get_crd_status(State(state), Path(name.to_string()))
+        let resp = get_crd_status(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get_crd_status must still succeed")
             .into_response();
@@ -4542,7 +4581,7 @@ mod tests {
             "a scalar status must be rejected with 422, matching the merge-patch behavior"
         );
 
-        let resp = get_crd_status(State(state), Path(name.to_string()))
+        let resp = get_crd_status(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get_crd_status must still succeed")
             .into_response();
@@ -4669,7 +4708,7 @@ mod tests {
             "the legitimate status change in the same patch must still apply"
         );
 
-        let reget = get_crd(State(state), Path(name.to_string()))
+        let reget = get_crd(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get must succeed");
         let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
@@ -4723,7 +4762,7 @@ mod tests {
         };
         assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 422);
 
-        let reget = get_crd(State(state), Path(name.to_string()))
+        let reget = get_crd(State(state), Path(name.to_string()), Default::default())
             .await
             .expect("get must succeed");
         let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
@@ -4819,7 +4858,13 @@ mod tests {
         let state = make_state();
         let name = "missing.example.io";
 
-        let err = match get_crd_status(State(state.clone()), Path(name.to_string())).await {
+        let err = match get_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            Default::default(),
+        )
+        .await
+        {
             Ok(_) => panic!("expected 404"),
             Err(e) => e,
         };
