@@ -147,16 +147,100 @@ pub(crate) struct RingShard {
     /// write lock before tearing a shard down, so a watch that reconnects during the grace
     /// window (bumping this back above zero) defeats the pending teardown.
     watchers: AtomicUsize,
-    /// Live events for watchers whose prefix is exactly this shard's key.
-    tx: broadcast::Sender<Arc<InternalEvent>>,
+    /// Live-event channels, allocated by the first subscriber and dropped with the last.
+    channels: std::sync::Mutex<Channels>,
     /// Flipped to `true` when the shard is torn down because its resource type no longer exists,
     /// so every attached stream ends and its client relists. Channel closure cannot signal this:
     /// each stream's `ShardWatcherGuard` keeps the shard, and so `tx`, alive.
     closed: tokio::sync::watch::Sender<bool>,
-    /// Live events for watchers that reuse this shard's history but watch one namespace under it
-    /// (prefix = shard key + `<ns>/`), keyed by that prefix, so a write in another namespace never
-    /// wakes them. Entries without receivers are pruned on the next `subscribe`.
-    scoped: std::sync::Mutex<HashMap<String, broadcast::Sender<Arc<InternalEvent>>>>,
+}
+
+/// A shard's live-event channels: nothing is allocated for a shard or namespace nobody watches.
+#[derive(Default)]
+struct Channels {
+    /// Watchers whose prefix is exactly the shard's key.
+    root: Option<broadcast::Sender<Arc<InternalEvent>>>,
+    /// Watchers that reuse the shard's history but watch one namespace under it (prefix = shard
+    /// key + `<ns>/`), keyed by that prefix, so a write in another namespace never wakes them.
+    scoped: HashMap<String, broadcast::Sender<Arc<InternalEvent>>>,
+}
+
+impl Channels {
+    fn sender(&mut self, scope: Option<&str>) -> &broadcast::Sender<Arc<InternalEvent>> {
+        match scope {
+            None => self
+                .root
+                .get_or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0),
+            Some(prefix) => self
+                .scoped
+                .entry(prefix.to_string())
+                .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0),
+        }
+    }
+
+    fn prune(&mut self, scope: Option<&str>) {
+        match scope {
+            None => {
+                if self
+                    .root
+                    .as_ref()
+                    .is_some_and(|tx| tx.receiver_count() == 0)
+                {
+                    self.root = None;
+                }
+            }
+            Some(prefix) => {
+                if self
+                    .scoped
+                    .get(prefix)
+                    .is_some_and(|tx| tx.receiver_count() == 0)
+                {
+                    self.scoped.remove(prefix);
+                }
+            }
+        }
+    }
+}
+
+/// A live-event receiver that removes its channel when the last receiver of it goes away.
+///
+/// Race argument: `subscribe`, `resubscribe`, `publish` and the prune in `Drop` all run under
+/// `RingShard::channels`' lock. `Drop` releases its own receiver first, then, holding the lock,
+/// removes the channel only if `receiver_count() == 0`. A subscriber that got in before the lock
+/// is already counted, so the channel survives; one that comes after finds the entry gone and
+/// allocates a fresh channel. A live receiver therefore never sits on a channel `publish` can no
+/// longer reach.
+struct ShardRx {
+    shard: Arc<RingShard>,
+    /// `None` is the shard root; otherwise the namespace prefix.
+    scope: Option<String>,
+    rx: Option<broadcast::Receiver<Arc<InternalEvent>>>,
+}
+
+impl ShardRx {
+    async fn recv(
+        &mut self,
+    ) -> std::result::Result<Arc<InternalEvent>, broadcast::error::RecvError> {
+        self.rx
+            .as_mut()
+            .expect("rx present until drop")
+            .recv()
+            .await
+    }
+
+    /// Replace the receiver with one at the channel's current tail (lag recovery).
+    fn resubscribe(&mut self) {
+        let mut channels = self.shard.channels.lock().expect("channels poisoned");
+        self.rx = Some(channels.sender(self.scope.as_deref()).subscribe());
+    }
+}
+
+impl Drop for ShardRx {
+    fn drop(&mut self) {
+        drop(self.rx.take());
+        let mut channels = self.shard.channels.lock().expect("channels poisoned");
+        channels.prune(self.scope.as_deref());
+    }
 }
 
 impl RingShard {
@@ -167,43 +251,51 @@ impl RingShard {
             horizon: AtomicU64::new(0),
             deletion_log: RwLock::new(DeletionLog::default()),
             watchers: AtomicUsize::new(0),
-            tx: broadcast::channel(BROADCAST_CAPACITY).0,
+            channels: std::sync::Mutex::new(Channels::default()),
             closed: tokio::sync::watch::channel(false).0,
-            scoped: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Subscribe to exactly the events a watch on `prefix` can match. `key` is this shard's own
     /// map key.
-    fn subscribe(&self, key: &str, prefix: &str) -> broadcast::Receiver<Arc<InternalEvent>> {
-        if prefix == key {
-            return self.tx.subscribe();
+    fn subscribe(self: &Arc<Self>, key: &str, prefix: &str) -> ShardRx {
+        let scope = (prefix != key).then(|| prefix.to_string());
+        let rx = self
+            .channels
+            .lock()
+            .expect("channels poisoned")
+            .sender(scope.as_deref())
+            .subscribe();
+        ShardRx {
+            shard: Arc::clone(self),
+            scope,
+            rx: Some(rx),
         }
-        let mut scoped = self.scoped.lock().expect("scoped poisoned");
-        scoped.retain(|_, tx| tx.receiver_count() > 0);
-        scoped
-            .entry(prefix.to_string())
-            .or_insert_with(|| broadcast::channel(BROADCAST_CAPACITY).0)
-            .subscribe()
     }
 
     fn close(&self) {
         self.closed.send_replace(true);
     }
 
+    #[cfg(test)]
+    fn root_sender(&self) -> Option<broadcast::Sender<Arc<InternalEvent>>> {
+        self.channels.lock().unwrap().root.clone()
+    }
+
+    #[cfg(test)]
+    fn scoped_sender(&self, ns_prefix: &str) -> Option<broadcast::Sender<Arc<InternalEvent>>> {
+        self.channels.lock().unwrap().scoped.get(ns_prefix).cloned()
+    }
+
     /// Deliver `event` to this shard's whole-shard watchers and, when it lives in namespace
     /// `ns_prefix` (shard key + `<ns>/`), to that namespace's sub-channel only.
     fn publish(&self, ns_prefix: Option<&str>, event: &Arc<InternalEvent>) {
-        if self.tx.receiver_count() > 0 {
-            let _ = self.tx.send(Arc::clone(event));
+        let channels = self.channels.lock().expect("channels poisoned");
+        if let Some(tx) = &channels.root {
+            let _ = tx.send(Arc::clone(event));
         }
-        if let Some(ns_prefix) = ns_prefix {
-            let scoped = self.scoped.lock().expect("scoped poisoned");
-            if let Some(tx) = scoped.get(ns_prefix) {
-                if tx.receiver_count() > 0 {
-                    let _ = tx.send(Arc::clone(event));
-                }
-            }
+        if let Some(tx) = ns_prefix.and_then(|p| channels.scoped.get(p)) {
+            let _ = tx.send(Arc::clone(event));
         }
     }
 }
@@ -2734,7 +2826,7 @@ impl Store for SqliteStore {
                         // If the ring buffer has also been compacted past last_replayed, we
                         // fall back to yielding Compacted so the client can relist from a valid
                         // revision rather than silently skipping events.
-                        rx = rx.resubscribe();
+                        rx.resubscribe();
                         // Timed separately from the `for event in &catchup { yield ... }` loop
                         // below: `yield` inside this generator suspends on the consumer's poll
                         // rate (backpressure), which would fold client-drain latency into this
@@ -3558,8 +3650,8 @@ mod tests {
             .unwrap()
             .get("/registry/services/")
             .expect("watch creates its shard")
-            .tx
-            .clone();
+            .root_sender()
+            .expect("an open watch holds the root channel");
 
         // 1. Global bookmark at rv=365 (from a concurrent Endpoints write on a different prefix).
         //    This arrives BEFORE the service event at rv=364 due to scheduling jitter.
@@ -8627,8 +8719,8 @@ mod tests {
             .unwrap()
             .get(key)
             .unwrap_or_else(|| panic!("no shard {key}"))
-            .tx
-            .clone()
+            .root_sender()
+            .unwrap_or_else(|| panic!("no root channel for {key}"))
     }
 
     /// A write must only touch the channel of the resource type it belongs to. Every open watch
@@ -8690,10 +8782,7 @@ mod tests {
                 .unwrap()
                 .get("/registry/pods/")
                 .unwrap()
-                .scoped
-                .lock()
-                .unwrap()
-                .get(ns_prefix)
+                .scoped_sender(ns_prefix)
                 .unwrap_or_else(|| panic!("no scoped channel {ns_prefix}"))
                 .len()
         };
@@ -9051,5 +9140,99 @@ mod tests {
             before,
             "a {BURST}-event burst must not lag any watcher's channel"
         );
+    }
+
+    fn test_event(key: &str) -> Arc<InternalEvent> {
+        Arc::new(InternalEvent {
+            key: key.into(),
+            revision: 1,
+            value: Some(scoped_value("Pod", "p", Some("ns"))),
+            is_create: true,
+            deleted_body: None,
+        })
+    }
+
+    /// Every shard used to allocate a 1024-slot broadcast channel up front; write-only shards
+    /// (nobody watching) paid that memory for nothing on 1 GiB nodes.
+    #[test]
+    fn write_to_unwatched_shard_allocates_no_channel() {
+        let shard = Arc::new(RingShard::new());
+        assert!(
+            shard.root_sender().is_none(),
+            "a fresh shard has no watcher"
+        );
+
+        shard.publish(
+            Some("/registry/pods/ns/"),
+            &test_event("/registry/pods/ns/p"),
+        );
+
+        assert!(
+            shard.root_sender().is_none(),
+            "publishing to a shard with no watcher must not allocate its root channel"
+        );
+        assert!(
+            shard.scoped_sender("/registry/pods/ns/").is_none(),
+            "publishing must not allocate a namespace sub-channel either"
+        );
+    }
+
+    /// Sub-channels used to linger until the next subscribe or shard idle-GC, so churning
+    /// short-lived namespace watches pinned ~40 KB each.
+    #[tokio::test]
+    async fn namespace_channel_is_freed_when_last_watcher_drops() {
+        let store = SqliteStore::new(":memory:").expect("store");
+        let ns_prefix = "/registry/pods/ns-a/";
+        let _all = store.watch("/registry/pods/", 0).await.expect("watch all");
+        let first = store.watch(ns_prefix, 0).await.expect("watch");
+        let second = store.watch(ns_prefix, 0).await.expect("watch");
+        let shard = store.shard_for_test("/registry/pods/p", None);
+        assert!(shard.scoped_sender(ns_prefix).is_some());
+
+        drop(first);
+        assert!(
+            shard.scoped_sender(ns_prefix).is_some(),
+            "one watcher is still attached; its channel must survive"
+        );
+        drop(second);
+        assert!(
+            shard.scoped_sender(ns_prefix).is_none(),
+            "the namespace channel must be freed as soon as its last watcher drops"
+        );
+    }
+
+    /// A watcher that subscribes while the previous watcher of the same namespace is being
+    /// dropped must not end up on a channel that prune already unlinked, or it would silently
+    /// receive nothing.
+    #[tokio::test]
+    async fn subscribe_racing_prune_still_receives_events() {
+        let ns_prefix = "/registry/pods/ns/";
+        let key = "/registry/pods/";
+        let event = test_event("/registry/pods/ns/p");
+
+        // Deterministic interleaving: the new subscriber is in before the old one prunes.
+        let shard = Arc::new(RingShard::new());
+        let old = shard.subscribe(key, ns_prefix);
+        let mut new = shard.subscribe(key, ns_prefix);
+        drop(old);
+        shard.publish(Some(ns_prefix), &event);
+        tokio::time::timeout(Duration::from_secs(1), new.recv())
+            .await
+            .expect("event must reach a subscriber that outlived the pruning drop")
+            .expect("recv");
+
+        // Real interleavings.
+        for _ in 0..200 {
+            let shard = Arc::new(RingShard::new());
+            let old = shard.subscribe(key, ns_prefix);
+            let dropper = std::thread::spawn(move || drop(old));
+            let mut new = shard.subscribe(key, ns_prefix);
+            dropper.join().unwrap();
+            shard.publish(Some(ns_prefix), &event);
+            tokio::time::timeout(Duration::from_secs(1), new.recv())
+                .await
+                .expect("subscriber racing a prune must still be published to")
+                .expect("recv");
+        }
     }
 }
