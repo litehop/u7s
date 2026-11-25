@@ -8,7 +8,7 @@ upstream kube-apiserver.
 | Request body size | 3 MiB per request (same as upstream) | 413 `RequestEntityTooLarge` Status |
 | Shared in-flight body budget | 6 MiB across all concurrent requests | 429 with `Retry-After: 1` |
 | Body read deadline | 60 s for the body to finish arriving | 504 `Timeout` Status |
-| Proxy response-header timeout | 60 s from request sent to upstream headers | 504 `Timeout` Status |
+| Proxy response-header timeout | 60 s from request sent to upstream headers; also bounds dialing on direct paths; the tunnel path has two 60 s waits (CONNECT answer, then the pod request) | 504 `Timeout` Status |
 
 The body budget is taken as bytes arrive, not from `Content-Length`, so a slow
 client holds only what it has sent. Bytes are returned when the request

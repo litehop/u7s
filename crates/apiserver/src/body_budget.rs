@@ -6,8 +6,11 @@
 //   - rejects a declared Content-Length above MAX_BODY_BYTES with 413 before any body
 //     byte is read;
 //   - reserves body bytes from a shared budget incrementally, as each chunk arrives, and
-//     holds them for the life of the request; a slow client therefore holds only what it
-//     has sent. When the budget is exhausted mid-body the request is answered 429 +
+//     holds them until the handler's future finishes (or the client disconnects), or, for
+//     proxy handlers, until they call BodyBudgetRelease once upstream has answered with
+//     headers, so a streamed response body never holds request-body bytes; a slow client
+//     holds only what it has sent. When the budget is exhausted mid-body the request is
+//     answered 429 +
 //     Retry-After;
 //     Accepted: three concurrent maximum-size bodies can each take 2 MiB and all end in
 //     429; clients retry, and the budget bounds memory rather than guaranteeing admission;

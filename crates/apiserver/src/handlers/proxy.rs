@@ -4186,11 +4186,21 @@ mod tests {
     /// source address for the given route, which needs no external reachability, just a
     /// non-loopback interface in the routing table (true of every dev machine and CI runner
     /// this suite runs on).
-    fn test_backend_ip() -> std::net::IpAddr {
+    ///
+    /// Only one test at a time may use this address: on macOS concurrent multi-MiB
+    /// uploads to the host's own non-loopback address stall (reproduced with plain
+    /// reqwest, no proxy involved), failing unrelated proxy tests. The returned guard
+    /// serializes those tests; keep it alive for the whole test.
+    async fn test_backend_ip() -> (std::net::IpAddr, tokio::sync::MutexGuard<'static, ()>) {
+        static NON_LOOPBACK_UPSTREAM: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = NON_LOOPBACK_UPSTREAM.lock().await;
         let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral UDP socket");
         sock.connect("8.8.8.8:80")
             .expect("resolve a local route to pick a non-loopback source address");
-        sock.local_addr().expect("query bound local address").ip()
+        (
+            sock.local_addr().expect("query bound local address").ip(),
+            guard,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -10584,7 +10594,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
@@ -10776,7 +10786,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let ep_port = listener.local_addr().unwrap().port();
 
@@ -11131,11 +11141,16 @@ mod tests {
         }
     }
 
-    async fn assert_silent_upstream_gets_504_and_frees_budget(router: axum::Router) {
+    /// `proxy_calls` is how many 3 MiB proxy uploads run concurrently; the final budget
+    /// check still needs all 6 MiB free, so one call is enough to catch a leaked hold.
+    async fn assert_silent_upstream_gets_504_and_frees_budget(
+        router: axum::Router,
+        proxy_calls: usize,
+    ) {
         use tower::ServiceExt as _;
-        // The second round only fits if the first round's 6 MiB came back.
+        // The second round only fits if the first round's bytes came back.
         for round in 0..2 {
-            let calls: Vec<_> = (0..2)
+            let calls: Vec<_> = (0..proxy_calls)
                 .map(|_| tokio::spawn(router.clone().oneshot(post_3mib(STALL_PROXY_URI))))
                 .collect();
             for call in calls {
@@ -11160,11 +11175,11 @@ mod tests {
         .await;
     }
 
-    /// Two proxied requests whose responses have started but never finish must not hold
-    /// the budget: the request bodies are long since delivered.
-    async fn assert_streamed_response_frees_budget(router: axum::Router) {
+    /// Proxied requests whose responses have started but never finish must not hold the
+    /// budget: the request bodies are long since delivered.
+    async fn assert_streamed_response_frees_budget(router: axum::Router, proxy_calls: usize) {
         use tower::ServiceExt as _;
-        let calls: Vec<_> = (0..2)
+        let calls: Vec<_> = (0..proxy_calls)
             .map(|_| tokio::spawn(router.clone().oneshot(post_3mib(STALL_PROXY_URI))))
             .collect();
         let mut responses = Vec::new();
@@ -11256,19 +11271,33 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pod_proxy_direct_silent_upstream_gets_504_and_frees_budget() {
-        let ip = test_backend_ip();
+        let (ip, _upstream_guard) = test_backend_ip().await;
         let port = spawn_plain_upstream(ip, Upstream::Silent).await;
         let state = pod_state_for(ip, port).await;
-        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(pod_proxy_fn(
-            state,
-            STALL_HEADER_TIMEOUT,
-        )))
+        assert_silent_upstream_gets_504_and_frees_budget(
+            budgeted_router(pod_proxy_fn(state, STALL_HEADER_TIMEOUT)),
+            1,
+        )
+        .await;
+    }
+
+    /// The direct pod path must hand back response headers without collecting the body, or
+    /// two long downloads would hold the whole write budget and answer other writes 429.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pod_proxy_direct_streamed_response_does_not_hold_body_budget() {
+        let (ip, _upstream_guard) = test_backend_ip().await;
+        let port = spawn_plain_upstream(ip, Upstream::HeadersThenStall("text/plain")).await;
+        let state = pod_state_for(ip, port).await;
+        assert_streamed_response_frees_budget(
+            budgeted_router(pod_proxy_fn(state, PROXY_RESPONSE_HEADER_TIMEOUT)),
+            1,
+        )
         .await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn service_proxy_direct_silent_upstream_gets_504_and_frees_budget() {
-        let ip = test_backend_ip();
+        let (ip, _upstream_guard) = test_backend_ip().await;
         let port = spawn_plain_upstream(ip, Upstream::Silent).await;
         let state = make_state();
         let svc = serde_json::json!({
@@ -11314,7 +11343,7 @@ mod tests {
                     .await
             })
         });
-        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(proxy)).await;
+        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(proxy), 1).await;
     }
 
     fn node_proxy_fn(port: u16, header_timeout_after: std::time::Duration) -> ProxyFn {
@@ -11341,26 +11370,27 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn node_proxy_silent_upstream_gets_504_and_frees_budget() {
         let port = spawn_plain_upstream("127.0.0.1".parse().unwrap(), Upstream::Silent).await;
-        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(node_proxy_fn(
-            port,
-            STALL_HEADER_TIMEOUT,
-        )))
+        assert_silent_upstream_gets_504_and_frees_budget(
+            budgeted_router(node_proxy_fn(port, STALL_HEADER_TIMEOUT)),
+            2,
+        )
         .await;
     }
 
-    /// Long downloads must not keep the request-body budget: headers have arrived and the
-    /// request body is delivered, so only the response body is still in flight.
+    /// Guards that `forward_to_kubelet` streams: it must return headers while the upstream
+    /// body is still stalled. The budget release is redundant with the layer dropping its
+    /// hold at headers, so only a regression to buffering the body fails this.
     #[tokio::test(flavor = "multi_thread")]
-    async fn node_proxy_streamed_response_does_not_hold_body_budget() {
+    async fn node_proxy_returns_headers_without_buffering_stalled_response_body() {
         let port = spawn_plain_upstream(
             "127.0.0.1".parse().unwrap(),
             Upstream::HeadersThenStall("text/plain"),
         )
         .await;
-        assert_streamed_response_frees_budget(budgeted_router(node_proxy_fn(
-            port,
-            PROXY_RESPONSE_HEADER_TIMEOUT,
-        )))
+        assert_streamed_response_frees_budget(
+            budgeted_router(node_proxy_fn(port, PROXY_RESPONSE_HEADER_TIMEOUT)),
+            2,
+        )
         .await;
     }
 
@@ -11369,10 +11399,10 @@ mod tests {
     async fn tunnel_proxy_silent_upstream_gets_504_and_frees_budget() {
         let (addr, cert_der) = spawn_konnectivity_mock(Upstream::Silent, true).await;
         let state = tunnel_state(addr, cert_der).await;
-        assert_silent_upstream_gets_504_and_frees_budget(budgeted_router(pod_proxy_fn(
-            state,
-            STALL_HEADER_TIMEOUT,
-        )))
+        assert_silent_upstream_gets_504_and_frees_budget(
+            budgeted_router(pod_proxy_fn(state, STALL_HEADER_TIMEOUT)),
+            2,
+        )
         .await;
     }
 
@@ -11412,10 +11442,10 @@ mod tests {
         let (addr, cert_der) =
             spawn_konnectivity_mock(Upstream::HeadersThenStall("text/plain"), true).await;
         let state = tunnel_state(addr, cert_der).await;
-        assert_streamed_response_frees_budget(budgeted_router(pod_proxy_fn(
-            state,
-            PROXY_RESPONSE_HEADER_TIMEOUT,
-        )))
+        assert_streamed_response_frees_budget(
+            budgeted_router(pod_proxy_fn(state, PROXY_RESPONSE_HEADER_TIMEOUT)),
+            2,
+        )
         .await;
     }
 
@@ -11486,7 +11516,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -11566,7 +11596,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
@@ -11678,7 +11708,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let pod_port = listener.local_addr().unwrap().port();
 
@@ -12940,7 +12970,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let backend_ip = test_backend_ip();
+        let (backend_ip, _upstream_guard) = test_backend_ip().await;
         let listener = TcpListener::bind((backend_ip, 0)).await.unwrap();
         let ep_port = listener.local_addr().unwrap().port();
 
