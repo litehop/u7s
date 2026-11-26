@@ -36,8 +36,21 @@ if [ "$CHECK" = 1 ]; then
 fi
 
 limactl shell "$VM_NAME" sudo bash -c '
+  # 04-start-kcm.sh runs KCM as a setsid supervisor (which respawns it) plus a signing-key
+  # sync loop, outside systemd; left alive, KCM holds :10257 and the installed u7s-kcm cannot start its own.
+  # The [x] bracket keeps each pattern from matching this shell'\''s own command line.
+  pkill -f "[k]cm-supervisor.sh" || true
+  pkill -f "[u]7s-kcm-signing-sync" || true
+  pkill -f "[k]ube-controller-manager" || true
+  rm -rf /var/tmp/u7s-kcm-signing
   systemctl disable --now kube-proxy.service 2>/dev/null || true
   systemctl disable --now kubelet.service 2>/dev/null || true
+  # The rig'\''s flannel pods and CNI state (cni0 keeps the rig'\''s pod CIDR; the installed stack needs its own).
+  if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
+  ip link delete cni0 2>/dev/null || true
+  ip link delete flannel.1 2>/dev/null || true
+  rm -rf /run/flannel
+  rm -f /etc/cni/net.d/10-flannel.conflist
   rm -f /etc/systemd/system/kube-proxy.service /etc/systemd/system/kubelet.service.d/u7s.conf
   rmdir /etc/systemd/system/kubelet.service.d 2>/dev/null || true
   systemctl daemon-reload
