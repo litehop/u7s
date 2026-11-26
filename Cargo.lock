@@ -3457,6 +3457,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "u7s-kcm"
+version = "0.1.0"
+dependencies = [
+ "hyper",
+ "politeia",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "u7s-migrate"
 version = "0.1.0"
 dependencies = [

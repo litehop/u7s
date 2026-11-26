@@ -36,6 +36,14 @@ fn ndjson_event_raw(event_type: &str, raw_object_json: &str) -> Bytes {
     Bytes::from(buf)
 }
 
+/// In-stream 410 ERROR line sent when a watcher falls behind the retained history.
+/// Must be valid JSON: a client that cannot parse it never learns it has to relist.
+fn compacted_error_line(horizon: u64) -> String {
+    format!(
+        "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+    )
+}
+
 /// Serialize a BOOKMARK line into a single heap allocation.
 ///
 /// Watch clients parse these bytes; any format change breaks every informer.
@@ -1282,9 +1290,7 @@ async fn watch_generic_impl<S: Store>(
                                 // Use horizon (not last_rv) so clients relist from a revision
                                 // the store still holds. last_rv may predate the horizon and
                                 // cause an infinite relist loop.
-                                let error_line = Bytes::from(format!(
-                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
-                                ));
+                                let error_line = Bytes::from(compacted_error_line(*horizon));
                                 u7s_store::metrics::WATCH_CLOSED_TOTAL
                                     .with_label_values(&["compacted"])
                                     .inc();
@@ -2945,6 +2951,19 @@ mod tests {
              even if from_revision is below the compaction horizon — the watch starts from list_rv, \
              not from_revision"
         );
+    }
+
+    /// The compaction ERROR line must parse: with a stray closing brace every client
+    /// skipped it as malformed and retried the expired resourceVersion forever.
+    #[test]
+    fn compacted_error_line_is_valid_json_carrying_horizon() {
+        let line = compacted_error_line(500);
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim_end())
+            .expect("410 ERROR line must be valid JSON or informers never relist");
+        assert_eq!(v["type"], "ERROR");
+        assert_eq!(v["object"]["code"], 410);
+        assert_eq!(v["object"]["metadata"]["resourceVersion"], "500");
     }
 
     /// When Compacted fires, the 410 ERROR's metadata.resourceVersion must be the
