@@ -45,6 +45,12 @@ pub(crate) struct ServeLimits {
     pub h2_idle_timeout: Duration,
 }
 
+/// kube-apiserver's `MaxHeaderValueCount`; hyper's default of 100 would answer users in a few
+/// hundred groups (one header line per group) with 431.
+const MAX_HEADER_VALUES: usize = 16384;
+/// net/http's default `MaxHeaderBytes`, which kube-apiserver keeps (hyper's is ~400 KiB).
+const MAX_HEADER_BYTES: usize = 1 << 20;
+
 impl Default for ServeLimits {
     fn default() -> Self {
         Self {
@@ -202,6 +208,8 @@ pub(crate) async fn serve_tls_with<L: AcceptTcp>(
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
     conn_builder
         .http1()
+        .max_headers(MAX_HEADER_VALUES)
+        .max_buf_size(MAX_HEADER_BYTES)
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout);
     conn_builder
@@ -602,6 +610,38 @@ mod tests {
             closed_within(&mut tcp, SHORT * 10).await,
             "a client that never finishes the TLS handshake must not hold a connection slot forever"
         );
+    }
+
+    /// Users in hundreds of groups arrive via impersonation or authenticating-proxy as one
+    /// header line per group; hyper's default of 100 headers answers them 431. Matches
+    /// kube-apiserver's 16384 header-value limit and 1 MiB header-size budget.
+    #[tokio::test]
+    async fn requests_up_to_16384_header_values_are_accepted_and_beyond_are_431() {
+        let tls = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limits = ServeLimits {
+            header_read_timeout: Duration::from_secs(30),
+            ..test_limits()
+        };
+        start(listener, ok_app(), &tls, limits).await;
+
+        for (values, expected) in [(16383, "HTTP/1.1 200"), (20000, "HTTP/1.1 431")] {
+            let mut req = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+            for i in 0..values {
+                req.push_str(&format!("X-Remote-Group: group-{i}\r\n"));
+            }
+            req.push_str("\r\n");
+            let mut s = tls_connect(&tls, addr).await;
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).await.unwrap();
+            let status_line = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(
+                status_line.starts_with(expected),
+                "{values} header values must answer {expected}, got {status_line:?}"
+            );
+        }
     }
 
     #[tokio::test]

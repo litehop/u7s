@@ -6,6 +6,7 @@ upstream kube-apiserver.
 | Limit | Value | Response |
 |---|---|---|
 | Request body size | 3 MiB per request (same as upstream) | 413 `RequestEntityTooLarge` Status |
+| Request header values (HTTP/1) | 16384 values and 1 MiB of headers (same as upstream; hyper's default is 100) | 431 |
 | Shared in-flight body budget | 6 MiB across all concurrent requests | 429 with `Retry-After: 1` |
 | Body read deadline | 60 s for the body to finish arriving | 504 `Timeout` Status |
 | Proxy response-header timeout | 60 s from request sent to upstream headers; also bounds dialing on direct paths; the tunnel path has two 60 s waits (CONNECT answer, then the pod request) | 504 `Timeout` Status |
