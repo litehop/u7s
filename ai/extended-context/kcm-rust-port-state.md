@@ -91,23 +91,23 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 Sonobuoy stays authoritative via these invariants:
 
 1. `scripts/conformance/guard.sha256` pins the e2e binary, plugin config,
-   skip/focus lists, focus registry, baselines, multi-node list and N.
-   `guard-check.sh` recomputes it in CI. A pin-change PR may touch no
-   `crates/kcm/` file. CODEOWNERS names the operator but is documentation
-   only (`require_code_owner_review` is false); the mayor flags pin-changing
-   PRs to the operator.
+   skip/focus lists, focus registry, baselines and N. `guard-check.sh`
+   recomputes it in CI. A pin-change PR may touch no `crates/kcm/` file.
+   Operator decision 2026-11-26: CODEOWNERS is documentation only
+   (`require_code_owner_review` stays false); `guard.sha256` +
+   `guard-check.sh` is the gate, and the mayor flags pin-changing PRs to
+   the operator.
 2. Executed spec-name set equals the committed baseline exactly; conditional
    specs are pinned by repeating the baseline 3 times.
 3. Trimmed Go must match the baseline's spec and failure sets; port-run
-   failures must be a subset of the baseline's. Compare with
-   `spec-set.sh --single-node`, which drops the specs in
-   `kcm-multinode-specs.txt` so a 1-node and a 2-node run compare alike.
+   failures must be a subset of the baseline's. Baseline and comparison runs
+   are 2-node (`run-all.sh --extra-node`); compare with `spec-set.sh`.
 4. Zero KCM restarts: any supervisor restart or non-active unit fails the run.
 5. A PASS is a sonobuoy line quoted from `e2e.txt`, or operator sign-off.
 
 Layers: L0 `cargo test` reconcile tables from upstream unit cases; L1 local
-`--focus` entries; L2 local 2-node full suite (`run-all.sh --install`, 20-25
-min, needed to ship); L3 differential corpus; L4 memory gate.
+`--focus` entries; L2 local 2-node full suite (`run-all.sh --extra-node`,
+25-30 min, needed to ship); L3 differential corpus; L4 memory gate.
 Never run Go and Rust copies of a controller together.
 
 Rollback: one env file renders Go's `--controllers=*,-<ported>` and Rust's
@@ -116,14 +116,14 @@ two sets are disjoint and their union is the full set.
 
 ## Trim validation (release-1.37 sources)
 
-Baseline: untrimmed Go KCM, single node (lima-node-2, kubelet 1.37.3), `--install`: 462 executed,
-460 passed, 2 failed (the 2-node-only specs in `kcm-multinode-specs.txt`). The 11-controller trim
-failed the VAC lifecycle spec (the apiserver adds `kubernetes.io/vac-protection`; only
-`volumeattributesclass-protection-controller` removes it), so that controller stays and the trim
-is 10 controllers. Full run of the 10-controller trim: executed spec set identical, one new failure,
-`Probing container should *not* be restarted with a tcp:8080 liveness probe`; it did not reproduce
-(8 replicas, 2.5 min, 0 restarts) on the idle trimmed stack; load flake unconfirmed. The 2-node
-baseline is owed.
+Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3), host rig
+`run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed, 462 passed, spec sets identical.
+The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
+`kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
+that controller stays and the trim is 10 controllers. Two 2-node runs of the 10-controller trim
+(`--kcm-mode T`): spec set and failure set (empty) equal the baseline. The tcp:8080 liveness-probe
+failure seen once on a single-node run passed in all 4 two-node runs (2 R, 2 T): a load flake.
+`--install` has no 2-node mode.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 

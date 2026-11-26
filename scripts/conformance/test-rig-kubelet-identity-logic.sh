@@ -115,6 +115,8 @@ assert "lima-start.sh starts KCM before issuing the identity (nothing signs the 
   "$([ -n "$KCM_LINE" ] && [ -n "$ISSUE_LINE" ] && [ "$KCM_LINE" -lt "$ISSUE_LINE" ] && echo 1 || echo 0)"
 assert "a standalone lima-start.sh that must issue an identity fails fast naming --with-kcm (otherwise it hangs at the CSR wait)" \
   "$(grep -qF 'no KCM is running. Re-run with --with-kcm' "$LIMA_START" && echo 1 || echo 0)"
+assert "the no-KCM check does not look for a leader-election lease (the rig runs KCM with --leader-elect=false, so a lease never exists and every --extra-node join would be refused)" \
+  "$(grep -q 'get lease kube-controller-manager' "$LIMA_START" && echo 0 || echo 1)"
 assert "lima-start.sh checks for host jq up front (install.sh's CSR flow needs it)" \
   "$(grep -qF 'for cmd in limactl kubectl jq' "$LIMA_START" && echo 1 || echo 0)"
 assert "lima-start.sh replays install.sh's label_control_plane_node so the rig node carries the control-plane role label like an install" \

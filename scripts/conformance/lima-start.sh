@@ -418,7 +418,9 @@ if [ -f "$CA_CERT" ]; then
   if rig_kubelet_identity_script "$INSTALL_SH" | limactl shell "$VM_NAME" sudo bash -s; then
     echo "Kubelet identity for $VM_NAME is current; not re-issuing."
   else
-    if [ "$START_KCM" -eq 0 ] && [ -z "$(kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" ]; then
+    # The rig runs KCM with --leader-elect=false, so there is no lease to find; the root-CA
+    # ConfigMap that KCM publishes into every namespace shows a KCM is running.
+    if [ "$START_KCM" -eq 0 ] && ! kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get configmap kube-root-ca.crt >/dev/null 2>&1; then
       echo "error: ${VM_NAME} needs a kubelet identity, which KCM must sign, and no KCM is running. Re-run with --with-kcm." >&2
       exit 1
     fi
