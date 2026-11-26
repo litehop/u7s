@@ -1953,6 +1953,12 @@ exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$
 assert "an expired client identity fails the upgrade with a re-join-with-a-fresh-token message naming the state to clear (a silently restarted kubelet would crash-loop on 401 with no hint)" \
   "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | drain_grep -q 'expired' && printf '%s' "$exp_out" | drain_grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | drain_grep -q 'fresh token' && echo 1 || echo 0)"
 
+chain_status=0; chain_out="$(bash "$VERIFY_RUNNER" "$foreign_dir" 2>&1)" || chain_status=$?
+assert "an unexpired cert that fails chain verification is reported as a chain/issuer failure with openssl's error, not as expired (a wrong 'expired' message hid a real chain bug)" \
+  "$([ "$chain_status" -ne 0 ] && printf '%s' "$chain_out" | drain_grep -q 'does not chain to the cluster CA' && printf '%s' "$chain_out" | drain_grep -q 'openssl: .*error' && ! printf '%s' "$chain_out" | drain_grep -q 'has expired' && echo 1 || echo 0)"
+assert "an expired cert is not reported as a chain failure" \
+  "$(printf '%s' "$exp_out" | drain_grep -q 'does not chain' && echo 0 || echo 1)"
+
 bothexp_dir="$(new_worker_state both-expired "$UPG_WORK/expired.crt")"
 cp "$UPG_WORK/expired-rotated.crt" "$bothexp_dir/kubelet/pki/kubelet-client-current.pem"
 bothexp_out="$(bash "$VERIFY_RUNNER" "$bothexp_dir" 2>&1)" || true
