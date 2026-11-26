@@ -2,7 +2,7 @@
 updated: 2026-11-25T16:14Z
 ---
 # Dashboard — session 2026-11-25 closing (main `1e43f3f3`)
-**Stance:** alpha (no compat promise); correctness > security > perf > features; upstream 1.37.3 except secure crypto; queue merge on green, never `--admin`; security PRs drafted for operator; every release gated (agent runs burst + upgrade gates, operator pushes tags + approves publish).
+**Stance:** alpha (no compat promise); correctness > security > perf > features; upstream 1.37.1 except secure crypto; queue merge on green, never `--admin`; security PRs drafted for operator; every release gated (agent runs burst + upgrade gates, operator pushes tags + approves publish).
 **Resume:** paste `ai/prompts/mayor-bootstrap.md`; `bd prime`; re-register crons; `bd show mayor-rh8y3`; `bd recall listagents-completed-may-still-be-live-pass-to-live-agents`; `bd recall gcp-project-lives-in-u7s-gcp-gcloud-config`.
 
 ## 🎯 Waiting on you
