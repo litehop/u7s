@@ -2114,6 +2114,33 @@ mod tests {
         })
     }
 
+    /// Aggregated API traffic carries the caller's identity headers and full request bodies;
+    /// a backend client that silently fell back to classical key exchange would expose both
+    /// to harvest-now-decrypt-later.
+    #[tokio::test]
+    async fn build_backend_client_negotiates_x25519mlkem768() {
+        use crate::service_resolver::test_support::put_loopback_service;
+
+        crate::tls::install_pq_provider().unwrap();
+        let server = crate::test_tls::pq_only_server("api.wardle-ns.svc").await;
+        let ca_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            server.cert_pem.as_bytes(),
+        );
+        let state = make_state();
+        put_loopback_service(&*state.store, "wardle-ns", "api", server.port).await;
+        let client = build_backend_client(&state, &wardle_apiservice(&ca_b64, server.port))
+            .await
+            .unwrap();
+        crate::test_tls::assert_pq_request(
+            "apiserver -> aggregated API backend",
+            &client,
+            &format!("https://api.wardle-ns.svc:{}/", server.port),
+            &server,
+        )
+        .await;
+    }
+
     /// An authenticated user must not be able to make the aggregator buffer an unbounded
     /// request body: the proxy read bypassed `DefaultBodyLimit`, so one large POST to an
     /// aggregated group could exhaust a ~1 GiB host. Oversized bodies get 413 before any dial.

@@ -3477,9 +3477,11 @@ dependencies = [
  "hyper",
  "politeia",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "u7s-apiserver",
  "u7s-version",
 ]
