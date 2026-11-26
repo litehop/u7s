@@ -66,14 +66,6 @@ async fn dropped_watch_resumes_from_rv_without_relist() {
 async fn expired_rv_410_relists_and_converges() {
     let (api, admin, proxy) = rig("gone").await;
     admin.create_cm("victim", 10).await;
-    // Another watcher on the same resource (as other controllers are in a real
-    // cluster) keeps the apiserver's retained history alive during the outage.
-    let other = api.client_via(api.port);
-    let other_watch = tokio::spawn(async move {
-        let _ = other
-            .watch_stream(&format!("{CM_PATH}?watch=true"), |_| {})
-            .await;
-    });
     let inf = Informer::<Cm>::spawn(api.client_via(proxy.port), cfg(), |_| {});
     inf.wait_synced().await;
     admin.create_cm("probe", 10).await;
@@ -93,7 +85,6 @@ async fn expired_rv_410_relists_and_converges() {
         "expected a 410 and a relist, got {:?}",
         inf.stats()
     );
-    other_watch.abort();
 }
 
 /// After an apiserver restart the informer must reconnect on its own and see

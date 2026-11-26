@@ -2,7 +2,7 @@ use super::*;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
@@ -140,6 +140,12 @@ pub(crate) struct RingShard {
     /// Authoritative for expiry decisions. `SqliteStore::compaction_horizon` is a cross-shard
     /// maximum and must NOT be used to expire a watch — see its field doc.
     horizon: AtomicU64,
+    /// Whether the ring has been backfilled with the current state under this shard's prefix.
+    /// A delete creates a shard with only its own tombstone in it, so without the backfill a
+    /// watch resuming from before that delete would replay the delete and silently miss every
+    /// create/update since — the shard would claim history it never recorded. The first watch to
+    /// attach backfills it (see `SqliteStore::watch`).
+    seeded: AtomicBool,
     deletion_log: RwLock<DeletionLog>,
     /// Number of currently-open `watch()` streams attached to this shard. Incremented when a
     /// stream resolves (or creates) this shard at open, decremented when the stream ends —
@@ -249,6 +255,7 @@ impl RingShard {
             ring: RwLock::new(VecDeque::new()),
             push_secs: RwLock::new(VecDeque::new()),
             horizon: AtomicU64::new(0),
+            seeded: AtomicBool::new(false),
             deletion_log: RwLock::new(DeletionLog::default()),
             watchers: AtomicUsize::new(0),
             channels: std::sync::Mutex::new(Channels::default()),
@@ -1000,6 +1007,76 @@ fn push_into_shard(
             .with_label_values(&[shard_key_label])
             .set(guard.by_key.len() as i64);
     }
+}
+
+/// Backfill `shard` with `seeds` (current state, oldest revision first) without disturbing events
+/// it already recorded: a seed is dropped when the ring already holds that key at the same or a
+/// newer revision, and the rest are merged in revision order so replay stays monotonic. A seed
+/// also retires an older tombstone for its key (the object exists again), as a real create would.
+/// Evicts from the front past `RING_CAPACITY`, raising the shard's floor like a real push.
+fn merge_seed_into_shard(
+    shard_key_label: &str,
+    shard: &RingShard,
+    compaction_horizon: &AtomicU64,
+    now_secs: u32,
+    seeds: Vec<Arc<InternalEvent>>,
+) {
+    let mut ring = shard.ring.write().expect("ring poisoned");
+    let mut secs = shard.push_secs.write().expect("push_secs poisoned");
+    let mut newest: HashMap<&str, u64> = HashMap::with_capacity(ring.len());
+    for e in ring.iter() {
+        let r = newest.entry(e.key.as_str()).or_insert(0);
+        *r = (*r).max(e.revision);
+    }
+    let fresh: Vec<Arc<InternalEvent>> = seeds
+        .into_iter()
+        .filter(|s| newest.get(s.key.as_str()).is_none_or(|&r| r < s.revision))
+        .collect();
+    drop(newest);
+    if fresh.is_empty() {
+        return;
+    }
+    {
+        let mut log = shard.deletion_log.write().expect("deletion_log poisoned");
+        for s in &fresh {
+            if let Some(old) = log.by_key.get(&s.key) {
+                let old_revision = old.revision();
+                if old_revision < s.revision {
+                    log.by_key.remove(&s.key);
+                    log.by_revision.remove(&old_revision);
+                    log.full_revisions.remove(&old_revision);
+                }
+            }
+        }
+    }
+    let mut merged = VecDeque::with_capacity(ring.len() + fresh.len());
+    let mut merged_secs = VecDeque::with_capacity(merged.capacity());
+    let mut fresh = fresh.into_iter().peekable();
+    for (event, pushed) in ring.drain(..).zip(secs.drain(..)) {
+        while let Some(seed) = fresh.next_if(|s| s.revision < event.revision) {
+            merged.push_back(seed);
+            merged_secs.push_back(now_secs);
+        }
+        merged.push_back(event);
+        merged_secs.push_back(pushed);
+    }
+    for seed in fresh {
+        merged.push_back(seed);
+        merged_secs.push_back(now_secs);
+    }
+    while merged.len() > RING_CAPACITY {
+        merged.pop_front();
+        merged_secs.pop_front();
+        if let Some(oldest) = merged.front() {
+            shard.horizon.fetch_max(oldest.revision, Ordering::Relaxed);
+            compaction_horizon.fetch_max(oldest.revision, Ordering::Relaxed);
+        }
+    }
+    crate::metrics::WATCH_RING_OCCUPANCY
+        .with_label_values(&[shard_key_label])
+        .set(merged.len() as i64);
+    *ring = merged;
+    *secs = merged_secs;
 }
 
 /// Push one write's event onto the ring buffer, deletion log, and broadcast channel.
@@ -2591,14 +2668,13 @@ impl Store for SqliteStore {
         // shard that idle-GC has already unlinked (writes would no longer reach it). Attaching
         // bumps `watchers`, which defeats any not-yet-run GC; re-checking the map after attaching
         // catches one that already ran, and the loop resolves again.
-        let (shard_key_owned, shard, created_fresh, watcher_guard) = loop {
+        let (shard_key_owned, shard, watcher_guard) = loop {
             let found = find_shard_key(&self.shards.read().expect("shards poisoned"), prefix);
-            let (key, shard, created_fresh) = match found {
-                Some((key, shard)) => (key, shard, false),
+            let (key, shard) = match found {
+                Some(found) => found,
                 None => (
                     prefix.to_string(),
                     get_or_create_shard(&self.shards, &self.reclaimed_horizons, prefix),
-                    true,
                 ),
             };
             // Registers this stream as one of `shard`'s live watchers for as long as it stays
@@ -2617,7 +2693,7 @@ impl Store for SqliteStore {
                 .get(&key)
                 .is_some_and(|s| Arc::ptr_eq(s, &shard));
             if still_linked {
-                break (key, shard, created_fresh, guard);
+                break (key, shard, guard);
             }
         };
 
@@ -2635,28 +2711,45 @@ impl Store for SqliteStore {
         // KCM's metadata informer) now that writes alone no longer keep a shard's history alive.
         // Not broadcast (`push_into_shard` only touches THIS shard's ring/deletion_log): these
         // are not new writes, and every other already-open watch has already seen them for real.
-        // An EXISTING, reused shard (the `false` branch) needs none of this — it has been
-        // accumulating real history since whichever earlier watch created it.
-        if created_fresh {
-            let mut items = self.list(prefix, ListOptions::default()).await?.items;
+        // A shard a delete created (see `push_event_locked`) is also unseeded: it holds only
+        // that tombstone, so it must be backfilled exactly like a watch-created one or a resume
+        // from before the delete would silently miss every create/update since. The backfill
+        // covers the SHARD's own prefix, which can be broader than this watch's (a reused root
+        // shard serving a namespace-scoped watch). Events already in the ring win over the
+        // backfilled state for the same key. An EXISTING seeded shard has been accumulating real
+        // history since its backfill and needs none of this.
+        if !shard.seeded.swap(true, Ordering::AcqRel) {
+            let seeded = self
+                .list(&shard_key_owned, ListOptions::default())
+                .await
+                .map(|l| l.items);
+            let mut items = match seeded {
+                Ok(items) => items,
+                Err(e) => {
+                    shard.seeded.store(false, Ordering::Release);
+                    return Err(e);
+                }
+            };
             items.sort_by_key(|o| o.revision);
-            let seed_secs = self.epoch.elapsed().as_secs() as u32;
-            for obj in &items {
-                let event = Arc::new(InternalEvent {
-                    key: obj.key.clone(),
-                    revision: obj.revision,
-                    value: Some(obj.value.clone()),
-                    is_create: true,
-                    deleted_body: None,
-                });
-                push_into_shard(
-                    &shard_key_owned,
-                    &shard,
-                    &self.compaction_horizon,
-                    seed_secs,
-                    &event,
-                );
-            }
+            let seeds = items
+                .into_iter()
+                .map(|obj| {
+                    Arc::new(InternalEvent {
+                        key: obj.key,
+                        revision: obj.revision,
+                        value: Some(obj.value),
+                        is_create: true,
+                        deleted_body: None,
+                    })
+                })
+                .collect();
+            merge_seed_into_shard(
+                &shard_key_owned,
+                &shard,
+                &self.compaction_horizon,
+                self.epoch.elapsed().as_secs() as u32,
+                seeds,
+            );
         }
 
         // Expire against THIS shard's floor, never the cross-shard maximum. The store-wide value
@@ -3698,6 +3791,113 @@ mod tests {
              (from a different resource's write) arrives before the service event; \
              if global bookmarks advance last_replayed, the service event is dedup-skipped \
              and controllers like KCM never create EndpointSlices for the service"
+        );
+    }
+
+    async fn collect_watch(
+        store: &SqliteStore,
+        prefix: &str,
+        from: u64,
+    ) -> Vec<(&'static str, String)> {
+        let stream = store.watch(prefix, from).await.expect("watch opens");
+        futures_util::pin_mut!(stream);
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            match ev {
+                WatchEvent::Added(o) => out.push(("ADDED", o.key)),
+                WatchEvent::Modified(o) => out.push(("MODIFIED", o.key)),
+                WatchEvent::Deleted { key, .. } => out.push(("DELETED", key)),
+                WatchEvent::Compacted { .. } => out.push(("COMPACTED", String::new())),
+                WatchEvent::Bookmark { .. } => {}
+            }
+        }
+        out
+    }
+
+    fn cm_body(name: &str, v: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"{name}","namespace":"default"}},"data":{{"v":"{v}"}}}}"#
+        ))
+    }
+
+    /// A delete with no watcher creates its shard holding only the tombstone. A watch resuming
+    /// from before the gap must still see the creates/updates that preceded that delete,
+    /// otherwise an informer's cache silently diverges after any reconnect.
+    #[tokio::test]
+    async fn resume_after_gap_replays_writes_preceding_a_delete_made_with_no_watcher() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        let keep = format!("{ns}keep");
+        let doomed = format!("{ns}doomed");
+        let keep_rev = store
+            .put(&keep, cm_body("keep", "1"), Some(0))
+            .await
+            .unwrap();
+        let doomed_rev = store
+            .put(&doomed, cm_body("doomed", "1"), Some(0))
+            .await
+            .unwrap();
+        let resume_from = doomed_rev;
+
+        let born = format!("{ns}born-offline");
+        store
+            .put(&born, cm_body("born-offline", "1"), Some(0))
+            .await
+            .unwrap();
+        store
+            .put(&keep, cm_body("keep", "2"), Some(keep_rev))
+            .await
+            .unwrap();
+        store.delete(&doomed, None).await.unwrap();
+
+        let got = collect_watch(&store, ns, resume_from).await;
+        let keys_of = |kind: &str| -> Vec<&String> {
+            got.iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, v)| v)
+                .collect()
+        };
+        assert!(
+            got.iter().all(|(k, _)| *k != "COMPACTED"),
+            "history is replayable here, so a 410 would force a needless relist: {got:?}"
+        );
+        assert!(
+            keys_of("ADDED").contains(&&born),
+            "a create made while nobody watched was silently dropped on resume: {got:?}"
+        );
+        assert!(
+            got.iter().any(|(_, k)| *k == keep),
+            "an update made while nobody watched was silently dropped on resume: {got:?}"
+        );
+        assert!(
+            keys_of("DELETED").contains(&&doomed),
+            "the delete itself must still be delivered: {got:?}"
+        );
+    }
+
+    /// Resuming below what the shard retained is a 410, never a silent partial replay.
+    #[tokio::test]
+    async fn resume_below_retained_history_is_expired_not_a_partial_replay() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        let first = store
+            .put(&format!("{ns}first"), cm_body("first", "1"), Some(0))
+            .await
+            .unwrap();
+        let _watcher = store.watch(ns, 0).await.unwrap();
+        for i in 0..(RING_CAPACITY + 8) {
+            store
+                .put(&format!("{ns}c{i}"), cm_body("c", "1"), Some(0))
+                .await
+                .unwrap();
+        }
+
+        let got = collect_watch(&store, ns, first).await;
+        assert_eq!(
+            got.last().map(|(k, _)| *k),
+            Some("COMPACTED"),
+            "resume below the ring's floor must end in an Expired signal: {got:?}"
         );
     }
 
