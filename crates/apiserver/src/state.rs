@@ -2823,6 +2823,47 @@ mod tests {
         );
     }
 
+    /// The shared webhook client carries every admission and CRD-conversion call that is not
+    /// given a per-webhook CA; one that fell back to classical key exchange would expose
+    /// object bodies to harvest-now-decrypt-later.
+    #[tokio::test]
+    async fn build_webhook_client_negotiates_x25519mlkem768() {
+        crate::tls::install_pq_provider().unwrap();
+        let server = crate::test_tls::pq_only_server("localhost").await;
+        let client = AppState::<SqliteStore>::build_webhook_client(
+            Some(std::slice::from_ref(&server.cert_der)),
+            None,
+        )
+        .unwrap();
+        crate::test_tls::assert_pq_request(
+            "apiserver -> webhook (shared client)",
+            &client,
+            &format!("https://localhost:{}/", server.port),
+            &server,
+        )
+        .await;
+    }
+
+    /// Kubelet log and node-proxy calls use this client; a classical-only handshake would
+    /// expose the kubelet client certificate exchange and streamed logs.
+    #[tokio::test]
+    async fn build_kubelet_client_negotiates_x25519mlkem768() {
+        crate::tls::install_pq_provider().unwrap();
+        let server = crate::test_tls::pq_only_server("localhost").await;
+        let client = AppState::<SqliteStore>::build_kubelet_client(
+            Some(std::slice::from_ref(&server.cert_der)),
+            Some(format!("{}{}", server.cert_pem, server.key_pem).as_bytes()),
+        )
+        .unwrap();
+        crate::test_tls::assert_pq_request(
+            "apiserver -> kubelet (shared client)",
+            &client,
+            &format!("https://localhost:{}/", server.port),
+            &server,
+        )
+        .await;
+    }
+
     // ---------------------------------------------------------------------------
     // ServiceIpAllocator unit tests
     // ---------------------------------------------------------------------------

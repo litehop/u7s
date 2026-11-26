@@ -7613,6 +7613,29 @@ mod tests {
         drop(client);
     }
 
+    /// Every admission webhook and CRD conversion webhook is called through this per-webhook
+    /// client; a webhook link that silently fell back to classical key exchange would let a
+    /// recorded handshake be decrypted later, exposing full object bodies.
+    #[tokio::test]
+    async fn build_webhook_call_client_negotiates_x25519mlkem768() {
+        crate::tls::install_pq_provider().unwrap();
+        let server = crate::test_tls::pq_only_server("localhost").await;
+        let ca_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            server.cert_pem.as_bytes(),
+        );
+        let fallback = reqwest::Client::new();
+        let client =
+            build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback, None);
+        crate::test_tls::assert_pq_request(
+            "apiserver -> admission webhook (per-webhook client)",
+            &client,
+            &format!("https://localhost:{}/", server.port),
+            &server,
+        )
+        .await;
+    }
+
     /// build_webhook_call_client must apply the konnectivity proxy when proxy_addr is set.
     /// Without this, per-webhook clients built with a custom caBundle bypass konnectivity
     /// and cannot reach the service ClusterIP from the Mac host — every webhook call fails.

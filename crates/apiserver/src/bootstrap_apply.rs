@@ -505,6 +505,27 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use u7s_store::Store;
 
+    /// The bootstrap applier presents the installer's client certificate to the apiserver's own
+    /// listener; a classical-only handshake there would expose the manifests it applies.
+    #[tokio::test]
+    async fn bootstrap_apply_build_client_negotiates_x25519mlkem768() {
+        crate::tls::install_pq_provider().unwrap();
+        let server = crate::test_tls::pq_only_server("localhost").await;
+        let creds = KubeconfigCreds {
+            server: format!("https://localhost:{}", server.port),
+            ca_pem: server.cert_pem.clone().into_bytes(),
+            identity_pem: format!("{}{}", server.cert_pem, server.key_pem).into_bytes(),
+        };
+        let client = build_client(&creds).unwrap();
+        crate::test_tls::assert_pq_request(
+            "bootstrap applier -> apiserver",
+            &client,
+            &format!("{}/", creds.server),
+            &server,
+        )
+        .await;
+    }
+
     // -----------------------------------------------------------------------
     // split_yaml_documents / kind_to_resource / ssa_url — pure-function coverage
     // -----------------------------------------------------------------------
