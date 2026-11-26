@@ -630,18 +630,33 @@ pub(crate) fn pq_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// that pick up `CryptoProvider::get_default()`. Fails if a different default was already
 /// installed: those clients would silently handshake without the hybrid group.
 pub(crate) fn install_pq_provider() -> anyhow::Result<()> {
+    #[cfg(test)]
+    PQ_INSTALL_CALLS.with(|c| c.set(c.get() + 1));
     rustls_post_quantum::provider().install_default().ok();
     let default = rustls::crypto::CryptoProvider::get_default()
         .ok_or_else(|| anyhow::anyhow!("no process-default rustls CryptoProvider is installed"))?;
     ensure_pq_first(default)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls to `install_pq_provider` on this thread, so tests can prove a startup path reaches it.
+    static PQ_INSTALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn ensure_pq_first(provider: &rustls::crypto::CryptoProvider) -> anyhow::Result<()> {
+    const FIX: &str = "outbound clients (webhooks, aggregated APIs, proxies) would negotiate \
+        classical-only key exchange; remove the code or dependency that installs a different \
+        process-default CryptoProvider before u7s starts so u7s can install \
+        rustls_post_quantum::provider()";
     match provider.kx_groups.first().map(|g| g.name()) {
         Some(rustls::NamedGroup::X25519MLKEM768) => Ok(()),
-        first => anyhow::bail!(
-            "process-default rustls CryptoProvider prefers {first:?}, not X25519MLKEM768: \
-             outbound clients would negotiate classical-only key exchange"
+        Some(first) => anyhow::bail!(
+            "process-default rustls CryptoProvider prefers {first:?}, not X25519MLKEM768: {FIX}"
+        ),
+        None => anyhow::bail!(
+            "process-default rustls CryptoProvider has no key-exchange groups, not \
+             X25519MLKEM768: {FIX}"
         ),
     }
 }
@@ -3363,9 +3378,52 @@ mod tests {
             .retain(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
         let err = ensure_pq_first(&provider).unwrap_err().to_string();
         assert!(err.contains("X25519MLKEM768"), "{err}");
+        assert!(
+            err.contains("rustls_post_quantum::provider()"),
+            "an operator must be told how to fix a refused startup: {err}"
+        );
 
         provider.kx_groups.clear();
-        assert!(ensure_pq_first(&provider).is_err());
+        let err = ensure_pq_first(&provider).unwrap_err().to_string();
+        assert!(
+            err.contains("no key-exchange groups") && !err.contains("None"),
+            "an empty group list must be reported as such, not as 'prefers None': {err}"
+        );
+    }
+
+    /// Deleting the install call from `generate_tls` would leave reqwest and tungstenite on
+    /// whatever default the process has, silently dropping the hybrid group for every
+    /// webhook, aggregation and proxy link while all handshake tests still pass.
+    #[test]
+    fn generate_tls_installs_the_pq_provider() {
+        let dir = test_temp_dir("pq-wiring-tls");
+        let args = Args {
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            ..args_with(None)
+        };
+        let before = PQ_INSTALL_CALLS.with(|c| c.get());
+        generate_tls(&args).expect("generate_tls must succeed");
+        assert!(
+            PQ_INSTALL_CALLS.with(|c| c.get()) > before,
+            "generate_tls must install the PQ provider before building any client"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// `run` must install the PQ provider before anything else can build a client. The
+    /// database path is unopenable so `run` fails right after the install, before TLS
+    /// generation, which means only `run`'s own call can account for the count.
+    #[tokio::test]
+    async fn run_installs_the_pq_provider_before_opening_the_store() {
+        let mut args = args_with(None);
+        args.db = "/nonexistent-u7s-dir/state.db".into();
+        let before = PQ_INSTALL_CALLS.with(|c| c.get());
+        let err = crate::run(args).await.unwrap_err();
+        assert!(
+            PQ_INSTALL_CALLS.with(|c| c.get()) > before,
+            "run must install the PQ provider at startup (run failed with: {err:#})"
+        );
     }
 
     /// Harvest-now-decrypt-later: every control-plane session the apiserver terminates or

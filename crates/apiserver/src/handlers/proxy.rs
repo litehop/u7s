@@ -9613,6 +9613,28 @@ mod tests {
         );
     }
 
+    /// Pod proxy requests (pods/<name>/proxy to https backends) use this client; a classical
+    /// fallback would expose proxied request bodies and credentials to harvest-now-decrypt-later.
+    #[tokio::test]
+    async fn build_pod_proxy_client_negotiates_x25519mlkem768() {
+        crate::tls::install_pq_provider().unwrap();
+        for insecure in [false, true] {
+            let server = crate::test_tls::pq_only_server("localhost").await;
+            let client = build_pod_proxy_client(
+                Some(std::slice::from_ref(&server.cert_der)),
+                None,
+                insecure,
+            );
+            crate::test_tls::assert_pq_request(
+                &format!("apiserver -> pod proxy (insecure_https={insecure})"),
+                &client,
+                &format!("https://localhost:{}/", server.port),
+                &server,
+            )
+            .await;
+        }
+    }
+
     /// AppState::build_kubelet_client with a cluster CA must return Some(client).
     ///
     /// The shared kubelet client is built once at startup. If it fails to build when a
