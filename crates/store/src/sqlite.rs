@@ -2756,7 +2756,34 @@ impl Store for SqliteStore {
         let horizon = shard.horizon.load(Ordering::Relaxed);
 
         // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
-        let replayed: Vec<Arc<InternalEvent>> = {
+        // `from_revision == 0` means "start from current state" (upstream sends every live
+        // object as ADDED). The ring holds only the newest RING_CAPACITY events, so it cannot
+        // serve that: replay the listed state, then any ring events newer than the listing.
+        let replayed: Vec<Arc<InternalEvent>> = if from_revision == 0 {
+            let mut items = self.list(prefix, ListOptions::default()).await?.items;
+            items.sort_by_key(|o| o.revision);
+            let snapshot_rv = items.last().map_or(0, |o| o.revision);
+            let mut out: Vec<Arc<InternalEvent>> = items
+                .into_iter()
+                .map(|obj| {
+                    Arc::new(InternalEvent {
+                        key: obj.key,
+                        revision: obj.revision,
+                        value: Some(obj.value),
+                        is_create: true,
+                        deleted_body: None,
+                    })
+                })
+                .collect();
+            let guard = shard.ring.read().expect("ring poisoned");
+            out.extend(
+                guard
+                    .iter()
+                    .filter(|e| e.key.starts_with(prefix) && e.revision > snapshot_rv)
+                    .cloned(),
+            );
+            out
+        } else {
             let guard = shard.ring.read().expect("ring poisoned");
             guard
                 .iter()
@@ -3916,6 +3943,70 @@ mod tests {
                 "{name} watcher must replay the pre-existing object: {ev:?}"
             );
         }
+    }
+
+    async fn put_many(store: &SqliteStore, ns: &str, n: usize) -> Vec<u64> {
+        let mut revs = Vec::with_capacity(n);
+        for i in 0..n {
+            let rv = store
+                .put(
+                    &format!("{ns}cm-{i}"),
+                    cm_body(&format!("cm-{i}"), "1"),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+            revs.push(rv);
+        }
+        revs
+    }
+
+    /// A first watch of a resource larger than the ring must not silently drop the oldest
+    /// objects: a resume below the raised floor is 410, so the client relists.
+    #[tokio::test]
+    async fn first_watch_resume_below_seed_floor_of_large_resource_is_410_not_partial() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        let revs = put_many(&store, ns, 2000).await;
+
+        let stream = store.watch(ns, revs[10]).await.expect("watch opens");
+        futures_util::pin_mut!(stream);
+        let mut got = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            got.push(ev);
+        }
+        assert!(
+            matches!(got.last(), Some(WatchEvent::Compacted { .. })),
+            "resume below the seed floor must end in Compacted, not replay a truncated set: {} events",
+            got.len()
+        );
+    }
+
+    /// `resourceVersion=0` is "start from current state": every live object must arrive as
+    /// ADDED, however large the resource, or an informer's cache silently misses the oldest.
+    #[tokio::test]
+    async fn rv0_first_watch_of_large_resource_delivers_every_object() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        put_many(&store, ns, 2000).await;
+
+        let stream = store.watch(ns, 0).await.expect("watch opens");
+        futures_util::pin_mut!(stream);
+        let mut added = std::collections::HashSet::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            if let WatchEvent::Added(o) = ev {
+                added.insert(o.key);
+            }
+        }
+        assert_eq!(
+            added.len(),
+            2000,
+            "rv=0 watch must replay the complete current state"
+        );
     }
 
     /// Guards the 410 path only: resuming below what the shard retained is Expired, never a
