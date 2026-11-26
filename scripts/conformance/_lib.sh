@@ -434,7 +434,7 @@ lan_v6_seed_mesh() {
 # (--cluster-cidr 10.244.0.0/16,fd00:244::/56, --service-cidr
 # 10.96.0.0/12,fd00:96::/108; kube-dns is the tenth host of each range).
 # Single-stack rigs keep the IPv4 values.
-RIG_POD_CIDR_V4="10.244.0.0/16"
+RIG_POD_CIDR_V4="${RIG_POD_CIDR_V4:-10.244.0.0/16}"
 RIG_POD_CIDR_V6="fd00:244::/56"
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
 RIG_SERVICE_CIDR_V4="10.96.0.0/12"
@@ -974,6 +974,12 @@ write_run_meta() {
   } > "$run_dir/run-meta"
 }
 
+# Appends the cluster's node count to a run archive's run-meta, so a 2-node archive never
+# reads as single-node. Args: <run-dir> <node count>.
+run_meta_record_nodes() {
+  echo "nodes=$2" >> "$1/run-meta"
+}
+
 # Prints, one per line, the names of run-all.sh options that only configure the host
 # rig and so cannot be honoured by --install mode. Args: <name>=<value> pairs; an
 # empty value means "not given".
@@ -982,6 +988,21 @@ install_mode_incompatible_flags() {
   for pair in "$@"; do
     if [ -n "${pair#*=}" ]; then echo "${pair%%=*}"; fi
   done
+}
+
+# Reads install.sh --mint-join-token's output on stdin and prints the join URL, the token
+# and the CA hash, one per line. Fails when any is missing.
+join_fields_from_mint_output() {
+  local out server token hash
+  out="$(cat)"
+  server="$(sed -n 's/^ *install\.sh --join \([^ ]*\) .*/\1/p' <<<"$out")"
+  token="$(sed -n 's/^Join token created.*: //p' <<<"$out")"
+  hash="$(grep -oE 'sha256:[0-9a-f]{64}' <<<"$out" | head -1)" || true
+  if [ -z "$server" ] || [ -z "$token" ] || [ -z "$hash" ]; then
+    echo "error: could not parse the join URL, token and CA hash from --mint-join-token output" >&2
+    return 1
+  fi
+  printf '%s\n%s\n%s\n' "$server" "$token" "$hash"
 }
 
 # True when <pid> is an ssh process forwarding exactly 127.0.0.1:<port> (this slot's
