@@ -19,7 +19,11 @@
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #                                  [--embedded-scheduler <true|false>]
 #                                  [--service-cidr <cidr>[,<cidr>]]
+#                                  [--kcm-mode R|T]
 #
+#   --kcm-mode  (--install only) R = shipped KCM, T = trimmed --controllers (kcm-mode.sh), applied
+#                after bring-up and before sonobuoy; the effective flag and the unit restart
+#                count land in the run archive as kcm-mode.txt. Default: shipped KCM, untouched.
 #   --install    Release sign-off path: instead of the host rig, build an arm64 tarball
 #                from this checkout, run the real scripts/install.sh on the VM, tunnel
 #                the VM's apiserver to 127.0.0.1:<--port>, apply the rig-only add-ons
@@ -274,6 +278,7 @@ PROCS=""
 K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
 SERVICE_CIDR=""
+KCM_MODE=""
 INSTALL=0
 
 while [[ $# -gt 0 ]]; do
@@ -309,6 +314,7 @@ while [[ $# -gt 0 ]]; do
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --install) INSTALL=1; shift ;;
+    --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -425,6 +431,11 @@ banner() {
   echo "============================================================"
 }
 
+if [ -n "$KCM_MODE" ]; then
+  [ "$INSTALL" -eq 1 ] || { echo "error: --kcm-mode needs --install (it edits install.sh's u7s-kcm unit)" >&2; exit 1; }
+  case "$KCM_MODE" in R|T) ;; *) echo "error: --kcm-mode must be R or T, got '$KCM_MODE'" >&2; exit 1 ;; esac
+fi
+
 # --install: the real install.sh on the VM instead of the host rig. Options that configure
 # the host rig have no install-mode meaning, so reject them rather than ignore them silently.
 if [ "$INSTALL" -eq 1 ]; then
@@ -452,6 +463,7 @@ if [ "$INSTALL" -eq 1 ]; then
   [ "$UNSAFE_FOCUS" -eq 0 ] || _INSTALL_ARGS+=(--unsafe-focus)
   [ -z "$PROCS" ] || _INSTALL_ARGS+=(--procs "$PROCS")
   [ -z "$K8S_VERSION" ] || _INSTALL_ARGS+=(--k8s-version "$K8S_VERSION")
+  [ -z "$KCM_MODE" ] || _INSTALL_ARGS+=(--kcm-mode "$KCM_MODE")
   [ -z "$NETWORK" ] || _INSTALL_ARGS+=(--network "$NETWORK")
   [ -z "${U7S_VM_NAME:-}" ] || _INSTALL_ARGS+=(--vm "$U7S_VM_NAME")
   [ "$VERBOSE" -lt 1 ] || _INSTALL_ARGS+=(--rust-log "$RUST_LOG")

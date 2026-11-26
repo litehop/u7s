@@ -7,15 +7,18 @@
 #      systemd drop-in derived from the installed unit's own ExecStart. install.sh is not touched.
 #
 # Nothing calls this unless asked: without it every rig run is byte-identical to before.
-# The T exclusions are an unvalidated candidate (no conformance run has confirmed them).
+# T excludes 10 controllers. The first 11-controller trim failed the VolumeAttributesClass lifecycle spec: the
+# apiserver adds the vac-protection finalizer and only volumeattributesclass-protection-controller removes
+# it, so that controller must stay. A full conformance run of the 10-controller trim is still owed.
 #
 # Usage: scripts/conformance/kcm-mode.sh --vm <name> --mode R|T
 # Prints the effective "--controllers=..." of the running KCM on stdout.
 set -euo pipefail
 
 # Candidate trim from the memory decomposition: HPA, TTL and the controllers for features
-# the u7s apiserver does not serve.
-KCM_TRIM_EXCLUDE="-ttl-controller,-legacy-serviceaccount-token-cleaner-controller,-validatingadmissionpolicy-status-controller,-storage-version-migrator-controller,-storageversion-garbage-collector-controller,-kube-apiserver-serving-clustertrustbundle-publisher-controller,-podcertificaterequest-cleaner-controller,-podgroup-protection-controller,-resourcepoolstatusrequest-controller,-volumeattributesclass-protection-controller,-horizontal-pod-autoscaler-controller"
+# the u7s apiserver does not serve. A KCM_TRIM_EXCLUDE in the environment replaces it (the
+# leave-one-out sweep excludes one controller at a time).
+KCM_TRIM_EXCLUDE="${KCM_TRIM_EXCLUDE:--ttl-controller,-legacy-serviceaccount-token-cleaner-controller,-validatingadmissionpolicy-status-controller,-storage-version-migrator-controller,-storageversion-garbage-collector-controller,-kube-apiserver-serving-clustertrustbundle-publisher-controller,-podcertificaterequest-cleaner-controller,-podgroup-protection-controller,-resourcepoolstatusrequest-controller,-horizontal-pod-autoscaler-controller}"
 
 KCM_DROPIN=/etc/systemd/system/u7s-kcm.service.d/90-kcm-mode.conf
 

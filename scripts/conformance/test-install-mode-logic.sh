@@ -323,6 +323,13 @@ for f in lima-start.sh install-bringup.sh; do
   grep -q 'default_network_for_vm' "$REPO/scripts/conformance/$f" || bad "$f does not call default_network_for_vm"
 done
 
+# --kcm-mode edits install.sh's unit, so on the host rig it must fail loudly instead of running an
+# untrimmed "trimmed" conformance run that would be read as a pass.
+out=$("$REPO/scripts/conformance/run-all.sh" --kcm-mode T --stack-only 2>&1 || true)
+case "$out" in *"--kcm-mode needs --install"*) ok "--kcm-mode is rejected on the host rig" ;; *) bad "--kcm-mode accepted without --install: $out" ;; esac
+out=$("$REPO/scripts/conformance/run-all.sh" --install --kcm-mode X 2>&1 || true)
+case "$out" in *"must be R or T"*) ok "--kcm-mode rejects values other than R or T" ;; *) bad "--kcm-mode X accepted: $out" ;; esac
+
 echo ""
-echo "install-mode logic: $PASS passed, $FAIL failed"
+echo "install-mode logic:$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

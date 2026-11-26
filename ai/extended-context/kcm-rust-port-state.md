@@ -6,8 +6,8 @@ kind: initiative-state
 # KCM Rust port state
 
 **AS OF 2026-11-25.** Decision record:
-`docs/decisions/kcm-rust-port-local-first-separate-process.md`. No port code
-exists; Phase 0 is not started. Original design: `git show 900097c6:ai/findings/2026-11-24-mayor-w9xt5-kcm-port-phase2-design.md`.
+`docs/decisions/kcm-rust-port-local-first-separate-process.md`. Phase 0 harness
+and trim validation are done (children of `mayor-rh8y3`). Original design: `git show 900097c6:ai/findings/2026-11-24-mayor-w9xt5-kcm-port-phase2-design.md`.
 
 ## Operator decision (2026-11-25) and what follows
 
@@ -41,7 +41,7 @@ conformance. Until then nothing ships in `install.sh` or releases.
 | Rewrite-only residual after flags | 10-22 |
 
 Unmeasured targets: Rust fixed cost at most 8; Pod cache at most N
-bytes/pod (provisionally 1024). The trim has never passed conformance.
+bytes/pod (provisionally 1024). The 11-controller trim failed conformance; see below.
 
 ## Phase plan
 
@@ -116,19 +116,48 @@ Rollback: one env file renders Go's `--controllers=*,-<ported>` and Rust's
 `--controllers=<ported>`; an empty file is pure Go. A logic test asserts the
 two sets are disjoint and their union is the full set.
 
+## Trim validation and spec-to-controller map (release-1.37 sources)
+
+Baseline: untrimmed shipped Go KCM, single node (lima-node-2, kubelet 1.37.3), full certified
+conformance in `--install` mode: 462 executed (460 parallel + 2 disruptive), 460 passed, 2 failed.
+Both failures need two nodes (`Conformance Tests should have at least two untainted nodes`,
+`Daemon set should rollback without unnecessary restarts`). The executed spec set is
+`scripts/conformance/kcm-baseline-specs.txt`, the failure set `kcm-baseline-failures.txt`, both
+pinned by `guard.sha256`; regenerate with `scripts/conformance/spec-set.sh`. The 2-node baseline
+is still owed before shipping.
+
+First trim (11 controllers): executed spec set identical (462 names), failure set plus one:
+`VolumeAttributesClass should run through the lifecycle of a VolumeAttributesClass`
+(`test/e2e/storage/volumeattributesclass.go:51`). The apiserver puts
+`kubernetes.io/vac-protection` on every new VAC (checked with kubectl on a trimmed stack) and only
+`volumeattributesclass-protection-controller` removes it, so the delete never finishes. That
+controller is dropped from the trim (10 controllers). The corrected trim passed the
+`VolumeAttributesClass` focus (17 of 17); a full run of the 10-controller trim is still owed.
+
+| Trimmed controller | Specs in the release-1.37 listings | Trimmed result |
+|---|---|---|
+| volumeattributesclass-protection | VAC lifecycle (`storage/volumeattributesclass.go:51`, Conformance) | failed; kept |
+| validatingadmissionpolicy-status | VAP "should validate against a Deployment" waits for `status.typeChecking` (`apimachinery/validatingadmissionpolicy.go:79`) | passed |
+| storage-version-migrator | StorageVersionMigration CRUD (`apimachinery/storage_version_migration.go:43`, Conformance) | passed |
+| podcertificaterequest-cleaner | PodCertificateRequest API operations (`auth/podcertificaterequest.go`, Conformance) | passed |
+| storageversion-garbage-collector | `StorageVersion resources` (`apimachinery/storage_version.go:44`, `feature.StorageVersionAPI`, not Conformance) | not run |
+| horizontal-pod-autoscaler | `autoscaling/horizontal_pod_autoscaling*.go`, all `feature.HPA`, none Conformance | not run |
+| ttl, legacy-serviceaccount-token-cleaner, kube-apiserver-serving-clustertrustbundle-publisher, podgroup-protection, resourcepoolstatusrequest | none in `conformance.yaml` | not run |
+
+`ttl-controller` (node TTL annotation) is not `ttl-after-finished-controller`, which stays.
+The Projected PodCertificate and ClusterTrustBundle specs are Conformance-tagged but feature-gated,
+so the rig's FeatureGate label filter excludes them from every run here.
+
 ## Open and needs-data
 
-- Rust fixed cost, bytes/pod, Go leave-one-out savings: all unmeasured. Bead
-  `mayor-rh8y3` (Phase 0).
-- Trim validity (HPA, TTL): unproven. `mayor-rh8y3`.
+- Rust fixed cost and bytes/pod: unmeasured. Bead `mayor-rh8y3` (Phase 0).
+- Full conformance of the 10-controller trim: owed (the 11-controller trim failed one spec).
 - Embedded-in-apiserver alternative: re-measure each phase end; raise to the
   operator if the estimated saving is at least 4 MiB.
 - Can upstream integration tests target an external apiserver; does audit
   show per-controller identity: `mayor-anvu2`.
 - Wedged-but-alive controller detection: `mayor-n6njd`.
 - Nightly multi-node job: `mayor-iv2yg`, deferred until the ship gate.
-- Spec-to-controller mapping is from directory listings only; re-derive from
-  release-1.37 in Phase 0 (`mayor-rh8y3`).
 
 ## Kubelet
 

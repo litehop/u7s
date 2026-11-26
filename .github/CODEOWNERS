@@ -1,0 +1,13 @@
+# Files pinned by scripts/conformance/guard.sha256 decide which conformance specs run and what the
+# KCM trim excludes; a change to any of them needs the operator's review. Keep in sync with PINNED
+# in scripts/conformance/guard-check.sh.
+/scripts/conformance/guard.sha256                    @valerauko
+/scripts/conformance/guard-check.sh                  @valerauko
+/scripts/conformance/sonobuoy-plugin-e2e.yaml        @valerauko
+/scripts/conformance/06-run-sonobuoy.sh              @valerauko
+/scripts/conformance/kcm-mode.sh                     @valerauko
+/scripts/conformance/kcm-pod-bytes.txt               @valerauko
+/scripts/conformance/kcm-baseline-specs.txt          @valerauko
+/scripts/conformance/kcm-baseline-failures.txt       @valerauko
+/.githooks/sensitive-conformance-focus.yaml          @valerauko
+/.github/CODEOWNERS                                  @valerauko

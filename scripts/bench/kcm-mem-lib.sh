@@ -88,3 +88,18 @@ kcm_aggregate() {
     | .phase0_pass = ([.stages[].kcm_diff_mib >= $min] | all)
   ' "$@"
 }
+
+# stdin: JSON lines {controller, kcm_mib}; controller "R" is the untrimmed baseline measured
+# between the leave-one-out runs. stdout: {baseline_mib (median of the R rows), baseline_spread_mib
+# (max - min of the R rows: the noise floor), rows: [{controller, kcm_mib, saved_mib}]} with
+# saved_mib = baseline - kcm_mib, sorted by saved_mib descending. A row whose saved_mib is inside
+# the spread is not distinguishable from noise.
+kcm_loo_table() {
+  jq -s '
+    def median: sort | if length == 0 then null elif length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+    def r2: . * 100 | round / 100;
+    ([.[] | select(.controller == "R") | .kcm_mib]) as $r
+    | ($r | median) as $b
+    | {baseline_mib: ($b | r2), baseline_spread_mib: ((($r | max) - ($r | min)) | r2),
+       rows: ([.[] | select(.controller != "R") | {controller, kcm_mib, saved_mib: (($b - .kcm_mib) | r2)}] | sort_by(-.saved_mib))}'
+}
