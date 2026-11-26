@@ -604,6 +604,35 @@ mod tests {
         );
     }
 
+    /// The header limit is deliberately hyper's default (100 header lines) to bound
+    /// pre-auth per-connection allocation; identities with more than ~100 groups via
+    /// impersonation or request-header auth get 431. Raising it (upstream accepts 16384)
+    /// widens the unauthenticated memory surface, so a revert must fail here.
+    #[tokio::test]
+    async fn header_limit_stays_at_hyper_default_to_bound_preauth_allocation() {
+        let tls = test_tls();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        start(listener, ok_app(), &tls, test_limits()).await;
+
+        for (groups, expected) in [(90, "HTTP/1.1 200"), (150, "HTTP/1.1 431")] {
+            let mut req = String::from("GET / HTTP/1.1\r\nHost: localhost\r\n");
+            for i in 0..groups {
+                req.push_str(&format!("X-Remote-Group: group-{i}\r\n"));
+            }
+            req.push_str("\r\n");
+            let mut s = tls_connect(&tls, addr).await;
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).await.unwrap();
+            let status_line = std::str::from_utf8(&buf[..n]).unwrap();
+            assert!(
+                status_line.starts_with(expected),
+                "{groups} group headers must answer {expected}, got {status_line:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn client_that_never_sends_a_request_is_dropped() {
         let tls = test_tls();

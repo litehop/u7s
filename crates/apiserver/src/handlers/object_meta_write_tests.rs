@@ -565,3 +565,67 @@ async fn status_and_scale_writes_succeed_on_a_stored_workload_with_an_invalid_te
         "7 workload kinds with status plus Deployment scale"
     );
 }
+
+/// A Binding's metadata is validated like a pod's: an invalid label key or an annotation set
+/// over 256 KiB must be a 422 and must not bind the pod, while a conforming Binding binds it.
+#[tokio::test]
+async fn pod_binding_metadata_is_validated_like_pod_create() {
+    let c = cluster().await;
+    let pod = &kinds()[2];
+    let (st, resp) = c
+        .call(
+            "POST",
+            pod.collection,
+            "application/json",
+            body(pod, "p", None),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{resp}");
+    let uri = "/api/v1/namespaces/default/pods/p/binding";
+    let binding = |meta: Value| {
+        let mut b = json!({"apiVersion": "v1", "kind": "Binding", "metadata": {"name": "p"},
+            "target": {"apiVersion": "v1", "kind": "Node", "name": "node-1"}});
+        for (k, v) in meta.as_object().unwrap() {
+            b["metadata"][k] = v.clone();
+        }
+        b
+    };
+
+    let (st, resp) = c
+        .call(
+            "POST",
+            uri,
+            "application/json",
+            binding(json!({"labels": {"not a key": "v"}})),
+        )
+        .await;
+    assert_label_rejected("Binding", "POST", st, &resp, "name part must consist of");
+
+    let big = json!({"annotations": {"a": "x".repeat(300 * 1024)}});
+    let (st, resp) = c.call("POST", uri, "application/json", binding(big)).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("metadata.annotations: Too long: may not be more than 262144 bytes"),
+        "{resp}"
+    );
+
+    let (_, after) = c
+        .call(
+            "GET",
+            "/api/v1/namespaces/default/pods/p",
+            "application/json",
+            Value::Null,
+        )
+        .await;
+    assert!(
+        after["spec"]["nodeName"].is_null(),
+        "a rejected binding must leave the pod unscheduled: {after}"
+    );
+
+    let ok = binding(json!({"labels": {"k": "v"}, "annotations": {"example.com/a": "b"}}));
+    let (st, resp) = c.call("POST", uri, "application/json", ok).await;
+    assert_eq!(st, StatusCode::CREATED, "{resp}");
+}

@@ -17,6 +17,15 @@ maximum-size writes can be answered 429, and clients should retry.
 
 Streamed requests (exec, attach, portforward, logs, watch) are not metered.
 
+## Header limits (divergence)
+
+u7s keeps hyper's defaults: 100 header lines (HTTP/1) and a 16 KiB header list
+(HTTP/2). Upstream accepts up to 16384 header values and 1 MiB of header bytes
+(kubernetes #142607, #142770). Impersonated or request-header-authenticated
+users in more than ~100 groups (HTTP/1), or whose header list exceeds 16 KiB
+(HTTP/2), receive 431. The limits bound pre-auth per-connection allocation:
+hyper allocates the header array eagerly, before authentication.
+
 ## Proxy subresources
 
 Upstream treats `pods|services|nodes/{name}/proxy` as long-running and
