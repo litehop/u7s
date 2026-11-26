@@ -6331,6 +6331,27 @@ mod tests {
         assert_eq!(events[0]["object"]["metadata"]["name"], "stranded-pod");
     }
 
+    /// A pod deleted and recreated under the same name must be scheduled from
+    /// its own list entry (new UID) once the predecessor's bind releases the
+    /// key; the scheduler keeps no UID-agnostic cache that could resurrect the
+    /// old pod, so a missed delete cannot strand or mis-route the new one.
+    #[test]
+    fn pods_needing_resync_schedules_same_name_recreated_pod_with_its_new_uid() {
+        let items = vec![json!({
+            "metadata": { "name": "web-0", "namespace": "default", "uid": "new-uid" },
+            "spec": {}
+        })];
+        let mut in_flight = std::collections::HashSet::from(["default/web-0".to_owned()]);
+        assert!(
+            pods_needing_resync(&items, &in_flight).is_empty(),
+            "the predecessor's in-flight bind owns the key until it finishes"
+        );
+        in_flight.clear();
+        let events = pods_needing_resync(&items, &in_flight);
+        assert_eq!(events.len(), 1, "recreated pod must not stay stranded");
+        assert_eq!(events[0]["object"]["metadata"]["uid"], "new-uid");
+    }
+
     /// Regression for the resync GET's dropped `fieldSelector=spec.nodeName=`:
     /// a real unscheduled pod never has `spec.nodeName` present-and-empty like
     /// the test above — `nodeName` is an `Option<String>` with
