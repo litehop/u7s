@@ -155,10 +155,18 @@ fi
 # kube-system/extension-apiserver-authentication; the supervisor's crash-burst
 # breaker (5 crashes) could give up on that race, so wait here instead.
 if command -v kubectl &>/dev/null; then
+  AUTH_CM_READY=0
   for _ in \$(seq 1 60); do
-    kubectl --kubeconfig="\$KUBECONFIG_FILE" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1 && break
+    if kubectl --kubeconfig="\$KUBECONFIG_FILE" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1; then
+      AUTH_CM_READY=1
+      break
+    fi
     sleep 2
   done
+  if [ "\$AUTH_CM_READY" -ne 1 ]; then
+    echo "error: kube-system/extension-apiserver-authentication was not published within 120s (check the apiserver log); KCM needs it for delegated authn/authz" >&2
+    exit 1
+  fi
 fi
 
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
