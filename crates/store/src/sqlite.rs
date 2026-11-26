@@ -2,7 +2,7 @@ use super::*;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
@@ -144,8 +144,10 @@ pub(crate) struct RingShard {
     /// A delete creates a shard with only its own tombstone in it, so without the backfill a
     /// watch resuming from before that delete would replay the delete and silently miss every
     /// create/update since — the shard would claim history it never recorded. The first watch to
-    /// attach backfills it (see `SqliteStore::watch`).
-    seeded: AtomicBool,
+    /// attach backfills it (see `SqliteStore::watch`). The async mutex is held across the backfill so a
+    /// concurrent first watcher waits for it instead of replaying a still-empty ring; the flag is only
+    /// set once the backfill has merged, so a failed seed is retried by the next watcher.
+    seeded: tokio::sync::Mutex<bool>,
     deletion_log: RwLock<DeletionLog>,
     /// Number of currently-open `watch()` streams attached to this shard. Incremented when a
     /// stream resolves (or creates) this shard at open, decremented when the stream ends —
@@ -255,7 +257,7 @@ impl RingShard {
             ring: RwLock::new(VecDeque::new()),
             push_secs: RwLock::new(VecDeque::new()),
             horizon: AtomicU64::new(0),
-            seeded: AtomicBool::new(false),
+            seeded: tokio::sync::Mutex::new(false),
             deletion_log: RwLock::new(DeletionLog::default()),
             watchers: AtomicUsize::new(0),
             channels: std::sync::Mutex::new(Channels::default()),
@@ -2718,18 +2720,12 @@ impl Store for SqliteStore {
         // shard serving a namespace-scoped watch). Events already in the ring win over the
         // backfilled state for the same key. An EXISTING seeded shard has been accumulating real
         // history since its backfill and needs none of this.
-        if !shard.seeded.swap(true, Ordering::AcqRel) {
-            let seeded = self
+        let mut seeded = shard.seeded.lock().await;
+        if !*seeded {
+            let mut items = self
                 .list(&shard_key_owned, ListOptions::default())
-                .await
-                .map(|l| l.items);
-            let mut items = match seeded {
-                Ok(items) => items,
-                Err(e) => {
-                    shard.seeded.store(false, Ordering::Release);
-                    return Err(e);
-                }
-            };
+                .await?
+                .items;
             items.sort_by_key(|o| o.revision);
             let seeds = items
                 .into_iter()
@@ -2750,7 +2746,9 @@ impl Store for SqliteStore {
                 self.epoch.elapsed().as_secs() as u32,
                 seeds,
             );
+            *seeded = true;
         }
+        drop(seeded);
 
         // Expire against THIS shard's floor, never the cross-shard maximum. The store-wide value
         // is dominated by whichever resource type churns hardest, so using it here would reject a
@@ -3876,9 +3874,51 @@ mod tests {
         );
     }
 
-    /// Resuming below what the shard retained is a 410, never a silent partial replay.
+    /// Two first watchers racing on an unseeded shard must both receive the backfilled state.
+    /// If the second attaches while the first is still listing and replays the still-empty
+    /// ring, its informer silently misses every object created before it connected.
     #[tokio::test]
-    async fn resume_below_retained_history_is_expired_not_a_partial_replay() {
+    async fn concurrent_first_watchers_both_receive_the_backfill() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        let key = format!("{ns}pre-existing");
+        store
+            .put(&key, cm_body("pre-existing", "1"), Some(0))
+            .await
+            .unwrap();
+
+        // The first watcher parks inside the backfill's list (spawn_blocking), so the second
+        // is polled while the shard's backfill is provably in flight.
+        let mut first = Box::pin(store.watch(ns, 0));
+        assert!(
+            futures_util::poll!(first.as_mut()).is_pending(),
+            "first watcher must be mid-backfill for this interleaving to mean anything"
+        );
+        let mut second = Box::pin(store.watch(ns, 0));
+        let second = match futures_util::poll!(second.as_mut()) {
+            std::task::Poll::Ready(opened) => opened,
+            std::task::Poll::Pending => second.await,
+        };
+
+        let first = first.await.expect("first watch opens");
+        let second = second.expect("second watch opens");
+        for (name, stream) in [("first", first), ("second", second)] {
+            futures_util::pin_mut!(stream);
+            let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("{name} watcher replayed an empty ring: event lost"));
+            assert!(
+                matches!(ev, Some(WatchEvent::Added(ref o)) if o.key == key),
+                "{name} watcher must replay the pre-existing object: {ev:?}"
+            );
+        }
+    }
+
+    /// Guards the 410 path only: resuming below what the shard retained is Expired, never a
+    /// silent partial replay. A watcher is attached before the writes, so this does not exercise
+    /// backfill seeding.
+    #[tokio::test]
+    async fn expired_resume_below_ring_floor_yields_410_not_partial_replay() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
         let ns = "/registry/configmaps/default/";
         let first = store
