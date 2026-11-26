@@ -1797,12 +1797,15 @@ wait_for_joined_node() {
 
 # Prints the path of the newest client cert that is unexpired and chains to
 # the current CA (ca-bundle.pem on the control plane, else ca.pem), rotated first.
+# KCM signs with the intermediate and returns leaf + intermediate in one file;
+# the file is passed as -untrusted so the chain builds, while only the CA file
+# is a trust anchor.
 current_client_cert() {
   local c ca="$STATE_DIR/ca.pem"
   [ -s "$STATE_DIR/ca-bundle.pem" ] && ca="$STATE_DIR/ca-bundle.pem"
   for c in "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" "$STATE_DIR/kubelet-client.crt"; do
     if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 \
-      && openssl verify -CAfile "$ca" "$c" >/dev/null 2>&1; then
+      && openssl verify -CAfile "$ca" -untrusted "$c" "$c" >/dev/null 2>&1; then
       printf '%s' "$c"
       return 0
     fi
