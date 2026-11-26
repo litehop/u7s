@@ -1056,14 +1056,17 @@ fn validate_cr_schema_with_budgets(
     let compiled = match cache.get(&ctx.schema_cache_key) {
         Some(compiled) => compiled,
         None => {
-            let mut schemas = boon::Schemas::new();
-            let mut compiler = boon::Compiler::new();
-            compiler
-                .add_resource("schema.json", schema.clone())
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let index = compiler
-                .compile("schema.json", &mut schemas)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            let (schemas, index) = crate::cel_runtime::format::on_compile_stack(|| {
+                let mut schemas = boon::Schemas::new();
+                let mut compiler = boon::Compiler::new();
+                compiler
+                    .add_resource("schema.json", schema.clone())
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let index = compiler
+                    .compile("schema.json", &mut schemas)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                Ok::<_, crate::status::StatusError>((schemas, index))
+            })?;
             let mut cel_programs = std::collections::HashMap::new();
             collect_cel_programs(schema, &mut cel_programs);
             #[cfg(test)]

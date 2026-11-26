@@ -110,8 +110,9 @@ assert_true "u7s-kcm.service delegates authentication to the apiserver via the f
 assert_true "u7s-kcm.service delegates authorization to the apiserver (SubjectAccessReview), so /metrics honours system:monitoring RBAC" \
   grep -qF -- '--authorization-kubeconfig=$STATE_DIR/kcm-kubeconfig' <<<"$kcm_exec_line"
 kcm_unit="$(awk '/^cat > \/etc\/systemd\/system\/u7s-kcm.service/,/^EOF$/' "$INSTALL")"
-assert_true "u7s-kcm.service sets StartLimitIntervalSec=0 -- KCM exits until the apiserver publishes extension-apiserver-authentication, and systemd's default 5 starts/10s would leave it failed for good" \
-  grep -qx 'StartLimitIntervalSec=0' <<<"$kcm_unit"
+kcm_unit_section="$(awk '/^\[Unit\]$/{u=1;next} /^\[/{u=0} u' <<<"$kcm_unit")"
+assert_true "u7s-kcm.service sets StartLimitIntervalSec=0 in [Unit] (systemd ignores it in [Service]) -- KCM exits until the apiserver publishes extension-apiserver-authentication, and systemd's default 5 starts/10s would leave it failed for good" \
+  grep -qx 'StartLimitIntervalSec=0' <<<"$kcm_unit_section"
 assert_true "u7s-kcm.service runs at OOMScoreAdjust=-997 so the control plane outlives pods under node OOM (kubeadm static pods are node-critical)" \
   grep -qx 'OOMScoreAdjust=-997' <<<"$kcm_unit"
 apiserver_unit="$(awk '/^cat > \/etc\/systemd\/system\/u7s-apiserver.service/,/^EOF$/' "$INSTALL")"

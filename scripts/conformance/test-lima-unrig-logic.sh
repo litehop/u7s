@@ -42,6 +42,23 @@ assert "removes kube-proxy.service (else it keeps programming iptables beside in
 assert "stops and disables the rig's kubelet and kube-proxy" \
   "$([ "$(has 'disable --now kube-proxy.service')" = 1 ] && [ "$(has 'disable --now kubelet.service')" = 1 ] && echo 1 || echo 0)"
 assert "reloads systemd so removal takes effect" "$(has 'daemon-reload')"
+kcm_pat="$(printf '%s\n' "$CALLS" | sed -n 's/.*"\(\[k\]ube-controller-manager[^"]*\)".*/\1/p' | sed -n 1p)"
+matches() { [[ "$1" =~ $kcm_pat ]] && echo 1 || echo 0; }
+assert "kills the rig KCM (else it keeps :10257 and install.sh's u7s-kcm cannot bind)" \
+  "$(matches '/bin/bash /tmp/x /home/u/.cache/u7s/kcm/kube-controller-manager-1.37.3-linux-arm64 --kubeconfig=/w/kcm-kubeconfig')"
+installed_exec="$(sed -n '/^cat > \/etc\/systemd\/system\/u7s-kcm\.service <</,/^EOF$/p' "$DIR/../install.sh" | sed -n 's/^ExecStart=//p' | sed 's|\$BIN_DIR|/opt/u7s/bin|g; s|\$STATE_DIR|/var/lib/u7s|g')"
+assert "extracted the installed u7s-kcm ExecStart from install.sh (else the no-kill check below is vacuous)" \
+  "$([[ "$installed_exec" == */kube-controller-manager\ --kubeconfig=* ]] && echo 1 || echo 0)"
+assert "does not kill an installed u7s-kcm (unrig on an --install stack must leave the control plane running)" \
+  "$([ -n "$kcm_pat" ] && [ -n "$installed_exec" ] && [ "$(matches "$installed_exec")" = 0 ] && echo 1 || echo 0)"
+assert "kills the KCM supervisor (else it respawns the KCM that was just killed)" \
+  "$(has 'pkill -f "[k]cm-supervisor.sh"')"
+assert "stops the signing-key sync loop and removes its mirror dir" \
+  "$([ "$(has '[u]7s-kcm-signing-sync')" = 1 ] && [ "$(has 'rm -rf /var/tmp/u7s-kcm-signing')" = 1 ] && echo 1 || echo 0)"
+assert "deletes the rig's cni0 bridge (else install.sh's flannel inherits a stale pod CIDR)" \
+  "$(has 'ip link delete cni0')"
+assert "deletes flannel.1 and the rig flannel CNI conflist and run state" \
+  "$([ "$(has 'ip link delete flannel.1')" = 1 ] && [ "$(has '/etc/cni/net.d/10-flannel.conflist')" = 1 ] && [ "$(has 'rm -rf /run/flannel')" = 1 ] && echo 1 || echo 0)"
 
 run "$DIR/lima-unrig.sh"
 assert "missing --vm is rejected (exit 2) rather than guessing a VM" "$([ "$rc" = 2 ] && echo 1 || echo 0)"
