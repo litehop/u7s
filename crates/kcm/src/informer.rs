@@ -324,6 +324,7 @@ async fn run<T: Object>(
         };
 
         stats.watches.fetch_add(1, Relaxed);
+        let opened = std::time::Instant::now();
         let url = format!(
             "{}?watch=true&allowWatchBookmarks=true&resourceVersion={}",
             cfg.path,
@@ -353,13 +354,11 @@ async fn run<T: Object>(
 
         let gone = match (&res, st.end) {
             (_, Some(End::Gone)) => true,
-            (Err(e), _) => format!("{e:#}").contains("HTTP 410"),
+            (Err(e), _) => is_gone_error(e),
             _ => false,
         };
         let failed = res.is_err() || st.end.is_some();
-        if st.progressed {
-            backoff.reset();
-        }
+        let delay = after_watch(&mut backoff, failed, st.progressed, opened.elapsed());
         if gone {
             stats.gone.fetch_add(1, Relaxed);
             rv = None;
@@ -370,10 +369,36 @@ async fn run<T: Object>(
             stats.errors.fetch_add(1, Relaxed);
             tracing::warn!("watch {} ended: {res:?}; end={:?}", cfg.path, st.end);
         }
-        if failed || !st.progressed {
-            tokio::time::sleep(backoff.next_delay()).await;
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
         }
     }
+}
+
+/// A watch that ended cleanly after at least this long was healthy (the server
+/// timed it out); anything shorter without progress is treated as a flapping
+/// endpoint and backed off.
+const HEALTHY_WATCH: Duration = Duration::from_secs(1);
+
+/// Updates `backoff` after a watch ends and returns the delay before reconnecting, if any.
+/// A quiet resource's watch is closed by the server timeout with no event or bookmark;
+/// that must reconnect immediately without growing the delay.
+fn after_watch(
+    backoff: &mut Backoff,
+    failed: bool,
+    progressed: bool,
+    lived: Duration,
+) -> Option<Duration> {
+    let healthy_close = !failed && lived >= HEALTHY_WATCH;
+    if progressed || healthy_close {
+        backoff.reset();
+    }
+    (failed || !(progressed || healthy_close)).then(|| backoff.next_delay())
+}
+
+/// politeia reports a non-2xx watch response as `watch returned HTTP <status>`.
+pub fn is_gone_error(e: &impl std::fmt::Display) -> bool {
+    format!("{e:#}").contains("HTTP 410")
 }
 
 #[cfg(test)]
@@ -490,6 +515,51 @@ mod tests {
         assert_eq!(b.next_with(0.5), Duration::from_millis(150));
         let j = Backoff::new(Duration::from_secs(1), Duration::from_secs(1)).next_delay();
         assert!(j >= Duration::from_secs(1) && j <= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn repeated_clean_timeouts_on_a_quiet_resource_never_grow_the_delay() {
+        let mut b = Backoff::new(Duration::from_millis(100), Duration::from_secs(30));
+        for _ in 0..10 {
+            assert_eq!(
+                after_watch(&mut b, false, false, Duration::from_secs(300)),
+                None,
+                "a server-timed-out watch must re-watch immediately, as client-go does"
+            );
+        }
+        assert_eq!(
+            b.next_with(0.0),
+            Duration::from_millis(100),
+            "clean closes must not have inflated the backoff for the next real failure"
+        );
+    }
+
+    #[test]
+    fn instantly_closed_clean_watches_still_back_off() {
+        let mut b = Backoff::new(Duration::from_millis(100), Duration::from_secs(30));
+        assert!(after_watch(&mut b, false, false, Duration::ZERO).is_some());
+        let second = after_watch(&mut b, false, false, Duration::ZERO).unwrap();
+        assert!(
+            second >= Duration::from_millis(200),
+            "a server that closes every watch at once must not be hammered in a tight loop"
+        );
+    }
+
+    #[test]
+    fn failure_after_progress_restarts_backoff_from_initial() {
+        let mut b = Backoff::new(Duration::from_millis(100), Duration::from_secs(30));
+        b.next_with(0.0);
+        b.next_with(0.0);
+        let d = after_watch(&mut b, true, true, Duration::from_secs(5)).unwrap();
+        assert!(d <= Duration::from_millis(200), "got {d:?}");
+    }
+
+    #[test]
+    fn http_410_text_is_recognised_as_gone() {
+        assert!(is_gone_error(&"watch returned HTTP 410 Gone"));
+        assert!(!is_gone_error(
+            &"watch returned HTTP 500 Internal Server Error"
+        ));
     }
 
     #[test]

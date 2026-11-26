@@ -13,7 +13,7 @@ use std::{
     },
     time::Duration,
 };
-use u7s_kcm::informer::{Config, Informer};
+use u7s_kcm::informer::{is_gone_error, Config, Informer};
 
 const CONVERGE: Duration = Duration::from_secs(30);
 
@@ -174,5 +174,31 @@ async fn slow_consumer_converges() {
         inf.stats().gone.load(Relaxed) >= 1,
         "burst never outran the server's retained history, so the lag path was not exercised: {:?}",
         inf.stats()
+    );
+}
+
+/// The informer decides "relist" from politeia's error text for an HTTP 410
+/// watch response. Pinning the real error against the real apiserver makes a
+/// politeia bump that rewords it fail here instead of turning every compaction
+/// into an endless resume loop on an expired resourceVersion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn politeia_http_410_watch_error_is_recognised_as_gone() {
+    let api = Apiserver::start("pin410").await;
+    let admin = api.admin();
+    admin.create_cm("first", 10).await;
+    // The shard and its bounded history exist only once something watches it.
+    let holder = Informer::<Cm>::spawn(api.client_via(api.port), cfg(), |_| {});
+    holder.wait_synced().await;
+    for i in 0..600 {
+        admin.create_cm(&format!("fill-{i}"), 10).await;
+    }
+    let err = admin
+        .0
+        .watch_stream(&format!("{CM_PATH}?watch=true&resourceVersion=1"), |_| {})
+        .await
+        .expect_err("a watch from an evicted resourceVersion must be refused");
+    assert!(
+        is_gone_error(&err),
+        "politeia's 410 error no longer matches the informer's relist trigger: {err:#}"
     );
 }
