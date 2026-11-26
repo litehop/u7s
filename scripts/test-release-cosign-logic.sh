@@ -95,7 +95,7 @@ FETCH_RUNNER="$WORK/fetch-runner.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  echo 'K8S_VERSION=1.37.1'
+  echo 'K8S_VERSION=1.37.3'
   echo ". '$LIB'"
   echo 'fetch_k8s_binary "$1" amd64 kubelet'
   echo 'echo FETCHED'
@@ -135,7 +135,7 @@ sha_runner="$WORK/sha-runner.sh"
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
-  echo 'K8S_VERSION=1.37.1'
+  echo 'K8S_VERSION=1.37.3'
   echo ". '$LIB'"
   echo 'sha256_of() { echo deadbeef; }'
   echo 'fetch_k8s_binary "$1" amd64 kubelet'

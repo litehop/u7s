@@ -641,7 +641,7 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 # The kubelet's version selects the kube-proxy image tag, as install.sh does. The fallback
 # must stay in sync with KUBELET_PKG_VERSION in lima/kubelet.yaml.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n 1p)
-KUBELET_VERSION="${KUBELET_VERSION:-1.37.1}"
+KUBELET_VERSION="${KUBELET_VERSION:-1.37.3}"
 
 # kube-proxy is the shipped DaemonSet (manifests/kube-proxy.yaml, staged below), as on an
 # install.sh node. A VM last provisioned by an older rig still has the host systemd
