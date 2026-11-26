@@ -36,6 +36,14 @@ fn ndjson_event_raw(event_type: &str, raw_object_json: &str) -> Bytes {
     Bytes::from(buf)
 }
 
+/// In-stream 410 ERROR line sent when a watcher falls behind the retained history.
+/// Must be valid JSON: a client that cannot parse it never learns it has to relist.
+fn compacted_error_line(horizon: u64) -> String {
+    format!(
+        "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+    )
+}
+
 /// Serialize a BOOKMARK line into a single heap allocation.
 ///
 /// Watch clients parse these bytes; any format change breaks every informer.
@@ -1282,9 +1290,7 @@ async fn watch_generic_impl<S: Store>(
                                 // Use horizon (not last_rv) so clients relist from a revision
                                 // the store still holds. last_rv may predate the horizon and
                                 // cause an infinite relist loop.
-                                let error_line = Bytes::from(format!(
-                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
-                                ));
+                                let error_line = Bytes::from(compacted_error_line(*horizon));
                                 u7s_store::metrics::WATCH_CLOSED_TOTAL
                                     .with_label_values(&["compacted"])
                                     .inc();
@@ -2947,6 +2953,19 @@ mod tests {
         );
     }
 
+    /// The compaction ERROR line must parse: with a stray closing brace every client
+    /// skipped it as malformed and retried the expired resourceVersion forever.
+    #[test]
+    fn compacted_error_line_is_valid_json_carrying_horizon() {
+        let line = compacted_error_line(500);
+        assert!(line.ends_with('\n'));
+        let v: serde_json::Value = serde_json::from_str(line.trim_end())
+            .expect("410 ERROR line must be valid JSON or informers never relist");
+        assert_eq!(v["type"], "ERROR");
+        assert_eq!(v["object"]["code"], 410);
+        assert_eq!(v["object"]["metadata"]["resourceVersion"], "500");
+    }
+
     /// When Compacted fires, the 410 ERROR's metadata.resourceVersion must be the
     /// horizon, not last_rv.
     #[test]
@@ -3653,6 +3672,142 @@ mod tests {
         );
         assert_eq!(events[0]["type"], "MODIFIED");
         assert_eq!(events[0]["object"]["data"]["k"], "new");
+    }
+
+    fn resume_cfg(from_revision: u64) -> WatchConfig {
+        WatchConfig {
+            prefix: "/registry/configmaps/default/".into(),
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            from_revision,
+            initial_items: None,
+            explicit_no_initial_events: false,
+            label_selector: None,
+            field_selector: None,
+            allow_watch_bookmarks: false,
+            username: "test-user".into(),
+            as_partial_object_metadata: false,
+            group: "".into(),
+            plural: "".into(),
+            timeout_seconds: Some(1),
+        }
+    }
+
+    fn resume_cm(name: &str, v: &str) -> bytes::Bytes {
+        bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" },
+                "data": { "v": v }
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// A watch resumed at an old resourceVersion with no watcher open during the gap must
+    /// deliver every change made in the gap. A 200 that silently omitted them left informers
+    /// (KCM, kubelet, scheduler) with a permanently stale cache after any reconnect.
+    #[tokio::test]
+    async fn watch_resume_after_gap_with_no_concurrent_watcher_replays_every_change() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = "/registry/configmaps/default/";
+        let keep = store
+            .put(&format!("{ns}keep"), resume_cm("keep", "1"), Some(0))
+            .await
+            .unwrap();
+        let resume_from = store
+            .put(&format!("{ns}doomed"), resume_cm("doomed", "1"), Some(0))
+            .await
+            .unwrap();
+        store
+            .put(
+                &format!("{ns}born-offline"),
+                resume_cm("born-offline", "1"),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        store
+            .put(&format!("{ns}keep"), resume_cm("keep", "2"), Some(keep))
+            .await
+            .unwrap();
+        store.delete(format!("{ns}doomed"), None).await.unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let resp = watch_generic(state, resume_cfg(resume_from))
+            .await
+            .unwrap_or_else(|_| panic!("history covers the resume point, so it must not be 410"));
+        let seen: Vec<(String, String)> = read_watch_body_with_timeout(resp)
+            .await
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap_or("").to_string(),
+                    e["object"]["metadata"]["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        let has = |t: &str, n: &str| seen.iter().any(|(st, sn)| st == t && sn == n);
+        assert!(
+            has("ADDED", "born-offline"),
+            "create in the gap lost: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|(t, n)| n == "keep" && (t == "MODIFIED" || t == "ADDED")),
+            "update in the gap lost: {seen:?}"
+        );
+        assert!(has("DELETED", "doomed"), "delete in the gap lost: {seen:?}");
+    }
+
+    /// Resuming below the history the store still holds must be a 410 so the client
+    /// relists; serving it as a 200 would hide the missing events.
+    #[tokio::test]
+    async fn watch_resume_below_retained_history_is_410() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = "/registry/configmaps/default/";
+        let first = store
+            .put(&format!("{ns}first"), resume_cm("first", "1"), Some(0))
+            .await
+            .unwrap();
+        let _watcher = store.watch(ns, 0).await.unwrap();
+        for i in 0..600 {
+            store
+                .put(&format!("{ns}c{i}"), resume_cm("c", "1"), Some(0))
+                .await
+                .unwrap();
+        }
+        let state = AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        use axum::response::IntoResponse;
+        let err = watch_generic(state, resume_cfg(first))
+            .await
+            .expect_err("resume below retained history must not stream");
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::GONE,
+            "clients only relist on 410"
+        );
     }
 
     /// A watch with a matching label selector must emit the ADDED event for a matching object.
