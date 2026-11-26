@@ -434,7 +434,7 @@ lan_v6_seed_mesh() {
 # (--cluster-cidr 10.244.0.0/16,fd00:244::/56, --service-cidr
 # 10.96.0.0/12,fd00:96::/108; kube-dns is the tenth host of each range).
 # Single-stack rigs keep the IPv4 values.
-RIG_POD_CIDR_V4="10.244.0.0/16"
+RIG_POD_CIDR_V4="${RIG_POD_CIDR_V4:-10.244.0.0/16}"
 RIG_POD_CIDR_V6="fd00:244::/56"
 RIG_SERVICE_CIDR_DUAL="10.96.0.0/12,fd00:96::/108"
 RIG_SERVICE_CIDR_V4="10.96.0.0/12"

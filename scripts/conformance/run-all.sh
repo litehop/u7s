@@ -18,7 +18,7 @@
 #                                  [--k8s-version <ver>]
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #                                  [--embedded-scheduler <true|false>]
-#                                  [--service-cidr <cidr>[,<cidr>]]
+#                                  [--service-cidr <cidr>[,<cidr>]] [--pod-cidr <ipv4-cidr>]
 #                                  [--kcm-mode R|T]
 #
 #   --kcm-mode  R = shipped KCM, T = trimmed --controllers (kcm-mode.sh). With --install it is applied
@@ -279,6 +279,7 @@ PROCS=""
 K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
 SERVICE_CIDR=""
+POD_CIDR=""
 KCM_MODE=""
 INSTALL=0
 
@@ -314,6 +315,7 @@ while [[ $# -gt 0 ]]; do
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
+    --pod-cidr) POD_CIDR="$2"; shift 2 ;;
     --install) INSTALL=1; shift ;;
     --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
@@ -449,7 +451,7 @@ if [ "$INSTALL" -eq 1 ]; then
     "--extra-node=$EXTRA_NODE" "--profile=$([ "$PROFILE" -eq 1 ] && echo 1)" \
     "--dhat-depth=$DHAT_DEPTH" "--pki-test-lifetime=$PKI_TEST_LIFETIME" \
     "--pki-test-sa-rotation=$PKI_TEST_SA_ROTATION" "--pki-test-intermediate=$PKI_TEST_INTERMEDIATE" \
-    "--embedded-scheduler=$EMBEDDED_SCHEDULER" "--service-cidr=$SERVICE_CIDR" \
+    "--embedded-scheduler=$EMBEDDED_SCHEDULER" "--service-cidr=$SERVICE_CIDR" "--pod-cidr=$POD_CIDR" \
     "--sample-interval=$SAMPLE_INTERVAL" | paste -sd' ' -)
   if [ -n "$_INSTALL_BAD" ]; then
     echo "error: --install runs the real install.sh on the VM; host-rig option(s) not supported with it: $_INSTALL_BAD" >&2
@@ -538,6 +540,7 @@ if [ -n "$_DUAL_STACK_ARG" ]; then
   rig_service_cidr_v6 "$SERVICE_CIDR" >/dev/null || exit 1
 fi
 [ -n "$SERVICE_CIDR" ] && export RIG_SERVICE_CIDR="$SERVICE_CIDR"
+[ -n "$POD_CIDR" ] && export RIG_POD_CIDR_V4="$POD_CIDR"
 [ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
 if [ "$RESET" -eq 1 ]; then
