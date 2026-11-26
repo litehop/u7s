@@ -34,6 +34,8 @@ mod pom_coverage_tests;
 pub mod proxy;
 pub mod resource;
 pub mod scale;
+#[cfg(test)]
+mod stack_budget_tests;
 pub mod status;
 pub mod storage_versions;
 pub mod storagemigration;
