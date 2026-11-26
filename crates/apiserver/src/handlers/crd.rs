@@ -284,6 +284,77 @@ pub(crate) fn walk_schema_dos_bounds(
     }
 }
 
+/// Upper bound on the compiled NFA of a single CRD `pattern`, matching CEL `matches()`
+/// (`cel_runtime/strlib.rs`). boon compiles `pattern` with `regex`'s 10 MiB default,
+/// which lets one 8-byte `\pL{244}` cost ~30 ms and ~15 MiB resident; a 200-property
+/// CRD of them cost ~6 s and ~2.9 GiB, all paid by the first CR write on a cache miss.
+pub(crate) const MAX_CRD_PATTERN_NFA_BYTES: usize = 1 << 20;
+
+fn ascii_shorthands(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('d') => out.push_str("[0-9]"),
+            Some('D') => out.push_str("[^0-9]"),
+            Some('w') => out.push_str("[A-Za-z0-9_]"),
+            Some('W') => out.push_str("[^A-Za-z0-9_]"),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Rejects any `pattern` in the schema whose compiled size exceeds
+/// `MAX_CRD_PATTERN_NFA_BYTES`. boon's ECMA rewrite is approximated by making `\d`/`\w`
+/// ASCII-only (as ECMA does), since Unicode `\w{253}` alone would exceed the budget;
+/// patterns boon cannot compile at all are left for boon to report.
+pub(crate) fn check_pattern_compile_budget(
+    node: &serde_json::Value,
+    field_path: &str,
+) -> Result<(), crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
+                let too_big = crate::cel_runtime::format::on_compile_stack(|| {
+                    matches!(
+                        regex::RegexBuilder::new(&ascii_shorthands(pattern))
+                            .size_limit(MAX_CRD_PATTERN_NFA_BYTES)
+                            .build(),
+                        Err(regex::Error::CompiledTooBig(_))
+                    )
+                });
+                if too_big {
+                    return Err(Status::unprocessable_entity(format!(
+                        "{field_path}.pattern compiles to more than \
+                         {MAX_CRD_PATTERN_NFA_BYTES} bytes; simplify the expression or \
+                         lower repetition counts"
+                    )));
+                }
+            }
+            for (key, value) in map {
+                check_pattern_compile_budget(value, &format!("{field_path}.{key}"))?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                check_pattern_compile_budget(item, &format!("{field_path}[{i}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Mirrors the `additionalProperties`/`properties` exclusivity rule in upstream
 /// `ValidateCustomResourceDefinitionOpenAPISchema` (only `additionalProperties: true` may
 /// coexist with `properties`), recursing into the same sub-schema positions upstream does.
@@ -477,6 +548,7 @@ fn validate_crd_schema(
         };
         let path = format!("spec.versions[{}].schema.openAPIV3Schema", version.name);
         walk_schema_dos_bounds(schema, &path)?;
+        check_pattern_compile_budget(schema, &path)?;
         check_properties_additional_properties_exclusive(schema, &path)?;
         let ratchet = crate::handlers::cel_rules::Ratchet {
             preexisting: stored.map(|_| &preexisting),
