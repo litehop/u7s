@@ -32,9 +32,13 @@
 #                them), then run sonobuoy. Delegates to install-run.sh. Works with
 #                --reset, --focus, --all-e2e, --stack-only, --vm, --port, --kubelet-port,
 #                --network, --procs, --k8s-version, -v (RUST_LOG goes to a systemd
-#                drop-in on u7s-apiserver). Host-rig-only options (--binary, --profile,
-#                --pki-test-*, --extra-node, --dual-stack, --embedded-scheduler, ...) are
+#                drop-in on u7s-apiserver). --extra-node/--extra-kubelet-port make it a
+#                2-node cluster: the 2nd VM joins through install.sh --mint-join-token /
+#                --join (no host-rig add-node.sh). Host-rig-only options (--binary,
+#                --profile, --pki-test-*, --dual-stack, --embedded-scheduler,
+#                --service-cidr, --pod-cidr, ...) are
 #                rejected. Every run archive carries run-meta with topology=install
+#                and nodes=<count>
 #                (host-rig on the default path). Tear down with
 #                scripts/conformance/reset.sh --vm <vm> --workdir <workdir> (deletes the
 #                VM), then nothing else is left on the host.
@@ -448,7 +452,7 @@ if [ "$INSTALL" -eq 1 ]; then
   source "$DIR/_lib.sh"
   _INSTALL_BAD=$(install_mode_incompatible_flags "--binary=$BINARY" \
     "--konnectivity-server-port=$KONNECTIVITY_SERVER_PORT" "--dual-stack=$_DUAL_STACK_ARG" \
-    "--extra-node=$EXTRA_NODE" "--profile=$([ "$PROFILE" -eq 1 ] && echo 1)" \
+    "--profile=$([ "$PROFILE" -eq 1 ] && echo 1)" \
     "--dhat-depth=$DHAT_DEPTH" "--pki-test-lifetime=$PKI_TEST_LIFETIME" \
     "--pki-test-sa-rotation=$PKI_TEST_SA_ROTATION" "--pki-test-intermediate=$PKI_TEST_INTERMEDIATE" \
     "--embedded-scheduler=$EMBEDDED_SCHEDULER" "--service-cidr=$SERVICE_CIDR" "--pod-cidr=$POD_CIDR" \
@@ -467,6 +471,7 @@ if [ "$INSTALL" -eq 1 ]; then
   [ -z "$K8S_VERSION" ] || _INSTALL_ARGS+=(--k8s-version "$K8S_VERSION")
   [ -z "$KCM_MODE" ] || _INSTALL_ARGS+=(--kcm-mode "$KCM_MODE")
   [ -z "$NETWORK" ] || _INSTALL_ARGS+=(--network "$NETWORK")
+  [ -z "$EXTRA_NODE" ] || _INSTALL_ARGS+=(--extra-node "$EXTRA_NODE" --extra-kubelet-port "$EXTRA_KUBELET_PORT")
   [ -z "${U7S_VM_NAME:-}" ] || _INSTALL_ARGS+=(--vm "$U7S_VM_NAME")
   [ "$VERBOSE" -lt 1 ] || _INSTALL_ARGS+=(--rust-log "$RUST_LOG")
   exec bash "$DIR/install-run.sh" "${_INSTALL_ARGS[@]}"
