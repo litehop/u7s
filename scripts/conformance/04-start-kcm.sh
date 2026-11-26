@@ -14,6 +14,7 @@ KCM_LOG="/tmp/kcm.log"
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 KCM_V=""
+KCM_MODE=""
 SIGNING_DURATION="8760h"
 DUAL_STACK=0
 # shellcheck source=scripts/conformance/_lib.sh
@@ -25,6 +26,7 @@ while [[ $# -gt 0 ]]; do
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kcm-v) KCM_V="$2"; shift 2 ;;
+    --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     --signing-duration) SIGNING_DURATION="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -32,6 +34,21 @@ done
 PORT="${_PORT_OVERRIDE:-6443}"
 KCM_CIDR_FLAGS="$(rig_kcm_cidr_flags "$DUAL_STACK")"
 KCM_SERVICE_CIDR_FLAG="--service-cluster-ip-range=$(rig_effective_service_cidr "$DUAL_STACK")"
+
+KCM_CONTROLLERS='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller'
+# BEGIN kcm_controllers_for_mode
+kcm_controllers_for_mode() {
+  case "$1" in
+    ""|R) ;;
+    T)
+      # shellcheck source=scripts/conformance/kcm-mode.sh
+      source "$REPO/scripts/conformance/kcm-mode.sh"
+      KCM_CONTROLLERS="$KCM_CONTROLLERS,$KCM_TRIM_EXCLUDE" ;;
+    *) echo "error: --kcm-mode must be R or T, got '$1'" >&2; exit 1 ;;
+  esac
+}
+# END kcm_controllers_for_mode
+kcm_controllers_for_mode "$KCM_MODE"
 
 _VM="${U7S_VM_NAME:-lima-node}"
 VM_NAME="$_VM"
@@ -177,7 +194,7 @@ setsid bash /tmp/kcm-supervisor.sh "\$KCM_BINARY" "\$KCM_LOG" \\
   --cluster-signing-key-file="\$SIGNING_DIR/intermediate.key" \\
   --cluster-signing-duration="${SIGNING_DURATION}" \\
   --root-ca-file="\$WORKDIR/ca-bundle.pem" \\
-  --controllers='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller' \\
+  --controllers='${KCM_CONTROLLERS}' \\
   $KCM_CIDR_FLAGS \\
   $KCM_SERVICE_CIDR_FLAG \\
   --allocate-node-cidrs=true \\

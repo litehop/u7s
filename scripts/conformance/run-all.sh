@@ -19,7 +19,12 @@
 #                                  [--extra-node <vm>] [--extra-kubelet-port <N>]
 #                                  [--embedded-scheduler <true|false>]
 #                                  [--service-cidr <cidr>[,<cidr>]]
+#                                  [--kcm-mode R|T]
 #
+#   --kcm-mode  R = shipped KCM, T = trimmed --controllers (kcm-mode.sh). With --install it is applied
+#                after bring-up and before sonobuoy; on the host rig 04-start-kcm.sh starts KCM
+#                trimmed. The effective flag lands in the run archive as kcm-mode.txt and
+#                run-meta. Default: shipped KCM, untouched.
 #   --install    Release sign-off path: instead of the host rig, build an arm64 tarball
 #                from this checkout, run the real scripts/install.sh on the VM, tunnel
 #                the VM's apiserver to 127.0.0.1:<--port>, apply the rig-only add-ons
@@ -274,6 +279,7 @@ PROCS=""
 K8S_VERSION=""
 EMBEDDED_SCHEDULER=""
 SERVICE_CIDR=""
+KCM_MODE=""
 INSTALL=0
 
 while [[ $# -gt 0 ]]; do
@@ -309,6 +315,7 @@ while [[ $# -gt 0 ]]; do
     --embedded-scheduler) EMBEDDED_SCHEDULER="$2"; shift 2 ;;
     --service-cidr) SERVICE_CIDR="$2"; shift 2 ;;
     --install) INSTALL=1; shift ;;
+    --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -425,6 +432,10 @@ banner() {
   echo "============================================================"
 }
 
+if [ -n "$KCM_MODE" ]; then
+  case "$KCM_MODE" in R|T) ;; *) echo "error: --kcm-mode must be R or T, got '$KCM_MODE'" >&2; exit 1 ;; esac
+fi
+
 # --install: the real install.sh on the VM instead of the host rig. Options that configure
 # the host rig have no install-mode meaning, so reject them rather than ignore them silently.
 if [ "$INSTALL" -eq 1 ]; then
@@ -452,6 +463,7 @@ if [ "$INSTALL" -eq 1 ]; then
   [ "$UNSAFE_FOCUS" -eq 0 ] || _INSTALL_ARGS+=(--unsafe-focus)
   [ -z "$PROCS" ] || _INSTALL_ARGS+=(--procs "$PROCS")
   [ -z "$K8S_VERSION" ] || _INSTALL_ARGS+=(--k8s-version "$K8S_VERSION")
+  [ -z "$KCM_MODE" ] || _INSTALL_ARGS+=(--kcm-mode "$KCM_MODE")
   [ -z "$NETWORK" ] || _INSTALL_ARGS+=(--network "$NETWORK")
   [ -z "${U7S_VM_NAME:-}" ] || _INSTALL_ARGS+=(--vm "$U7S_VM_NAME")
   [ "$VERBOSE" -lt 1 ] || _INSTALL_ARGS+=(--rust-log "$RUST_LOG")
@@ -487,6 +499,8 @@ _UNSAFE_FOCUS_ARG=""
 # apiserver leaves, so the kubelet renews its serving cert inside the rotation run.
 _KCM_SIGNING_ARG=""
 [ -n "$PKI_TEST_LIFETIME" ] && _KCM_SIGNING_ARG="--signing-duration ${PKI_TEST_LIFETIME}s"
+_KCM_MODE_ARG=""
+[ -n "$KCM_MODE" ] && _KCM_MODE_ARG="--kcm-mode $KCM_MODE"
 # Forwarded to lima-start.sh (and, via add-node.sh, to a 2nd node's lima-start.sh),
 # which raises kubelet to --v=5 (PLEG relist detail) and flips CRI-O's crio.conf.d
 # drop-in to log_level=debug — see lima-start.sh for why both live behind one flag.
@@ -625,7 +639,7 @@ kubectl --kubeconfig="$KUBECONFIG" apply -f "$REPO/scripts/conformance/manifests
 # KCM approves and signs.
 banner "Steps 3-4/6: Start lima VM + kube-controller-manager, join kubelet"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" --with-kcm ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG}
+bash "$DIR/lima-start.sh" --with-kcm ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG} ${_NETWORK_ARG} ${_VERBOSE_ARG} ${_DUAL_STACK_ARG} ${_KCM_V_ARG} ${_KCM_SIGNING_ARG} ${_KCM_MODE_ARG}
 
 # Label every rig-only add-on (metrics-server and external-snapshotter applied above,
 # kube-network-policies by lima-start.sh) exactly as install-bringup.sh does.
@@ -771,6 +785,11 @@ else
     [ "$PROFILE" -eq 1 ] && [ -n "$DHAT_DEPTH" ] && _DHAT_DEPTH_PROV_ARG="--dhat-depth $DHAT_DEPTH"
     # shellcheck disable=SC2086
     bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "${U7S_VM_NAME:-lima-node}" ${_EXTRA_NODE_ARG} ${_PROFILE_PROV_ARG} ${_DHAT_DEPTH_PROV_ARG} --argv-json "$ARGV_JSON"
+    if [ -n "$KCM_MODE" ]; then
+      echo "kcm_mode=$KCM_MODE" >> "$RUN_DIR/run-meta"
+      printf 'kcm_mode=%s\nkcm_controllers_flag=%s\n' "$KCM_MODE" \
+        "$(limactl shell "${U7S_VM_NAME:-lima-node}" pgrep -af 'kube-controller-manager-[0-9]' | grep -oE -- '--controllers=[^ ]+' | sed -n 1p || true)" > "$RUN_DIR/kcm-mode.txt"
+    fi
   else
     echo "warning: could not resolve this run's temp/e2e/ output dir — build.json not written" >&2
   fi

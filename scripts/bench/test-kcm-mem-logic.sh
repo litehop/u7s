@@ -103,5 +103,16 @@ check "an A/B run killed by TERM leaves no KCM drop-in (mode R), so an interrupt
 grep -q '^kcm_mode_revert_on_exit "\$VM"$' "$REPO/scripts/bench/kcm-mem-ab.sh"
 check "kcm-mem-ab.sh installs the revert before its first run" "0" "$?"
 
+# Leave-one-out table: savings are measured against the median of the interleaved baselines, and
+# the baseline spread is reported so a "saving" inside the noise is not read as one.
+loo="$(printf '%s\n' '{"controller":"R","kcm_mib":40.0}' '{"controller":"a","kcm_mib":37.0}' \
+  '{"controller":"R","kcm_mib":42.0}' '{"controller":"b","kcm_mib":41.5}' '{"controller":"R","kcm_mib":41.0}' | kcm_loo_table)"
+check "baseline is the median of the R rows" "41" "$(jq -r .baseline_mib <<<"$loo")"
+check "the R rows' spread is the noise floor" "2" "$(jq -r .baseline_spread_mib <<<"$loo")"
+check "rows are ordered by saving and R rows are not listed" "a b" "$(jq -r '[.rows[].controller] | join(" ")' <<<"$loo")"
+check "saving is baseline minus the run (a negative one is kept, not clamped)" "4 -0.5" "$(jq -r '[.rows[].saved_mib | tostring] | join(" ")' <<<"$loo")"
+check "KCM_TRIM_EXCLUDE from the environment replaces the default trim, so the sweep excludes exactly one controller" \
+  "ExecStart=x --controllers=*,-only-this y" "$(KCM_TRIM_EXCLUDE=-only-this bash -c '. "$1"; echo "ExecStart=x --controllers=* y" | kcm_trim_execstart' _ "$REPO/scripts/conformance/kcm-mode.sh")"
+
 echo "kcm-mem logic:$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

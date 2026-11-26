@@ -52,6 +52,7 @@ DUAL_STACK=0
 VERBOSE=0
 START_KCM=0
 KCM_V=""
+KCM_MODE=""
 SIGNING_DURATION=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --verbose) VERBOSE=1; shift ;;
     --with-kcm) START_KCM=1; shift ;;
     --kcm-v) KCM_V="$2"; shift 2 ;;
+    --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     --signing-duration) SIGNING_DURATION="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -408,6 +410,7 @@ if [ -f "$CA_CERT" ]; then
   if [ "$START_KCM" -eq 1 ]; then
     KCM_ARGS=(--vm "$VM_NAME" --port "$PORT" --workdir "$(dirname "$KUBECONFIG_PATH")")
     [ -z "$KCM_V" ] || KCM_ARGS+=(--kcm-v "$KCM_V")
+    [ -z "$KCM_MODE" ] || KCM_ARGS+=(--kcm-mode "$KCM_MODE")
     [ -z "$SIGNING_DURATION" ] || KCM_ARGS+=(--signing-duration "$SIGNING_DURATION")
     [ "$DUAL_STACK" -eq 0 ] || KCM_ARGS+=(--dual-stack)
     bash "$(dirname "$0")/04-start-kcm.sh" "${KCM_ARGS[@]}"
@@ -415,7 +418,9 @@ if [ -f "$CA_CERT" ]; then
   if rig_kubelet_identity_script "$INSTALL_SH" | limactl shell "$VM_NAME" sudo bash -s; then
     echo "Kubelet identity for $VM_NAME is current; not re-issuing."
   else
-    if [ "$START_KCM" -eq 0 ] && [ -z "$(kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get lease kube-controller-manager -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)" ]; then
+    # The rig runs KCM with --leader-elect=false, so there is no lease to find; the root-CA
+    # ConfigMap that KCM publishes into every namespace shows a KCM is running.
+    if [ "$START_KCM" -eq 0 ] && ! kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system get configmap kube-root-ca.crt >/dev/null 2>&1; then
       echo "error: ${VM_NAME} needs a kubelet identity, which KCM must sign, and no KCM is running. Re-run with --with-kcm." >&2
       exit 1
     fi

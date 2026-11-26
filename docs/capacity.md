@@ -71,7 +71,7 @@ Release timing: [releasing.md](releasing.md).
 scripts/bench/kcm-mem-ab.sh --vm <vm> --port <port> --kubelet-port <port>
 ```
 
-Compares the shipped Go KCM (R) with the same KCM minus 11 candidate controllers (T, applied by
+Compares the shipped Go KCM (R) with the same KCM minus 10 candidate controllers (T, applied by
 `scripts/conformance/kcm-mode.sh` as a systemd drop-in; install.sh is untouched). Runs R, T, R, T, R, T on
 one VM, each from a fresh `install.sh`, and records `Pss_Anon` of the KCM and apiserver processes at an idle
 and a WordPress + MariaDB stage. Writes `docs/benchmarks/<date>-<sha8>-lima-kcm-mem/` with one `kcm-mem.json`
@@ -80,6 +80,20 @@ on the KCM process at every stage). Lima only, non-authoritative, not part of an
 restores mode R on exit (including INT/TERM), and install teardown removes `u7s-kcm.service.d`.
 
 The checked-in run `2026-11-25-64b81227-lima-kcm-mem` is **exploratory and non-authoritative** (local Lima,
-n=3 per mode). T is the unvalidated 11-controller trim and has NOT passed conformance (mayor-rh8y3.3). The
+n=3 per mode). T was the 11-controller trim, which failed the VolumeAttributesClass lifecycle spec; the trim is now 10 controllers (volumeattributesclass-protection kept) and its full conformance run matched the baseline spec set with one extra failure (a tcp:8080 liveness-probe spec, not reproduced on an idle stack), so T is not validated. The
 tree was dirty (`git_dirty=1`) and the stamped SHA differs from the code that ran: two fixes were made after
 the run, a lint fix (`head -1` to `sed -n 1p`) and diff rounding.
+
+### KCM leave-one-out (local)
+
+```bash
+scripts/bench/kcm-mem-loo.sh --vm <vm> --port <port> --kubelet-port <port>
+```
+
+One install, WordPress + MariaDB deployed once, then the shipped KCM restarted with a single controller
+excluded (`--controllers=<installed>,-<name>`) and `Pss_Anon` sampled after a settle. An untrimmed
+baseline is re-measured every 8 controllers. Writes `docs/benchmarks/<date>-<sha8>-lima-kcm-loo/`
+(`rows.jsonl`, `table.json`, `table.md`). One sample set per controller, so a saving below the baseline
+spread (reported in the table) is noise. The checked-in run `2026-11-26-bde957a6-lima-kcm-loo` covers the
+46 controllers install.sh does not already exclude; only validatingadmissionpolicy-status (7.1 MiB) and
+garbage-collector (4.1 MiB) stand clear of the 1.2 MiB spread.

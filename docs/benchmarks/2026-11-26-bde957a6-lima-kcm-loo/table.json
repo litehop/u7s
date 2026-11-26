@@ -1,0 +1,236 @@
+{
+  "baseline_mib": 41.28,
+  "baseline_spread_mib": 1.16,
+  "rows": [
+    {
+      "controller": "validatingadmissionpolicy-status-controller",
+      "kcm_mib": 34.22,
+      "saved_mib": 7.06
+    },
+    {
+      "controller": "garbage-collector-controller",
+      "kcm_mib": 37.17,
+      "saved_mib": 4.11
+    },
+    {
+      "controller": "endpointslice-mirroring-controller",
+      "kcm_mib": 39.93,
+      "saved_mib": 1.35
+    },
+    {
+      "controller": "daemonset-controller",
+      "kcm_mib": 40.18,
+      "saved_mib": 1.1
+    },
+    {
+      "controller": "certificatesigningrequest-signing-controller",
+      "kcm_mib": 40.57,
+      "saved_mib": 0.71
+    },
+    {
+      "controller": "disruption-controller",
+      "kcm_mib": 40.69,
+      "saved_mib": 0.59
+    },
+    {
+      "controller": "cronjob-controller",
+      "kcm_mib": 40.72,
+      "saved_mib": 0.56
+    },
+    {
+      "controller": "taint-eviction-controller",
+      "kcm_mib": 40.80,
+      "saved_mib": 0.48
+    },
+    {
+      "controller": "node-lifecycle-controller",
+      "kcm_mib": 40.82,
+      "saved_mib": 0.46
+    },
+    {
+      "controller": "ttl-after-finished-controller",
+      "kcm_mib": 40.85,
+      "saved_mib": 0.43
+    },
+    {
+      "controller": "resourcequota-controller",
+      "kcm_mib": 40.90,
+      "saved_mib": 0.38
+    },
+    {
+      "controller": "podgroup-protection-controller",
+      "kcm_mib": 40.90,
+      "saved_mib": 0.38
+    },
+    {
+      "controller": "token-cleaner-controller",
+      "kcm_mib": 41.09,
+      "saved_mib": 0.19
+    },
+    {
+      "controller": "storageversion-garbage-collector-controller",
+      "kcm_mib": 41.12,
+      "saved_mib": 0.16
+    },
+    {
+      "controller": "persistentvolume-binder-controller",
+      "kcm_mib": 41.35,
+      "saved_mib": -0.07
+    },
+    {
+      "controller": "ephemeral-volume-controller",
+      "kcm_mib": 41.35,
+      "saved_mib": -0.07
+    },
+    {
+      "controller": "storage-version-migrator-controller",
+      "kcm_mib": 41.35,
+      "saved_mib": -0.07
+    },
+    {
+      "controller": "statefulset-controller",
+      "kcm_mib": 41.36,
+      "saved_mib": -0.08
+    },
+    {
+      "controller": "endpoints-controller",
+      "kcm_mib": 41.38,
+      "saved_mib": -0.1
+    },
+    {
+      "controller": "resourceclaim-controller",
+      "kcm_mib": 41.42,
+      "saved_mib": -0.14
+    },
+    {
+      "controller": "volumeattributesclass-protection-controller",
+      "kcm_mib": 41.42,
+      "saved_mib": -0.14
+    },
+    {
+      "controller": "root-ca-certificate-publisher-controller",
+      "kcm_mib": 41.43,
+      "saved_mib": -0.15
+    },
+    {
+      "controller": "job-controller",
+      "kcm_mib": 41.46,
+      "saved_mib": -0.18
+    },
+    {
+      "controller": "device-taint-eviction-controller",
+      "kcm_mib": 41.46,
+      "saved_mib": -0.18
+    },
+    {
+      "controller": "endpointslice-controller",
+      "kcm_mib": 41.63,
+      "saved_mib": -0.35
+    },
+    {
+      "controller": "certificatesigningrequest-approving-controller",
+      "kcm_mib": 41.63,
+      "saved_mib": -0.35
+    },
+    {
+      "controller": "persistentvolume-attach-detach-controller",
+      "kcm_mib": 41.63,
+      "saved_mib": -0.35
+    },
+    {
+      "controller": "legacy-serviceaccount-token-cleaner-controller",
+      "kcm_mib": 41.78,
+      "saved_mib": -0.5
+    },
+    {
+      "controller": "persistentvolume-expander-controller",
+      "kcm_mib": 41.80,
+      "saved_mib": -0.52
+    },
+    {
+      "controller": "selinux-warning-controller",
+      "kcm_mib": 41.80,
+      "saved_mib": -0.52
+    },
+    {
+      "controller": "pod-garbage-collector-controller",
+      "kcm_mib": 41.84,
+      "saved_mib": -0.56
+    },
+    {
+      "controller": "node-ipam-controller",
+      "kcm_mib": 41.85,
+      "saved_mib": -0.57
+    },
+    {
+      "controller": "namespace-controller",
+      "kcm_mib": 41.87,
+      "saved_mib": -0.59
+    },
+    {
+      "controller": "ttl-controller",
+      "kcm_mib": 41.87,
+      "saved_mib": -0.59
+    },
+    {
+      "controller": "deployment-controller",
+      "kcm_mib": 41.89,
+      "saved_mib": -0.61
+    },
+    {
+      "controller": "horizontal-pod-autoscaler-controller",
+      "kcm_mib": 41.91,
+      "saved_mib": -0.63
+    },
+    {
+      "controller": "podcertificaterequest-cleaner-controller",
+      "kcm_mib": 41.92,
+      "saved_mib": -0.64
+    },
+    {
+      "controller": "persistentvolume-protection-controller",
+      "kcm_mib": 41.95,
+      "saved_mib": -0.67
+    },
+    {
+      "controller": "resourcepoolstatusrequest-controller",
+      "kcm_mib": 41.96,
+      "saved_mib": -0.68
+    },
+    {
+      "controller": "replicationcontroller-controller",
+      "kcm_mib": 42.00,
+      "saved_mib": -0.72
+    },
+    {
+      "controller": "certificatesigningrequest-cleaner-controller",
+      "kcm_mib": 42.09,
+      "saved_mib": -0.81
+    },
+    {
+      "controller": "bootstrap-signer-controller",
+      "kcm_mib": 42.09,
+      "saved_mib": -0.81
+    },
+    {
+      "controller": "persistentvolumeclaim-protection-controller",
+      "kcm_mib": 42.11,
+      "saved_mib": -0.83
+    },
+    {
+      "controller": "kube-apiserver-serving-clustertrustbundle-publisher-controller",
+      "kcm_mib": 42.71,
+      "saved_mib": -1.43
+    },
+    {
+      "controller": "serviceaccount-controller",
+      "kcm_mib": 42.77,
+      "saved_mib": -1.49
+    },
+    {
+      "controller": "replicaset-controller",
+      "kcm_mib": 43.49,
+      "saved_mib": -2.21
+    }
+  ]
+}

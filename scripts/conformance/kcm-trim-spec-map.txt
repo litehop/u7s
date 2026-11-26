@@ -1,0 +1,30 @@
+Trimmed controller -> specs in the release-1.37 listings -> result on the trimmed stack.
+The ttl-controller (node TTL annotation) is not ttl-after-finished-controller, which stays.
+Projected PodCertificate and ClusterTrustBundle specs are Conformance-tagged but feature-gated, so
+the rig's FeatureGate label filter excludes them from every run here.
+
+volumeattributesclass-protection-controller
+  VAC lifecycle (test/e2e/storage/volumeattributesclass.go:51, Conformance)
+  failed when trimmed (the apiserver adds kubernetes.io/vac-protection to every new VAC and only
+  this controller removes it); kept in the trim
+validatingadmissionpolicy-status-controller
+  VAP "should validate against a Deployment" waits for status.typeChecking
+  (apimachinery/validatingadmissionpolicy.go:79)
+  passed
+storage-version-migrator-controller
+  StorageVersionMigration CRUD (apimachinery/storage_version_migration.go:43, Conformance)
+  passed
+podcertificaterequest-cleaner-controller
+  PodCertificateRequest API operations (auth/podcertificaterequest.go, Conformance)
+  passed
+storageversion-garbage-collector-controller
+  StorageVersion resources (apimachinery/storage_version.go:44, feature.StorageVersionAPI, not Conformance)
+  not run
+horizontal-pod-autoscaler-controller
+  autoscaling/horizontal_pod_autoscaling*.go, all feature.HPA, none Conformance
+  not run
+ttl-controller, legacy-serviceaccount-token-cleaner-controller,
+kube-apiserver-serving-clustertrustbundle-publisher-controller, podgroup-protection-controller,
+resourcepoolstatusrequest-controller
+  none in conformance.yaml
+  not run

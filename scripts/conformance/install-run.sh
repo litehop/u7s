@@ -24,6 +24,7 @@ RESET=0
 STACK_ONLY=0
 SONOBUOY_ARGS=()
 RUST_LOG_FILTER=""
+KCM_MODE=""
 ORIGINAL_ARGV_JSON="[]"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --kubelet-port) KUBELET_PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     --rust-log) RUST_LOG_FILTER="$2"; shift 2 ;;
+    --kcm-mode) KCM_MODE="$2"; shift 2 ;;
     --argv-json) ORIGINAL_ARGV_JSON="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -70,6 +72,18 @@ bash "$DIR/install-bringup.sh" --vm "$VM_NAME" --port "$PORT" --kubelet-port "$K
   --tarball "$ARTIFACTS/u7s-gate-aarch64-unknown-linux-gnu.tar.gz" --rust-log "$RUST_LOG_FILTER"
 echo "install-mode timing: tarball build ${BUILT}s, VM provision + install.sh + add-ons $(( SECONDS - BRINGUP_START ))s"
 
+KCM_FLAG=""
+kcm_restarts() { limactl shell "$VM_NAME" sudo systemctl show -p NRestarts --value u7s-kcm.service | tr -d "[:space:]"; }
+if [ -n "$KCM_MODE" ]; then
+  banner "KCM mode $KCM_MODE on $VM_NAME"
+  # shellcheck source=scripts/conformance/kcm-mode.sh
+  source "$DIR/kcm-mode.sh"
+  [ "$STACK_ONLY" -eq 1 ] || kcm_mode_revert_on_exit "$VM_NAME"
+  KCM_FLAG=$(kcm_mode_apply "$VM_NAME" "$KCM_MODE")
+  echo "effective KCM flag: $KCM_FLAG"
+  KCM_RESTARTS_BEFORE=$(kcm_restarts)
+fi
+
 KUBECONFIG="$WORKDIR/kubeconfig"
 export KUBECONFIG
 
@@ -91,6 +105,12 @@ bash "$DIR/06-run-sonobuoy.sh" --port "$PORT" --workdir "$WORKDIR" ${SONOBUOY_AR
 RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
 if [ -n "$RUN_DIR" ]; then
   bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "$VM_NAME" --argv-json "$ORIGINAL_ARGV_JSON"
+  if [ -n "$KCM_MODE" ]; then
+    echo "kcm_mode=$KCM_MODE" >> "$RUN_DIR/run-meta"
+    printf 'kcm_mode=%s\nkcm_controllers_flag=%s\nkcm_restarts_before=%s\nkcm_restarts_after=%s\nkcm_active=%s\n' \
+      "$KCM_MODE" "$KCM_FLAG" "$KCM_RESTARTS_BEFORE" "$(kcm_restarts)" \
+      "$(limactl shell "$VM_NAME" sudo systemctl is-active u7s-kcm.service || true)" > "$RUN_DIR/kcm-mode.txt"
+  fi
 else
   echo "warning: could not resolve this run's temp/e2e/ output dir — build.json not written" >&2
 fi
