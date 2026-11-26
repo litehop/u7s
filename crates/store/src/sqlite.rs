@@ -3895,13 +3895,17 @@ mod tests {
             "first watcher must be mid-backfill for this interleaving to mean anything"
         );
         let mut second = Box::pin(store.watch(ns, 0));
-        let second = match futures_util::poll!(second.as_mut()) {
-            std::task::Poll::Ready(opened) => opened,
-            std::task::Poll::Pending => second.await,
+        let early = match futures_util::poll!(second.as_mut()) {
+            std::task::Poll::Ready(opened) => Some(opened),
+            std::task::Poll::Pending => None,
         };
 
         let first = first.await.expect("first watch opens");
-        let second = second.expect("second watch opens");
+        let second = match early {
+            Some(opened) => opened,
+            None => second.await,
+        }
+        .expect("second watch opens");
         for (name, stream) in [("first", first), ("second", second)] {
             futures_util::pin_mut!(stream);
             let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
