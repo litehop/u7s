@@ -6,7 +6,6 @@ upstream kube-apiserver.
 | Limit | Value | Response |
 |---|---|---|
 | Request body size | 3 MiB per request (same as upstream) | 413 `RequestEntityTooLarge` Status |
-| Request header values (HTTP/1) | 16384 values and 1 MiB of headers (same as upstream; hyper's default is 100) | 431 |
 | Shared in-flight body budget | 6 MiB across all concurrent requests | 429 with `Retry-After: 1` |
 | Body read deadline | 60 s for the body to finish arriving | 504 `Timeout` Status |
 | Proxy response-header timeout | 60 s from request sent to upstream headers; also bounds dialing on direct paths; the tunnel path has two 60 s waits (CONNECT answer, then the pod request) | 504 `Timeout` Status |
@@ -17,6 +16,15 @@ finishes. Ordinary requests (a few KiB) never notice it; several concurrent
 maximum-size writes can be answered 429, and clients should retry.
 
 Streamed requests (exec, attach, portforward, logs, watch) are not metered.
+
+## Header limits (divergence)
+
+u7s keeps hyper's defaults: 100 header lines (HTTP/1) and a 16 KiB header list
+(HTTP/2). Upstream accepts up to 16384 header values and 1 MiB of header bytes
+(kubernetes #142607, #142770). Impersonated or request-header-authenticated
+users in more than ~100 groups (HTTP/1), or whose header list exceeds 16 KiB
+(HTTP/2), receive 431. The limits bound pre-auth per-connection allocation:
+hyper allocates the header array eagerly, before authentication.
 
 ## Proxy subresources
 
