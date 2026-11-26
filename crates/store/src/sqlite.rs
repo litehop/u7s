@@ -671,6 +671,16 @@ pub struct SqliteStore {
     /// `Instant` rather than a wall-clock `SystemTime` so the derived ages stay correct across
     /// NTP steps and DST — the metric measures elapsed retention, not a calendar time.
     epoch: Instant,
+    /// Lets a test hold a watch inside the seeding backfill until released.
+    #[cfg(test)]
+    backfill_gate: std::sync::Mutex<Option<Arc<BackfillGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct BackfillGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl SqliteStore {
@@ -704,6 +714,8 @@ impl SqliteStore {
             compaction_horizon,
             last_written_revision,
             epoch: Instant::now(),
+            #[cfg(test)]
+            backfill_gate: std::sync::Mutex::new(None),
         })
     }
 
@@ -2726,6 +2738,14 @@ impl Store for SqliteStore {
                 .list(&shard_key_owned, ListOptions::default())
                 .await?
                 .items;
+            #[cfg(test)]
+            {
+                let gate = self.backfill_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             items.sort_by_key(|o| o.revision);
             let seeds = items
                 .into_iter()
@@ -3902,37 +3922,47 @@ mod tests {
     }
 
     /// Two first watchers racing on an unseeded shard must both receive the backfilled state.
-    /// If the second attaches while the first is still listing and replays the still-empty
-    /// ring, its informer silently misses every object created before it connected.
+    /// If the second attaches while the first is still backfilling and replays the still-empty
+    /// ring, its informer silently misses every object created before it connected. Resumes
+    /// from a non-zero revision so the ring is the only replay source (rv=0 lists directly and
+    /// would mask the race).
     #[tokio::test]
     async fn concurrent_first_watchers_both_receive_the_backfill() {
         let store = SqliteStore::new(":memory:").expect("in-memory store");
         let ns = "/registry/configmaps/default/";
         let key = format!("{ns}pre-existing");
         store
+            .put(
+                "/registry/secrets/default/filler",
+                cm_body("filler", "1"),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let rev = store
             .put(&key, cm_body("pre-existing", "1"), Some(0))
             .await
             .unwrap();
+        let resume = rev - 1;
+        assert!(resume > 0, "rv=0 would take the list path, not the ring");
 
-        // The first watcher parks inside the backfill's list (spawn_blocking), so the second
-        // is polled while the shard's backfill is provably in flight.
-        let mut first = Box::pin(store.watch(ns, 0));
+        let gate = Arc::new(BackfillGate::default());
+        *store.backfill_gate.lock().unwrap() = Some(Arc::clone(&gate));
+
+        let mut first = Box::pin(store.watch(ns, resume));
+        tokio::select! {
+            _ = gate.entered.notified() => {}
+            _ = first.as_mut() => panic!("first watcher finished without entering the backfill"),
+        }
+        let mut second = Box::pin(store.watch(ns, resume));
         assert!(
-            futures_util::poll!(first.as_mut()).is_pending(),
-            "first watcher must be mid-backfill for this interleaving to mean anything"
+            futures_util::poll!(second.as_mut()).is_pending(),
+            "second watcher must wait for the in-flight backfill, not replay an empty ring"
         );
-        let mut second = Box::pin(store.watch(ns, 0));
-        let early = match futures_util::poll!(second.as_mut()) {
-            std::task::Poll::Ready(opened) => Some(opened),
-            std::task::Poll::Pending => None,
-        };
+        gate.release.notify_one();
 
         let first = first.await.expect("first watch opens");
-        let second = match early {
-            Some(opened) => opened,
-            None => second.await,
-        }
-        .expect("second watch opens");
+        let second = second.await.expect("second watch opens");
         for (name, stream) in [("first", first), ("second", second)] {
             futures_util::pin_mut!(stream);
             let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
@@ -3942,6 +3972,33 @@ mod tests {
                 matches!(ev, Some(WatchEvent::Added(ref o)) if o.key == key),
                 "{name} watcher must replay the pre-existing object: {ev:?}"
             );
+        }
+    }
+
+    /// Concurrent cold rv=0 watchers each list for themselves: neither may lose state to the
+    /// other's seeding.
+    #[tokio::test]
+    async fn concurrent_first_rv0_watchers_each_receive_full_state() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let ns = "/registry/configmaps/default/";
+        put_many(&store, ns, 5).await;
+
+        let (a, b) = futures_util::future::join(store.watch(ns, 0), store.watch(ns, 0)).await;
+        for (name, stream) in [("a", a.unwrap()), ("b", b.unwrap())] {
+            futures_util::pin_mut!(stream);
+            let mut keys = Vec::new();
+            for _ in 0..5 {
+                let ev = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .unwrap_or_else(|_| panic!("{name} watcher lost initial state: {keys:?}"));
+                match ev {
+                    Some(WatchEvent::Added(o)) => keys.push(o.key),
+                    other => panic!("{name}: unexpected {other:?}"),
+                }
+            }
+            keys.sort();
+            let want: Vec<String> = (0..5).map(|i| format!("{ns}cm-{i}")).collect();
+            assert_eq!(keys, want, "{name} watcher must see every listed object");
         }
     }
 
@@ -4152,6 +4209,7 @@ mod tests {
             compaction_horizon: Arc::new(AtomicU64::new(0)),
             last_written_revision: last_written,
             epoch: Instant::now(),
+            backfill_gate: std::sync::Mutex::new(None),
         };
 
         // last_written_revision is already written_rv (set by put_sync).
