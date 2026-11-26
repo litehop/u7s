@@ -27,6 +27,8 @@ ALLOW=(
   '_kill-pattern.sh::pgrep -f "\$pattern"::pattern is workdir_kill_pattern output (assigned on the previous line)'
   'conformance/reset.sh::sudo pkill -f (kubelet|kube-controller-manager|sonobuoy)::fixed process names inside the guest VM, no path'
   'conformance/reset.sh::pkill -f .\[(k|s)\]::fixed bracketed process names inside the guest VM, no path'
+  'conformance/lima-unrig.sh::pkill -f "\[(k|u)\]::fixed bracketed process names inside the guest VM, no host workdir path'
+  'conformance/test-lima-unrig-logic.sh::pkill -f::asserts on lima-unrig.sh'"'"'s guest-VM pkill text via a fake limactl; issues no pkill of its own'
   'conformance/04-start-kcm.sh::kube-controller-manager-\[0-9\]::fixed binary-name pattern inside the guest VM, no path'
   'conformance/test-host-only-kill-scope-logic.sh::pkill -f "\$(APISERVER|KONNECTIVITY)_PATTERN"::pattern variables are workdir_kill_pattern output'
   'conformance/test-kcm-supervisor-logic.sh::FAKE_PATTERN::pattern is the test'"'"'s own sleeper binary path, no workdir'

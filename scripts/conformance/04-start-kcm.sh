@@ -63,6 +63,7 @@ limactl shell "$VM_NAME" bash -c \
 # run. See kcm-supervisor.sh for the backoff/circuit-breaker logic.
 limactl copy "$REPO/scripts/conformance/kcm-supervisor.sh" "${VM_NAME}:/tmp/kcm-supervisor.sh"
 limactl copy "$REPO/scripts/conformance/fetch-cached-binary.sh" "${VM_NAME}:/tmp/fetch-cached-binary.sh"
+limactl copy "$REPO/scripts/conformance/kcm-wait-auth-cm.sh" "${VM_NAME}:/tmp/kcm-wait-auth-cm.sh"
 
 # Run setup foreground (download, cert conversion, kubeconfig rewrite),
 # then background only the final binary launch.
@@ -155,10 +156,8 @@ fi
 # kube-system/extension-apiserver-authentication; the supervisor's crash-burst
 # breaker (5 crashes) could give up on that race, so wait here instead.
 if command -v kubectl &>/dev/null; then
-  for _ in \$(seq 1 60); do
-    kubectl --kubeconfig="\$KUBECONFIG_FILE" -n kube-system get configmap extension-apiserver-authentication >/dev/null 2>&1 && break
-    sleep 2
-  done
+  source /tmp/kcm-wait-auth-cm.sh
+  wait_for_auth_configmap "\$KUBECONFIG_FILE" || exit 1
 fi
 
 echo "Starting kube-controller-manager v\${K8S_VERSION} (under crash supervisor) ..."
