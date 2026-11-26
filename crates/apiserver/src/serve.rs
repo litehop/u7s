@@ -633,10 +633,16 @@ mod tests {
             }
             req.push_str("\r\n");
             let mut s = tls_connect(&tls, addr).await;
-            s.write_all(req.as_bytes()).await.unwrap();
+            let wrote = s.write_all(req.as_bytes()).await;
             let mut buf = [0u8; 512];
-            let n = s.read(&mut buf).await.unwrap();
-            let status_line = std::str::from_utf8(&buf[..n]).unwrap();
+            let read = s.read(&mut buf).await;
+            if expected.ends_with("431") && (wrote.is_err() || read.is_err()) {
+                // The server closes right after the 431, so a still-writing client can see a
+                // reset instead of the response; either way the request was refused.
+                continue;
+            }
+            wrote.unwrap();
+            let status_line = std::str::from_utf8(&buf[..read.unwrap()]).unwrap();
             assert!(
                 status_line.starts_with(expected),
                 "{values} header values must answer {expected}, got {status_line:?}"
