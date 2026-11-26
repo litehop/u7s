@@ -288,9 +288,10 @@ install_units=$({
 cleared_units=$(sed -n 's/^units="\(.*\)"$/\1/p' "$REPO/scripts/conformance/clear-native-units.sh" | tr ' ' '\n' | sort -u)
 [ -n "$install_units" ] && [ -n "$cleared_units" ] || bad "could not read the u7s unit lists (install: '$install_units', cleared: '$cleared_units')"
 for known in u7s-apiserver.service u7s-kcm.service u7s-scheduler.service; do
-  printf '%s\n' "$install_units" | grep -qxF "$known" \
-    && ok "install.sh unit discovery finds $known" \
-    || bad "install.sh unit discovery missed $known, so the cleared-list check below compares against an incomplete set"
+  case $'\n'"$install_units"$'\n' in
+    *$'\n'"$known"$'\n'*) ok "install.sh unit discovery finds $known" ;;
+    *) bad "install.sh unit discovery missed $known, so the cleared-list check below compares against an incomplete set" ;;
+  esac
 done
 assert_eq "clear-native-units.sh clears exactly the u7s units install.sh writes or retires, so no install leftover survives a rig bring-up" \
   "$cleared_units" "$install_units"
