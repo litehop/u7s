@@ -36,14 +36,19 @@ KCM_CIDR_FLAGS="$(rig_kcm_cidr_flags "$DUAL_STACK")"
 KCM_SERVICE_CIDR_FLAG="--service-cluster-ip-range=$(rig_effective_service_cidr "$DUAL_STACK")"
 
 KCM_CONTROLLERS='*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller'
-case "$KCM_MODE" in
-  ""|R) ;;
-  T)
-    # shellcheck source=scripts/conformance/kcm-mode.sh
-    source "$REPO/scripts/conformance/kcm-mode.sh"
-    KCM_CONTROLLERS="$KCM_CONTROLLERS,$KCM_TRIM_EXCLUDE" ;;
-  *) echo "error: --kcm-mode must be R or T, got '$KCM_MODE'" >&2; exit 1 ;;
-esac
+# BEGIN kcm_controllers_for_mode
+kcm_controllers_for_mode() {
+  case "$1" in
+    ""|R) ;;
+    T)
+      # shellcheck source=scripts/conformance/kcm-mode.sh
+      source "$REPO/scripts/conformance/kcm-mode.sh"
+      KCM_CONTROLLERS="$KCM_CONTROLLERS,$KCM_TRIM_EXCLUDE" ;;
+    *) echo "error: --kcm-mode must be R or T, got '$1'" >&2; exit 1 ;;
+  esac
+}
+# END kcm_controllers_for_mode
+kcm_controllers_for_mode "$KCM_MODE"
 
 _VM="${U7S_VM_NAME:-lima-node}"
 VM_NAME="$_VM"

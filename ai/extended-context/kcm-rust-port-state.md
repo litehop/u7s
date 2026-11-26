@@ -122,7 +122,7 @@ The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
 that controller stays and the trim is 10 controllers. Two 2-node runs of the 10-controller trim
 (`--kcm-mode T`): spec set and failure set (empty) equal the baseline. The tcp:8080 liveness-probe
-failure seen once on a single-node run passed in all 4 two-node runs (2 R, 2 T): a load flake.
+failure seen once on a single-node run: not reproduced in 4 two-node runs (R 2/2, T 2/2); cause unestablished.
 `--install` has no 2-node mode.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
