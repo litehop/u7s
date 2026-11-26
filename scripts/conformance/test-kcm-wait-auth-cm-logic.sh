@@ -48,5 +48,10 @@ run 2
 assert "returns 0 when the ConfigMap appears after failed probes (apiserver still booting)" \
   "$([ "$rc" = 0 ] && [ "$(wc -l < "$TMP/calls")" -eq 3 ] && echo 1 || echo 0)"
 
+# 04-start-kcm.sh builds its VM script inside an unquoted heredoc, so it cannot be sourced or
+# stubbed; assert on the call line itself.
+assert "04-start-kcm.sh exits when wait_for_auth_configmap fails (else the supervisor is started against a missing ConfigMap)" \
+  "$(grep -qE '^[[:space:]]*wait_for_auth_configmap .*\|\| exit 1$' "$DIR/04-start-kcm.sh" && echo 1 || echo 0)"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

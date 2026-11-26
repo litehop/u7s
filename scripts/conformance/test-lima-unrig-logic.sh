@@ -46,8 +46,11 @@ kcm_pat="$(printf '%s\n' "$CALLS" | sed -n 's/.*"\(\[k\]ube-controller-manager[^
 matches() { [[ "$1" =~ $kcm_pat ]] && echo 1 || echo 0; }
 assert "kills the rig KCM (else it keeps :10257 and install.sh's u7s-kcm cannot bind)" \
   "$(matches '/bin/bash /tmp/x /home/u/.cache/u7s/kcm/kube-controller-manager-1.37.3-linux-arm64 --kubeconfig=/w/kcm-kubeconfig')"
+installed_exec="$(sed -n '/^cat > \/etc\/systemd\/system\/u7s-kcm\.service <</,/^EOF$/p' "$DIR/../install.sh" | sed -n 's/^ExecStart=//p' | sed 's|\$BIN_DIR|/opt/u7s/bin|g; s|\$STATE_DIR|/var/lib/u7s|g')"
+assert "extracted the installed u7s-kcm ExecStart from install.sh (else the no-kill check below is vacuous)" \
+  "$([[ "$installed_exec" == */kube-controller-manager\ --kubeconfig=* ]] && echo 1 || echo 0)"
 assert "does not kill an installed u7s-kcm (unrig on an --install stack must leave the control plane running)" \
-  "$([ -n "$kcm_pat" ] && [ "$(matches '/opt/u7s/bin/kube-controller-manager --kubeconfig=/var/lib/u7s/kcm-kubeconfig --controllers=*')" = 0 ] && echo 1 || echo 0)"
+  "$([ -n "$kcm_pat" ] && [ -n "$installed_exec" ] && [ "$(matches "$installed_exec")" = 0 ] && echo 1 || echo 0)"
 assert "kills the KCM supervisor (else it respawns the KCM that was just killed)" \
   "$(has 'pkill -f "[k]cm-supervisor.sh"')"
 assert "stops the signing-key sync loop and removes its mirror dir" \
