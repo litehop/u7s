@@ -46,6 +46,7 @@ fn apiserver_bin() -> PathBuf {
         let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args([
                 "build",
+                "--locked",
                 "--quiet",
                 "-p",
                 "u7s-apiserver",
