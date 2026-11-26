@@ -4,7 +4,7 @@
 /// The Kubernetes release u7s claims conformance with and ships kubelet/KCM
 /// for. `scripts/test-k8s-version-pins-logic.sh` keeps this equal to the
 /// tarball's `K8S_VERSION`.
-pub const K8S_VERSION: &str = "1.37.1";
+pub const K8S_VERSION: &str = "1.37.3";
 
 /// Stamped by the release build via `U7S_RELEASE`; dev builds are marked so
 /// they are never mistaken for a release.
@@ -88,9 +88,9 @@ mod tests {
 
     #[test]
     fn release_goes_in_build_metadata_not_prerelease_so_helm_kube_version_constraints_accept_it() {
-        let v = format!("v{}", version_core("1.37.1", "0.4.0-snapshot.1"));
+        let v = format!("v{}", version_core("1.37.3", "0.4.0-snapshot.1"));
         let (core, pre, build) = split_semver(&v);
-        assert_eq!(core, "1.37.1");
+        assert_eq!(core, "1.37.3");
         assert_eq!(
             pre, None,
             "a '-' suffix makes {v} a pre-release sorting below 1.37.0; Helm kubeVersion >=1.37.0 rejects the cluster"

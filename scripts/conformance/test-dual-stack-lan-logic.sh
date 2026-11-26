@@ -91,7 +91,7 @@ check "single-stack KCM flags stay as before" \
 stage() {
   local d
   d="$(mktemp -d)"
-  rig_stage_manifests "$d" eth0 "$2" "$1" 1.37.1 "${3:-6443}" || return 1
+  rig_stage_manifests "$d" eth0 "$2" "$1" 1.37.3 "${3:-6443}" || return 1
   echo "$d"
 }
 dual_dir=$(stage 1 1500)
@@ -200,7 +200,7 @@ check "no manifest keeps an install-time placeholder after staging (an unrendere
   "0" "$(cat "$single_dir"/*.yaml "$dual_dir"/*.yaml | grep -vE '^ *#' | grep -cE '__[A-Z_]+__' || true)"
 stale_dir=$(mktemp -d)
 echo 'kind: Stale' > "$stale_dir/removed-upstream.yaml"
-rig_stage_manifests "$stale_dir" eth0 1500 0 1.37.1 6443
+rig_stage_manifests "$stale_dir" eth0 1500 0 1.37.3 6443
 check "a manifest dropped from manifests/ disappears from the staging folder on the next run" \
   "0" "$([ -e "$stale_dir/removed-upstream.yaml" ] && echo 1 || echo 0)"
 
