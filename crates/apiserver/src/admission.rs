@@ -2953,7 +2953,17 @@ pub async fn load_old_object_for_admission<S: Store>(
 ///
 /// Returns the (possibly mutated) object, or a StatusError if any Fail-policy
 /// webhook denied or was unreachable.
-pub async fn run_mutating_webhooks<S: Store>(
+/// Boxed for the same reason as `run_validating_webhooks`.
+pub fn run_mutating_webhooks<'a, S: Store>(
+    state: &'a AppState<S>,
+    object: serde_json::Value,
+    old_object: Option<&'a serde_json::Value>,
+    ctx: &'a AdmissionContext<'_>,
+) -> futures_util::future::BoxFuture<'a, Result<serde_json::Value, StatusError>> {
+    Box::pin(run_mutating_webhooks_inner(state, object, old_object, ctx))
+}
+
+async fn run_mutating_webhooks_inner<S: Store>(
     state: &AppState<S>,
     mut object: serde_json::Value,
     old_object: Option<&serde_json::Value>,
@@ -3454,7 +3464,20 @@ fn eval_vap_invocation(
 /// Fetches all ValidatingWebhookConfiguration objects from the store, filters by
 /// rules, POSTs AdmissionReview to each matching webhook URL.
 /// Returns Ok(()) if all webhooks allow, or a StatusError if any deny or fail with Fail policy.
-pub async fn run_validating_webhooks<S: Store>(
+/// Boxed so the caller's frame holds a pointer, not a by-value copy of this large future:
+/// in a debug build an `.await` on it costs the caller about three times its size in stack.
+pub fn run_validating_webhooks<'a, S: Store>(
+    state: &'a AppState<S>,
+    object: &'a serde_json::Value,
+    old_object: Option<&'a serde_json::Value>,
+    ctx: &'a AdmissionContext<'_>,
+) -> futures_util::future::BoxFuture<'a, Result<(), StatusError>> {
+    Box::pin(run_validating_webhooks_inner(
+        state, object, old_object, ctx,
+    ))
+}
+
+async fn run_validating_webhooks_inner<S: Store>(
     state: &AppState<S>,
     object: &serde_json::Value,
     old_object: Option<&serde_json::Value>,
