@@ -106,6 +106,7 @@ RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) ||
 if [ -n "$RUN_DIR" ]; then
   bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "$VM_NAME" --argv-json "$ORIGINAL_ARGV_JSON"
   if [ -n "$KCM_MODE" ]; then
+    echo "kcm_mode=$KCM_MODE" >> "$RUN_DIR/run-meta"
     printf 'kcm_mode=%s\nkcm_controllers_flag=%s\nkcm_restarts_before=%s\nkcm_restarts_after=%s\nkcm_active=%s\n' \
       "$KCM_MODE" "$KCM_FLAG" "$KCM_RESTARTS_BEFORE" "$(kcm_restarts)" \
       "$(limactl shell "$VM_NAME" sudo systemctl is-active u7s-kcm.service || true)" > "$RUN_DIR/kcm-mode.txt"

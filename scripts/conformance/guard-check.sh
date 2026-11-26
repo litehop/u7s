@@ -29,7 +29,6 @@ PINNED=(
   scripts/conformance/kcm-pod-bytes.txt
   scripts/conformance/kcm-baseline-specs.txt
   scripts/conformance/kcm-baseline-failures.txt
-  scripts/conformance/kcm-multinode-specs.txt
   .githooks/sensitive-conformance-focus.yaml
 )
 PIN="$ROOT/scripts/conformance/guard.sha256"

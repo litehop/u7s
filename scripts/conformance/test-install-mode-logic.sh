@@ -323,10 +323,13 @@ for f in lima-start.sh install-bringup.sh; do
   grep -q 'default_network_for_vm' "$REPO/scripts/conformance/$f" || bad "$f does not call default_network_for_vm"
 done
 
-# --kcm-mode edits install.sh's unit, so on the host rig it must fail loudly instead of running an
-# untrimmed "trimmed" conformance run that would be read as a pass.
-out=$("$REPO/scripts/conformance/run-all.sh" --kcm-mode T --stack-only 2>&1 || true)
-case "$out" in *"--kcm-mode needs --install"*) ok "--kcm-mode is rejected on the host rig" ;; *) bad "--kcm-mode accepted without --install: $out" ;; esac
+# --kcm-mode is shared by the host rig (04-start-kcm.sh appends the trim) and --install (systemd
+# drop-in); a typo must fail before any VM is touched instead of running an untrimmed "trimmed"
+# conformance run that would be read as a pass.
+out=$("$REPO/scripts/conformance/run-all.sh" --kcm-mode X --stack-only 2>&1 || true)
+case "$out" in *"must be R or T"*) ok "--kcm-mode rejects values other than R or T on the host rig" ;; *) bad "--kcm-mode X accepted on the host rig: $out" ;; esac
+out=$("$REPO/scripts/conformance/04-start-kcm.sh" --kcm-mode X 2>&1 || true)
+case "$out" in *"must be R or T"*) ok "04-start-kcm.sh rejects an unknown --kcm-mode before touching a VM" ;; *) bad "04-start-kcm.sh accepted --kcm-mode X: $out" ;; esac
 out=$("$REPO/scripts/conformance/run-all.sh" --install --kcm-mode X 2>&1 || true)
 case "$out" in *"must be R or T"*) ok "--kcm-mode rejects values other than R or T" ;; *) bad "--kcm-mode X accepted: $out" ;; esac
 

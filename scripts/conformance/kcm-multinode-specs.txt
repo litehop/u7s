@@ -1,2 +1,0 @@
-[It] [sig-apps] Daemon set should rollback without unnecessary restarts [Conformance] [Serial]
-[It] [sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]
