@@ -18,11 +18,6 @@ use super::test_support::{make_state, seed_namespace};
 /// this in-process router does not exercise.
 const ROUTER_STACK: usize = (512 - 128) * 1024;
 
-/// A custom-resource create alone overflows `ROUTER_STACK` in a debug build (it needs ~390
-/// KiB with no regex involved), so the regex scenario runs with this much room: the
-/// unfixed in-place compile still overflows it, while the sized-thread compile passes.
-const CR_ROUTER_STACK: usize = 448 * 1024;
-
 /// The router with the layers `run` stacks on it, so middleware frames count too.
 async fn production_app(state: crate::state::AppState) -> Router {
     state.init().await;
@@ -114,10 +109,8 @@ fn nested_group_pattern() -> String {
     format!("^{}a{}$", "(".repeat(200), ")".repeat(200))
 }
 
-/// A CRD `pattern` compiles when the first CR write against the CRD builds its schema, and a
-/// CEL `matches()` compiles when an admission expression first uses its pattern; both
-/// patterns come from users.
-async fn user_regexes_compile_on_first_use(app: Router) {
+/// Creates a CRD whose `spec.slug` has the given schema, then the first CR of it.
+async fn create_widget_crd_then_cr(app: &Router, slug_schema: serde_json::Value) {
     let crd = serde_json::json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
@@ -132,10 +125,7 @@ async fn user_regexes_compile_on_first_use(app: Router) {
                     "type": "object",
                     "properties": {"spec": {
                         "type": "object",
-                        "properties": {"slug": {
-                            "type": "string",
-                            "pattern": nested_group_pattern()
-                        }}
+                        "properties": {"slug": slug_schema}
                     }}
                 }}
             }]
@@ -143,7 +133,7 @@ async fn user_regexes_compile_on_first_use(app: Router) {
     });
     assert_eq!(
         send(
-            &app,
+            app,
             "POST",
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
             "application/json",
@@ -159,7 +149,7 @@ async fn user_regexes_compile_on_first_use(app: Router) {
     });
     assert_eq!(
         send(
-            &app,
+            app,
             "POST",
             "/apis/stack.example.com/v1/namespaces/default/widgets",
             "application/json",
@@ -168,6 +158,23 @@ async fn user_regexes_compile_on_first_use(app: Router) {
         .await,
         StatusCode::CREATED
     );
+}
+
+/// A custom-resource create with no regex anywhere: its admission and schema frames alone
+/// must fit the worker stack.
+async fn plain_custom_resource_create(app: Router) {
+    create_widget_crd_then_cr(&app, serde_json::json!({"type": "string"})).await;
+}
+
+/// A CRD `pattern` compiles when the first CR write against the CRD builds its schema, and a
+/// CEL `matches()` compiles when an admission expression first uses its pattern; both
+/// patterns come from users.
+async fn user_regexes_compile_on_first_use(app: Router) {
+    create_widget_crd_then_cr(
+        &app,
+        serde_json::json!({"type": "string", "pattern": nested_group_pattern()}),
+    )
+    .await;
 
     let env = crate::cel_runtime::Env::new(vec![]);
     assert_eq!(
@@ -218,9 +225,15 @@ fn stack_budget_child() {
 }
 
 #[test]
+#[ignore = "run by custom_resource_create_fits_a_production_worker_stack in a fresh process"]
+fn plain_custom_resource_child() {
+    run_on_production_stack(ROUTER_STACK, plain_custom_resource_create);
+}
+
+#[test]
 #[ignore = "run by user_regexes_fit_a_production_worker_stack_on_first_use in a fresh process"]
 fn user_regex_child() {
-    run_on_production_stack(CR_ROUTER_STACK, user_regexes_compile_on_first_use);
+    run_on_production_stack(ROUTER_STACK, user_regexes_compile_on_first_use);
 }
 
 fn assert_child_fits(child: &str, what: &str, stack: usize) {
@@ -257,6 +270,15 @@ fn user_regexes_fit_a_production_worker_stack_on_first_use() {
     assert_child_fits(
         "user_regex_child",
         "a first-use CRD `pattern` or CEL `matches()` compile",
-        CR_ROUTER_STACK,
+        ROUTER_STACK,
+    );
+}
+
+#[test]
+fn custom_resource_create_fits_a_production_worker_stack() {
+    assert_child_fits(
+        "plain_custom_resource_child",
+        "a custom-resource create",
+        ROUTER_STACK,
     );
 }
