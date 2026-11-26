@@ -109,6 +109,10 @@ Layers: L0 `cargo test` reconcile tables from upstream unit cases; L1 local
 `--focus` entries; L2 local 2-node full suite (`run-all.sh --extra-node`,
 25-30 min, needed to ship); L3 differential corpus; L4 memory gate.
 Never run Go and Rust copies of a controller together.
+Upstream `test/integration` runs its own in-process apiserver and Go
+controllers, so each ported controller needs black-box L1 scenarios
+(`mayor-anvu2`). No audit log or identity metric label: per-controller writes
+are unobservable (`mayor-mb71h`).
 
 Rollback: one env file renders Go's `--controllers=*,-<ported>` and Rust's
 `--controllers=<ported>`; an empty file is pure Go. A logic test asserts the
@@ -117,13 +121,13 @@ two sets are disjoint and their union is the full set.
 ## Trim validation (release-1.37 sources)
 
 Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3), host rig
-`run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed, 462 passed, spec sets identical.
+`run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed and passed, spec sets identical.
 The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
-that controller stays and the trim is 10 controllers. Two 2-node runs of the 10-controller trim
-(`--kcm-mode T`): spec set and failure set (empty) equal the baseline. The tcp:8080 liveness-probe
-failure seen once on a single-node run: not reproduced in 4 two-node runs (R 2/2, T 2/2); cause unestablished.
-`--install` has no 2-node mode.
+it stays; the trim is 10 controllers. Two 2-node 10-controller trim runs
+(`--kcm-mode T`): spec and failure sets (empty) equal baseline. The tcp:8080 liveness-probe
+failure seen once on a single-node run did not reproduce in 4 two-node runs (R 2/2, T 2/2); cause
+unestablished.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 
@@ -132,8 +136,6 @@ Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 - Rust fixed cost and bytes/pod: unmeasured.
 - Embedded-in-apiserver alternative: re-measure each phase end; raise to the
   operator if the estimated saving is at least 4 MiB.
-- Can upstream integration tests target an external apiserver; does audit
-  show per-controller identity: `mayor-anvu2`.
 - Wedged-but-alive controller detection: `mayor-n6njd`.
 - Nightly multi-node job: `mayor-iv2yg`, deferred until the ship gate.
 
