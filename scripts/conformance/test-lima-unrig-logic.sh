@@ -42,8 +42,12 @@ assert "removes kube-proxy.service (else it keeps programming iptables beside in
 assert "stops and disables the rig's kubelet and kube-proxy" \
   "$([ "$(has 'disable --now kube-proxy.service')" = 1 ] && [ "$(has 'disable --now kubelet.service')" = 1 ] && echo 1 || echo 0)"
 assert "reloads systemd so removal takes effect" "$(has 'daemon-reload')"
+kcm_pat="$(printf '%s\n' "$CALLS" | sed -n 's/.*"\(\[k\]ube-controller-manager[^"]*\)".*/\1/p' | sed -n 1p)"
+matches() { [[ "$1" =~ $kcm_pat ]] && echo 1 || echo 0; }
 assert "kills the rig KCM (else it keeps :10257 and install.sh's u7s-kcm cannot bind)" \
-  "$(has 'pkill -f "[k]ube-controller-manager"')"
+  "$(matches '/bin/bash /tmp/x /home/u/.cache/u7s/kcm/kube-controller-manager-1.37.3-linux-arm64 --kubeconfig=/w/kcm-kubeconfig')"
+assert "does not kill an installed u7s-kcm (unrig on an --install stack must leave the control plane running)" \
+  "$([ -n "$kcm_pat" ] && [ "$(matches '/opt/u7s/bin/kube-controller-manager --kubeconfig=/var/lib/u7s/kcm-kubeconfig --controllers=*')" = 0 ] && echo 1 || echo 0)"
 assert "kills the KCM supervisor (else it respawns the KCM that was just killed)" \
   "$(has 'pkill -f "[k]cm-supervisor.sh"')"
 assert "stops the signing-key sync loop and removes its mirror dir" \
