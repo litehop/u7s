@@ -3272,23 +3272,78 @@ mod tests {
     }
 
     /// The controller-manager shares one identity across every informer and GC watch (68
-    /// measured on a quiet cluster, more with CRDs); the reserved cap must sit well above
-    /// the ordinary 100-watch conformance budget or GC stays unsynced and the cluster
-    /// unhealthy.
+    /// measured on a quiet cluster, ~2 more per namespaced CRD); at its cap it is rejected,
+    /// but every watch below it must be admitted or GC stays unsynced on CRD-heavy clusters.
+    /// Holding the scheduler and every controller ServiceAccount at their caps must not
+    /// take the controller-manager's slots.
     #[tokio::test]
-    async fn kcm_identity_fits_its_reserved_per_client_watch_budget() {
+    async fn kcm_gets_its_full_budget_even_with_other_control_plane_identities_at_cap() {
+        use crate::state::*;
         let state = global_cap_state(1);
+        let mut others = Vec::new();
+        for _ in 0..MAX_SCHEDULER_WATCHES {
+            others.push(
+                state
+                    .watch_limit
+                    .try_acquire_global("system:kube-scheduler")
+                    .unwrap(),
+            );
+        }
+        for sa in KCM_CONTROLLER_SERVICE_ACCOUNTS {
+            let u = format!("system:serviceaccount:kube-system:{sa}");
+            for _ in 0..MAX_CONTROLLER_SA_WATCHES {
+                others.push(state.watch_limit.try_acquire_global(&u).unwrap());
+            }
+        }
         let mut held = Vec::new();
-        for i in 0..crate::state::MAX_RESERVED_WATCHES_PER_CLIENT {
+        for i in 0..MAX_KCM_WATCHES {
             held.push(
                 watch_generic(
                     state.clone(),
                     global_cap_cfg("system:kube-controller-manager"),
                 )
                 .await
-                .unwrap_or_else(|_| panic!("kcm watch {i} must not hit a per-client cap")),
+                .unwrap_or_else(|_| panic!("kcm watch {i} must fit its 1024 budget")),
             );
         }
+        watch_generic(
+            state.clone(),
+            global_cap_cfg("system:kube-controller-manager"),
+        )
+        .await
+        .expect_err("the controller-manager is capped too");
+    }
+
+    /// Two kubelets filling the node pool must not block the controller-manager.
+    #[tokio::test]
+    async fn exhausted_node_pool_does_not_block_kcm_watch() {
+        let mut state = global_cap_state(1);
+        state.watch_limit = crate::state::WatchLimitState::with_capacities(1, 4, 1);
+        let _node = watch_generic(state.clone(), global_cap_cfg("system:node:n1"))
+            .await
+            .expect("first kubelet takes the only node slot");
+        watch_generic(state.clone(), global_cap_cfg("system:node:n2"))
+            .await
+            .expect_err("node pool exhausted");
+        watch_generic(
+            state.clone(),
+            global_cap_cfg("system:kube-controller-manager"),
+        )
+        .await
+        .expect("a full node pool must not starve the controller-manager");
+    }
+
+    /// A kubelet is capped per identity so one node cannot drain the node pool.
+    #[tokio::test]
+    async fn kubelet_watches_are_capped_per_node() {
+        let state = global_cap_state(1);
+        let sem = state.watch_limit.semaphore_for("system:node:n1");
+        let _held: Vec<_> = (0..crate::state::MAX_NODE_WATCHES)
+            .map(|_| sem.clone().try_acquire_owned().unwrap())
+            .collect();
+        watch_generic(state.clone(), global_cap_cfg("system:node:n1"))
+            .await
+            .expect_err("a kubelet at its cap must be rejected");
     }
 
     /// Both rejections must tell clients when to retry (details.retryAfterSeconds and the
@@ -3335,7 +3390,7 @@ mod tests {
         let state = global_cap_state(1);
         let sa = "system:serviceaccount:kube-system:deployment-controller";
         let client_sem = state.watch_limit.semaphore_for(sa);
-        let _held: Vec<_> = (0..crate::state::MAX_RESERVED_WATCHES_PER_CLIENT)
+        let _held: Vec<_> = (0..crate::state::MAX_CONTROLLER_SA_WATCHES)
             .map(|_| client_sem.clone().try_acquire_owned().unwrap())
             .collect();
 
@@ -3349,12 +3404,12 @@ mod tests {
             .expect("admin takes no permits");
     }
 
-    /// The reserved pool is separate from the ordinary one: tenants exhausting theirs must
-    /// not block kubelets, and reserved identities exhausting theirs must not block tenants.
+    /// The node pool is separate from the ordinary one: tenants exhausting theirs must not
+    /// block kubelets, and kubelets exhausting theirs must not block tenants.
     #[tokio::test]
-    async fn reserved_and_ordinary_watch_pools_are_independent() {
+    async fn node_and_ordinary_watch_pools_are_independent() {
         let mut state = global_cap_state(1);
-        state.watch_limit = crate::state::WatchLimitState::with_capacities(1, 1);
+        state.watch_limit = crate::state::WatchLimitState::with_capacities(1, 1, 1);
 
         let _tenant = watch_generic(state.clone(), global_cap_cfg("tenant"))
             .await
@@ -3367,7 +3422,10 @@ mod tests {
             .expect("kubelet watch must not be blocked by an exhausted tenant pool");
         watch_generic(state.clone(), global_cap_cfg("system:node:n2"))
             .await
-            .expect_err("reserved pool is bounded too");
+            .expect_err("node pool is bounded too");
+        watch_generic(state.clone(), global_cap_cfg("tenant3"))
+            .await
+            .expect_err("kubelets must not have freed tenant slots");
     }
 
     /// Global slots must come back when streams end, and a per-client rejection must not leak
