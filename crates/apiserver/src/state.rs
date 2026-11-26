@@ -254,16 +254,45 @@ pub(crate) const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
     "volumeattributesclass-protection-controller",
 ];
 
-/// Identities whose watches bypass both the per-client and global caps, so a tenant
-/// exhausting the pool cannot lock out the control plane (and the controller-manager's
-/// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
-/// (`system:node:<name>`, O=system:nodes), the controller-manager, the scheduler and the
-/// kube-system ServiceAccounts the controller-manager runs its controllers as
-/// (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts (coredns,
-/// metrics-server, anything user-deployed) draw from the ordinary pools: upstream maps them
-/// to the shared-seat workload-high level, not an exemption.
-/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
-/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// Per-identity cap on concurrent watches for a reserved identity (kubelet, scheduler,
+/// controller-manager and its ServiceAccounts). The controller-manager holds 68 watches on a
+/// live single-node stack running a Deployment rollout and namespace deletion (kubelet 14,
+/// scheduler 7, no controller ServiceAccount watches); 256 leaves ~3.8x headroom for CRD-heavy
+/// clusters, where the garbage collector adds one watch per resource, and still bounds a
+/// leaked control-plane credential.
+pub const MAX_RESERVED_WATCHES_PER_CLIENT: usize = 256;
+
+/// Server-wide cap across all reserved identities, drawn from a pool separate from
+/// `MAX_WATCHES_GLOBAL` so exhausted tenants never block the control plane. The measured
+/// single-node total is ~100 (controller-manager 68 + kubelet 14 + scheduler 7 + ...); 512
+/// is ~5x that and leaves room for ~30 kubelets.
+pub const MAX_RESERVED_WATCHES_GLOBAL: usize = 512;
+
+/// `(per-client, server-wide)` watch caps that apply to `username`.
+pub fn watch_caps(username: &str) -> (usize, usize) {
+    if is_system_priority_username(username) {
+        (MAX_RESERVED_WATCHES_PER_CLIENT, MAX_RESERVED_WATCHES_GLOBAL)
+    } else {
+        (MAX_WATCHES_PER_CLIENT, MAX_WATCHES_GLOBAL)
+    }
+}
+
+/// The only identity exempt from watch and in-flight limits: the provisioned admin
+/// (CN=admin, O=system:masters), mirroring upstream's exempt level, which holds
+/// system:masters alone.
+pub fn is_exempt_username(username: &str) -> bool {
+    username == "admin"
+}
+
+/// Identities with reserved capacity: they draw from the reserved watch pool and the
+/// reserved in-flight seats, so a tenant exhausting the ordinary pools cannot lock out the
+/// control plane, but each is still capped (`MAX_RESERVED_WATCHES_PER_CLIENT`, per-identity
+/// in-flight share). Kubelets (`system:node:<name>`, O=system:nodes), the controller-manager,
+/// the scheduler and the kube-system ServiceAccounts the controller-manager runs its
+/// controllers as (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts
+/// (coredns, metrics-server, anything user-deployed) draw from the ordinary pools. Upstream
+/// maps these to the shared-seat system and workload-high levels, not an exemption.
+/// Matched on username, which is only as trustworthy as the cluster CA's
 /// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
 /// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
 /// O=system:masters), so that RBAC grant is effectively a control-plane grant. Likewise
@@ -286,6 +315,7 @@ pub fn is_system_priority_username(username: &str) -> bool {
 pub struct WatchLimitState {
     inner: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     global: Arc<Semaphore>,
+    reserved_global: Arc<Semaphore>,
 }
 
 impl Default for WatchLimitState {
@@ -300,22 +330,39 @@ impl WatchLimitState {
     }
 
     pub fn with_global_capacity(capacity: usize) -> Self {
+        Self::with_capacities(capacity, MAX_RESERVED_WATCHES_GLOBAL)
+    }
+
+    pub fn with_capacities(global: usize, reserved_global: usize) -> Self {
         WatchLimitState {
             inner: Arc::default(),
-            global: Arc::new(Semaphore::new(capacity)),
+            global: Arc::new(Semaphore::new(global)),
+            reserved_global: Arc::new(Semaphore::new(reserved_global)),
         }
     }
 
-    /// Take one slot from the server-wide pool, or `None` when it is exhausted.
-    pub fn try_acquire_global(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.global.clone().try_acquire_owned().ok()
+    /// Take one slot from the server-wide pool of `client_key`'s class (reserved identities
+    /// draw from their own pool), or `None` when it is exhausted.
+    pub fn try_acquire_global(
+        &self,
+        client_key: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let pool = if is_system_priority_username(client_key) {
+            &self.reserved_global
+        } else {
+            &self.global
+        };
+        pool.clone().try_acquire_owned().ok()
     }
 
-    /// Return the Semaphore for the given client key, creating one if absent.
+    /// Return the Semaphore for the given client key, creating one if absent. Reserved
+    /// identities get `MAX_RESERVED_WATCHES_PER_CLIENT`, everyone else
+    /// `MAX_WATCHES_PER_CLIENT`.
     pub fn semaphore_for(&self, client_key: &str) -> Arc<Semaphore> {
+        let cap = watch_caps(client_key).0;
         let mut map = self.inner.lock().unwrap();
         map.entry(client_key.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(MAX_WATCHES_PER_CLIENT)))
+            .or_insert_with(|| Arc::new(Semaphore::new(cap)))
             .clone()
     }
 
