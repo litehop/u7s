@@ -121,12 +121,13 @@ two sets are disjoint and their union is the full set.
 ## Trim validation (release-1.37 sources)
 
 Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3), host rig
-`run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed, 462 passed, spec sets identical.
+`run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed and passed, spec sets identical.
 The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
-that controller stays and the trim is 10 controllers. Two 2-node runs of the 10-controller trim
-(`--kcm-mode T`): spec set and failure set (empty) equal the baseline. The tcp:8080 liveness-probe
-failure seen once on a single-node run did not reproduce in 4 two-node runs.
+it stays; the trim is 10 controllers. Two 2-node 10-controller trim runs
+(`--kcm-mode T`): spec and failure sets (empty) equal baseline. The tcp:8080 liveness-probe
+failure seen once on a single-node run did not reproduce in 4 two-node runs (R 2/2, T 2/2); cause
+unestablished.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 
