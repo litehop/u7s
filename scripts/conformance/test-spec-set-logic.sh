@@ -49,6 +49,29 @@ got=$("$SPEC_SET" --failed "$TMP/a" "$TMP/b")
 [ "$got" = "$(printf 'failed\t[It] [sig-a] runs and fails [Conformance]')" ] && ok "--failed lists exactly the failures" \
   || bad "--failed wrong: $got"
 
+mk "$TMP/c" <<'EOF'
+<testsuites>
+  <testcase name="[It] [sig-a] runs and passes [Conformance]" classname="Kubernetes e2e suite" status="passed" time="1"></testcase>
+  <testcase name="[It] [sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]" classname="Kubernetes e2e suite" status="failed" time="1"></testcase>
+  <testcase name="[It] [sig-apps] Daemon set should rollback without unnecessary restarts [Conformance] [Serial]" classname="Kubernetes e2e suite" status="failed" time="1"></testcase>
+</testsuites>
+EOF
+mk "$TMP/d" <<'EOF'
+<testsuites>
+  <testcase name="[It] [sig-a] runs and passes [Conformance]" classname="Kubernetes e2e suite" status="passed" time="1"></testcase>
+  <testcase name="[It] [sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]" classname="Kubernetes e2e suite" status="passed" time="1"></testcase>
+  <testcase name="[It] [sig-apps] Daemon set should rollback without unnecessary restarts [Conformance] [Serial]" classname="Kubernetes e2e suite" status="passed" time="1"></testcase>
+</testsuites>
+EOF
+one=$("$SPEC_SET" --single-node "$TMP/c"); two=$("$SPEC_SET" --single-node "$TMP/d")
+[ "$one" = "$two" ] && [ "$one" = "$(printf 'passed\t[It] [sig-a] runs and passes [Conformance]')" ] \
+  && ok "--single-node makes a 1-node and a 2-node run compare equal (multi-node specs fail on 1 node, pass on 2)" \
+  || bad "--single-node left topology-dependent specs in the set: [$one] vs [$two]"
+[ -z "$("$SPEC_SET" --single-node --failed "$TMP/c")" ] \
+  && ok "--single-node --failed is empty on a healthy 1-node run, matching the empty baseline failure set" \
+  || bad "--single-node --failed still reports multi-node specs"
+[ "$("$SPEC_SET" "$TMP/c" | wc -l)" -eq 3 ] && ok "without --single-node nothing is dropped" || bad "default output filtered specs"
+
 "$SPEC_SET" "$TMP/missing" >/dev/null 2>&1 && bad "a missing archive did not fail; an empty set would compare equal to an empty set" \
   || ok "a missing archive fails loudly"
 

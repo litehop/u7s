@@ -1,5 +1,3 @@
-failed	[It] [sig-apps] Daemon set should rollback without unnecessary restarts [Conformance] [Serial]
-failed	[It] [sig-architecture] Conformance Tests should have at least two untainted nodes [Conformance]
 passed	[It] [sig-api-machinery] API priority and fairness should support FlowSchema API operations [Conformance]
 passed	[It] [sig-api-machinery] API priority and fairness should support PriorityLevelConfiguration API operations [Conformance]
 passed	[It] [sig-api-machinery] AdmissionWebhook [Privileged:ClusterAdmin] listing mutating webhooks should work [Conformance]

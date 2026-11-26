@@ -9,7 +9,8 @@
 # Nothing calls this unless asked: without it every rig run is byte-identical to before.
 # T excludes 10 controllers. The first 11-controller trim failed the VolumeAttributesClass lifecycle spec: the
 # apiserver adds the vac-protection finalizer and only volumeattributesclass-protection-controller removes
-# it, so that controller must stay. A full conformance run of the 10-controller trim is still owed.
+# it, so that controller must stay. A full run of the 10-controller trim added one failure, the
+# tcp:8080 liveness-probe spec, that did not reproduce on an idle stack.
 #
 # Usage: scripts/conformance/kcm-mode.sh --vm <name> --mode R|T
 # Prints the effective "--controllers=..." of the running KCM on stdout.

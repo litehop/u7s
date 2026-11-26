@@ -9,5 +9,6 @@
 /scripts/conformance/kcm-pod-bytes.txt               @valerauko
 /scripts/conformance/kcm-baseline-specs.txt          @valerauko
 /scripts/conformance/kcm-baseline-failures.txt       @valerauko
+/scripts/conformance/kcm-multinode-specs.txt         @valerauko
 /.githooks/sensitive-conformance-focus.yaml          @valerauko
 /.github/CODEOWNERS                                  @valerauko

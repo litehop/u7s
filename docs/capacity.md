@@ -80,7 +80,7 @@ on the KCM process at every stage). Lima only, non-authoritative, not part of an
 restores mode R on exit (including INT/TERM), and install teardown removes `u7s-kcm.service.d`.
 
 The checked-in run `2026-11-25-64b81227-lima-kcm-mem` is **exploratory and non-authoritative** (local Lima,
-n=3 per mode). T was the 11-controller trim, which failed the VolumeAttributesClass lifecycle spec; the trim is now 10 controllers (volumeattributesclass-protection kept) and its full conformance run is owed. The
+n=3 per mode). T was the 11-controller trim, which failed the VolumeAttributesClass lifecycle spec; the trim is now 10 controllers (volumeattributesclass-protection kept) and its full conformance run matched the baseline spec set with one extra failure (a tcp:8080 liveness-probe spec, not reproduced on an idle stack), so T is not validated. The
 tree was dirty (`git_dirty=1`) and the stamped SHA differs from the code that ran: two fixes were made after
 the run, a lint fix (`head -1` to `sed -n 1p`) and diff rounding.
 
