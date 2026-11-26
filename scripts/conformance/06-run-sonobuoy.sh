@@ -50,7 +50,7 @@ UNSAFE_FOCUS=0
 # SONOBUOY_K8S_VERSION/image tag, so an invocation that omits --k8s-version
 # behaves exactly as before (same reasoning as PROCS's default above). Keep
 # these two in sync.
-K8S_VERSION="1.37.1"
+K8S_VERSION="1.37.3"
 
 # "all" (default) runs two child passes of this script: "disruptive" (--procs 1,
 # only [Disruptive] specs) and "parallel" (everything else). [Disruptive] specs

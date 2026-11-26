@@ -966,7 +966,7 @@ write_manifest_copy_runner() {
     # flannel.yaml/kube-proxy.yaml fixture in play) aren't forced to.
     echo 'IFACE="${4:-eth0}"'
     echo 'POD_CLUSTER_CIDR="${5:-10.244.0.0/16}"'
-    echo 'KUBE_VERSION="${6:-1.37.1}"'
+    echo 'KUBE_VERSION="${6:-1.37.3}"'
     echo 'IFACE_IP="${7:-10.0.0.1}"'
     echo 'CLUSTER_DNS="${8:-10.96.0.10}"'
     echo 'POD_MTU=1426'
@@ -2350,7 +2350,7 @@ assert "a stale config left by a failed first attempt does not block a fresh ins
 NET_DEST="$NET_WORK/rendered"
 mkdir -p "$NET_DEST"
 cp "$ROOT_DIR"/manifests/*.yaml "$NET_DEST/"
-net_run "$K3S"'; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+net_run "$K3S"'; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.3
 validate_network_config 0
 render_vendored_manifests "'"$NET_DEST"'" && echo rendered
 STATE_DIR="'"$NET_WORK"'"; systemctl() { return 1; }
@@ -2555,7 +2555,7 @@ assert "single-stack leaves the IPv6 placeholders empty rather than inventing a 
 DUAL_DEST="$NET_WORK/rendered-dual"
 mkdir -p "$DUAL_DEST"
 cp "$ROOT_DIR"/manifests/*.yaml "$DUAL_DEST/"
-net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+net_run "$DUAL"'; CLUSTER_DNS=10.96.0.10; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.3
 validate_network_config 0 && render_vendored_manifests "'"$DUAL_DEST"'" && echo rendered'
 assert "rendering the real vendored manifests for a dual-stack install succeeds" \
   "$([ "$NET_STATUS" -eq 0 ] && [ "$NET_OUT" = rendered ] && echo 1 || echo 0)"
@@ -2575,14 +2575,14 @@ assert "CoreDNS Service is PreferDualStack with one kube-dns VIP per family, pri
   "$(grep -A4 '^  clusterIP: ' "$DUAL_DEST/coredns.yaml" | paste -sd'|' - | drain_grep -qxF '  clusterIP: 10.96.0.10|  clusterIPs:|  - 10.96.0.10|  - fd00:96::a|  ipFamilyPolicy: PreferDualStack' && echo 1 || echo 0)"
 assert_false "no dual-stack rendered manifest keeps an unresolved __PLACEHOLDER__" \
   grep -qE '__[A-Z_]+__' "$DUAL_DEST/flannel.yaml" "$DUAL_DEST/kube-proxy.yaml" "$DUAL_DEST/beep.yaml"
-net_run 'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.1
+net_run 'SERVICE_CIDR=fd00:96::/108,10.96.0.0/12; POD_CLUSTER_CIDR=fd00:244::/56,10.244.0.0/16; CLUSTER_DNS=fd00:96::a; IFACE=eth0; IFACE_IP=192.168.1.5; KUBE_VERSION=1.37.3
 mkdir -p "'"$NET_WORK/dual6"'" && cp "'"$ROOT_DIR"'"/manifests/coredns.yaml "'"$NET_WORK/dual6/"'"
 validate_network_config 0 && render_vendored_manifests "'"$NET_WORK/dual6"'" && echo rendered'
 assert "an IPv6-primary dual-stack CoreDNS lists its IPv6 VIP first and the IPv4 VIP second" \
   "$(grep -A2 '^  clusterIPs:' "$NET_WORK/dual6/coredns.yaml" | paste -sd'|' - | drain_grep -qxF '  clusterIPs:|  - fd00:96::a|  - 10.96.0.10' && echo 1 || echo 0)"
 mkdir -p "$NET_WORK/v6url"
 cp "$ROOT_DIR"/manifests/kube-proxy.yaml "$NET_WORK/v6url/"
-net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; IFACE=eth0; IFACE_IP=fd00::5; KUBE_VERSION=1.37.1
+net_run 'SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; IFACE=eth0; IFACE_IP=fd00::5; KUBE_VERSION=1.37.3
 render_vendored_manifests "'"$NET_WORK/v6url"'" && echo rendered'
 assert_true "an IPv6 node address is bracketed in kube-proxy's apiserver URL (https://fd00::5:6443 does not parse)" \
   grep -qx '        server: https://\[fd00::5\]:6443' "$NET_WORK/v6url/kube-proxy.yaml"
@@ -2595,7 +2595,7 @@ GOLDEN_OUT="$NET_WORK/golden"
 mkdir -p "$GOLDEN_OUT" "$NET_WORK/golden-man"
 cp "$ROOT_DIR"/manifests/*.yaml "$NET_WORK/golden-man/"
 golden_scenario='SERVICE_CIDR=10.96.0.0/12; POD_CLUSTER_CIDR=10.244.0.0/16; CLUSTER_DNS=10.96.0.10; POD_MTU=1426
-BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; APISERVER_LISTEN=192.168.1.5:6443; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.1
+BIN_DIR=/usr/local/bin; STATE_DIR=/var/lib/u7s; IFACE=eth0; IFACE_IP=192.168.1.5; IFACE_IP_HOST=192.168.1.5; APISERVER_LISTEN=192.168.1.5:6443; NODE_IPS=192.168.1.5; APISERVER_EXTRA_SANS_FLAG=""; NODE_NAME=n1; KUBE_VERSION=1.37.3
 validate_network_config 0 || exit 1
 KCM_NODE_CIDR_MASK_FLAGS="$(kcm_node_cidr_mask_flags)"
 '

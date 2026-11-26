@@ -75,12 +75,12 @@ build_base_args() {
 
 # Default (no --k8s-version): must still emit a well-formed image tag, not an
 # empty/broken one -- an invocation that omits the flag must keep working.
-# 1.37.1 matches 06-run-sonobuoy.sh's own K8S_VERSION default (kept in sync
+# 1.37.3 matches 06-run-sonobuoy.sh's own K8S_VERSION default (kept in sync
 # with sonobuoy-plugin-e2e.yaml's hardcoded SONOBUOY_K8S_VERSION/image) --
 # update both together if that default ever moves again.
-DEFAULT_ARGS=$(build_base_args "1.37.1")
-assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.1" \
-  "$(printf '%s' "$DEFAULT_ARGS" | drain_grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.1' && echo 1 || echo 0)"
+DEFAULT_ARGS=$(build_base_args "1.37.3")
+assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.3" \
+  "$(printf '%s' "$DEFAULT_ARGS" | drain_grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.37.3' && echo 1 || echo 0)"
 
 # Explicit override to a DIFFERENT version than the default above -- the
 # actual motivating case (scouting new specs needs a conformance image the
@@ -90,8 +90,8 @@ assert "default (no --k8s-version) emits --kube-conformance-image=...v1.37.1" \
 OVERRIDE_ARGS=$(build_base_args "1.35.9")
 assert "--k8s-version 1.35.9 emits --kube-conformance-image=...v1.35.9" \
   "$(printf '%s' "$OVERRIDE_ARGS" | drain_grep -q -- '--kube-conformance-image=registry.k8s.io/conformance:v1.35.9' && echo 1 || echo 0)"
-assert "--k8s-version 1.35.9 does NOT emit the default's v1.37.1 tag" \
-  "$(printf '%s' "$OVERRIDE_ARGS" | drain_grep -q -- 'v1.37.1' && echo 0 || echo 1)"
+assert "--k8s-version 1.35.9 does NOT emit the default's v1.37.3 tag" \
+  "$(printf '%s' "$OVERRIDE_ARGS" | drain_grep -q -- 'v1.37.3' && echo 0 || echo 1)"
 
 # ---------------------------------------------------------------------------
 # 3. Real end-to-end invocation: run-all.sh's arg parser must actually accept

@@ -14,7 +14,7 @@ decisions get made, and what "done" means in principle (changes rarely,
 needs operator sign-off). This file is current state and priorities.
 Figures: see `dashboard.md`.
 
-Priority: correctness (Conformance first) > security > perf > features. Target: Kubernetes 1.37.1.
+Priority: correctness (Conformance first) > security > perf > features. Target: Kubernetes 1.37.3.
 
 ---
 
@@ -51,7 +51,7 @@ data. No clean flag lever remains; rewrite-only residual (2026-10-21, loaded
 
 ### Gate 1 — Conformance floor ✓ CLEARED, with known blind spots
 Full sonobuoy Conformance passes: single-node first green 2026-07-24.
-Latest recorded (1.37.1, two-node, iptables kube-proxy): 460/460 + 2/2
+Latest recorded (1.37.3, two-node, iptables kube-proxy): 460/460 + 2/2
 disruptive on 2026-10-14; a re-run is pending.
 
 Green is necessary, not sufficient (single-node bias, security surface).

@@ -430,8 +430,8 @@ this repo. When you need it:
   E.g. `gh api -H "Accept: application/vnd.github.raw" "/repos/kubernetes/kubernetes/contents/test/e2e/node/pods.go?ref=release-1.37"`.
   Fetch each file ONCE, save it into `temp/research/<filename>`, then grep/read
   the cached copy locally for any further lookups — don't re-fetch per symbol.
-- **Pin to the latest Kubernetes version: `1.37.1`** (as of 2026-09) — branch
-  `release-1.37` for raw GitHub fetches, and reference 1.37.1 API/test
+- **Pin to the latest Kubernetes version: `1.37.3`** (as of 2026-09) — branch
+  `release-1.37` for raw GitHub fetches, and reference 1.37.3 API/test
   semantics, not an older minor. Deviate only if a run's `serverversion.json`
   explicitly shows a different client version for that run.
 

@@ -164,8 +164,8 @@ provision:
       # the held package aborts it (set -e) as soon as upstream publishes a newer
       # patch. Keep in sync with the KUBELET_VERSION fallback in
       # scripts/conformance/lima-start.sh.
-      KUBELET_PKG_VERSION="1.37.1-1.1"
-      apt-get install -y "kubelet=${KUBELET_PKG_VERSION}"
+      KUBELET_PKG_VERSION="1.37.3-1.1"
+      apt-get install -y --allow-change-held-packages "kubelet=${KUBELET_PKG_VERSION}"
       apt-mark hold kubelet
 
       # Install crictl — CLI for the CRI runtime; lets workers inspect containers when debugging.

@@ -113,11 +113,11 @@ case "$*" in
         echo "  install.sh --join https://127.0.0.1:6443 \\"
         echo "    --ca-cert-hash $STUB_HASH --tarball <path> --node-name <name>" ;;
       *"get nodes -o wide"*)
-        echo "u7s-e2e-t-w1.zone.internal Ready <none> 1m v1.37.1 10.80.0.3 <none> Ubuntu"
+        echo "u7s-e2e-t-w1.zone.internal Ready <none> 1m v1.37.3 10.80.0.3 <none> Ubuntu"
         case "${STUB_NODES:-one}" in
-          one|dup) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
+          one|dup) echo "u7s-e2e-t-cp.zone.internal Ready <none> 1m v1.37.3 10.80.0.2 <none> Ubuntu" ;;
         esac
-        [ "${STUB_NODES:-one}" != dup ] || echo "u7s-e2e-t-cp2.zone.internal Ready <none> 1m v1.37.1 10.80.0.2 <none> Ubuntu" ;;
+        [ "${STUB_NODES:-one}" != dup ] || echo "u7s-e2e-t-cp2.zone.internal Ready <none> 1m v1.37.3 10.80.0.2 <none> Ubuntu" ;;
       *"status.addresses"*)
         case "$*" in *-cp.*) echo "10.80.0.2 ${STUB_NODE_V6-2600:1900::2}" ;; *) echo "10.80.0.3 ${STUB_NODE_V6-2600:1900::3}" ;; esac ;;
       *"spec.podCIDRs"*) echo "${STUB_PODCIDRS-10.244.0.0/24 fd00:244::/64}" ;;
@@ -125,7 +125,7 @@ case "$*" in
       *"status.podIPs"*) echo "10.244.1.2 fd00:244:0:1::2" ;;
       *"dig +short"*)
         case "$*" in *" AAAA "*) echo "${STUB_AAAA-fd00:96::50}" ;; *) echo "${STUB_A-10.96.0.50}" ;; esac ;;
-      *kubeletVersion*) echo v1.37.1 ;;
+      *kubeletVersion*) echo v1.37.3 ;;
       *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig status"*) echo "PLUGIN  STATUS  RESULT  COUNT"; echo "e2e     ${STUB_SB_STATUS-complete}  failed  1" ;;
       *"sonobuoy --kubeconfig /var/lib/u7s/kubeconfig retrieve"*)
         if [ -n "${STUB_SB_NOTAR:-}" ]; then echo "$*" >>"$STUB_LOG.retr"; exit 1; fi
@@ -331,7 +331,7 @@ assert "pod-to-pod and pod-to-Service run per family, v6 in brackets" \
 assert "the LB is curled from the client over IPv4 (-4) and IPv6 (-6) on every ingress address" \
   "$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.2/clientip' "$dual_log")$(has 'curl -4 -g -fsS --max-time 15 http://10.80.0.3/clientip' "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::2]/clientip'" "$dual_log")$(has "curl -6 -g -fsS --max-time 15 'http://[2600:1900::3]/clientip'" "$dual_log")"
 assert "sonobuoy runs the upstream dual-stack focus with the node's own conformance image tag" \
-  "$(has "--e2e-focus 'IPv6DualStack|dual-stack|DualStack|ipFamilyPolicy'" "$dual_log")$(has 'registry.k8s.io/conformance:v1.37.1' "$dual_log")"
+  "$(has "--e2e-focus 'IPv6DualStack|dual-stack|DualStack|ipFamilyPolicy'" "$dual_log")$(has 'registry.k8s.io/conformance:v1.37.3' "$dual_log")"
 assert "sonobuoy results come from 'sonobuoy retrieve' into a known dir and are read from that tarball (the splat|tar pipeline silently yielded no tarball once)" \
   "$(has 'retrieve /tmp/sonobuoy-retrieve' "$dual_log")$(has 'sonobuoy results /tmp/sonobuoy-retrieve/202611_sonobuoy_x.tar.gz' "$dual_log")$(hasnt 'splat' "$dual_log")"
 assert "sonobuoy results are reported inline" "$(has 'Total: 9' "$dual_out")$(has 'Failed: 0' "$dual_out")"

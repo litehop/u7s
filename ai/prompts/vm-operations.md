@@ -452,8 +452,8 @@ this repo. When you need it:
    a worker and need a file that lives in the mayor's `temp/research/`, ask the
    mayor to copy it into your worktree rather than fetching your own divergent
    copy or reaching into the mayor checkout.
-3. **Pin to the latest Kubernetes version: `1.37.1`** (as of 2026-09). Use
-   branch `release-1.37` for raw GitHub fetches and reference 1.37.1 API/test
+3. **Pin to the latest Kubernetes version: `1.37.3`** (as of 2026-09). Use
+   branch `release-1.37` for raw GitHub fetches and reference 1.37.3 API/test
    semantics — not an older minor. Only deviate if a run's `serverversion.json`
    explicitly shows a different client version for that specific run.
 
@@ -578,7 +578,7 @@ before finding the cause.
 **Diagnostic flow when `--focus` reports zero matches:**
 1. Is the regex correct? (grep the upstream test file for the exact `ginkgo.It`
    text — see "Locating the failing test's source" above.)
-2. Is the feature Beta or Alpha as of the pinned upstream (`1.37.1`)? (check the
+2. Is the feature Beta or Alpha as of the pinned upstream (`1.37.3`)? (check the
    API group version — `v1alpha1`/`v1beta1` vs `v1` — or bd memories for
    feature-gate status.)
 3. If either might be true, re-run with `--unsafe-focus` added — it wipes the
