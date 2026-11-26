@@ -18,6 +18,11 @@ use super::test_support::{make_state, seed_namespace};
 /// this in-process router does not exercise.
 const ROUTER_STACK: usize = (512 - 128) * 1024;
 
+/// A custom-resource create alone overflows `ROUTER_STACK` in a debug build (it needs ~390
+/// KiB with no regex involved), so the regex scenario runs with this much room: the
+/// unfixed in-place compile still overflows it, while the sized-thread compile passes.
+const CR_ROUTER_STACK: usize = 448 * 1024;
+
 /// The router with the layers `run` stacks on it, so middleware frames count too.
 async fn production_app(state: crate::state::AppState) -> Router {
     state.init().await;
@@ -103,14 +108,83 @@ async fn labeled_create_then_patches(app: Router) {
     }
 }
 
-/// The scenario itself. Handlers run as spawned tasks on a runtime worker thread, so the
-/// future lives on the heap but every poll's frames land on that thread's stack.
-#[test]
-#[ignore = "run by labeled_pod_create_and_patch_fit_a_production_worker_stack in a fresh process"]
-fn stack_budget_child() {
+/// The regex parser recurses once per group nesting level, so a deeply nested pattern is the
+/// cheapest user input that makes a compile need far more stack than the pattern's length.
+fn nested_group_pattern() -> String {
+    format!("^{}a{}$", "(".repeat(200), ")".repeat(200))
+}
+
+/// A CRD `pattern` compiles when the first CR write against the CRD builds its schema, and a
+/// CEL `matches()` compiles when an admission expression first uses its pattern; both
+/// patterns come from users.
+async fn user_regexes_compile_on_first_use(app: Router) {
+    let crd = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.stack.example.com"},
+        "spec": {
+            "group": "stack.example.com",
+            "names": {"plural": "widgets", "singular": "widget", "kind": "Widget", "listKind": "WidgetList"},
+            "scope": "Namespaced",
+            "versions": [{
+                "name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {
+                    "type": "object",
+                    "properties": {"spec": {
+                        "type": "object",
+                        "properties": {"slug": {
+                            "type": "string",
+                            "pattern": nested_group_pattern()
+                        }}
+                    }}
+                }}
+            }]
+        }
+    });
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            "application/json",
+            crd.to_string()
+        )
+        .await,
+        StatusCode::CREATED
+    );
+    let widget = serde_json::json!({
+        "apiVersion": "stack.example.com/v1", "kind": "Widget",
+        "metadata": {"name": "w", "namespace": "default"},
+        "spec": {"slug": "a"}
+    });
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/apis/stack.example.com/v1/namespaces/default/widgets",
+            "application/json",
+            widget.to_string()
+        )
+        .await,
+        StatusCode::CREATED
+    );
+
+    let env = crate::cel_runtime::Env::new(vec![]);
+    assert_eq!(
+        crate::cel_runtime::eval_bool(&env, &format!("'a'.matches('{}')", nested_group_pattern())),
+        Ok(true)
+    );
+}
+
+/// Runs `scenario` as a spawned task on a runtime worker thread, so the future lives on the
+/// heap but every poll's frames land on that thread's stack.
+fn run_on_production_stack<Fut>(stack: usize, scenario: fn(Router) -> Fut)
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .thread_stack_size(ROUTER_STACK)
+        .thread_stack_size(stack)
         .enable_all()
         .build()
         .unwrap();
@@ -133,29 +207,56 @@ fn stack_budget_child() {
     rt.block_on(async {
         seed_namespace(&state, "default").await;
         let app = production_app(state).await;
-        tokio::spawn(labeled_create_then_patches(app))
-            .await
-            .unwrap();
+        tokio::spawn(scenario(app)).await.unwrap();
     });
 }
 
 #[test]
-fn labeled_pod_create_and_patch_fit_a_production_worker_stack() {
+#[ignore = "run by labeled_pod_create_and_patch_fit_a_production_worker_stack in a fresh process"]
+fn stack_budget_child() {
+    run_on_production_stack(ROUTER_STACK, labeled_create_then_patches);
+}
+
+#[test]
+#[ignore = "run by user_regexes_fit_a_production_worker_stack_on_first_use in a fresh process"]
+fn user_regex_child() {
+    run_on_production_stack(CR_ROUTER_STACK, user_regexes_compile_on_first_use);
+}
+
+fn assert_child_fits(child: &str, what: &str, stack: usize) {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
             "--exact",
-            "handlers::stack_budget_tests::stack_budget_child",
+            &format!("handlers::stack_budget_tests::{child}"),
             "--nocapture",
         ])
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "a labeled pod create or PATCH overflowed a {} KiB worker stack ({:?}): {}{}",
-        ROUTER_STACK / 1024,
+        "{what} overflowed a {} KiB worker stack ({:?}): {}{}",
+        stack / 1024,
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn labeled_pod_create_and_patch_fit_a_production_worker_stack() {
+    assert_child_fits(
+        "stack_budget_child",
+        "a labeled pod create or PATCH",
+        ROUTER_STACK,
+    );
+}
+
+#[test]
+fn user_regexes_fit_a_production_worker_stack_on_first_use() {
+    assert_child_fits(
+        "user_regex_child",
+        "a first-use CRD `pattern` or CEL `matches()` compile",
+        CR_ROUTER_STACK,
     );
 }

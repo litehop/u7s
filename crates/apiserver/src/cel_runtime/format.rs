@@ -122,22 +122,24 @@ const QUALIFIED_NAME_MSG: &str = "must consist of alphanumeric characters, '-', 
 const LABEL_VALUE_FMT: &str = "(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?";
 const LABEL_VALUE_MSG: &str = "a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character";
 
-/// Whichever request first needs a format pays its regex's compile, and a debug build's
-/// compiler frames alone take ~170 KiB of the 512 KiB request-thread stack on top of the
-/// request's own, so the compile gets a thread sized for it.
-fn compile_static(pattern: String) -> Regex {
+/// Whichever request first needs a regex pays its compile, and a debug build's compiler
+/// frames alone take ~170 KiB of the 512 KiB request-thread stack on top of the request's
+/// own, so the compile gets a thread sized for it. Callers must reach this only on a cache
+/// miss: it spawns a thread per call.
+pub(crate) fn on_compile_stack<T: Send>(compile: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .stack_size(4 << 20)
-            .spawn_scoped(s, move || Regex::new(&pattern).expect("static pattern"))
+            .spawn_scoped(s, compile)
             .expect("spawn regex compile thread")
             .join()
-            .expect("static pattern compiles")
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }
 
 fn anchored(fmt: &str) -> Regex {
-    compile_static(format!("^(?:{fmt})$"))
+    let pattern = format!("^(?:{fmt})$");
+    on_compile_stack(|| Regex::new(&pattern).expect("static pattern"))
 }
 
 fn dns1123_label_re() -> &'static Regex {
@@ -168,10 +170,12 @@ fn label_value_re() -> &'static Regex {
 fn uuid_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        compile_static(
-            "(?i)(^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)|(^[0-9a-f]{32}$)"
-                .into(),
-        )
+        on_compile_stack(|| {
+            Regex::new(
+                "(?i)(^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$)|(^[0-9a-f]{32}$)",
+            )
+            .expect("static pattern")
+        })
     })
 }
 

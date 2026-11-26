@@ -25,9 +25,7 @@ fn compile(pattern: &str) -> Result<Arc<Regex>, CelError> {
         return Ok(re.clone());
     }
     let re = Arc::new(
-        RegexBuilder::new(pattern)
-            .size_limit(1 << 20)
-            .build()
+        super::format::on_compile_stack(|| RegexBuilder::new(pattern).size_limit(1 << 20).build())
             .map_err(|e| CelError::new(format!("Illegal regex: error parsing regexp: {e}")))?,
     );
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
