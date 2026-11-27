@@ -258,6 +258,10 @@ async fn evict_victims(
         let Some((v_ns, v_name)) = victim.split_once('/') else {
             continue;
         };
+        let victim_uid = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_uid(v_ns, v_name);
         // Best-effort: mirrors upstream kube-scheduler, which stamps
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
@@ -270,10 +274,14 @@ async fn evict_victims(
             );
         }
         delete_pod(client, v_ns, v_name).await?;
-        tally
-            .lock()
-            .expect("tally lock poisoned")
-            .remove(v_ns, v_name);
+        // By UID: a same-name pod recreated while the DELETE was in flight must keep its
+        // reservation.
+        if let Some(uid) = victim_uid {
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .remove_if_uid(v_ns, v_name, &uid);
+        }
     }
     Ok(())
 }
@@ -2285,6 +2293,8 @@ mod tests {
         patch_status: std::sync::atomic::AtomicUsize,
         event: std::sync::atomic::AtomicUsize,
         bind_bodies: Mutex<Vec<String>>,
+        /// Runs once when a DELETE arrives, before its response is written.
+        on_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
@@ -2373,6 +2383,15 @@ mod tests {
                                 "200 OK".to_owned(),
                                 r#"{"kind":"Status","status":"Success"}"#.to_owned(),
                             )
+                        } else if method == "DELETE" {
+                            let hook = counts.on_delete.lock().unwrap().take();
+                            if let Some(hook) = hook {
+                                hook();
+                            }
+                            (
+                                "200 OK".to_owned(),
+                                r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                            )
                         } else if method == "POST" && path.ends_with("/events") {
                             counts.event.fetch_add(1, Ordering::SeqCst);
                             ("201 Created".to_owned(), r#"{"kind":"Event"}"#.to_owned())
@@ -2422,6 +2441,46 @@ mod tests {
                 "status": {}
             }
         })
+    }
+
+    fn bound_pod_event(event_type: &str, uid: &str) -> serde_json::Value {
+        json!({
+            "type": event_type,
+            "object": {
+                "metadata": {"name": "victim", "namespace": "default", "uid": uid},
+                "spec": {"nodeName": "worker-0", "containers": []},
+                "status": {"phase": "Running"}
+            }
+        })
+    }
+
+    /// A victim deleted and recreated under the same name while its DELETE is in flight: the
+    /// recreation's tally entry must survive the post-eviction removal, or the node looks
+    /// emptier than it is and a later pod is force-bound onto a full node.
+    #[tokio::test]
+    async fn evicting_a_victim_does_not_release_a_same_name_recreations_reservation() {
+        let (client, counts) = spawn_bind_outcome_mock_server(201, "{}").await;
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .unwrap()
+            .apply_event(&bound_pod_event("ADDED", "uid-old"));
+        let hook_tally = tally.clone();
+        *counts.on_delete.lock().unwrap() = Some(Box::new(move || {
+            let mut t = hook_tally.lock().unwrap();
+            t.apply_event(&bound_pod_event("DELETED", "uid-old"));
+            t.apply_event(&bound_pod_event("ADDED", "uid-new"));
+        }));
+
+        evict_victims(&client, &["default/victim".to_owned()], &tally, "preemptor")
+            .await
+            .expect("eviction succeeds");
+
+        assert_eq!(
+            tally.lock().unwrap().tallied_uid("default", "victim"),
+            Some("uid-new".to_owned()),
+            "the recreated pod's reservation must survive the old pod's eviction cleanup"
+        );
     }
 
     #[tokio::test]

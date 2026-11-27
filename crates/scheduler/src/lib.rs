@@ -2028,6 +2028,13 @@ impl NodeTally {
         }
     }
 
+    /// UID of the tallied pod `namespace/pod_name`, if any.
+    pub fn tallied_uid(&self, namespace: &str, pod_name: &str) -> Option<String> {
+        self.pods
+            .get(&format!("{namespace}/{pod_name}"))
+            .map(|p| p.uid.clone())
+    }
+
     /// Drop all tallied state. Called on watch reconnect: `POD_WATCH_PATH`'s
     /// `sendInitialEvents=true` makes every reconnect relist current pod
     /// state as ADDED events from scratch, and without clearing first, a pod
