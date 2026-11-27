@@ -966,7 +966,7 @@ etime_to_secs() {
 # text (e.g. `gh pr create --body "until ! pgrep -f ..."`) is not a loop.
 wait_loop_is_statement() {
   local script q="" c i n=0 before rest
-  local lead_re='(^|[;&|(]|'$'\n''|(^|[[:space:]]){)[[:space:]]*$|(^|[^[:alnum:]_])(do|then|else|elif|!)[[:space:]]+$'
+  local lead_re='(^|[;&|(]|'$'\n''|(^|[[:space:]])[{])[[:space:]]*$|(^|[^[:alnum:]_])(do|then|else|elif|!)[[:space:]]+$'
   [[ "$1" =~ $WAIT_LOOP_SHELL_RE ]] || return 1
   script="${1:${#BASH_REMATCH[0]}}"
   n=${#script}
