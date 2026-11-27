@@ -32,8 +32,8 @@ use crate::{
     failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
     fetch_node, fetch_pv_info_batch, fetch_pvc_binding_info_batch,
     fetch_read_write_once_pod_pvc_names, fetch_unbound_csi_pvc_drivers, find_preemption_plan,
-    http_get, is_bind_already_assigned, needs_scheduling, nominated_node_name_patch,
-    patch_pod_status, pick_node, pods_needing_resync, preemption_reservation_still_fits,
+    http_get, is_bind_noop, needs_scheduling, nominated_node_name_patch, patch_pod_status,
+    pick_node, pods_needing_resync, preemption_reservation_still_fits,
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, ApiClient, BindError,
@@ -61,8 +61,16 @@ async fn bind_reserved_node(
     // choice the instant the pod is bound rather than after (see
     // `stamp_selected_node_for_pvcs`'s doc comment).
     stamp_selected_node_for_pvcs(client, &pending.namespace, &pending.pvc_names, node).await;
-    if let Err(e) = bind_pod(client, &pending.namespace, &pending.pod_name, node).await {
-        if !is_bind_already_assigned(&e) {
+    if let Err(e) = bind_pod(
+        client,
+        &pending.namespace,
+        &pending.pod_name,
+        &pending.uid,
+        node,
+    )
+    .await
+    {
+        if !is_bind_noop(&e) {
             tally
                 .lock()
                 .expect("tally lock poisoned")
@@ -303,7 +311,7 @@ async fn attempt_deferred_bind(
     pending: PendingPod,
     node_name: String,
 ) {
-    let key = format!("{}/{}", pending.namespace, pending.pod_name);
+    let key = pending.in_flight_key();
     async {
         let node = match fetch_node(tally, &node_name) {
             Some(node) => node,
@@ -922,15 +930,16 @@ fn handle_pod_event(
     };
 
     let key = format!("{}/{}", pending.namespace, pending.pod_name);
+    let flight_key = pending.in_flight_key();
 
     // Dedup: skip if a bind task for this pod is already in flight.
     {
         let mut guard = in_flight.lock().expect("in_flight lock poisoned");
-        if !should_schedule(&guard, &key) {
+        if !should_schedule(&guard, &flight_key) {
             info!("skipping duplicate scheduling request for {key}");
             return;
         }
-        guard.insert(key.clone());
+        guard.insert(flight_key.clone());
     }
 
     info!(
@@ -990,7 +999,7 @@ fn handle_pod_event(
                     in_flight_clone
                         .lock()
                         .expect("in_flight lock poisoned")
-                        .remove(&key);
+                        .remove(&flight_key);
                     return;
                 }
             };
@@ -1056,7 +1065,7 @@ fn handle_pod_event(
                 in_flight_clone
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .remove(&key);
+                    .remove(&flight_key);
                 return;
             }
             let bound_volume_names: Vec<String> = pvc_info
@@ -1073,7 +1082,7 @@ fn handle_pod_event(
                     in_flight_clone
                         .lock()
                         .expect("in_flight lock poisoned")
-                        .remove(&key);
+                        .remove(&flight_key);
                     return;
                 }
             };
@@ -1100,7 +1109,7 @@ fn handle_pod_event(
                     in_flight_clone
                         .lock()
                         .expect("in_flight lock poisoned")
-                        .remove(&key);
+                        .remove(&flight_key);
                     return;
                 }
             }
@@ -1129,7 +1138,7 @@ fn handle_pod_event(
                     in_flight_clone
                         .lock()
                         .expect("in_flight lock poisoned")
-                        .remove(&key);
+                        .remove(&flight_key);
                     return;
                 }
             }
@@ -1158,7 +1167,7 @@ fn handle_pod_event(
                 in_flight_clone
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .remove(&key);
+                    .remove(&flight_key);
                 return;
             }
         }
@@ -1222,7 +1231,7 @@ fn handle_pod_event(
                 .await
             {
                 Ok(()) => SchedulingOutcome::Done(Ok(node)),
-                Err(e) if is_bind_already_assigned(&e) => {
+                Err(e) if is_bind_noop(&e) => {
                     // The apiserver rejected this bind because the pod is
                     // ALREADY correctly bound (an earlier bind of this exact
                     // pod already succeeded) — a benign no-op, not a
@@ -1250,14 +1259,14 @@ fn handle_pod_event(
                 in_flight_clone
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .remove(&key);
+                    .remove(&flight_key);
                 return;
             }
             SchedulingOutcome::Done(outcome) => {
                 in_flight_clone
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .remove(&key);
+                    .remove(&flight_key);
                 outcome
             }
         };
@@ -2264,6 +2273,7 @@ mod tests {
         bind: std::sync::atomic::AtomicUsize,
         patch_status: std::sync::atomic::AtomicUsize,
         event: std::sync::atomic::AtomicUsize,
+        bind_bodies: Mutex<Vec<String>>,
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
@@ -2338,6 +2348,13 @@ mod tests {
                     let (status_line, body): (String, String) =
                         if method == "POST" && path.ends_with("/binding") {
                             counts.bind.fetch_add(1, Ordering::SeqCst);
+                            counts.bind_bodies.lock().unwrap().push(
+                                request
+                                    .split("\r\n\r\n")
+                                    .nth(1)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                            );
                             (format!("{bind_status} bind-response"), bind_body.to_owned())
                         } else if method == "PATCH" && path.ends_with("/status") {
                             counts.patch_status.fetch_add(1, Ordering::SeqCst);
@@ -2457,6 +2474,71 @@ mod tests {
              already-assigned bind rejection — it is already correctly counting this pod's \
              real usage from the earlier, successful bind, so removing it here would \
              under-count worker-0's real usage"
+        );
+    }
+
+    /// A bind decided for a pod that was deleted and recreated under the same name
+    /// while the bind was in flight must (1) not be deduped against the recreated pod,
+    /// so the new pod gets its own scheduling attempt, (2) carry its own UID so the
+    /// apiserver can refuse a stale one, and (3) when refused as stale, never patch
+    /// PodScheduled=False, emit FailedScheduling or release the predecessor's
+    /// in-flight entry — all of which would now hit the healthy recreated pod.
+    #[tokio::test]
+    async fn stale_bind_for_recreated_pod_is_not_applied_to_the_new_pod() {
+        use std::sync::atomic::Ordering;
+
+        let (client, counts) = spawn_bind_outcome_mock_server(
+            409,
+            r#"{"kind":"Status","status":"Failure","message":"Operation cannot be fulfilled on pods/binding \"web-0\": Precondition failed: UID in precondition: uid-old, UID in object meta: uid-new. The object might have been deleted and then recreated","reason":"Conflict","code":409}"#,
+        )
+        .await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+        in_flight
+            .lock()
+            .expect("in_flight lock poisoned")
+            .insert(crate::in_flight_key("default", "web-0", "uid-old"));
+
+        let mut recreated = bind_outcome_test_pod_event();
+        recreated["object"]["metadata"]["uid"] = json!("uid-new");
+        handle_pod_event(recreated, &client, &in_flight, &tally);
+        wait_until(
+            || counts.bind.load(Ordering::SeqCst) >= 1,
+            "the recreated pod to get its own bind attempt while its predecessor's is in flight",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let bodies = counts.bind_bodies.lock().unwrap().clone();
+        assert!(
+            bodies.iter().any(|b| b.contains(r#""uid":"uid-new""#)),
+            "the bind must carry the scheduled pod's own UID so the apiserver can refuse a \
+             stale one — got {bodies:?}"
+        );
+        assert_eq!(
+            counts.patch_status.load(Ordering::SeqCst),
+            0,
+            "a stale-UID rejection must not patch PodScheduled=False onto the recreated pod"
+        );
+        assert_eq!(
+            counts.event.load(Ordering::SeqCst),
+            0,
+            "a stale-UID rejection must not emit FailedScheduling for the recreated pod"
+        );
+        assert!(
+            in_flight
+                .lock()
+                .expect("in_flight lock poisoned")
+                .contains(&crate::in_flight_key("default", "web-0", "uid-old")),
+            "finishing the recreated pod's attempt must not release its predecessor's \
+             in-flight entry"
         );
     }
 
@@ -3094,10 +3176,10 @@ mod tests {
         handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || {
-                !in_flight
+                in_flight
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .contains("default/web-0")
+                    .is_empty()
             },
             "the deferred scheduling attempt to release its in_flight dedup key",
         )
@@ -3214,10 +3296,10 @@ mod tests {
         handle_pod_event(pod_event, &client, &in_flight, &tally);
         wait_until(
             || {
-                !in_flight
+                in_flight
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .contains("default/web-0")
+                    .is_empty()
             },
             "the deferred scheduling attempt to release its in_flight dedup key",
         )
@@ -3590,7 +3672,7 @@ mod tests {
             .collect();
         assert_eq!(
             left,
-            ["default/kept"],
+            ["default/kept/u-kept"],
             "a pod deleted while the watch was down must not leave backoff state behind forever"
         );
     }
@@ -3990,10 +4072,10 @@ mod tests {
             handle_pod_event(pod_event.clone(), &client, &in_flight, &tally);
             wait_until(
                 || {
-                    !in_flight
+                    in_flight
                         .lock()
                         .expect("in_flight lock poisoned")
-                        .contains("default/web-0")
+                        .is_empty()
                 },
                 "each repeated defer to release its in_flight dedup key before the next tick",
             )
@@ -4020,10 +4102,10 @@ mod tests {
         handle_pod_event(pod_event.clone(), &client, &in_flight, &tally);
         wait_until(
             || {
-                !in_flight
+                in_flight
                     .lock()
                     .expect("in_flight lock poisoned")
-                    .contains("default/web-0")
+                    .is_empty()
             },
             "the defer to release its in_flight dedup key before the pod is deleted",
         )
