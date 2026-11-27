@@ -88,7 +88,7 @@ use auth::AuthLayer;
 use body_budget::BodyBudgetLayer;
 use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
-pub use metrics::record_request_total;
+pub use metrics::{record_request_total, user_label};
 use state::AppState;
 use tls::{generate_tls, write_component_kubeconfig, write_kubeconfig};
 pub use util::resolve_dhat_backtrace_depth;

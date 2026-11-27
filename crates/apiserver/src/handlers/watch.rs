@@ -1009,6 +1009,7 @@ async fn watch_generic_impl<S: Store>(
     };
     let watch_version = derive_watch_version(&api_version).to_string();
     let watch_scope = derive_watch_scope(&prefix, &plural);
+    let metric_user = crate::metrics::user_label(&username);
     // Only the admin (system:masters) takes no permits. Reserved identities (kubelets,
     // controller-manager and its ServiceAccounts, scheduler) draw from their own larger
     // per-client cap and a separate global pool, so an exhausted tenant pool cannot starve
@@ -1020,9 +1021,15 @@ async fn watch_generic_impl<S: Store>(
         // per-client budget alone does not bound the aggregate.
         let sem = state.watch_limit.semaphore_for(&username);
         let client_permit = sem.try_acquire_owned().map_err(|_| {
-            crate::metrics::REQUEST_TOTAL
-                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "429"])
-                .inc();
+            crate::metrics::record_request_total(
+                "watch",
+                &group,
+                &watch_version,
+                &plural,
+                watch_scope,
+                "429",
+                metric_user,
+            );
             u7s_store::metrics::WATCH_CLOSED_TOTAL
                 .with_label_values(&["client_limit_exceeded"])
                 .inc();
@@ -1038,16 +1045,15 @@ async fn watch_generic_impl<S: Store>(
             .watch_limit
             .try_acquire_global(&username)
             .ok_or_else(|| {
-                crate::metrics::REQUEST_TOTAL
-                    .with_label_values(&[
-                        "watch",
-                        &group,
-                        &watch_version,
-                        &plural,
-                        watch_scope,
-                        "429",
-                    ])
-                    .inc();
+                crate::metrics::record_request_total(
+                    "watch",
+                    &group,
+                    &watch_version,
+                    &plural,
+                    watch_scope,
+                    "429",
+                    metric_user,
+                );
                 u7s_store::metrics::WATCH_CLOSED_TOTAL
                     .with_label_values(&["global_limit_exceeded"])
                     .inc();
@@ -1076,9 +1082,15 @@ async fn watch_generic_impl<S: Store>(
         // type's ring is fully intact.
         let horizon = state.store.compaction_horizon_for(&prefix);
         if from_revision < horizon {
-            crate::metrics::REQUEST_TOTAL
-                .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "410"])
-                .inc();
+            crate::metrics::record_request_total(
+                "watch",
+                &group,
+                &watch_version,
+                &plural,
+                watch_scope,
+                "410",
+                metric_user,
+            );
             return Err(Status::expired(format!(
                 "too old resource version: {from_revision} (current compaction horizon: {horizon})"
             )));
@@ -1146,9 +1158,15 @@ async fn watch_generic_impl<S: Store>(
     // From this point the watch is committed to opening — count it as a successful request
     // now, matching upstream's counting of the initial HTTP response code for watch requests
     // (the eventual stream-close reason is tracked separately by u7s_watch_closed_total).
-    crate::metrics::REQUEST_TOTAL
-        .with_label_values(&["watch", &group, &watch_version, &plural, watch_scope, "200"])
-        .inc();
+    crate::metrics::record_request_total(
+        "watch",
+        &group,
+        &watch_version,
+        &plural,
+        watch_scope,
+        "200",
+        metric_user,
+    );
 
     // Cloned so live/DELETED CR watch events can be converted via the CRD's conversion
     // webhook mid-stream (see convert_watched_cr_object). The webhook call needs the full
@@ -6867,7 +6885,7 @@ mod tests {
             .collect();
 
         let request_total_before = crate::metrics::REQUEST_TOTAL
-            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429", "other"])
             .get();
         let closed_total_before = u7s_store::metrics::WATCH_CLOSED_TOTAL
             .with_label_values(&["client_limit_exceeded"])
@@ -6896,7 +6914,7 @@ mod tests {
         assert!(result.is_err(), "the 429th watch attempt must be rejected");
 
         let request_total_after = crate::metrics::REQUEST_TOTAL
-            .with_label_values(&["watch", group, "v1", plural, "cluster", "429"])
+            .with_label_values(&["watch", group, "v1", plural, "cluster", "429", "other"])
             .get();
         assert_eq!(
             request_total_after,

@@ -22,8 +22,8 @@ use u7s_store::{SqliteStore, Store};
 use crate::apf;
 use crate::keys::object_key;
 use crate::metrics::{
-    record_request_total, AUTHENTICATION_ATTEMPTS, AUTHENTICATION_FAILURES_TOTAL,
-    AUTHORIZATION_ATTEMPTS_TOTAL,
+    record_request_total, user_label, AUTHENTICATION_ATTEMPTS, AUTHENTICATION_FAILURES_TOTAL,
+    AUTHORIZATION_ATTEMPTS_TOTAL, USER_LABEL_UNAUTHENTICATED,
 };
 use crate::node_authz::{self, NodeGraph};
 use crate::rbac::{AuthzRequest, RbacIndex};
@@ -1514,7 +1514,15 @@ where
             let Ok(verification) =
                 begin_token_verification(auth_header, &token_map, sig_cache.as_ref())
             else {
-                record_request_total(method_to_verb(req.method()), "", "", "", "", "429");
+                record_request_total(
+                    method_to_verb(req.method()),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "429",
+                    USER_LABEL_UNAUTHENTICATED,
+                );
                 AUTHENTICATION_ATTEMPTS.with_label_values(&["error"]).inc();
                 return Ok(log_denial(
                     axum::response::IntoResponse::into_response(
@@ -1557,7 +1565,7 @@ where
                         non_resource_path.is_some(),
                         req.uri().query(),
                     );
-                    record_request_total(verb, "", "", "", "", "401");
+                    record_request_total(verb, "", "", "", "", "401", USER_LABEL_UNAUTHENTICATED);
                     let reason = bad_token_reason(auth_header);
                     AUTHENTICATION_ATTEMPTS
                         .with_label_values(&["failure"])
@@ -1875,6 +1883,7 @@ where
                     metric_resource,
                     scope,
                     "403",
+                    user_label(&user.username),
                 );
                 AUTHORIZATION_ATTEMPTS_TOTAL
                     .with_label_values(&["denied"])
@@ -1901,6 +1910,7 @@ where
                 classify_request(&flowcontrol_cache, verb, &parsed, non_resource_url, &user);
 
             // 3. Attach UserInfo to request extensions and pass through.
+            let metric_user = user_label(&user.username);
             req.extensions_mut().insert(user);
             let mut resp = inner.call(req).await;
             // Set the same two response headers real kube-apiserver always sets once a
@@ -1932,6 +1942,7 @@ where
                     metric_resource,
                     scope,
                     &code,
+                    metric_user,
                 );
             }
             resp
@@ -6206,7 +6217,7 @@ mod tests {
 
         for (method, uri, verb) in cases {
             let before = REQUEST_TOTAL
-                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200"])
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200", "other"])
                 .get();
 
             let req = Request::builder()
@@ -6223,7 +6234,7 @@ mod tests {
             );
 
             let after = REQUEST_TOTAL
-                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200"])
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "200", "other"])
                 .get();
             assert_eq!(
                 after,
@@ -6231,6 +6242,104 @@ mod tests {
                 "a {method} request must be recorded under verb={verb:?} in \
                  apiserver_request_total — an operator filtering by verb would otherwise \
                  miscount this traffic"
+            );
+        }
+    }
+
+    /// KCM port work needs per-controller write counts and there is no audit log: a
+    /// controller SA's request must land under its own name, while any other kube-system SA
+    /// or kubelet collapses into `other`, otherwise whoever can create SAs or node certs
+    /// mints unbounded series.
+    #[tokio::test]
+    async fn auth_layer_labels_controller_sa_by_name_and_everyone_else_other() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        use crate::metrics::REQUEST_TOTAL;
+
+        let idx = Arc::new(RbacIndex::new());
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/user-label-allow-all",
+            &serde_json::json!({
+                "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }]
+            }),
+        );
+        idx.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/user-label-allow-all",
+            &serde_json::json!({
+                "subjects": [{ "kind": "Group", "name": "user-label-testers" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "user-label-allow-all"
+                }
+            }),
+        );
+
+        const RESOURCE: &str = "authuserlabelitems";
+        let identities = [
+            (
+                "system:serviceaccount:kube-system:job-controller",
+                "job-controller",
+            ),
+            (
+                "system:serviceaccount:kube-system:attacker-minted-sa",
+                "other",
+            ),
+            ("system:node:attacker-node-1", "other"),
+        ];
+        let mut token_map = HashMap::new();
+        for (i, (username, _)) in identities.iter().enumerate() {
+            token_map.insert(
+                format!("user-label-token-{i}"),
+                UserInfo {
+                    username: (*username).to_owned(),
+                    uid: i.to_string(),
+                    groups: vec!["user-label-testers".to_owned()],
+                    extra: Default::default(),
+                },
+            );
+        }
+        async fn ok() -> &'static str {
+            "ok"
+        }
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/authuserlabelitems", get(ok))
+            .layer(AuthLayer::new(
+                idx,
+                token_map,
+                None,
+                Arc::new(make_test_store()),
+                Arc::new(make_test_sig_cache()),
+                Arc::new(FlowControlCache::new()),
+                Arc::new(NodeGraph::new()),
+                resource_registry_with("", "v1", RESOURCE),
+                Arc::new(DiscoveryCache::new()),
+            ));
+
+        for (i, (username, label)) in identities.iter().enumerate() {
+            let series = || {
+                REQUEST_TOTAL
+                    .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "200", label])
+                    .get()
+            };
+            let before = series();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/namespaces/default/authuserlabelitems")
+                        .header("authorization", format!("Bearer user-label-token-{i}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                series(),
+                before + 1,
+                "{username} must be counted under user={label:?} in apiserver_request_total"
             );
         }
     }
@@ -6268,7 +6377,7 @@ mod tests {
                     // Mirrors handlers/watch.rs's own REQUEST_TOTAL increment on a
                     // successful watch open — this test proves AuthLayer does not add a
                     // second increment on top of it.
-                    record_request_total("watch", "", "v1", RESOURCE, "namespace", "200");
+                    record_request_total("watch", "", "v1", RESOURCE, "namespace", "200", "other");
                     Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "application/json")
@@ -6307,7 +6416,7 @@ mod tests {
         .layer(ChunkedWatchService);
 
         let before = REQUEST_TOTAL
-            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200"])
+            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200", "other"])
             .get();
 
         let req = Request::builder()
@@ -6333,7 +6442,7 @@ mod tests {
         );
 
         let after = REQUEST_TOTAL
-            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200"])
+            .with_label_values(&["watch", "", "v1", RESOURCE, "namespace", "200", "other"])
             .get();
         assert_eq!(
             after,
@@ -6406,7 +6515,7 @@ mod tests {
 
         for (verb, uri) in cases {
             let before = REQUEST_TOTAL
-                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410"])
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410", "other"])
                 .get();
 
             let req = Request::builder()
@@ -6424,7 +6533,7 @@ mod tests {
             );
 
             let after = REQUEST_TOTAL
-                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410"])
+                .with_label_values(&[verb, "", "v1", RESOURCE, "namespace", "410", "other"])
                 .get();
             assert_eq!(
                 after,
@@ -6644,7 +6753,7 @@ mod tests {
             ));
 
         let before_401 = REQUEST_TOTAL
-            .with_label_values(&["list", "", "", "", "", "401"])
+            .with_label_values(&["list", "", "", "", "", "401", "unauthenticated"])
             .get();
 
         let req_401 = Request::builder()
@@ -6662,7 +6771,7 @@ mod tests {
         );
 
         let after_401 = REQUEST_TOTAL
-            .with_label_values(&["list", "", "", "", "", "401"])
+            .with_label_values(&["list", "", "", "", "", "401", "unauthenticated"])
             .get();
         assert_eq!(
             after_401,
@@ -6701,7 +6810,7 @@ mod tests {
             ));
 
         let before_403 = REQUEST_TOTAL
-            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403"])
+            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403", "other"])
             .get();
 
         let req_403 = Request::builder()
@@ -6719,7 +6828,7 @@ mod tests {
         );
 
         let after_403 = REQUEST_TOTAL
-            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403"])
+            .with_label_values(&["list", "", "v1", RESOURCE, "namespace", "403", "other"])
             .get();
         assert_eq!(
             after_403,
@@ -6773,7 +6882,7 @@ mod tests {
             "/apis/totallymadeupgroup2/v9fakeversion/bogusresourcetwo",
         ] {
             let before_other = REQUEST_TOTAL
-                .with_label_values(&["list", "other", "other", "other", "cluster", "403"])
+                .with_label_values(&["list", "other", "other", "other", "cluster", "403", "other"])
                 .get();
 
             let req = Request::builder()
@@ -6790,7 +6899,7 @@ mod tests {
             );
 
             let after_other = REQUEST_TOTAL
-                .with_label_values(&["list", "other", "other", "other", "cluster", "403"])
+                .with_label_values(&["list", "other", "other", "other", "cluster", "403", "other"])
                 .get();
             assert_eq!(
                 after_other,
