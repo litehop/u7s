@@ -1455,6 +1455,15 @@ assert "STEP I: a long-lived zsh -c wrapper that only quotes loop text is never 
   "$([ -z "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c gh pr create --body '"'"'until ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 15; done'"'"'')" ] && echo 1 || echo 0)"
 assert "STEP I: a loop after '&&' starts a statement and is killed when its target exited" \
   "$([ "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c echo go && until ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 15; done')" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+WL_UNTIL='until ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 15; done'
+for wl_lead in '{ ' '( ' '(' 'if false; then :; else ' 'if false; then :; elif ' '! '; do
+  assert "STEP I: a loop after '$wl_lead' starts a statement and is killed when its target exited -- else a real orphan survives" \
+    "$([ "$(step_i_dry "9100 1 01:00:00 /bin/zsh -c $wl_lead$WL_UNTIL")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+done
+assert "STEP I: a loop after an ANSI-C quote with an escaped quote is killed -- \$'a\\'b' must not leave the scanner inside a quote" \
+  "$([ "$(step_i_dry "9100 1 01:00:00 /bin/zsh -c echo \$'a\\'b'; $WL_UNTIL")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: loop text inside an ANSI-C quote is not a loop" \
+  "$([ -z "$(step_i_dry "9100 1 01:00:00 /bin/zsh -c echo \$'x\\'; $WL_UNTIL'")" ] && echo 1 || echo 0)"
 assert "STEP I: limactl shell ... until ! pgrep is never killed -- host pgrep can't see the guest target" \
   "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'limactl shell vm -- bash -c')")" ] && echo 1 || echo 0)"
 assert "STEP I: a shell bash -c loop containing ssh is never killed -- the target is on a remote host" \
