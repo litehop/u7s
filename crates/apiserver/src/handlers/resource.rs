@@ -1194,8 +1194,8 @@ pub(crate) async fn delete_resource<S: Store>(
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
-        // DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
+        // Admission webhook pipeline (mutating then validating; a mutating
+        // webhook may only allow or deny a DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
         // branch below, so a Fail-policy webhook can deny whichever delete decision this
         // attempt makes.
         let admission_ctx = AdmissionContext {
@@ -1213,7 +1213,7 @@ pub(crate) async fn delete_resource<S: Store>(
             })),
             dry_run,
         };
-        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
         let owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -4390,8 +4390,8 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
-        // DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
+        // Admission webhook pipeline (mutating then validating; a mutating
+        // webhook may only allow or deny a DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
         // branch below, so a Fail-policy webhook can deny whichever delete decision this
         // attempt makes.
         let admission_ctx = AdmissionContext {
@@ -4409,7 +4409,7 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
             })),
             dry_run,
         };
-        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
         let this_owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -4813,8 +4813,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
             check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
                 .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
 
-            // Admission webhook pipeline (validating only — mutating webhooks do not apply
-            // to DELETE), invoked per object exactly like the single-delete handlers above.
+            // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE), invoked per object exactly like the single-delete handlers above.
             // Upstream kube-apiserver's DeleteCollection runs admission per object too; a
             // Fail-policy deny propagates here and aborts the whole request at this object —
             // objects already deleted earlier in this loop stay deleted (DeleteCollection is
@@ -4830,7 +4829,7 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 user_info: user_info.clone(),
                 dry_run,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // clusterIP release, soft/hard delete) for this object.
@@ -5002,8 +5001,7 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
             check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
                 .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
 
-            // Admission webhook pipeline (validating only — mutating webhooks do not apply
-            // to DELETE), invoked per object exactly like the single-delete handlers and
+            // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE), invoked per object exactly like the single-delete handlers and
             // mirroring delete_collection_resource above. A Fail-policy deny propagates here
             // and aborts the whole request at this object — objects already deleted earlier
             // in this loop stay deleted, matching the fail-fast handling the store error
@@ -5018,7 +5016,7 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 user_info: user_info.clone(),
                 dry_run,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // soft/hard delete) for this object.
