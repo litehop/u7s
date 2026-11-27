@@ -1,5 +1,6 @@
-//! Measurement-only: compile cost of CRD `pattern` regexes through boon.
-//! Run with `cargo test -p apiserver --release crd_pattern_cost -- --ignored --nocapture`.
+//! Regression tests for the CRD `pattern` compile-size budget, plus `#[ignore]`d
+//! `measure_*` PoCs for the cost of compiling `pattern` regexes (measurement only).
+//! Run PoCs with `cargo test -p apiserver --release measure_ -- --ignored --nocapture`.
 
 use std::time::{Duration, Instant};
 
@@ -176,6 +177,80 @@ fn cilium_style_pattern_set_is_accepted_with_headroom() {
         total * 4 < super::crd::MAX_CRD_PATTERN_TOTAL_NFA_BYTES,
         "expected generous headroom, got {total}"
     );
+}
+
+/// A body full of `{"pattern":"a"}` nodes must hit the summed budget by count: each
+/// pattern is charged a floor, so admission CPU stays bounded by the budget rather than
+/// by the request-body limit (9 s at 3 MiB when tiny patterns were charged ~nothing).
+#[test]
+fn many_tiny_patterns_are_bounded_by_the_budget_not_the_body_limit() {
+    let many = vec!["a"; 3000];
+    let err = super::crd::check_pattern_compile_budget(&schema_with(&many), "s", &mut 0)
+        .expect_err("3000 tiny patterns must exceed the 8 MiB budget via the per-pattern floor");
+    let json = serde_json::to_value(&err.1).unwrap();
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("CRD pattern compile budget exceeded"),
+        "{json}"
+    );
+    let ok = vec!["a"; 1000];
+    super::crd::check_pattern_compile_budget(&schema_with(&ok), "s", &mut 0)
+        .expect("a thousand tiny patterns is far beyond real CRDs and must still pass");
+}
+
+fn tiny_pattern_spec(n: usize) -> (super::crd::CustomResourceDefinitionSpec, usize) {
+    let props: serde_json::Map<_, _> = (0..n)
+        .map(|i| {
+            (
+                format!("f{i:05}"),
+                serde_json::json!({"type": "string", "pattern": "a"}),
+            )
+        })
+        .collect();
+    let schema = serde_json::json!({ "type": "object", "properties": props });
+    let body = serde_json::json!({
+        "group": "example.io",
+        "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+        "scope": "Namespaced",
+        "versions": [{"name": "v1", "served": true, "storage": true,
+                      "schema": {"openAPIV3Schema": schema}}]
+    });
+    let len = body.to_string().len();
+    (serde_json::from_value(body).unwrap(), len)
+}
+
+/// Admission cost of a request-body-sized CRD of tiny patterns: each property adds
+/// almost nothing to the summed budget but costs one compile.
+#[test]
+#[ignore = "timing PoC; run with --release --ignored --nocapture"]
+fn measure_admission_cost_of_tiny_pattern_properties() {
+    let (_, len_1k) = tiny_pattern_spec(1000);
+    let max = crate::MAX_BODY_BYTES * 1000 / len_1k;
+    let global = Instant::now();
+    let mut n = 1000;
+    loop {
+        let n_now = n.min(max);
+        let (spec, len) = tiny_pattern_spec(n_now);
+        let t0 = Instant::now();
+        let ok = super::crd::validate_crd_schema(&spec, None).is_ok();
+        let total = t0.elapsed();
+        let schema = &spec.versions[0].schema.as_ref().unwrap()["openAPIV3Schema"];
+        let t1 = Instant::now();
+        let _ = super::crd::check_pattern_compile_budget(schema, "s", &mut 0);
+        let budget = t1.elapsed();
+        eprintln!(
+            "POC admit n={n_now} body={len}B ok={ok} total={:.0}ms budget={:.0}ms rest={:.0}ms",
+            total.as_secs_f64() * 1e3,
+            budget.as_secs_f64() * 1e3,
+            total.saturating_sub(budget).as_secs_f64() * 1e3,
+        );
+        if n_now == max || global.elapsed() > WALL_CAP / 2 {
+            break;
+        }
+        n *= 4;
+    }
 }
 
 #[test]

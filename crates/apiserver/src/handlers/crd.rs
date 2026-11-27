@@ -320,6 +320,12 @@ fn ascii_shorthands(pattern: &str) -> String {
 /// ~20x headroom.
 pub(crate) const MAX_CRD_PATTERN_TOTAL_NFA_BYTES: usize = 8 << 20;
 
+/// Every pattern is charged at least this much, and patterns that build under it skip
+/// the bisection. Without a floor a body full of `{"pattern":"a"}` nodes costs ~21 builds
+/// each while adding ~nothing to the sum (9 s at the 3 MiB body limit); with it the sum
+/// caps the pattern count at `MAX_CRD_PATTERN_TOTAL_NFA_BYTES / PATTERN_SIZE_FLOOR`.
+const PATTERN_SIZE_FLOOR: usize = 4 << 10;
+
 enum PatternSize {
     Bytes(usize),
     TooBig,
@@ -337,12 +343,17 @@ fn build_under(pattern: &str, limit: usize) -> Result<(), regex::Error> {
 fn compiled_pattern_size(pattern: &str) -> PatternSize {
     let pattern = ascii_shorthands(pattern);
     crate::cel_runtime::format::on_compile_stack(|| {
+        match build_under(&pattern, PATTERN_SIZE_FLOOR) {
+            Ok(()) => return PatternSize::Bytes(PATTERN_SIZE_FLOOR),
+            Err(regex::Error::CompiledTooBig(_)) => {}
+            Err(_) => return PatternSize::Invalid,
+        }
         match build_under(&pattern, MAX_CRD_PATTERN_NFA_BYTES) {
             Ok(()) => {}
             Err(regex::Error::CompiledTooBig(_)) => return PatternSize::TooBig,
             Err(_) => return PatternSize::Invalid,
         }
-        let (mut lo, mut hi) = (0, MAX_CRD_PATTERN_NFA_BYTES);
+        let (mut lo, mut hi) = (PATTERN_SIZE_FLOOR, MAX_CRD_PATTERN_NFA_BYTES);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if build_under(&pattern, mid).is_ok() {
@@ -583,7 +594,7 @@ fn validate_conversion_webhook(
 /// class of bugs before persisting the CRD. `stored` is the previous CRD on update: its
 /// expressions and unchanged version schemas are ratcheted so an unrelated write cannot
 /// start failing on a rule that was already accepted.
-fn validate_crd_schema(
+pub(crate) fn validate_crd_schema(
     spec: &CustomResourceDefinitionSpec,
     stored: Option<&serde_json::Value>,
 ) -> Result<(), crate::status::StatusError> {

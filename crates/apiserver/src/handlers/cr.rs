@@ -12635,6 +12635,32 @@ mod tests {
         );
     }
 
+    /// A stored CRD whose short pattern compiles past the NFA budget (`\pL{244}` is 8
+    /// bytes but ~15 MiB resident, under boon's 10 MiB default) must be refused on the CR
+    /// cache-miss path, or the first CR write pays the seconds and GiBs admission avoids.
+    #[test]
+    fn validate_cr_schema_cache_miss_rejects_pattern_over_nfa_budget_that_bypassed_crd_admission() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "field": { "type": "string", "pattern": "\\pL{244}" } }
+        });
+        let err = match check_schema(&serde_json::json!({ "field": "x" }), schema) {
+            Ok(()) => panic!(
+                "a pattern over the compile budget must be rejected on the cache-miss compile"
+            ),
+            Err(e) => e,
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("compiles to more than"),
+            "error must come from the compile budget: {json}"
+        );
+    }
+
     // A single high-privilege CRD install must not turn into a repeatable amplification
     // vector: without a cache, every CR create/update/patch against that CRD pays boon's
     // parse-and-regex-compile cost again (measured ~657ms for the max-allowed 1024-byte
