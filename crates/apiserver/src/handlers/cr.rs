@@ -1056,6 +1056,7 @@ fn validate_cr_schema_with_budgets(
     let compiled = match cache.get(&ctx.schema_cache_key) {
         Some(compiled) => compiled,
         None => {
+            crate::handlers::crd::check_pattern_compile_budget(schema, "openAPIV3Schema")?;
             let (schemas, index) = crate::cel_runtime::format::on_compile_stack(|| {
                 let mut schemas = boon::Schemas::new();
                 let mut compiler = boon::Compiler::new();
