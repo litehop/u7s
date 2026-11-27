@@ -1431,6 +1431,17 @@ assert "STEP I: with two loops on different targets only the dead target's loop 
   "$([ "$(step_i_dry "$WL_TARGET
 $(wl_loop 9100 'run-all.sh --vm alpha')
 $(wl_loop 9101 'run-all.sh --vm beta')")" = "[dry-run] would run: kill 9101" ] && echo 1 || echo 0)"
+assert "STEP I: a 'while pgrep -f' loop whose target exited is killed -- it self-matches and hangs forever just like the until form" \
+  "$([ "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c while pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go')" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a 'while pgrep -f' loop with a live target is kept" \
+  "$([ -z "$(step_i_dry "$WL_TARGET"'
+9100 1 01:00:00 /bin/zsh -c while pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go')" ] && echo 1 || echo 0)"
+WL_COMPOUND='9100 1 01:00:00 /bin/zsh -c until [ -f /tmp/done ] && ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go'
+assert "STEP I: an 'until [ -f F ] && ! pgrep -f' loop whose target exited is killed -- the file test can't rescue a self-matching loop" \
+  "$([ "$(step_i_dry "$WL_COMPOUND")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a compound-condition loop with a live target is kept" \
+  "$([ -z "$(step_i_dry "$WL_TARGET
+$WL_COMPOUND")" ] && echo 1 || echo 0)"
 assert "STEP I: an unquoted pattern is never killed -- the target can't be read, so the loop might be legitimate" \
   "$([ -z "$(step_i_dry "9100 1 01:00:00 /bin/zsh -c until ! pgrep -f run-all.sh >/dev/null; do sleep 15; done")" ] && echo 1 || echo 0)"
 assert "STEP I: a bracket-form loop with a live target is kept -- killing it would end a legitimate wait early" \

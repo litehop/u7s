@@ -97,7 +97,7 @@
 #   tag archive/<bead>-findings (pushed to origin); if that fails the branch
 #   is kept.
 # STEP G: reap fix-round worktrees on non-worker branch names (see below).
-# STEP I: kill `until ! pgrep -f "<pattern>"` wait loops whose pattern matches
+# STEP I: kill `until|while ... pgrep -f "<pattern>"` wait loops whose pattern matches
 #   nothing but wait loops (they match themselves and never exit). Only
 #   shell `-c` loops older than 10 minutes with no limactl/ssh/exec involvement
 #   are candidates; loops with a live target are never touched. Scope is every
@@ -934,8 +934,9 @@ step_h_main_audit() {
 
 # ---------------------------------------------------------------------------
 # STEP I -- orphaned self-matching wait loops.
-# `until ! pgrep -f "<pattern>"; do sleep N; done` matches its own command
-# line, so it never exits. Kill such a loop only when it is certainly an
+# `until ! pgrep -f "<pattern>"; do sleep N; done` (also `while pgrep -f ...`,
+# or a compound condition such as `until [ -f F ] && ! pgrep -f ...`) matches
+# its own command line, so it never exits. Kill such a loop only when it is certainly an
 # orphan; every doubt means "keep". The process must be a shell running
 # `-c <script>`, must not involve limactl/ssh/docker exec/kubectl exec (host
 # pgrep can't see a guest or remote target), must be older than
@@ -950,7 +951,7 @@ WAIT_LOOP_SHELL_RE='^([^ ]*/)?(bash|zsh|sh) (-[A-Za-z-]+ )*-[A-Za-z]*c '
 
 # Output: "pid ppid etime command" per candidate line.
 wait_loop_lines() {
-  ps -u "$(id -u)" -o pid=,ppid=,etime=,command= | grep -F 'until ! pgrep -f' | grep -v 'grep -F' || true
+  ps -u "$(id -u)" -o pid=,ppid=,etime=,command= | grep -E "(while|until) .*pgrep -f" || true
 }
 
 # [[dd-]hh:]mm:ss -> seconds; prints nothing when malformed.
@@ -976,9 +977,9 @@ wait_loop_killable() {
 }
 
 wait_loop_pattern() {
-  local re='until ! pgrep -f (-- )?("([^"]*)"|'"'"'([^'"'"']*)'"'"')'
+  local re='(while|until) [^;]*pgrep -f (-- )?("([^"]*)"|'"'"'([^'"'"']*)'"'"')'
   if [[ "$1" =~ $re ]]; then
-    printf '%s\n' "${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+    printf '%s\n' "${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
   fi
 }
 

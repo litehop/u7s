@@ -25,6 +25,10 @@ assert_true() {
 ALLOW=(
   'conformance/reset.sh::pgrep -f "\$pattern"::pattern is workdir_kill_pattern output (assigned on the previous line)'
   '_kill-pattern.sh::pgrep -f "\$pattern"::pattern is workdir_kill_pattern output (assigned on the previous line)'
+  'worktree-hygiene.sh::pgrep -f "\$pattern"::pattern is the literal target another wait loop was written against; matched only to prove a target is alive'
+  'worktree-hygiene.sh::pgrep -f -- "\$pattern"::pattern is the literal target another wait loop was written against; matched only to prove a target is alive'
+  'worktree-hygiene.sh::\(while\|until\) .*pgrep -f::text search over ps output for wait loops; no pgrep issued'
+  'worktree-hygiene.sh::local re=.*pgrep -f::regex over a wait loop command line; no pgrep issued'
   'conformance/reset.sh::sudo pkill -f (kubelet|kube-controller-manager|sonobuoy)::fixed process names inside the guest VM, no path'
   'conformance/reset.sh::pkill -f .\[(k|s)\]::fixed bracketed process names inside the guest VM, no path'
   'conformance/lima-unrig.sh::pkill -f "\[(k|u)\]::fixed bracketed process names inside the guest VM, no host workdir path'
