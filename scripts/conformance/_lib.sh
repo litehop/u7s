@@ -1070,13 +1070,27 @@ _probe_starting_stopped() {
   return "$rc"
 }
 
+# _refuse_if_both_states <probe fn> <label> <dir> <vm> <port>: returns 1 when the VM also carries
+# the other state, else 0 (2 when that probe itself fails). Clearing either state would wipe the
+# other's pods (lima-unrig.sh and install-teardown.sh both run crictl rmp -fa), so neither wins.
+_refuse_if_both_states() {
+  local probe="$1" label="$2" dir="$3" vm="$4" port="$5" rc=0
+  _probe_starting_stopped "$probe" "$label" "$dir" "$vm" "$port" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) echo "error: cannot determine whether $vm also carries $label" >&2; return 2 ;;
+  esac
+  echo "error: $vm carries both host-rig state ($RIG_STATE_MARKER or $RIG_STATE_LEGACY_UNIT) and install state ($INSTALL_STATE_MARKER or $INSTALL_STATE_LEGACY_UNIT); clearing either would wipe the other's pods." >&2
+  echo "       Resolve it with: scripts/conformance/run-all.sh --reset --vm $vm ... (deletes and reprovisions the VM)" >&2
+  return 1
+}
+
 # clear_rig_state_if_present <dir> <vm>=<kubelet port>...: runs lima-unrig.sh for each VM carrying
 # host-rig state and verifies it with --check; returns non-zero if a probe or a clear fails.
-# Sets RIG_CLEARED=1 when any VM was cleared.
 clear_rig_state_if_present() {
   local dir="$1" spec vm port rc
   shift
-  RIG_CLEARED=0
   for spec in "$@"; do
     vm="${spec%%=*}"; port="${spec#*=}"
     rc=0; _probe_starting_stopped vm_rig_state_probe "rig state" "$dir" "$vm" "$port" || rc=$?
@@ -1085,12 +1099,12 @@ clear_rig_state_if_present() {
       1) continue ;;
       *) echo "error: cannot determine whether $vm carries host-rig state; refusing to run install.sh on it" >&2; return 1 ;;
     esac
+    _refuse_if_both_states vm_install_state_probe "install state" "$dir" "$vm" "$port" || return 1
     echo "[run-all] $vm carries host-rig state; running lima-unrig.sh" >&2
     { bash "$dir/lima-unrig.sh" --vm "$vm" && bash "$dir/lima-unrig.sh" --vm "$vm" --check; } || {
       echo "error: lima-unrig.sh failed for $vm; install.sh cannot run on top of host-rig state" >&2
       return 1
     }
-    RIG_CLEARED=1
   done
 }
 
@@ -1107,12 +1121,45 @@ teardown_if_install_state() {
       1) continue ;;
       *) echo "error: cannot determine whether $vm is in install state; refusing to bring up the host rig" >&2; return 1 ;;
     esac
+    _refuse_if_both_states vm_rig_state_probe "host-rig state" "$dir" "$vm" "$port" || return 1
     echo "[run-all] $vm is in install state; running install-teardown.sh" >&2
     bash "$dir/install-teardown.sh" --vm "$vm" --workdir "$workdir" || {
       echo "error: install-teardown.sh failed for $vm; the host rig cannot run on top of install state" >&2
       return 1
     }
   done
+}
+
+INSTALL_STATE_DIR=/var/lib/u7s
+
+# clear_stale_extra_node_state <dir> <primary vm> <extra vm>: install.sh on an extra node that
+# already holds a kubeconfig takes the upgrade-in-place path ("Existing worker node detected"),
+# which needs that node's client identity to be valid on the primary. After the primary was
+# reinstalled (new CA) it is not, so the node's /var/lib/u7s is stale: install-teardown.sh it so
+# the caller joins it fresh. A node whose CA matches the primary's is left alone (a real upgrade).
+clear_stale_extra_node_state() {
+  local dir="$1" primary="$2" extra="$3" primary_ca extra_ca scratch out rc=0
+  out=$(limactl shell "$extra" sudo sh -c "if [ -s $INSTALL_STATE_DIR/kubeconfig ]; then echo present; else echo absent; fi") || out="<shell failed>"
+  case "$out" in
+    present) ;;
+    absent) return 0 ;;
+    *) echo "error: probing $extra for $INSTALL_STATE_DIR/kubeconfig returned '$out', expected present|absent; not touching it" >&2; return 1 ;;
+  esac
+  primary_ca=$(limactl shell "$primary" sudo sha256sum "$INSTALL_STATE_DIR/ca.pem" | awk '{print $1}') || primary_ca=""
+  [ -n "$primary_ca" ] || { echo "error: cannot read $primary's $INSTALL_STATE_DIR/ca.pem to compare with $extra's" >&2; return 1; }
+  out=$(limactl shell "$extra" sudo sh -c "if [ -e $INSTALL_STATE_DIR/ca.pem ]; then sha256sum $INSTALL_STATE_DIR/ca.pem; else echo absent; fi") || out="<shell failed>"
+  case "$out" in
+    absent) extra_ca="" ;;
+    *"  $INSTALL_STATE_DIR/ca.pem") extra_ca="${out%% *}" ;;
+    *) echo "error: reading $extra's $INSTALL_STATE_DIR/ca.pem returned '$out', expected a sha256sum line or absent; not tearing it down" >&2; return 1 ;;
+  esac
+  [ "$extra_ca" != "$primary_ca" ] || return 0
+  echo "[install] $extra holds join state from a different CA than $primary's; running install-teardown.sh on it" >&2
+  # install-teardown.sh also deletes <workdir>/kubeconfig and kills <workdir>'s tunnel: both belong to the primary.
+  scratch=$(mktemp -d)
+  bash "$dir/install-teardown.sh" --vm "$extra" --workdir "$scratch" || rc=$?
+  rm -rf "$scratch"
+  [ "$rc" -eq 0 ] || { echo "error: install-teardown.sh failed for $extra; it cannot join the new cluster with stale state" >&2; return 1; }
 }
 
 # Prints the per-VM default Lima network. Single source for lima-start.sh and

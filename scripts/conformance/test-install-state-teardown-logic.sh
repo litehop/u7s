@@ -52,7 +52,19 @@ case "\$1" in
       [ ! -e "$TMP/probe-garbage" ] || { echo "Permission denied"; exit 0; }
       if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_MARKER"*) grep -qx "\$2" "$TMP/rig-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/rig-legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
     elif [ "\$3" = sudo ]; then
-      PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6"
+      case "\$4" in
+        sha256sum) [ -e "$TMP/ca-\$2" ] && echo "\$(cat "$TMP/ca-\$2")  \$5" ;;
+        sh)
+          case "\$6" in
+            *sha256sum*)
+              [ ! -e "$TMP/ssh-fails-ca-\$2" ] || exit 255
+              if [ -e "$TMP/ca-\$2" ]; then echo "\$(cat "$TMP/ca-\$2")  $INSTALL_STATE_DIR/ca.pem"; else echo absent; fi ;;
+            *)
+              [ ! -e "$TMP/ssh-fails-kubeconfig-\$2" ] || exit 255
+              if [ -e "$TMP/joined-\$2" ]; then echo present; else echo absent; fi ;;
+          esac ;;
+        *) PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6" ;;
+      esac
     fi ;;
 esac
 EOF
@@ -74,7 +86,7 @@ export PATH="$TMP/bin:$PATH"
 reset_fixture() {
   : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/legacy-state"; : > "$TMP/teardown-fails"
   : > "$TMP/rig-state"; : > "$TMP/rig-legacy-state"; : > "$TMP/unrig-fails"
-  rm -f "$TMP"/status-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
+  rm -f "$TMP"/status-* "$TMP"/joined-* "$TMP"/ca-* "$TMP"/ssh-fails-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
 }
 teardowns() { grep -c 'install-teardown.sh' "$TMP/calls.log" || true; }
 
@@ -119,6 +131,9 @@ check "install.sh writes the marker before its first mutation (systemd preflight
   "0" "$(awk -v n="${write_line:-0}" 'NR < n && /^(install -d|mkdir|systemctl|cat >)/ {c++} END {print c + 0}' "$INSTALL_SH")"
 check "install-teardown.sh removes the marker, so a torn-down VM is not torn down again" \
   "1" "$(grep -c "rm -f '\"\$INSTALL_STATE_MARKER\"'" "$DIR/install-teardown.sh")"
+
+check "install-teardown.sh removes the legacy rig kube-proxy unit (else a torn-down VM probes as rig state and is unrigged once)" \
+  "1" "$(grep -c "rm -f '\"\$RIG_STATE_LEGACY_UNIT\"'" "$DIR/install-teardown.sh")"
 
 reset_fixture
 echo vm-a > "$TMP/install-state"
@@ -212,7 +227,6 @@ check "unrig ran once per rig-state VM, each followed by its --check (a survivin
   "2|2" "$(unrigs)|$(grep -c 'lima-unrig.sh --vm vm-[ab] --check' "$TMP/calls.log")"
 check "clearing is announced loudly so an operator sees why their rig VM was unrigged" \
   "2" "$(grep -c '^\[run-all\] vm-[ab] carries host-rig state; running lima-unrig.sh' "$TMP/err.log")"
-check "RIG_CLEARED tells run-all.sh the host rig's processes need reaping" "1" "$RIG_CLEARED"
 
 reset_fixture
 echo vm-b > "$TMP/rig-state"
@@ -222,7 +236,7 @@ check "a VM without rig state is left untouched (only the rig-state one is unrig
 
 reset_fixture
 clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null
-check "clean VM: unrig is not invoked and the host rig is not reaped" "0|0" "$(unrigs)|$RIG_CLEARED"
+check "clean VM: unrig is not invoked" "0" "$(unrigs)"
 
 reset_fixture
 echo vm-a > "$TMP/install-state"
@@ -270,8 +284,13 @@ check "run-all.sh --install still hands off to install-run.sh after clearing" "1
 
 reset_fixture
 "$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
-check "run-all.sh --install on a clean VM neither unrigs nor reaps host processes" \
-  "0|0" "$(unrigs)|$(grep -c 'reset.sh --host-only' "$TMP/calls.log" || true)"
+check "run-all.sh --install on a clean VM does not unrig but still reaps host processes (a retry after an aborted unrig leaves the rig apiserver on the port)" \
+  "0|1" "$(unrigs)|$(grep -c "reset.sh --host-only --workdir $TMP/wd --port 6444" "$TMP/calls.log" || true)"
+
+reset_fixture
+"$REAL_BASH" "$DIR/run-all.sh" --install --reset --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
+check "--install --reset does not take the host-only reap (the reset deletes the VM and wipes the workdir itself)" \
+  "0" "$(grep -c 'reset.sh --host-only' "$TMP/calls.log" || true)"
 
 reset_fixture
 echo vm-a > "$TMP/rig-state"
@@ -291,6 +310,86 @@ reset_fixture
 echo vm-a > "$TMP/rig-state"
 "$REAL_BASH" "$DIR/run-all.sh" --install --reset --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
 check "--install --reset skips the rig probe (the VM is deleted anyway)" "0" "$(unrigs)"
+
+# Both markers: either clear would crictl rmp -fa the other state's pods, so neither is chosen.
+for variant in marker legacy; do
+  reset_fixture
+  echo vm-a > "$TMP/install-state"
+  if [ "$variant" = marker ]; then echo vm-a > "$TMP/rig-state"; else echo vm-a > "$TMP/rig-legacy-state"; fi
+  clear_rig_state_if_present "$DIR" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+  check "[$variant] --install direction: a VM with both markers aborts (rc) instead of unrigging away the install's pods" "1" "$rc"
+  check "[$variant] --install direction: lima-unrig.sh is never invoked" "0" "$(unrigs)"
+  check "[$variant] --install direction: the message names both markers and the --reset resolution" \
+    "1|1|1" "$(grep -c -e "$RIG_STATE_MARKER" -e "$RIG_STATE_LEGACY_UNIT" "$TMP/err.log" | sed 's/^[1-9].*/1/')|$(grep -c "$INSTALL_STATE_MARKER" "$TMP/err.log")|$(grep -c 'run-all.sh --reset --vm vm-a' "$TMP/err.log")"
+
+  reset_fixture
+  echo vm-a > "$TMP/install-state"
+  if [ "$variant" = marker ]; then echo vm-a > "$TMP/rig-state"; else echo vm-a > "$TMP/rig-legacy-state"; fi
+  teardown_if_install_state "$DIR" "$TMP/wd" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+  check "[$variant] host-rig direction: a VM with both markers aborts (rc) instead of tearing down the rig's pods" "1" "$rc"
+  check "[$variant] host-rig direction: install-teardown.sh is never invoked" "0" "$(teardowns)"
+done
+
+reset_fixture
+echo vm-a > "$TMP/install-state"
+echo vm-a > "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh --install aborts on a both-markers VM before reaping or handing off" \
+  "1|0|0" "$rc|$(grep -c -e 'install-run.sh' -e 'reset.sh' "$TMP/calls.log" || true)|$(unrigs)"
+reset_fixture
+echo vm-a > "$TMP/install-state"
+echo vm-a > "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh (host rig) aborts on a both-markers VM before reset.sh or build" \
+  "1|0" "$rc|$(grep -c -e 'reset.sh' -e '01-build.sh' -e 'install-teardown.sh' "$TMP/calls.log" || true)"
+
+# Extra node left with join state from a previous primary: install.sh would take the
+# upgrade-in-place path and abort ("Existing worker node detected") against the new CA.
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>"$TMP/err.log" && rc=0 || rc=$?
+check "an extra node whose CA the new primary did not issue is torn down before joining (rc, teardown of that VM only)" \
+  "0|1|vm-b" "$rc|$(teardowns)|$(grep -o -e '--vm vm-.' "$TMP/calls.log" | sed 's/--vm //')"
+check "the teardown does not use a caller workdir (it would delete the primary's kubeconfig and tunnel)" \
+  "0" "$(grep -c -e "--workdir $TMP/wd" "$TMP/calls.log" || true)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo cafe > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node joined to this very primary is left alone (that is the upgrade-in-place path under test)" "0" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node with no join state is not torn down (nothing stale)" "0" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node with a kubeconfig but no ca.pem is stale and torn down" "1" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"; : > "$TMP/ssh-fails-ca-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an ssh error reading the extra node's ca.pem is an error, never a CA mismatch (rc, no teardown)" "1|0" "$rc|$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; : > "$TMP/joined-vm-b"; : > "$TMP/ssh-fails-kubeconfig-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an ssh error on the kubeconfig check fails loud instead of silently skipping the stale check (rc, no teardown)" "1|0" "$rc|$(teardowns)"
+
+reset_fixture
+: > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an unreadable primary CA is an error, not 'matches' (rc, no teardown)" "1|0" "$rc|$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"; echo vm-b > "$TMP/teardown-fails"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "a failed teardown of the stale extra node is fatal (joining on top of it would abort mid-install)" "1" "$rc"
+
+check "install-bringup.sh clears stale extra-node state before choosing upgrade-in-place vs join" \
+  "1" "$(awk '/clear_stale_extra_node_state/ {c=NR} /sudo test -s "\$VM_STATE_DIR\/kubeconfig"/ {t=NR} END {print (c > 0 && c < t) ? 1 : 0}' "$DIR/install-bringup.sh")"
 
 # reset.sh --store-only after install-teardown: /var/lib/kubelet is gone, and find on a missing
 # directory aborts the guest script, failing the whole bring-up. The dev host has no such dir;
