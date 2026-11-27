@@ -45,3 +45,15 @@ API server: implemented from scratch in Rust (no upstream kube-apiserver).
 Networking: CNI plugin model.
 State store: SQLite WAL (rusqlite bundled) — see docs/decisions/sqlite-over-lmdb.md.
 ```
+
+## Divergence decisions (operator-approved 2026-11-27)
+
+- **UID preconditions:** the scheduler binds and preempts with UID
+  preconditions (#2295, #2311). Upstream `DeletePod` sends none. A deliberate
+  tightening; behaviour differs only in the delete-and-recreate race.
+- **CRD `pattern` compile budget (#2289):** 8 MiB per CRD and 1 MiB per
+  pattern, with a 4 KiB per-pattern floor (so at most 2048 patterns per CRD),
+  compiled off the async runtime. Upstream has only a per-pattern Go limit
+  (about 128 MiB). Real CRDs measured at most 357 KB summed and 81 KB for a
+  single pattern.
+- **Security fixes** are not backported or advised while there are zero users.
