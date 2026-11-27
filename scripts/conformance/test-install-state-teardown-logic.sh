@@ -52,7 +52,11 @@ case "\$1" in
       [ ! -e "$TMP/probe-garbage" ] || { echo "Permission denied"; exit 0; }
       if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_MARKER"*) grep -qx "\$2" "$TMP/rig-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/rig-legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
     elif [ "\$3" = sudo ]; then
-      PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6"
+      case "\$4" in
+        test) [ -e "$TMP/joined-\$2" ] ;;
+        sha256sum) [ -e "$TMP/ca-\$2" ] && echo "\$(cat "$TMP/ca-\$2")  \$5" ;;
+        *) PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6" ;;
+      esac
     fi ;;
 esac
 EOF
@@ -74,7 +78,7 @@ export PATH="$TMP/bin:$PATH"
 reset_fixture() {
   : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/legacy-state"; : > "$TMP/teardown-fails"
   : > "$TMP/rig-state"; : > "$TMP/rig-legacy-state"; : > "$TMP/unrig-fails"
-  rm -f "$TMP"/status-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
+  rm -f "$TMP"/status-* "$TMP"/joined-* "$TMP"/ca-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
 }
 teardowns() { grep -c 'install-teardown.sh' "$TMP/calls.log" || true; }
 
@@ -330,6 +334,44 @@ echo vm-a > "$TMP/rig-state"
 "$REAL_BASH" "$DIR/run-all.sh" --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
 check "run-all.sh (host rig) aborts on a both-markers VM before reset.sh or build" \
   "1|0" "$rc|$(grep -c -e 'reset.sh' -e '01-build.sh' -e 'install-teardown.sh' "$TMP/calls.log" || true)"
+
+# Extra node left with join state from a previous primary: install.sh would take the
+# upgrade-in-place path and abort ("Existing worker node detected") against the new CA.
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>"$TMP/err.log" && rc=0 || rc=$?
+check "an extra node whose CA the new primary did not issue is torn down before joining (rc, teardown of that VM only)" \
+  "0|1|vm-b" "$rc|$(teardowns)|$(grep -o -e '--vm vm-.' "$TMP/calls.log" | sed 's/--vm //')"
+check "the teardown does not use a caller workdir (it would delete the primary's kubeconfig and tunnel)" \
+  "0" "$(grep -c -e "--workdir $TMP/wd" "$TMP/calls.log" || true)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo cafe > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node joined to this very primary is left alone (that is the upgrade-in-place path under test)" "0" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node with no join state is not torn down (nothing stale)" "0" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; : > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
+check "an extra node with a kubeconfig but no ca.pem is stale and torn down" "1" "$(teardowns)"
+
+reset_fixture
+: > "$TMP/joined-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an unreadable primary CA is an error, not 'matches' (rc, no teardown)" "1|0" "$rc|$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"; echo vm-b > "$TMP/teardown-fails"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "a failed teardown of the stale extra node is fatal (joining on top of it would abort mid-install)" "1" "$rc"
+
+check "install-bringup.sh clears stale extra-node state before choosing upgrade-in-place vs join" \
+  "1" "$(awk '/clear_stale_extra_node_state/ {c=NR} /sudo test -s "\$VM_STATE_DIR\/kubeconfig"/ {t=NR} END {print (c > 0 && c < t) ? 1 : 0}' "$DIR/install-bringup.sh")"
 
 # reset.sh --store-only after install-teardown: /var/lib/kubelet is gone, and find on a missing
 # directory aborts the guest script, failing the whole bring-up. The dev host has no such dir;

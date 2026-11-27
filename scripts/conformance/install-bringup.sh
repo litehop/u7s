@@ -150,6 +150,7 @@ if [ -n "$EXTRA_NODE" ]; then
     kubectl --kubeconfig="$KUBECONFIG_PATH" delete "node/$EXTRA_NODE" --ignore-not-found --wait=false
     limactl shell "$EXTRA_NODE" sudo bash -c "systemctl stop kubelet 2>/dev/null || true; rm -rf $VM_STATE_DIR"
   fi
+  clear_stale_extra_node_state "$DIR" "$VM_NAME" "$EXTRA_NODE" || exit 1
   if limactl shell "$EXTRA_NODE" sudo test -s "$VM_STATE_DIR/kubeconfig"; then
     banner "install.sh upgrade in place on $EXTRA_NODE (already joined; no token)"
     bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- --tarball "$TARBALL" --node-name "$EXTRA_NODE"

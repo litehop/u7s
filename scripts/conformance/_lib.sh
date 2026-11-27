@@ -1130,6 +1130,28 @@ teardown_if_install_state() {
   done
 }
 
+INSTALL_STATE_DIR=/var/lib/u7s
+
+# clear_stale_extra_node_state <dir> <primary vm> <extra vm>: install.sh on an extra node that
+# already holds a kubeconfig takes the upgrade-in-place path ("Existing worker node detected"),
+# which needs that node's client identity to be valid on the primary. After the primary was
+# reinstalled (new CA) it is not, so the node's /var/lib/u7s is stale: install-teardown.sh it so
+# the caller joins it fresh. A node whose CA matches the primary's is left alone (a real upgrade).
+clear_stale_extra_node_state() {
+  local dir="$1" primary="$2" extra="$3" primary_ca extra_ca scratch rc=0
+  limactl shell "$extra" sudo test -s "$INSTALL_STATE_DIR/kubeconfig" || return 0
+  primary_ca=$(limactl shell "$primary" sudo sha256sum "$INSTALL_STATE_DIR/ca.pem" | awk '{print $1}') || primary_ca=""
+  [ -n "$primary_ca" ] || { echo "error: cannot read $primary's $INSTALL_STATE_DIR/ca.pem to compare with $extra's" >&2; return 1; }
+  extra_ca=$(limactl shell "$extra" sudo sha256sum "$INSTALL_STATE_DIR/ca.pem" 2>/dev/null | awk '{print $1}') || extra_ca=""
+  [ "$extra_ca" != "$primary_ca" ] || return 0
+  echo "[install] $extra holds join state from a different CA than $primary's; running install-teardown.sh on it" >&2
+  # install-teardown.sh also deletes <workdir>/kubeconfig and kills <workdir>'s tunnel: both belong to the primary.
+  scratch=$(mktemp -d)
+  bash "$dir/install-teardown.sh" --vm "$extra" --workdir "$scratch" || rc=$?
+  rm -rf "$scratch"
+  [ "$rc" -eq 0 ] || { echo "error: install-teardown.sh failed for $extra; it cannot join the new cluster with stale state" >&2; return 1; }
+}
+
 # Prints the per-VM default Lima network. Single source for lima-start.sh and
 # install-bringup.sh; mirrors the Network column of the Lima VM protocol table in the
 # dispatch template doc. VMs outside the known set fall back to the flat "user-v2".
