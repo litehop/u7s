@@ -1138,11 +1138,21 @@ INSTALL_STATE_DIR=/var/lib/u7s
 # reinstalled (new CA) it is not, so the node's /var/lib/u7s is stale: install-teardown.sh it so
 # the caller joins it fresh. A node whose CA matches the primary's is left alone (a real upgrade).
 clear_stale_extra_node_state() {
-  local dir="$1" primary="$2" extra="$3" primary_ca extra_ca scratch rc=0
-  limactl shell "$extra" sudo test -s "$INSTALL_STATE_DIR/kubeconfig" || return 0
+  local dir="$1" primary="$2" extra="$3" primary_ca extra_ca scratch out rc=0
+  out=$(limactl shell "$extra" sudo sh -c "if [ -s $INSTALL_STATE_DIR/kubeconfig ]; then echo present; else echo absent; fi") || out="<shell failed>"
+  case "$out" in
+    present) ;;
+    absent) return 0 ;;
+    *) echo "error: probing $extra for $INSTALL_STATE_DIR/kubeconfig returned '$out', expected present|absent; not touching it" >&2; return 1 ;;
+  esac
   primary_ca=$(limactl shell "$primary" sudo sha256sum "$INSTALL_STATE_DIR/ca.pem" | awk '{print $1}') || primary_ca=""
   [ -n "$primary_ca" ] || { echo "error: cannot read $primary's $INSTALL_STATE_DIR/ca.pem to compare with $extra's" >&2; return 1; }
-  extra_ca=$(limactl shell "$extra" sudo sha256sum "$INSTALL_STATE_DIR/ca.pem" 2>/dev/null | awk '{print $1}') || extra_ca=""
+  out=$(limactl shell "$extra" sudo sh -c "if [ -e $INSTALL_STATE_DIR/ca.pem ]; then sha256sum $INSTALL_STATE_DIR/ca.pem; else echo absent; fi") || out="<shell failed>"
+  case "$out" in
+    absent) extra_ca="" ;;
+    *"  $INSTALL_STATE_DIR/ca.pem") extra_ca="${out%% *}" ;;
+    *) echo "error: reading $extra's $INSTALL_STATE_DIR/ca.pem returned '$out', expected a sha256sum line or absent; not tearing it down" >&2; return 1 ;;
+  esac
   [ "$extra_ca" != "$primary_ca" ] || return 0
   echo "[install] $extra holds join state from a different CA than $primary's; running install-teardown.sh on it" >&2
   # install-teardown.sh also deletes <workdir>/kubeconfig and kills <workdir>'s tunnel: both belong to the primary.

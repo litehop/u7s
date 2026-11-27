@@ -53,8 +53,16 @@ case "\$1" in
       if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_MARKER"*) grep -qx "\$2" "$TMP/rig-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/rig-legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
     elif [ "\$3" = sudo ]; then
       case "\$4" in
-        test) [ -e "$TMP/joined-\$2" ] ;;
         sha256sum) [ -e "$TMP/ca-\$2" ] && echo "\$(cat "$TMP/ca-\$2")  \$5" ;;
+        sh)
+          case "\$6" in
+            *sha256sum*)
+              [ ! -e "$TMP/ssh-fails-ca-\$2" ] || exit 255
+              if [ -e "$TMP/ca-\$2" ]; then echo "\$(cat "$TMP/ca-\$2")  $INSTALL_STATE_DIR/ca.pem"; else echo absent; fi ;;
+            *)
+              [ ! -e "$TMP/ssh-fails-kubeconfig-\$2" ] || exit 255
+              if [ -e "$TMP/joined-\$2" ]; then echo present; else echo absent; fi ;;
+          esac ;;
         *) PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6" ;;
       esac
     fi ;;
@@ -78,7 +86,7 @@ export PATH="$TMP/bin:$PATH"
 reset_fixture() {
   : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/legacy-state"; : > "$TMP/teardown-fails"
   : > "$TMP/rig-state"; : > "$TMP/rig-legacy-state"; : > "$TMP/unrig-fails"
-  rm -f "$TMP"/status-* "$TMP"/joined-* "$TMP"/ca-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
+  rm -f "$TMP"/status-* "$TMP"/joined-* "$TMP"/ca-* "$TMP"/ssh-fails-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
 }
 teardowns() { grep -c 'install-teardown.sh' "$TMP/calls.log" || true; }
 
@@ -359,6 +367,16 @@ reset_fixture
 echo cafe > "$TMP/ca-vm-a"; : > "$TMP/joined-vm-b"
 clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null
 check "an extra node with a kubeconfig but no ca.pem is stale and torn down" "1" "$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; echo beef > "$TMP/ca-vm-b"; : > "$TMP/joined-vm-b"; : > "$TMP/ssh-fails-ca-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an ssh error reading the extra node's ca.pem is an error, never a CA mismatch (rc, no teardown)" "1|0" "$rc|$(teardowns)"
+
+reset_fixture
+echo cafe > "$TMP/ca-vm-a"; : > "$TMP/joined-vm-b"; : > "$TMP/ssh-fails-kubeconfig-vm-b"
+clear_stale_extra_node_state "$DIR" vm-a vm-b 2>/dev/null && rc=0 || rc=$?
+check "an ssh error on the kubeconfig check fails loud instead of silently skipping the stale check (rc, no teardown)" "1|0" "$rc|$(teardowns)"
 
 reset_fixture
 : > "$TMP/joined-vm-b"
