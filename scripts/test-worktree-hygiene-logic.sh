@@ -1451,6 +1451,10 @@ assert "STEP I: a bracket-form loop with a dead target and old enough is killed"
   "$([ "$(step_i_dry "$(wl_loop 9100 '[r]un-all.sh --vm alpha')")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
 assert "STEP I: a non-shell process whose args contain the loop text is never killed -- it could be an editor or gh/bd with a body" \
   "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'gh pr create --body')")" ] && echo 1 || echo 0)"
+assert "STEP I: a long-lived zsh -c wrapper that only quotes loop text is never killed -- e.g. a gh pr create body, not a loop" \
+  "$([ -z "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c gh pr create --body '"'"'until ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 15; done'"'"'')" ] && echo 1 || echo 0)"
+assert "STEP I: a loop after '&&' starts a statement and is killed when its target exited" \
+  "$([ "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c echo go && until ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 15; done')" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
 assert "STEP I: limactl shell ... until ! pgrep is never killed -- host pgrep can't see the guest target" \
   "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'limactl shell vm -- bash -c')")" ] && echo 1 || echo 0)"
 assert "STEP I: a shell bash -c loop containing ssh is never killed -- the target is on a remote host" \

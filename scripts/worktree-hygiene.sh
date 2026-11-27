@@ -961,6 +961,43 @@ etime_to_secs() {
   echo $(( ((10#${BASH_REMATCH[2]:-0} * 24 + 10#${BASH_REMATCH[4]:-0}) * 60 + 10#${BASH_REMATCH[5]}) * 60 + 10#${BASH_REMATCH[6]} ))
 }
 
+# True when the -c script of "$1" has a `while`/`until ... pgrep -f` loop that
+# starts a shell statement outside any quotes. A wrapper that merely quotes loop
+# text (e.g. `gh pr create --body "until ! pgrep -f ..."`) is not a loop.
+wait_loop_is_statement() {
+  local script q="" c i n=0 before rest
+  local lead_re='(^|[;&|'$'\n''])[[:space:]]*$|(^|[^[:alnum:]_])(do|then)[[:space:]]+$'
+  [[ "$1" =~ $WAIT_LOOP_SHELL_RE ]] || return 1
+  script="${1:${#BASH_REMATCH[0]}}"
+  n=${#script}
+  for (( i = 0; i < n; i++ )); do
+    c="${script:i:1}"
+    if [ "$q" = "'" ]; then
+      [ "$c" = "'" ] && q=""
+      continue
+    fi
+    if [ "$c" = "\\" ]; then
+      i=$(( i + 1 ))
+      continue
+    fi
+    if [ -n "$q" ]; then
+      [ "$c" = "$q" ] && q=""
+      continue
+    fi
+    case "$c" in
+      "'" | '"') q="$c"; continue ;;
+    esac
+    rest="${script:i}"
+    if [[ "$rest" =~ ^(while|until)[[:space:]] ]]; then
+      before="${script:0:i}"
+      if [[ "$before" =~ $lead_re ]] && [[ "$rest" == *"pgrep -f"* ]]; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 # True for a well-formed, old-enough shell -c loop with no remote/VM
 # involvement. Arg: "pid ppid etime command".
 wait_loop_killable() {
@@ -969,7 +1006,7 @@ wait_loop_killable() {
   [[ "$pid" =~ ^[0-9]+$ && "$ppid" =~ ^[0-9]+$ ]] || return 1
   secs=$(etime_to_secs "$etime")
   [ -n "$secs" ] && [ "$secs" -ge "$WAIT_LOOP_MIN_AGE_SECS" ] || return 1
-  [[ "$cmd" =~ $WAIT_LOOP_SHELL_RE ]] || return 1
+  wait_loop_is_statement "$cmd" || return 1
   [[ "$cmd" =~ $WAIT_LOOP_REMOTE_RE ]] && return 1
   parent=$(ps -o command= -p "$ppid" 2>/dev/null || true)
   [[ "$parent" =~ $WAIT_LOOP_REMOTE_RE ]] && return 1
