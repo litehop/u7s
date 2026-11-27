@@ -10,10 +10,13 @@
 //     MUTATING_WAIT_TIMEOUT before returning 429 — see that constant's
 //     doc comment for why queuing, not instant-reject, is correct here.
 //
-// Each pool keeps a reserved fraction that only control-plane identities
-// (`state::is_system_priority_username`) may use, and caps any single other
-// user at a share of the pool, so one tenant can neither starve kubelets and
-// controllers nor take every seat. Long-running requests (watch, proxy,
+// Each pool keeps a reserved partition that only control-plane identities
+// (`state::is_system_priority_username`) may use, bounds all of them together
+// to that partition and each to a per-class share below it, and caps any single
+// other user at a share of the pool, so one tenant can neither starve kubelets
+// and controllers nor take every seat, and control-plane identities can never
+// take ordinary seats. Only the admin (`WatchClass::Exempt`) takes no seat.
+// Long-running requests (watch, proxy,
 // exec/attach/portforward, log) and health probes bypass the pools entirely,
 // as upstream's LongRunningFunc and exempt priority level do.
 //
@@ -42,7 +45,7 @@ use tower::Layer;
 use tower_service::Service;
 
 use crate::auth::{is_long_running_request, is_proxy_request, PeerAddr, UserInfo};
-use crate::state::is_system_priority_username;
+use crate::state::{watch_class, WatchClass};
 use crate::status::Status;
 
 const MAX_INFLIGHT: usize = 200;
@@ -61,6 +64,27 @@ const RESERVED_MUTATING: usize = MAX_MUTATING / 5;
 /// writes — well above what kubectl or a controller sustains.
 const USER_SHARE_INFLIGHT: usize = MAX_INFLIGHT / 4;
 const USER_SHARE_MUTATING: usize = MAX_MUTATING / 4;
+
+/// Most seats one reserved identity may hold, by class, as (read, write). All reserved
+/// identities together are bounded by the reserved partition (`Pool::reserved`), so a leaked
+/// control-plane token can never reach into the seats ordinary users share; each per-identity
+/// cap sits below that partition so no single identity can take it all. Measured peaks on a
+/// live stack running a Deployment rollout and namespace deletion were 5 (kubelet,
+/// scheduler), 4 (replicaset-controller) and ~1-3 for the other controllers, counted across
+/// reads and writes combined.
+fn reserved_user_share(class: WatchClass, mutating: bool) -> usize {
+    let (read, write) = match class {
+        WatchClass::Kcm | WatchClass::Scheduler => (20, 10),
+        _ => (10, 5),
+    };
+    if mutating {
+        write
+    } else {
+        read
+    }
+}
+
+const _: () = assert!(RESERVED_INFLIGHT > 20 && RESERVED_MUTATING > 10);
 
 /// Per-user semaphore map size past which idle entries are dropped, bounding memory
 /// against minted ServiceAccount names. Live entries never exceed the pool size plus the
@@ -127,15 +151,21 @@ const MAX_MUTATING_QUEUE_DEPTH: usize = 512;
 // ---------------------------------------------------------------------------
 
 enum Caller {
-    System,
+    /// The admin (system:masters): no seat accounting at all.
+    Exempt,
+    /// Control-plane identity: may use the reserved seats, capped per identity.
+    Reserved(String, WatchClass),
     Other(String),
 }
 
 impl Caller {
     fn of(req: &Request<Body>) -> Self {
         match req.extensions().get::<UserInfo>() {
-            Some(u) if is_system_priority_username(&u.username) => Caller::System,
-            Some(u) => Caller::Other(u.username.clone()),
+            Some(u) => match watch_class(&u.username) {
+                WatchClass::Exempt => Caller::Exempt,
+                WatchClass::Ordinary => Caller::Other(u.username.clone()),
+                class => Caller::Reserved(u.username.clone(), class),
+            },
             None => Caller::Other(String::new()),
         }
     }
@@ -144,32 +174,38 @@ impl Caller {
 /// Held for the life of a request; dropping it returns every seat.
 struct Seat {
     _user: Option<OwnedSemaphorePermit>,
-    _shared: Option<OwnedSemaphorePermit>,
-    _all: OwnedSemaphorePermit,
+    _partition: Option<OwnedSemaphorePermit>,
+    _all: Option<OwnedSemaphorePermit>,
 }
 
-/// A seat pool: `all` is the hard capacity, `shared` is the part non-system callers may
-/// use (capacity minus the reserved seats), and each non-system user is further limited
-/// by its own semaphore. System callers take only from `all`, so while non-system holders
-/// are bounded by `shared` the reserved seats are always free for them.
+/// A seat pool: `all` is the hard capacity and splits into `shared` (what ordinary callers
+/// may use: capacity minus the reserved seats) and `reserved` (the partition all reserved
+/// identities together draw from). Each caller is further limited by its own semaphore
+/// (`user_share` for ordinary users, `reserved_user_share` by class for reserved
+/// identities). Ordinary use is bounded by `shared` and reserved use by `reserved`, so
+/// neither can reduce the other's seats. Exempt callers take nothing.
 struct Pool {
     all: Arc<Semaphore>,
     shared: Arc<Semaphore>,
+    reserved: Arc<Semaphore>,
     user_share: usize,
+    mutating: bool,
     users: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl Pool {
-    fn new(capacity: usize, reserved: usize, user_share: usize) -> Arc<Self> {
+    fn new(capacity: usize, reserved: usize, user_share: usize, mutating: bool) -> Arc<Self> {
         Arc::new(Pool {
             all: Arc::new(Semaphore::new(capacity)),
             shared: Arc::new(Semaphore::new(capacity.saturating_sub(reserved))),
+            reserved: Arc::new(Semaphore::new(reserved)),
             user_share,
+            mutating,
             users: Mutex::new(HashMap::new()),
         })
     }
 
-    fn user_semaphore(&self, user: &str) -> Arc<Semaphore> {
+    fn user_semaphore(&self, user: &str, share: usize) -> Arc<Semaphore> {
         let mut users = self.users.lock().unwrap();
         if users.len() >= USER_MAP_PRUNE_AT {
             // An Arc held elsewhere is a live permit or a queued waiter.
@@ -178,23 +214,40 @@ impl Pool {
         Arc::clone(
             users
                 .entry(user.to_owned())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.user_share))),
+                .or_insert_with(|| Arc::new(Semaphore::new(share))),
         )
     }
 
+    /// The caller's own semaphore and the partition it draws from, or `None` for the exempt.
+    fn limits(&self, caller: &Caller) -> Option<(Arc<Semaphore>, Arc<Semaphore>)> {
+        match caller {
+            Caller::Exempt => None,
+            Caller::Reserved(name, class) => Some((
+                self.user_semaphore(name, reserved_user_share(*class, self.mutating)),
+                Arc::clone(&self.reserved),
+            )),
+            Caller::Other(name) => Some((
+                self.user_semaphore(name, self.user_share),
+                Arc::clone(&self.shared),
+            )),
+        }
+    }
+
     fn try_acquire(&self, caller: &Caller) -> Option<Seat> {
-        let (user, shared) = match caller {
-            Caller::System => (None, None),
-            Caller::Other(name) => (
-                Some(self.user_semaphore(name).try_acquire_owned().ok()?),
-                Some(Arc::clone(&self.shared).try_acquire_owned().ok()?),
-            ),
+        let Some((user, partition)) = self.limits(caller) else {
+            return Some(Seat {
+                _user: None,
+                _partition: None,
+                _all: None,
+            });
         };
+        let user = user.try_acquire_owned().ok()?;
+        let partition = partition.try_acquire_owned().ok()?;
         let all = Arc::clone(&self.all).try_acquire_owned().ok()?;
         Some(Seat {
-            _user: user,
-            _shared: shared,
-            _all: all,
+            _user: Some(user),
+            _partition: Some(partition),
+            _all: Some(all),
         })
     }
 
@@ -212,18 +265,16 @@ impl Pool {
         let _waiter = WaiterGuard::try_new(Arc::clone(waiters))?;
 
         let wait = async {
-            let (user, shared) = match caller {
-                Caller::System => (None, None),
-                Caller::Other(name) => (
-                    Some(self.user_semaphore(name).acquire_owned().await.ok()?),
-                    Some(Arc::clone(&self.shared).acquire_owned().await.ok()?),
-                ),
-            };
+            let (user, partition) = self
+                .limits(caller)
+                .expect("exempt callers always take the fast path");
+            let user = user.acquire_owned().await.ok()?;
+            let partition = partition.acquire_owned().await.ok()?;
             let all = Arc::clone(&self.all).acquire_owned().await.ok()?;
             Some(Seat {
-                _user: user,
-                _shared: shared,
-                _all: all,
+                _user: Some(user),
+                _partition: Some(partition),
+                _all: Some(all),
             })
         };
         tokio::time::timeout(MUTATING_WAIT_TIMEOUT, wait)
@@ -247,8 +298,8 @@ pub struct InflightLayer {
 impl InflightLayer {
     pub fn new() -> Self {
         InflightLayer {
-            inflight: Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT),
-            mutating: Pool::new(MAX_MUTATING, RESERVED_MUTATING, USER_SHARE_MUTATING),
+            inflight: Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT, false),
+            mutating: Pool::new(MAX_MUTATING, RESERVED_MUTATING, USER_SHARE_MUTATING, true),
             mutating_waiters: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -1267,6 +1318,140 @@ mod tests {
         open.send(true).unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_reserved_identity_is_capped_per_identity_but_admin_is_not() {
+        // A leaked controller token must not be able to take every read seat: reserved
+        // identities are bounded per identity, while the admin (system:masters) stays
+        // exempt as in upstream's exempt priority level.
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let sa = "system:serviceaccount:kube-system:deployment-controller";
+        let _held = hold_seats(
+            &layer,
+            &gate,
+            Method::GET,
+            "/api/v1/pods",
+            sa,
+            reserved_user_share(WatchClass::ControllerSa, false),
+        )
+        .await;
+
+        assert_eq!(
+            status_of(&layer, request_as(Method::GET, "/api/v1/pods", sa)).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a reserved identity past its per-identity cap must be rejected"
+        );
+        assert_eq!(
+            status_of(
+                &layer,
+                request_as(
+                    Method::GET,
+                    "/api/v1/pods",
+                    "system:serviceaccount:kube-system:replicaset-controller"
+                )
+            )
+            .await,
+            StatusCode::OK,
+            "another reserved identity keeps its own budget"
+        );
+        let _all = exhaust(&layer.inflight);
+        assert_eq!(
+            status_of(&layer, request_as(Method::GET, "/api/v1/pods", "admin")).await,
+            StatusCode::OK,
+            "admin is exempt even with the pool exhausted"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reserved_identity_cannot_exceed_its_write_share() {
+        let layer = InflightLayer::new();
+        let (open, gate) = tokio::sync::watch::channel(false);
+        let node = "system:node:n1";
+        let _held = hold_seats(
+            &layer,
+            &gate,
+            Method::PUT,
+            "/api/v1/nodes/n1/status",
+            node,
+            reserved_user_share(WatchClass::Node, true),
+        )
+        .await;
+
+        let over = {
+            let layer = layer.clone();
+            tokio::spawn(async move {
+                status_of(
+                    &layer,
+                    request_as(Method::PUT, "/api/v1/nodes/n1/status", node),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(MUTATING_WAIT_TIMEOUT + Duration::from_secs(1)).await;
+        assert_eq!(
+            over.await.unwrap(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a reserved identity past its write share must not be admitted"
+        );
+        open.send(true).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserved_identities_at_their_caps_never_reduce_ordinary_seats() {
+        // Per-identity caps below the partition are not enough: three or more reserved
+        // identities at their caps used to overflow the partition into the seats ordinary
+        // users share, so a busy control plane would 429 tenants.
+        for mutating in [false, true] {
+            let layer = InflightLayer::new();
+            let (open, gate) = tokio::sync::watch::channel(false);
+            let (method, uri, pool, reserved, capacity) = if mutating {
+                (
+                    Method::PUT,
+                    "/api/v1/namespaces/a/configmaps/c",
+                    &layer.mutating,
+                    RESERVED_MUTATING,
+                    MAX_MUTATING,
+                )
+            } else {
+                (
+                    Method::GET,
+                    "/api/v1/pods",
+                    &layer.inflight,
+                    RESERVED_INFLIGHT,
+                    MAX_INFLIGHT,
+                )
+            };
+            let mut held = Vec::new();
+            for user in [
+                "system:kube-controller-manager",
+                "system:kube-scheduler",
+                "system:node:n1",
+                "system:node:n2",
+                "system:node:n3",
+            ] {
+                let n = reserved_user_share(watch_class(user), mutating);
+                held.push(hold_seats(&layer, &gate, method.clone(), uri, user, n).await);
+            }
+
+            assert!(
+                pool.all.available_permits() >= capacity - reserved,
+                "every ordinary seat must stay available in the hard capacity (mutating={mutating})"
+            );
+            assert_eq!(
+                pool.reserved.available_permits(),
+                0,
+                "setup (mutating={mutating}): the reserved partition must be full"
+            );
+            assert_eq!(
+                status_of(&layer, request_as(method, uri, "tenant")).await,
+                StatusCode::OK,
+                "a tenant must be admitted while the control plane is at its caps"
+            );
+            open.send(true).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn health_probes_pass_when_every_seat_is_taken() {
         // A kubelet that gets 429 from /livez restarts a merely busy apiserver.
@@ -1474,7 +1659,7 @@ mod tests {
     fn per_user_semaphore_map_stays_bounded_under_minted_identities() {
         // ServiceAccount names are attacker-mintable; an entry per name forever is a slow
         // memory leak.
-        let pool = Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT);
+        let pool = Pool::new(MAX_INFLIGHT, RESERVED_INFLIGHT, USER_SHARE_INFLIGHT, false);
         for i in 0..USER_MAP_PRUNE_AT * 3 {
             let seat = pool.try_acquire(&Caller::Other(format!("sa-{i}")));
             assert!(seat.is_some());
