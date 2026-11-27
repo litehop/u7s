@@ -617,8 +617,28 @@ fn request_options(ctx: &AdmissionContext<'_>) -> serde_json::Value {
     };
     REQUEST_QUERY
         .try_with(|query| write_options(kind, query))
-        .unwrap_or_else(|_| write_options(kind, ""))
+        .unwrap_or_else(|_| {
+            report_scope_miss();
+            write_options(kind, "")
+        })
 }
+
+/// An admission read outside `with_request_query` sends stub options to webhooks; a caller
+/// spawned off the request task must not do that silently.
+fn report_scope_miss() {
+    if SCOPE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::warn!(
+            "admission: request options read outside the request scope; sending stub options"
+        );
+    }
+    // Unit tests drive handlers directly, without the request middleware's scope.
+    debug_assert!(
+        cfg!(test),
+        "admission request options read outside the request scope"
+    );
+}
+
+static SCOPE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Fetch the namespace object labels from the store.
 ///
@@ -3960,6 +3980,19 @@ mod tests {
             dry_run: false,
             options: None,
         }
+    }
+
+    /// A CREATE/UPDATE admission caller spawned off the request task would otherwise send
+    /// webhooks stub options (no dryRun/fieldManager) with nothing to show for it.
+    #[tokio::test]
+    async fn options_read_outside_request_scope_is_reported_not_silent() {
+        let ctx = old_object_ctx("", "pods");
+        let before = SCOPE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        request_options(&ctx);
+        assert!(
+            SCOPE_MISSES.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "an unscoped options read must be counted/reported"
+        );
     }
 
     /// With no webhook or policy configured nothing can read oldObject, so PATCH handlers must
