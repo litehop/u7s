@@ -836,6 +836,7 @@ async fn build_new_crd<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(headers),
+            options: None,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(state, obj_val, None, &admission_ctx).await?;
@@ -1045,6 +1046,7 @@ pub async fn replace_crd<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mut mutated =
@@ -1147,8 +1149,9 @@ pub async fn delete_crd<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    crate::admission::admit_delete(&state, &existing, &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &existing, &delete_opts, &admission_ctx).await?;
 
     // Dry-run: validation passed; return the would-be Success status without persisting or
     // running any of the cascade side effects (schema/conversion-cache evict, watch-ring
@@ -1829,6 +1832,7 @@ pub async fn patch_crd<S: Store>(
                     "extra": user.extra,
                 })),
                 dry_run: is_dry_run_header(&headers),
+                options: None,
             };
             let obj_val =
                 serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;

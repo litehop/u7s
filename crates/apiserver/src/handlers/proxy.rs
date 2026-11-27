@@ -666,6 +666,7 @@ pub async fn resolve_attach_target<S: Store>(
         operation: "CONNECT",
         user_info: None,
         dry_run: false,
+        options: None,
     };
     // Admission for a CONNECT subresource reviews the PodAttachOptions the
     // client requested (stdin/container/...), not the pod itself — matching
@@ -1240,6 +1241,7 @@ pub async fn resolve_exec_target<S: Store>(
         operation: "CONNECT",
         user_info: None,
         dry_run: false,
+        options: None,
     };
     run_validating_webhooks(state, &pod, None, &admission_ctx).await?;
 

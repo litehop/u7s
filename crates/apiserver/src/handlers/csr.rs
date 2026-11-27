@@ -561,6 +561,7 @@ pub async fn create_csr<S: Store>(
             "extra": user.extra.clone(),
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     finalize_csr_create(&state, &mut obj.body, &user).await?;
@@ -617,6 +618,7 @@ pub async fn create_csr<S: Store>(
                         "extra": user.extra.clone(),
                     })),
                     dry_run: is_dry_run_header(&headers),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
