@@ -34,12 +34,6 @@ fn all() -> super::generic::CollectionQuery {
     serde_json::from_value(json!({})).unwrap()
 }
 
-fn no_grace() -> Query<super::pods::GracePeriodQuery> {
-    Query(super::pods::GracePeriodQuery {
-        grace_period_seconds: None,
-    })
-}
-
 /// The request is a 409 with upstream's precondition text and the object is untouched: not
 /// deleted and not stamped with a deletionTimestamp.
 async fn assert_precondition_refused<T>(
@@ -153,7 +147,6 @@ async fn delete_pod_honours_preconditions_on_soft_and_hard_delete() {
             State(state_of(&mock)),
             Path(("default".to_string(), "p".to_string())),
             Extension(user()),
-            no_grace(),
             HeaderMap::new(),
             wrong_uid(),
         )
@@ -180,7 +173,6 @@ async fn delete_collection_pods_honours_preconditions() {
         Path(("default".to_string(),)),
         Extension(user()),
         Query(all()),
-        no_grace(),
         HeaderMap::new(),
         wrong_uid(),
     )
@@ -391,7 +383,6 @@ async fn deleting_an_object_deleted_mid_request_is_404() {
         State(state_of(&mock)),
         Path(("default".to_string(), "p".to_string())),
         Extension(user()),
-        no_grace(),
         HeaderMap::new(),
         Bytes::new(),
     )

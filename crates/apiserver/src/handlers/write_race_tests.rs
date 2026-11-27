@@ -802,9 +802,6 @@ async fn delete_pod_hard_delete_keeps_a_finalizer_added_after_the_read() {
         State(state),
         Path(("default".to_string(), "p".to_string())),
         Extension(user()),
-        Query(crate::handlers::pods::GracePeriodQuery {
-            grace_period_seconds: None,
-        }),
         HeaderMap::new(),
         Bytes::new(),
     )
@@ -882,9 +879,6 @@ async fn delete_collection_pods_keeps_a_finalizer_added_after_the_list() {
             send_initial_events: None,
             allow_watch_bookmarks: None,
             timeout_seconds: None,
-        }),
-        Query(crate::handlers::pods::GracePeriodQuery {
-            grace_period_seconds: None,
         }),
         HeaderMap::new(),
         Bytes::new(),
