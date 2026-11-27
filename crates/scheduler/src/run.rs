@@ -1239,11 +1239,17 @@ fn handle_pod_event(
                     // emit FailedScheduling onto a pod that is actually
                     // running fine, and do not roll back its tally
                     // reservation (see `bind_reserved_node`'s doc comment).
-                    info!(
-                        "bind for {key} rejected as already-assigned: {e} — pod is already \
-                         correctly bound from an earlier bind; treating as a no-op, not a \
-                         scheduling failure"
-                    );
+                    match &e {
+                        BindError::StalePod(_) => info!(
+                            "bind for {key} rejected as stale (pod recreated since the \
+                             decision): {e} — treating as a no-op, not a scheduling failure"
+                        ),
+                        _ => info!(
+                            "bind for {key} rejected as already-assigned: {e} — pod is already \
+                             correctly bound from an earlier bind; treating as a no-op, not a \
+                             scheduling failure"
+                        ),
+                    }
                     SchedulingOutcome::Skipped
                 }
                 Err(e) => SchedulingOutcome::Done(Err(e.into())),
