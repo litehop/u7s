@@ -232,7 +232,11 @@ pub(crate) mod cases {
                 .method(method)
                 .uri(uri)
                 .header("content-type", content_type)
-                .body(Body::from(body.to_string()))
+                .body(if body.is_null() {
+                    Body::empty()
+                } else {
+                    Body::from(body.to_string())
+                })
                 .unwrap();
             req.extensions_mut().insert(crate::auth::UserInfo {
                 username: "alice".into(),
@@ -2312,8 +2316,8 @@ pub(crate) mod cases {
                 let r = &reqs[0];
                 assert_eq!(r["operation"], "DELETE", "{label}");
                 assert!(
-                    r["object"].is_null(),
-                    "{label}: object must be null on DELETE: {r}"
+                    r.as_object().unwrap().contains_key("object") && r["object"].is_null(),
+                    "{label}: object must be present as null on DELETE: {r}"
                 );
                 assert_eq!(r["oldObject"]["metadata"]["name"], "o", "{label}: {r}");
                 assert_eq!(r["oldObject"]["kind"], kind, "{label}: {r}");
@@ -2326,6 +2330,124 @@ pub(crate) mod cases {
                     "{label}: options must be the full DeleteOptions the client sent"
                 );
             }
+        }
+    }
+
+    /// A webhook that gates collection deletes sees one request per stored item, each with that
+    /// item as `oldObject` and `object` null; a single call carrying the whole list, or the same
+    /// item twice, makes the policy judge the wrong objects.
+    #[tokio::test]
+    async fn collection_delete_calls_the_webhook_once_per_item_with_that_items_old_object() {
+        let c = Cluster::new().await;
+        for name in ["a", "b", "c"] {
+            c.create(
+                "/api/v1/namespaces/default/configmaps",
+                json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}}),
+            )
+            .await;
+        }
+        let hook = spawn_hook(|_| json!({"allowed": true})).await;
+        register_webhook(
+            &c.store,
+            false,
+            "d",
+            &hook.url,
+            "",
+            &["configmaps"],
+            &["DELETE"],
+        )
+        .await;
+
+        let (status, resp) = c
+            .call(
+                "DELETE",
+                "/api/v1/namespaces/default/configmaps",
+                "application/json",
+                json!({"gracePeriodSeconds": 3}),
+            )
+            .await;
+        assert!(status.is_success(), "{status} {resp}");
+
+        let reqs = hook.requests();
+        let mut names: Vec<String> = reqs
+            .iter()
+            .map(|r| r["oldObject"]["metadata"]["name"].as_str().unwrap().into())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a", "b", "c"], "one call per item: {reqs:?}");
+        for r in &reqs {
+            assert!(
+                r.as_object().unwrap().contains_key("object") && r["object"].is_null(),
+                "object must be present as null: {r}"
+            );
+            assert_eq!(
+                r["options"]["gracePeriodSeconds"], 3,
+                "each per-item call carries the collection request's DeleteOptions: {r}"
+            );
+        }
+    }
+
+    /// Pod and CRD deletes have their own handlers; a webhook on either must still see object
+    /// null (present), the stored object as oldObject, and a query-only `?dryRun=All` surfaced
+    /// both as the top-level dryRun and in `options.dryRun`.
+    #[tokio::test]
+    async fn pod_and_crd_deletes_with_query_only_dry_run_report_upstreams_delete_review() {
+        for (group, resource, uri, kind) in [
+            ("", "pods", "/api/v1/namespaces/default/pods/p", "Pod"),
+            (
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com",
+                "CustomResourceDefinition",
+            ),
+        ] {
+            let c = Cluster::new().await;
+            if kind == "Pod" {
+                c.create_pod("p").await;
+            } else {
+                c.create(
+                    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                    crd("widgets", "Widget", "Namespaced"),
+                )
+                .await;
+            }
+            let hook = spawn_hook(|_| json!({"allowed": true})).await;
+            register_webhook(
+                &c.store,
+                false,
+                "d",
+                &hook.url,
+                group,
+                &[resource],
+                &["DELETE"],
+            )
+            .await;
+
+            let (status, resp) = c
+                .call(
+                    "DELETE",
+                    &format!("{uri}?dryRun=All"),
+                    "application/json",
+                    Value::Null,
+                )
+                .await;
+            assert!(status.is_success(), "{kind}: {status} {resp}");
+
+            let reqs = hook.requests();
+            assert_eq!(reqs.len(), 1, "{kind}: {reqs:?}");
+            let r = &reqs[0];
+            assert!(
+                r.as_object().unwrap().contains_key("object") && r["object"].is_null(),
+                "{kind}: object must be present as null: {r}"
+            );
+            assert_eq!(r["oldObject"]["kind"], kind, "{kind}: {r}");
+            assert_eq!(r["dryRun"], true, "{kind}: {r}");
+            assert_eq!(
+                r["options"]["dryRun"],
+                json!(["All"]),
+                "{kind}: a query-only dryRun must reach the webhook's options: {r}"
+            );
+            assert_eq!(r["options"]["kind"], "DeleteOptions", "{kind}: {r}");
         }
     }
 }
