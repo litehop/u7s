@@ -3021,6 +3021,22 @@ pub(crate) async fn patch_pod_status<S: Store>(
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+        // `metadata.uid` in the patch body pins it to one pod incarnation, as the kubelet's
+        // status patches rely on: a same-name recreation must not receive a stale writer's patch.
+        if let Some(uid) = patch["metadata"]["uid"].as_str().filter(|u| !u.is_empty()) {
+            crate::types::Preconditions {
+                uid: Some(uid.to_owned()),
+                resource_version: None,
+            }
+            .check(&current_obj.body)
+            .map_err(|msg| {
+                Status::conflict(format!(
+                    "Operation cannot be fulfilled on pods \"{name}\": StorageError: invalid \
+                     object, Code: 4, Key: {key}, ResourceVersion: 0, AdditionalErrorMsg: {msg}"
+                ))
+            })?;
+        }
+
         let before_write = current_obj.body.clone();
         let ssa_plan = super::status::plan_status_apply(
             &headers,
@@ -16263,6 +16279,73 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A status patch pinned to `metadata.uid` must not land on a same-name recreation: the
+    /// scheduler stamps DisruptionTarget on a preemption victim this way, and the new pod must
+    /// not be marked as disrupted for a plan made about its predecessor.
+    #[tokio::test]
+    async fn patch_pod_status_with_stale_uid_is_a_409_and_leaves_the_pod_untouched() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1", "uid": "uid-new"
+            }}),
+        )
+        .await;
+        let patch_with = |uid: &str| {
+            let state = state.clone();
+            let body = serde_json::json!({
+                "metadata": {"uid": uid},
+                "status": {"conditions": [{"type": "DisruptionTarget", "status": "True"}]}
+            });
+            async move {
+                patch_pod_status(
+                    State(state),
+                    Path(("default".to_string(), "my-pod".to_string())),
+                    None,
+                    {
+                        let mut h = HeaderMap::new();
+                        h.insert(
+                            header::CONTENT_TYPE,
+                            "application/strategic-merge-patch+json".parse().unwrap(),
+                        );
+                        h
+                    },
+                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+
+        let err = patch_with("uid-old")
+            .await
+            .expect_err("a patch pinned to a replaced UID must be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            u7s_scheduler::is_uid_precondition_conflict(409, &err.1.message),
+            "unexpected message: {}",
+            err.1.message
+        );
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored["status"]["conditions"].is_null(),
+            "the refused patch must not stamp the recreated pod: {stored}"
+        );
+
+        patch_with("uid-new")
+            .await
+            .expect("a patch pinned to the live UID applies");
     }
 
     async fn pod_status_apply(

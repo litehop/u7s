@@ -261,8 +261,13 @@ async fn evict_victims(
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
         // for the higher-priority pod matters more than the condition.
-        if let Err(e) =
-            patch_pod_status(client, v_ns, v_name, &disruption_target_patch(pod_name)).await
+        if let Err(e) = patch_pod_status(
+            client,
+            v_ns,
+            v_name,
+            &disruption_target_patch(pod_name, victim_uid),
+        )
+        .await
         {
             error!(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
@@ -2288,6 +2293,8 @@ mod tests {
         /// UID of the victim pod as the mock apiserver sees it: a DELETE whose
         /// `preconditions.uid` differs is refused with the 409 the real apiserver returns.
         live_victim_uid: Mutex<Option<String>>,
+        /// Live UID of the pod each accepted status PATCH landed on.
+        stamped_pods: Mutex<Vec<String>>,
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
@@ -2373,10 +2380,31 @@ mod tests {
                         (format!("{bind_status} bind-response"), bind_body.to_owned())
                     } else if method == "PATCH" && path.ends_with("/status") {
                         counts.patch_status.fetch_add(1, Ordering::SeqCst);
-                        (
-                            "200 OK".to_owned(),
-                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        let sent_uid = serde_json::from_str::<serde_json::Value>(
+                            request.split("\r\n\r\n").nth(1).unwrap_or_default(),
                         )
+                        .ok()
+                        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned));
+                        let live = counts.live_victim_uid.lock().unwrap().clone();
+                        match (live, sent_uid) {
+                            (Some(live), Some(sent)) if sent != live => (
+                                "409 Conflict".to_owned(),
+                                format!(
+                                    r#"{{"kind":"Status","reason":"Conflict","message":"Precondition failed: UID in precondition: {sent}, UID in object meta: {live}"}}"#
+                                ),
+                            ),
+                            (live, _) => {
+                                counts
+                                    .stamped_pods
+                                    .lock()
+                                    .unwrap()
+                                    .push(live.unwrap_or_default());
+                                (
+                                    "200 OK".to_owned(),
+                                    r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                                )
+                            }
+                        }
                     } else if method == "DELETE" {
                         let hook = counts.on_delete.lock().unwrap().take();
                         if let Some(hook) = hook {
@@ -2535,6 +2563,12 @@ mod tests {
         assert!(
             format!("{err:#}").contains("recreated"),
             "unexpected error: {err:#}"
+        );
+        let stamped = counts.stamped_pods.lock().unwrap().clone();
+        assert!(
+            stamped.is_empty(),
+            "the recreated pod must not be marked DisruptionTarget for a plan about its \
+             predecessor: {stamped:?}"
         );
         let bodies = counts.delete_bodies.lock().unwrap().clone();
         assert_eq!(

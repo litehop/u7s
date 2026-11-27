@@ -5688,8 +5688,13 @@ const PREEMPTION_BY_SCHEDULER_REASON: &str = "PreemptionByScheduler";
 /// (test/e2e/framework/pod/resource.go) only checks the condition's `type`,
 /// but a made-up reason would misrepresent to `kubectl describe pod` who
 /// evicted the pod and why.
-pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
-    serde_json::json!({
+///
+/// A non-empty `victim_uid` pins the patch to that incarnation through `metadata.uid` (the
+/// pod status endpoint takes no JSON Patch, so a `test` op is not available; the kubelet's own
+/// status patches use the same body field): the victim may have been recreated since the
+/// plan, and the new pod must not be marked disrupted.
+pub fn disruption_target_patch(pending_pod_name: &str, victim_uid: &str) -> Value {
+    let mut patch = serde_json::json!({
         "status": {
             "conditions": [{
                 "type": "DisruptionTarget",
@@ -5700,7 +5705,11 @@ pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
                 ),
             }]
         }
-    })
+    });
+    if !victim_uid.is_empty() {
+        patch["metadata"] = serde_json::json!({ "uid": victim_uid });
+    }
+    patch
 }
 
 /// Build the status-subresource PATCH that stamps `status.nominatedNodeName`
@@ -12789,7 +12798,7 @@ mod tests {
     /// `DisruptionTarget`/`True`/`PreemptionByScheduler`.
     #[test]
     fn disruption_target_patch_sets_condition_type_status_and_reason() {
-        let patch = disruption_target_patch("preemptor-pod");
+        let patch = disruption_target_patch("preemptor-pod", "uid-v");
         let condition = &patch["status"]["conditions"][0];
         assert_eq!(condition["type"], "DisruptionTarget");
         assert_eq!(condition["status"], "True");
@@ -12804,8 +12813,18 @@ mod tests {
     /// The message must name the preemptor pod so a user reading `kubectl
     /// describe pod` on the victim can tell which pod displaced it.
     #[test]
+    fn disruption_target_patch_is_pinned_to_the_victim_uid_when_known() {
+        assert_eq!(
+            disruption_target_patch("p", "uid-v")["metadata"]["uid"],
+            "uid-v",
+            "an unpinned patch stamps a same-name recreation of the victim"
+        );
+        assert!(disruption_target_patch("p", "")["metadata"].is_null());
+    }
+
+    #[test]
     fn disruption_target_patch_message_names_the_preemptor() {
-        let patch = disruption_target_patch("high-priority-pod");
+        let patch = disruption_target_patch("high-priority-pod", "uid-v");
         let message = patch["status"]["conditions"][0]["message"]
             .as_str()
             .expect("message must be a string");
