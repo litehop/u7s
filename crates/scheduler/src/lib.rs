@@ -1836,11 +1836,19 @@ pub struct NodeTally {
     /// "namespace/name" -> (UID, when its DELETED was applied) of the latest pod incarnation seen
     /// deleted. A scheduling attempt still in flight for that incarnation must not register
     /// per-pod state afterwards: nothing would ever clean it up. Entries older than
-    /// `DELETED_POD_TTL` are pruned; no attempt outlives that.
+    /// `DELETED_POD_TTL` are pruned, and at most `DELETED_POD_CAP` are kept.
     deleted_pods: std::collections::HashMap<String, (String, std::time::Instant)>,
 }
 
+/// Far above every interval the tombstone must outlast: `RESYNC_INTERVAL` (30s, the PVC-waiter
+/// re-drive), `POD_MAX_BACKOFF` (10s) and `FAILED_EVENT_REPEAT_WINDOW` (60s, the longest) apply
+/// per scheduling attempt, and an attempt is a bounded run of API calls
+/// (`MAX_PREEMPTION_ATTEMPTS` = 5 plans, each a handful of requests). 600s is 10x the longest.
 const DELETED_POD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A churn burst can delete more pods than fit in the TTL window; the oldest tombstones go
+/// first since their attempts are the likeliest to have finished.
+const DELETED_POD_CAP: usize = 10_000;
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
 /// `NodeTally::resolve_csi_driver`.
@@ -1944,10 +1952,7 @@ impl NodeTally {
             self.remove_event_pod(&key, &uid);
             self.failures.clear(&key, &uid);
             if !uid.is_empty() {
-                let now = std::time::Instant::now();
-                self.deleted_pods
-                    .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
-                self.deleted_pods.insert(key.clone(), (uid.clone(), now));
+                self.tombstone(&key, &uid, std::time::Instant::now());
             }
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key, &uid);
@@ -2092,6 +2097,23 @@ impl NodeTally {
         if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
             self.remove_pod(&key);
         }
+    }
+
+    fn tombstone(&mut self, key: &str, uid: &str, now: std::time::Instant) {
+        self.deleted_pods
+            .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
+        if self.deleted_pods.len() >= DELETED_POD_CAP && !self.deleted_pods.contains_key(key) {
+            let oldest = self
+                .deleted_pods
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.deleted_pods.remove(&oldest);
+            }
+        }
+        self.deleted_pods
+            .insert(key.to_owned(), (uid.to_owned(), now));
     }
 
     fn is_deleted_incarnation(&self, key: &str, uid: &str) -> bool {
@@ -11340,6 +11362,27 @@ mod tests {
             tally.apply_pvc_event(&pvc_added()).is_empty(),
             "a deleted pod's late PVC wait leaked a waiter"
         );
+    }
+
+    /// A burst of deletes inside the TTL window must not grow the scheduler's memory without
+    /// bound, and the pods dropped must be the oldest, not the ones just deleted.
+    #[test]
+    fn deleted_pod_tombstones_stay_capped_under_churn_dropping_the_oldest() {
+        let mut tally = NodeTally::default();
+        let base = std::time::Instant::now();
+        let total = DELETED_POD_CAP + 500;
+        for i in 0..total {
+            tally.tombstone(
+                &format!("default/p{i}"),
+                &format!("uid{i}"),
+                base + std::time::Duration::from_millis(i as u64),
+            );
+            assert!(tally.deleted_pods.len() <= DELETED_POD_CAP);
+        }
+        assert_eq!(tally.deleted_pods.len(), DELETED_POD_CAP);
+        assert!(!tally.is_deleted_incarnation("default/p0", "uid0"));
+        let last = total - 1;
+        assert!(tally.is_deleted_incarnation(&format!("default/p{last}"), &format!("uid{last}")));
     }
 
     /// The tombstone is per incarnation: a same-name recreation still gets
