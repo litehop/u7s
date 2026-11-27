@@ -62,8 +62,10 @@ pub async fn http_post_json(
 pub async fn http_delete(
     client: &HyperApiClient,
     path: &str,
+    options: &Value,
 ) -> anyhow::Result<(StatusCode, String)> {
-    client.request(Method::DELETE, path, None).await
+    let body_str = serde_json::to_string(options)?;
+    client.request(Method::DELETE, path, Some(body_str)).await
 }
 
 /// PATCH with `application/strategic-merge-patch+json`, the content type
@@ -4038,10 +4040,14 @@ pub fn should_retry_without_preempting(err: &PickNodeError) -> bool {
 
 /// A viable preemption outcome: the node to bind the pending pod to, and the
 /// "namespace/name" keys of the pods that must be evicted first to free a slot.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct PreemptionPlan {
     pub node_name: String,
     pub victims: Vec<String>,
+    /// `(key, uid)` of each victim still tallied when the plan was committed
+    /// (`verify_and_reserve_preemption`). Eviction deletes exactly these
+    /// incarnations; a victim already gone at commit time is not evicted.
+    pub victim_uids: Vec<(String, String)>,
 }
 
 /// Search every node that qualifies for `pod` (see `node_qualifies_for_pod`)
@@ -4134,10 +4140,10 @@ pub fn find_preemption_plan(
         .expect("tally lock poisoned")
         .tallied_pod_labels();
 
-    let (index, plan) =
+    let (index, mut plan) =
         find_preemption_candidate(&list, pod, &tallied_pods, &node_labels_by_name, tally)
             .ok_or(FindPreemptionPlanError::NoViablePlan)?;
-    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
+    plan.victim_uids = verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
         .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
 
     Ok(plan)
@@ -4299,6 +4305,7 @@ fn find_preemption_candidate(
                 PreemptionPlan {
                     node_name: node_name.clone(),
                     victims,
+                    victim_uids: Vec::new(),
                 },
             ));
         }
@@ -4336,7 +4343,7 @@ fn verify_and_reserve_preemption(
     node: &NodeItem,
     plan: &PreemptionPlan,
     tally: &std::sync::Mutex<NodeTally>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let capacity = pod_count_capacity(node);
     let mut tally_guard = tally.lock().expect("tally lock poisoned");
     let current_pods = tally_guard.pods_on(&plan.node_name);
@@ -4405,8 +4412,16 @@ fn verify_and_reserve_preemption(
     // Claim the victims under this SAME lock acquisition, not a later one —
     // otherwise a fresher concurrent plan's search could still see them as
     // available in the gap between this commit and a separate claim call.
+    let victim_uids = plan
+        .victims
+        .iter()
+        .filter_map(|key| {
+            let (ns, name) = key.split_once('/')?;
+            Some((key.clone(), tally_guard.tallied_uid(ns, name)?))
+        })
+        .collect();
     tally_guard.claim_victims(&plan.victims);
-    Ok(())
+    Ok(victim_uids)
 }
 
 /// Re-check, under the CURRENT tally, that `pod`'s already-`assume`d
@@ -5698,16 +5713,43 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
 /// upstream's e2e preemption test (`test/e2e/scheduling/preemption.go`,
 /// 1s poll interval) to ever observe the intermediate
 /// "DeletionTimestamp set, still Gettable" state it asserts on.
-pub async fn delete_pod(client: &ApiClient, namespace: &str, pod_name: &str) -> anyhow::Result<()> {
+///
+/// The DELETE carries a UID precondition: the victim named by the plan may
+/// since have been deleted and recreated under the same name, and the new pod
+/// must not be evicted for a plan made about its predecessor. A refused
+/// precondition is an error, so the caller rolls the plan back and re-plans
+/// instead of treating the freed capacity as real. Upstream's
+/// `util.DeletePod` (pkg/scheduler/util/utils.go) sends empty `DeleteOptions{}`;
+/// the precondition is a deliberate tightening.
+pub async fn delete_pod(
+    client: &ApiClient,
+    namespace: &str,
+    pod_name: &str,
+    uid: &str,
+) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
     let start = std::time::Instant::now();
-    let (status, body) = http_delete(client, &path).await?;
+    let (status, body) = http_delete(client, &path, &victim_delete_options(uid)).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
+    if status == StatusCode::CONFLICT && body.contains("UID in precondition") {
+        bail!(
+            "victim {namespace}/{pod_name} was recreated since the plan (uid {uid} is gone): {body}"
+        );
+    }
     check_delete_response(status.as_u16())
         .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     info!("evicted pod {namespace}/{pod_name} (preemption)");
     Ok(())
+}
+
+/// `DeleteOptions` pinning the DELETE to one pod incarnation.
+pub fn victim_delete_options(uid: &str) -> Value {
+    serde_json::json!({
+        "kind": "DeleteOptions",
+        "apiVersion": "v1",
+        "preconditions": { "uid": uid },
+    })
 }
 
 /// Build the status-subresource PATCH path for a pod.
@@ -9394,6 +9436,7 @@ mod tests {
                 let plan = PreemptionPlan {
                     node_name: "worker-0".to_owned(),
                     victims: vec!["default/victim-a".to_owned(), "default/victim-b".to_owned()],
+                    ..Default::default()
                 };
                 std::thread::spawn(move || {
                     // Line every contender up so as many as possible call
@@ -9492,6 +9535,7 @@ mod tests {
                         let plan = PreemptionPlan {
                             node_name: "worker-0".to_owned(),
                             victims,
+                            ..Default::default()
                         };
                         if verify_and_reserve_preemption(&pod, &node, &plan, &tally).is_ok() {
                             return Some(plan.victims);
@@ -9591,6 +9635,7 @@ mod tests {
             // Named explicitly (not searched) so this test does not depend
             // on NodeTally's HashMap iteration order to pick filler-a.
             victims: vec!["default/filler-a".to_owned()],
+            ..Default::default()
         };
         verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
             .expect("evicting filler-a frees exactly enough room for preemptor-1");
@@ -9616,6 +9661,41 @@ mod tests {
              yet-evicted plan, so the second plan must fall through to the \
              only other eligible candidate (filler-b), never re-select \
              filler-a — got {victims2:?}"
+        );
+    }
+
+    /// The victim UIDs a plan evicts are the ones tallied when it is committed, not
+    /// whatever same-name pod exists when eviction later runs.
+    #[test]
+    fn committed_plan_records_the_victims_uid_at_plan_time() {
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "filler-a",
+            "uid-planned",
+            "worker-0",
+            100,
+            requests(1000, 0, 0),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "1".to_owned();
+        let mut pod = empty_pending_pod();
+        pod.priority = 1000;
+        pod.requests = requests(1000, 0, 0);
+        let plan = PreemptionPlan {
+            node_name: "worker-0".to_owned(),
+            victims: vec!["default/filler-a".to_owned(), "default/gone".to_owned()],
+            ..Default::default()
+        };
+        let uids = verify_and_reserve_preemption(&pod, &node, &plan, &tally)
+            .expect("evicting filler-a frees enough room");
+        assert_eq!(
+            uids,
+            vec![("default/filler-a".to_owned(), "uid-planned".to_owned())],
+            "an untallied victim is already gone and must not be evicted by name"
         );
     }
 
@@ -9651,6 +9731,7 @@ mod tests {
         let plan1 = PreemptionPlan {
             node_name: "worker-0".to_owned(),
             victims: vec!["default/filler-a".to_owned()],
+            ..Default::default()
         };
         verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
             .expect("evicting filler-a frees exactly enough room for preemptor-1");
@@ -12573,7 +12654,7 @@ mod tests {
             tokio_rustls::TlsConnector::from(Arc::new(client_config)),
             format!("https://127.0.0.1:{port}"),
         );
-        delete_pod(&client, "default", "victim")
+        delete_pod(&client, "default", "victim", "uid-1")
             .await
             .expect("delete_pod must succeed against a mock server that returns 200");
 
@@ -13368,6 +13449,7 @@ mod tests {
                 let plan = PreemptionPlan {
                     node_name: "worker-0".to_owned(),
                     victims: Vec::new(),
+                    ..Default::default()
                 };
                 std::thread::spawn(move || {
                     barrier.wait();
