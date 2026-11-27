@@ -2518,6 +2518,102 @@ pub(crate) mod cases {
         }
     }
 
+    /// The CSR create, scale and approval handlers build their own admission contexts; a
+    /// webhook keyed on `options.fieldManager` must still see the client's options there, as
+    /// `kubectl scale`/`certificate approve` send a field manager.
+    #[tokio::test]
+    async fn csr_scale_and_approval_reviews_carry_the_clients_options() {
+        use base64::Engine as _;
+        let csr_request = {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let pem = rcgen::CertificateParams::default()
+                .serialize_request(&key)
+                .unwrap()
+                .pem()
+                .unwrap();
+            base64::engine::general_purpose::STANDARD.encode(pem)
+        };
+        let csr_uri = "/apis/certificates.k8s.io/v1/certificatesigningrequests";
+        let csr = |name: &str| {
+            json!({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                "metadata": {"name": name},
+                "spec": {"request": csr_request, "signerName": "example.com/signer",
+                    "usages": ["digital signature"]}})
+        };
+        let cells = [
+            (
+                "POST csr",
+                "certificates.k8s.io",
+                "certificatesigningrequests",
+                "CREATE",
+                "CreateOptions",
+                csr_uri.to_string(),
+                "POST",
+                csr("c1"),
+            ),
+            (
+                "PUT deployments/scale",
+                "apps",
+                "deployments/scale",
+                "UPDATE",
+                "UpdateOptions",
+                "/apis/apps/v1/namespaces/default/deployments/d/scale".to_string(),
+                "PUT",
+                json!({"apiVersion": "autoscaling/v1", "kind": "Scale",
+                    "metadata": {"name": "d", "namespace": "default"},
+                    "spec": {"replicas": 3}}),
+            ),
+            (
+                "PUT csr approval",
+                "certificates.k8s.io",
+                "certificatesigningrequests/approval",
+                "UPDATE",
+                "UpdateOptions",
+                format!("{csr_uri}/c2/approval"),
+                "PUT",
+                json!({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                    "metadata": {"name": "c2"},
+                    "spec": {"request": csr_request, "signerName": "example.com/signer",
+                        "usages": ["digital signature"]},
+                    "status": {"conditions": [
+                        {"type": "Approved", "status": "True", "reason": "ok"}]}}),
+            ),
+        ];
+        for (label, group, resource, op, kind, uri, method, body) in cells {
+            let c = Cluster::new().await;
+            c.create(
+                "/apis/apps/v1/namespaces/default/deployments",
+                deployment("d"),
+            )
+            .await;
+            grant_signer_verb(&c.state, "alice", "approve", "example.com/signer");
+            c.store
+                .put(
+                    "/registry/certificates.k8s.io/certificatesigningrequests/c2",
+                    Bytes::from(csr("c2").to_string()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let hook = spawn_hook(|_| json!({"allowed": true})).await;
+            register_webhook(&c.store, false, "v", &hook.url, group, &[resource], &[op]).await;
+            let uri = format!("{uri}?fieldManager=my-mgr&fieldValidation=Ignore&dryRun=All");
+            let (status, resp) = c.call(method, &uri, "application/json", body).await;
+            assert!(status.is_success(), "{label}: {status} {resp}");
+            let reqs = hook.requests();
+            assert!(!reqs.is_empty(), "{label}: webhook never called");
+            for r in &reqs {
+                assert_eq!(
+                    r["options"],
+                    json!({"apiVersion": "meta.k8s.io/v1", "kind": kind,
+                        "fieldManager": "my-mgr", "fieldValidation": "Ignore",
+                        "dryRun": ["All"]}),
+                    "{label}: options must be what the client sent"
+                );
+            }
+        }
+    }
+
     /// CEL sees the same options as webhooks: a policy that requires
     /// `request.options.fieldManager` to be set (to stop anonymous writers) cannot work
     /// against a stub.
