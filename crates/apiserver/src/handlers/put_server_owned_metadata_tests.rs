@@ -235,3 +235,120 @@ async fn namespace_put_keeps_deletion_timestamp_so_finalizer_removal_still_delet
         "finalizer removal on a Terminating namespace must complete the deletion"
     );
 }
+
+fn merge_patch_headers() -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/merge-patch+json"),
+    );
+    h
+}
+
+/// A caller holding only `patch` must not start a delete by sending deletionTimestamp with empty
+/// finalizers: the drain decision reads the stored object's deletionTimestamp, so the live
+/// object survives and stays live (generic namespaced PATCH).
+#[tokio::test]
+async fn namespaced_patch_cannot_start_deletion_from_client_deletion_timestamp() {
+    let state = make_state();
+    let key = crate::keys::group_object_key("", "configmaps", Some("default"), "c1");
+    seed(
+        &state,
+        &key,
+        json!({"apiVersion":"v1","kind":"ConfigMap",
+            "metadata":{"name":"c1","namespace":"default","uid":"u1"},"data":{"a":"1"}}),
+    )
+    .await;
+
+    crate::handlers::resource::patch_namespaced_resource(
+        State(state.clone()),
+        Path((
+            "".into(),
+            "v1".into(),
+            "default".into(),
+            "configmaps".into(),
+            "c1".into(),
+        )),
+        Query(Default::default()),
+        user(),
+        merge_patch_headers(),
+        Bytes::from(
+            json!({"metadata":{"deletionTimestamp":DELETING_TS,"finalizers":[]}}).to_string(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+
+    let v = stored(&state, &key)
+        .await
+        .expect("a deletionTimestamp patch must not hard-delete a live object");
+    assert!(v["metadata"]["deletionTimestamp"].is_null());
+}
+
+/// Same invariant for pods.
+#[tokio::test]
+async fn pod_patch_cannot_start_deletion_from_client_deletion_timestamp() {
+    let state = make_state();
+    crate::handlers::test_support::seed_namespace(&state, "default").await;
+    let key = crate::keys::object_key("pods", "default", "p1");
+    seed(
+        &state,
+        &key,
+        json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":"p1","namespace":"default","uid":"u1"},
+            "spec":{"containers":[{"name":"c","image":"i"}]}}),
+    )
+    .await;
+
+    crate::handlers::pods::patch_pod(
+        State(state.clone()),
+        Path(("default".into(), "p1".into())),
+        Query(Default::default()),
+        user(),
+        merge_patch_headers(),
+        Bytes::from(
+            json!({"metadata":{"deletionTimestamp":DELETING_TS,"finalizers":[]}}).to_string(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+
+    let v = stored(&state, &key)
+        .await
+        .expect("a deletionTimestamp patch must not hard-delete a live pod");
+    assert!(v["metadata"]["deletionTimestamp"].is_null());
+}
+
+/// Same invariant for namespaces (spec.finalizers drain).
+#[tokio::test]
+async fn namespace_patch_cannot_start_deletion_from_client_deletion_timestamp() {
+    let state = make_state();
+    let key = crate::keys::cluster_object_key("namespaces", "live-ns");
+    seed(
+        &state,
+        &key,
+        json!({"apiVersion":"v1","kind":"Namespace",
+            "metadata":{"name":"live-ns","uid":"u3"},
+            "spec":{"finalizers":["kubernetes"]},"status":{"phase":"Active"}}),
+    )
+    .await;
+
+    crate::handlers::namespaces::patch_namespace(
+        State(state.clone()),
+        Path("live-ns".into()),
+        Query(Default::default()),
+        user(),
+        merge_patch_headers(),
+        Bytes::from(
+            json!({"metadata":{"deletionTimestamp":DELETING_TS},"spec":{"finalizers":[]}})
+                .to_string(),
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+
+    let v = stored(&state, &key)
+        .await
+        .expect("a deletionTimestamp patch must not hard-delete a live namespace");
+    assert!(v["metadata"]["deletionTimestamp"].is_null());
+}
