@@ -455,6 +455,8 @@ pub(crate) async fn replace_namespace<S: Store>(
             }
         }
 
+        crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, stored_obj.as_ref());
+
         run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
         crate::field_manager::WriteIdentity::new(None, &headers).record(
             stored_obj.as_ref().unwrap_or(&serde_json::Value::Null),
