@@ -49,7 +49,7 @@ case "\$1" in
     if [ "\$3" = sh ]; then
       [ ! -e "$TMP/probe-fails" ] || exit 255
       [ ! -e "$TMP/probe-garbage" ] || { echo "Permission denied"; exit 0; }
-      case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" && echo present || echo absent ;; *) echo absent ;; esac
+      if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
     elif [ "\$3" = sudo ]; then
       PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6"
     fi ;;
@@ -70,7 +70,7 @@ chmod +x "$TMP/bin/limactl" "$TMP/bin/bash" "$TMP/guest-bin/"*
 export PATH="$TMP/bin:$PATH"
 
 reset_fixture() {
-  : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/teardown-fails"
+  : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/legacy-state"; : > "$TMP/teardown-fails"
   rm -f "$TMP"/status-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
 }
 teardowns() { grep -c 'install-teardown.sh' "$TMP/calls.log" || true; }
@@ -95,18 +95,19 @@ reset_fixture
 teardown_if_install_state "$DIR" "$TMP/wd" vm-a=$PORT vm-b=$PORT 2>/dev/null
 check "no VM in install state means install-teardown.sh is not invoked at all" "0" "$(teardowns)"
 
-# install.sh writes the marker first in every mode; the stub models any VM carrying it, with no
-# u7s-apiserver.service involved. A marker that only a control-plane install writes would leave
-# worker-mode and early-failed installs fighting the rig.
+# The probe keys on the marker alone for worker-mode and early-failed installs (no
+# u7s-apiserver.service exists there). That install.sh writes the marker before its first
+# mutation in every mode is carried by the install.sh grep checks below, not by this stub.
 reset_fixture
 echo vm-a > "$TMP/install-state"
 teardown_if_install_state "$DIR" "$TMP/wd" vm-a=$PORT 2>/dev/null
-check "a worker-mode install-state VM (marker, no apiserver unit) is torn down instead of fighting the rig" "1" "$(teardowns)"
+check "a marker-only VM (no apiserver unit) is torn down instead of fighting the rig" "1" "$(teardowns)"
 
+# Installs from before the marker existed have only the apiserver unit.
 reset_fixture
-echo vm-a > "$TMP/install-state"
+echo vm-a > "$TMP/legacy-state"
 teardown_if_install_state "$DIR" "$TMP/wd" vm-a=$PORT 2>/dev/null
-check "a partial install (marker written, later steps never ran) is torn down, not mistaken for a clean VM" "1" "$(teardowns)"
+check "a pre-marker install (apiserver unit only, no marker) is torn down, not mistaken for a clean VM" "1" "$(teardowns)"
 INSTALL_SH="$DIR/../install.sh"
 write_line="$(grep -n "^: > $INSTALL_STATE_MARKER\$" "$INSTALL_SH" | head -1 | cut -d: -f1)"
 check "install.sh writes the exact marker the probe looks for (a mismatch makes every install look clean)" \

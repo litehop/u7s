@@ -1022,6 +1022,8 @@ is_install_tunnel_pid() {
 # and install-teardown.sh removes last; the rig never writes it. Its presence means the VM
 # carries install.sh state that fights the host rig ("node has no IPv4 podCIDR").
 INSTALL_STATE_MARKER=/etc/u7s-install-started
+# Installs from before the marker existed (control-plane only); remove once no slot VM predates the marker.
+INSTALL_STATE_LEGACY_UNIT=/etc/systemd/system/u7s-apiserver.service
 
 # vm_install_state_probe <vm>: never starts the VM. Returns 0 marker present, 1 marker absent
 # (or the VM does not exist), 2 the probe itself failed (ssh/shell error, unexpected output),
@@ -1031,7 +1033,7 @@ vm_install_state_probe() {
   status=$(limactl list --format '{{.Status}}' "$vm" 2>/dev/null) || return 1
   [ -n "$status" ] || return 1
   [ "$status" = Running ] || return 3
-  out=$(limactl shell "$vm" sh -c "if [ -e $INSTALL_STATE_MARKER ]; then echo present; else echo absent; fi") || {
+  out=$(limactl shell "$vm" sh -c "if [ -e $INSTALL_STATE_MARKER ] || [ -e $INSTALL_STATE_LEGACY_UNIT ]; then echo present; else echo absent; fi") || {
     echo "error: probing $vm for install state failed (limactl shell exited non-zero)" >&2
     return 2
   }
