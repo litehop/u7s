@@ -290,7 +290,7 @@ pub(crate) fn walk_schema_dos_bounds(
 /// CRD of them cost ~6 s and ~2.9 GiB, all paid by the first CR write on a cache miss.
 pub(crate) const MAX_CRD_PATTERN_NFA_BYTES: usize = 1 << 20;
 
-fn ascii_shorthands(pattern: &str) -> String {
+pub(crate) fn ascii_shorthands(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
