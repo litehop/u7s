@@ -948,8 +948,8 @@ Your assigned port: <PORT>
 Your assigned kubelet port: <KUBELET_PORT>
 Your assigned worktree: <ASSIGNED_WORKTREE>
 
-You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
-port `6443` — those belong to the mayor. All workers bind to `127.0.0.1` and
+You have exclusive use of this VM for this bead. Do not use any slot other
+than the one assigned. All workers bind to `127.0.0.1` and
 use `--port` for isolation. Use exactly the port assigned above — do not
 pick a different port even if you think the assigned one is in use.
 
