@@ -1797,12 +1797,15 @@ wait_for_joined_node() {
 
 # Prints the path of the newest client cert that is unexpired and chains to
 # the current CA (ca-bundle.pem on the control plane, else ca.pem), rotated first.
+# KCM signs with the intermediate and returns leaf + intermediate in one file;
+# the file is passed as -untrusted so the chain builds, while only the CA file
+# is a trust anchor.
 current_client_cert() {
   local c ca="$STATE_DIR/ca.pem"
   [ -s "$STATE_DIR/ca-bundle.pem" ] && ca="$STATE_DIR/ca-bundle.pem"
   for c in "$STATE_DIR/kubelet/pki/kubelet-client-current.pem" "$STATE_DIR/kubelet-client.crt"; do
     if [ -s "$c" ] && openssl x509 -in "$c" -noout -checkend 0 >/dev/null 2>&1 \
-      && openssl verify -CAfile "$ca" "$c" >/dev/null 2>&1; then
+      && openssl verify -CAfile "$ca" -untrusted "$c" "$c" >/dev/null 2>&1; then
       printf '%s' "$c"
       return 0
     fi
@@ -1823,6 +1826,14 @@ verify_worker_identity() {
     return 1
   fi
   if ! current_client_cert >/dev/null; then
+    if openssl x509 -in "$checked" -noout -checkend 0 >/dev/null 2>&1; then
+      local ca="$STATE_DIR/ca.pem" verr
+      [ -s "$STATE_DIR/ca-bundle.pem" ] && ca="$STATE_DIR/ca-bundle.pem"
+      verr="$(openssl verify -CAfile "$ca" -untrusted "$checked" "$checked" 2>&1)" || true
+      verr="$(printf '%s' "$verr" | tr '\n' ' ')"
+      echo "error: this worker's kubelet client certificate ($checked) is not expired but does not chain to the cluster CA $ca -- the cluster CA was likely reset or the cert was issued by another CA, so the node cannot authenticate and must re-join with a fresh token (stop kubelet, rm -rf $STATE_DIR, install.sh --join ...). openssl: $verr" >&2
+      return 1
+    fi
     echo "error: this worker's kubelet client certificate has expired ($checked: notAfter $(openssl x509 -in "$checked" -noout -enddate | cut -d= -f2)) -- the node can no longer authenticate, so it must re-join with a fresh token. On the control plane: install.sh --mint-join-token (and 'kubectl delete node $NODE_NAME' if it is still registered). Here: systemctl stop kubelet; rm -rf $STATE_DIR (clears kubeconfig, kubelet-client.*, ca.pem and kubelet/pki); re-run install.sh --join <url> --ca-cert-hash <hash> ... with the new token." >&2
     return 1
   fi
