@@ -70,9 +70,11 @@ pub static REQUEST_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
         Opts::new(
             "apiserver_request_total",
             "Counter of apiserver requests broken out by verb, group, version, resource, \
-             scope and HTTP status code.",
+             scope, HTTP status code and a bounded user (u7s-only).",
         ),
-        &["verb", "group", "version", "resource", "scope", "code"],
+        &[
+            "verb", "group", "version", "resource", "scope", "code", "user",
+        ],
     )
     .expect("static metric definition is valid");
     prometheus::default_registry()
@@ -81,10 +83,40 @@ pub static REQUEST_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// `user` label for requests that failed authentication (401, or 429 before a credential
+/// was verified).
+pub const USER_LABEL_UNAUTHENTICATED: &str = "unauthenticated";
+/// `user` label for every authenticated identity outside the fixed allowlist.
+pub const USER_LABEL_OTHER: &str = "other";
+
+/// Maps an authenticated username to the bounded `user` label of `apiserver_request_total`.
+/// Upstream has no such label; u7s has no audit log, so this is how per-controller write
+/// rates are observed. The value set is a fixed allowlist (the controller-manager, the
+/// scheduler and the kube-system ServiceAccounts in `KCM_CONTROLLER_SERVICE_ACCOUNTS`) plus
+/// `other`, never a prefix match: anyone able to create kube-system ServiceAccounts or
+/// certificates (kubelets are `system:node:<name>`) would otherwise mint unbounded series.
+pub fn user_label(username: &str) -> &'static str {
+    match username {
+        "system:kube-controller-manager" => "system:kube-controller-manager",
+        "system:kube-scheduler" => "system:kube-scheduler",
+        _ => username
+            .strip_prefix("system:serviceaccount:kube-system:")
+            .and_then(|sa| {
+                crate::state::KCM_CONTROLLER_SERVICE_ACCOUNTS
+                    .iter()
+                    .find(|known| **known == sa)
+            })
+            .copied()
+            .unwrap_or(USER_LABEL_OTHER),
+    }
+}
+
 /// Compile-time-args-checked wrapper for REQUEST_TOTAL increments.
-/// The 6-parameter signature prevents label-order drift and count-mismatch
+/// The 7-parameter signature prevents label-order drift and count-mismatch
 /// panics if a future edit changes REQUEST_TOTAL's registered labels — the
 /// helper must be updated in lockstep, forcing every call site to update too.
+/// `user` must come from [`user_label`] or [`USER_LABEL_UNAUTHENTICATED`] so the
+/// label stays bounded.
 pub fn record_request_total(
     verb: &str,
     group: &str,
@@ -92,9 +124,10 @@ pub fn record_request_total(
     resource: &str,
     scope: &str,
     code: &str,
+    user: &str,
 ) {
     REQUEST_TOTAL
-        .with_label_values(&[verb, group, version, resource, scope, code])
+        .with_label_values(&[verb, group, version, resource, scope, code, user])
         .inc();
 }
 
@@ -495,6 +528,48 @@ mod tests {
             series_count, 500,
             "IntCounterVec should hold exactly N=500 series for N=500 unique label combos — \
              if this fails, the crate's series-count semantics have changed"
+        );
+    }
+
+    /// Anyone able to create kube-system ServiceAccounts or node certificates controls the
+    /// username; the `user` label must stay bounded no matter how many identities they mint,
+    /// or a tenant exhausts apiserver memory through /metrics series.
+    #[test]
+    fn user_label_value_set_is_bounded_under_attacker_minted_identities() {
+        let mut seen = std::collections::BTreeSet::new();
+        for i in 0..1000 {
+            seen.insert(super::user_label(&format!(
+                "system:serviceaccount:kube-system:minted-{i}"
+            )));
+            seen.insert(super::user_label(&format!("system:node:minted-{i}")));
+            seen.insert(super::user_label(&format!(
+                "system:serviceaccount:ns-{i}:x"
+            )));
+            seen.insert(super::user_label(&format!("minted-{i}")));
+        }
+        for sa in crate::state::KCM_CONTROLLER_SERVICE_ACCOUNTS {
+            seen.insert(super::user_label(&format!(
+                "system:serviceaccount:kube-system:{sa}"
+            )));
+            assert_eq!(
+                super::user_label(&format!("system:serviceaccount:kube-system:{sa}")),
+                *sa,
+                "controller SA {sa} must be attributable by its own name"
+            );
+        }
+        seen.insert(super::user_label("system:kube-controller-manager"));
+        seen.insert(super::user_label("system:kube-scheduler"));
+        seen.insert(super::USER_LABEL_UNAUTHENTICATED);
+        let bound = crate::state::KCM_CONTROLLER_SERVICE_ACCOUNTS.len() + 2 + 2;
+        assert!(
+            seen.len() <= bound,
+            "user label produced {} values, bound is {bound}: {seen:?}",
+            seen.len()
+        );
+        assert_eq!(
+            super::user_label("system:serviceaccount:default:job-controller"),
+            super::USER_LABEL_OTHER,
+            "a same-named SA outside kube-system must not impersonate a controller"
         );
     }
 }

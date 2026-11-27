@@ -102,6 +102,7 @@ mod tests {
                 "metrics-endpoint-test-touch",
                 "cluster",
                 "200",
+                crate::metrics::USER_LABEL_OTHER,
             ])
             .inc();
         u7s_store::metrics::WATCH_BROADCAST_LAGGED_TOTAL
