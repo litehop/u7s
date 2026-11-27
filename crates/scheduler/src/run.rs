@@ -2495,7 +2495,7 @@ mod tests {
 
         let (client, counts) = spawn_bind_outcome_mock_server(
             409,
-            r#"{"kind":"Status","status":"Failure","message":"Operation cannot be fulfilled on pods/binding \"web-0\": Precondition failed: UID in precondition: uid-old, UID in object meta: uid-new. The object might have been deleted and then recreated","reason":"Conflict","code":409}"#,
+            r#"{"kind":"Status","status":"Failure","message":"Operation cannot be fulfilled on pods \"web-0\": StorageError: invalid object, Code: 4, Key: /registry/pods/default/web-0, ResourceVersion: 0, AdditionalErrorMsg: Precondition failed: UID in precondition: uid-old, UID in object meta: uid-new","reason":"Conflict","code":409}"#,
         )
         .await;
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
