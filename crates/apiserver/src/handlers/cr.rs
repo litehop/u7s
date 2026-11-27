@@ -1056,6 +1056,7 @@ fn validate_cr_schema_with_budgets(
     let compiled = match cache.get(&ctx.schema_cache_key) {
         Some(compiled) => compiled,
         None => {
+            crate::handlers::crd::check_pattern_compile_budget(schema, "openAPIV3Schema", &mut 0)?;
             let (schemas, index) = crate::cel_runtime::format::on_compile_stack(|| {
                 let mut schemas = boon::Schemas::new();
                 let mut compiler = boon::Compiler::new();
@@ -12653,6 +12654,32 @@ mod tests {
                 .unwrap_or("")
                 .contains("exceeds maximum length"),
             "error must identify the oversized-pattern ReDoS defense, not a generic failure: {json}"
+        );
+    }
+
+    /// A stored CRD whose short pattern compiles past the NFA budget (`\pL{244}` is 8
+    /// bytes but ~15 MiB resident, under boon's 10 MiB default) must be refused on the CR
+    /// cache-miss path, or the first CR write pays the seconds and GiBs admission avoids.
+    #[test]
+    fn validate_cr_schema_cache_miss_rejects_pattern_over_nfa_budget_that_bypassed_crd_admission() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "field": { "type": "string", "pattern": "\\pL{244}" } }
+        });
+        let err = match check_schema(&serde_json::json!({ "field": "x" }), schema) {
+            Ok(()) => panic!(
+                "a pattern over the compile budget must be rejected on the cache-miss compile"
+            ),
+            Err(e) => e,
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("compiles to more than"),
+            "error must come from the compile budget: {json}"
         );
     }
 

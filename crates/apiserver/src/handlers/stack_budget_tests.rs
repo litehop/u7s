@@ -19,7 +19,7 @@ use super::test_support::{make_state, seed_namespace};
 const ROUTER_STACK: usize = (512 - 128) * 1024;
 
 /// The router with the layers `run` stacks on it, so middleware frames count too.
-async fn production_app(state: crate::state::AppState) -> Router {
+pub(super) async fn production_app(state: crate::state::AppState) -> Router {
     state.init().await;
     crate::build_router(state.clone())
         .layer(crate::content_type::ContentTypeLayer)
@@ -38,7 +38,13 @@ async fn production_app(state: crate::state::AppState) -> Router {
         ))
 }
 
-async fn send(app: &Router, method: &str, uri: &str, ct: &str, body: String) -> StatusCode {
+pub(super) async fn send(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    ct: &str,
+    body: String,
+) -> StatusCode {
     let req = Request::builder()
         .method(method)
         .uri(uri)
@@ -195,6 +201,16 @@ where
         .enable_all()
         .build()
         .unwrap();
+    let state = root_state();
+    rt.block_on(async {
+        seed_namespace(&state, "default").await;
+        let app = production_app(state).await;
+        tokio::spawn(scenario(app)).await.unwrap();
+    });
+}
+
+/// State with a `root-token` bearer that may do anything.
+pub(super) fn root_state() -> crate::state::AppState {
     let mut state = make_state();
     let mut tokens = (*state.token_map).clone();
     tokens.insert(
@@ -211,11 +227,7 @@ where
         "/apis/rbac.authorization.k8s.io/v1/clusterroles/test-creator",
         &serde_json::json!({"rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]}),
     );
-    rt.block_on(async {
-        seed_namespace(&state, "default").await;
-        let app = production_app(state).await;
-        tokio::spawn(scenario(app)).await.unwrap();
-    });
+    state
 }
 
 #[test]
