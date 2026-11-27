@@ -1458,6 +1458,13 @@ fn same_incarnation(known_uid: &str, event_uid: &str) -> bool {
     known_uid.is_empty() || event_uid.is_empty() || known_uid == event_uid
 }
 
+/// `metadata.uid` of a raw pod event, empty if absent.
+pub fn event_uid(event: &Value) -> &str {
+    event["object"]["metadata"]["uid"]
+        .as_str()
+        .unwrap_or_default()
+}
+
 /// A preemption plan whose victims have all had their graceful DELETE issued
 /// (see `delete_pod`'s doc comment) but not yet confirmed PHYSICALLY gone by
 /// a real watch event from the kubelet actually running them.
@@ -2070,6 +2077,12 @@ impl NodeTally {
         if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
             self.remove_pod(&key);
         }
+    }
+
+    /// Forget `key`'s failure backoff after its pod (the one in `event`) was scheduled.
+    /// A decision for a deleted incarnation must not clear the recreated pod's backoff.
+    pub fn clear_backoff_after_schedule(&mut self, key: &str, event: &Value) {
+        self.failures.clear(key, event_uid(event));
     }
 
     /// UID of the tallied pod `namespace/pod_name`, if any.
@@ -11165,6 +11178,63 @@ mod tests {
             1,
             "the recreated pod lost its PVC waiter to a stale bound event"
         );
+    }
+
+    /// A late terminal-phase event of the old incarnation must not free the
+    /// recreated pod's tally slot, PVC waiter or bind waiter: the preemptor
+    /// would bind before the new victim is really gone.
+    #[test]
+    fn stale_terminal_event_of_old_uid_keeps_recreated_pods_slot_and_waiters() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        let bound = json!({ "spec": { "nodeName": "worker-0" }, "status": { "phase": "Running" } });
+        let _ = tally.apply_event(&pod_event("MODIFIED", Some("uid-new"), bound));
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-new".to_owned(),
+        );
+        let done =
+            json!({ "spec": { "nodeName": "worker-0" }, "status": { "phase": "Succeeded" } });
+        let ready = tally.apply_event(&pod_event("MODIFIED", Some("uid-old"), done));
+        assert!(
+            ready.is_empty(),
+            "a stale terminal event released a deferred bind"
+        );
+        assert_eq!(
+            tally.tallied_uid("default", "web-0").as_deref(),
+            Some("uid-new"),
+            "a stale terminal event freed the recreated pod's slot"
+        );
+        assert_eq!(
+            tally.apply_pvc_event(&pvc_added()).len(),
+            1,
+            "a stale terminal event dropped the recreated pod's PVC waiter"
+        );
+    }
+
+    /// A scheduling success reported for the deleted incarnation must not
+    /// clear the recreated pod's backoff, or it is retried immediately.
+    #[test]
+    fn scheduling_success_of_old_uid_keeps_recreated_pods_backoff() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        tally.clear_backoff_after_schedule(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-old"), json!({})),
+        );
+        assert_eq!(
+            tally.failures.backed_off(std::time::Instant::now()).len(),
+            1,
+            "the recreated pod lost its backoff to the old incarnation's success"
+        );
+        tally.clear_backoff_after_schedule(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-new"), json!({})),
+        );
+        assert!(tally
+            .failures
+            .backed_off(std::time::Instant::now())
+            .is_empty());
     }
 
     /// The ordinary order (the registered incarnation is the one deleted) must

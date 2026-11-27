@@ -1293,13 +1293,7 @@ fn handle_pod_event(
                 tally_clone
                     .lock()
                     .expect("tally lock poisoned")
-                    .failures
-                    .clear(
-                        &key,
-                        event["object"]["metadata"]["uid"]
-                            .as_str()
-                            .unwrap_or_default(),
-                    );
+                    .clear_backoff_after_schedule(&key, &event);
                 (
                     "Scheduled",
                     format!("Successfully assigned {namespace}/{pod_name} to {node}"),
