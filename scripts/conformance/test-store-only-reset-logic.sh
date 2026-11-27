@@ -51,7 +51,7 @@ mkdir -p "$SB/temp/u7s"
 git -C "$SB" init -q
 git -C "$SB" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 WD="$SB/temp/u7s"
-seed() { : >"$CALLS"; touch "$WD/state.db" "$WD/state.db-wal" "$WD/state.db-shm" "$WD/ca.crt" "$WD/sa.key" "$WD/kubeconfig"; }
+seed() { : >"$CALLS"; mkdir -p "$WD/manifests"; touch "$WD/state.db" "$WD/state.db-wal" "$WD/state.db-shm" "$WD/ca.crt" "$WD/sa.key" "$WD/kubeconfig" "$WD/manifests/coredns.yaml"; }
 
 seed
 (cd "$SB" && PATH="$STUBS:$PATH" bash "$SCRIPT" --store-only --vm lima-node --workdir "$WD" >"$TMPROOT/out" 2>&1) \
@@ -61,6 +61,11 @@ if ls "$WD"/state.db* >/dev/null 2>&1; then
   bad "--store-only left apiserver store files behind; the next boot would reuse them: $(ls "$WD")"
 else
   ok "--store-only deletes state.db and its -wal/-shm"
+fi
+if ls "$WD"/manifests/*.yaml >/dev/null 2>&1; then
+  bad "--store-only kept staged manifests; a run with different --service-cidr boot-applies a Service IP outside the new range and the apiserver exits"
+else
+  ok "--store-only removes staged manifests so a CIDR change cannot boot-apply stale ones"
 fi
 if [ -e "$WD/ca.crt" ] && [ -e "$WD/sa.key" ] && [ -e "$WD/kubeconfig" ]; then
   ok "--store-only keeps CA, SA key and kubeconfig (the VM's kubelet certs chain to them)"
@@ -77,6 +82,11 @@ if [[ "$guest" == *"crictl rmp -fa"* ]]; then
   ok "--store-only removes pod sandboxes in the guest"
 else
   bad "--store-only left pod sandboxes in the guest; old pods would outlive the empty store"
+fi
+if [[ "$guest" == *"rm -rf /var/lib/cni/networks /run/flannel/subnet.env"* && "$guest" == *"ip link delete flannel.1"* && "$guest" == *"ip link delete cni0"* ]]; then
+  ok "--store-only clears CNI IPAM, flannel subnet.env and the cni0/flannel.1 links so a new --pod-cidr cannot hand pods addresses from the old range"
+else
+  bad "--store-only left CNI state in the guest; after a pod-CIDR change new pods get IPs from the previous range"
 fi
 if [[ "$guest" == *"find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf"* && "$guest" != *"-name pki"* ]]; then
   ok "--store-only wipes all of /var/lib/kubelet, pki/ included, so no stale cert survives a reset (the kubelet's own certs live in /etc/u7s-rig)"
