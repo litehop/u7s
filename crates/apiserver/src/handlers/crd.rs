@@ -625,6 +625,18 @@ pub(crate) fn validate_crd_schema(
     Ok(())
 }
 
+/// `validate_crd_schema` on the blocking pool: the pattern budget can burn seconds of
+/// regex compiles, which must not stall the async workers serving every other request.
+pub(crate) async fn validate_crd_schema_blocking(
+    spec: &CustomResourceDefinitionSpec,
+    stored: Option<&serde_json::Value>,
+) -> Result<(), crate::status::StatusError> {
+    let (spec, stored) = (spec.clone(), stored.cloned());
+    tokio::task::spawn_blocking(move || validate_crd_schema(&spec, stored.as_ref()))
+        .await
+        .map_err(|e| Status::internal(format!("CRD validation task failed: {e}")))?
+}
+
 /// Reject a PUT/PATCH that changes spec.group, spec.scope, or spec.names.{plural,singular,kind}
 /// relative to the stored CRD. These four fields are structural identity, immutable upstream:
 /// CRs are stored under a group-and-plural-keyed prefix (see build_new_crd's storage-key
@@ -948,7 +960,7 @@ async fn build_new_crd<S: Store>(
     }
 
     validate_crd_group(&crd.spec.group)?;
-    validate_crd_schema(&crd.spec, None)?;
+    validate_crd_schema_blocking(&crd.spec, None).await?;
 
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if name != expected_name {
@@ -1136,7 +1148,7 @@ pub async fn replace_crd<S: Store>(
     };
 
     reject_structural_field_change(&existing, &crd.spec, &name)?;
-    validate_crd_schema(&crd.spec, Some(&existing))?;
+    validate_crd_schema_blocking(&crd.spec, Some(&existing)).await?;
 
     // metadata.uid is immutable identity, exactly like the generic replace_resource path
     // (resource.rs): a blank incoming uid is restored from the stored object, but a
@@ -1953,7 +1965,7 @@ pub async fn patch_crd<S: Store>(
             .as_str()
             .unwrap_or("")
             .to_string();
-        validate_crd_schema(&crd.spec, Some(&existing))?;
+        validate_crd_schema_blocking(&crd.spec, Some(&existing)).await?;
 
         // Admission webhook pipeline (mutating then validating).
         {

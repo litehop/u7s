@@ -44,6 +44,135 @@ fn compile(patterns: &[String]) -> (Duration, Result<(), String>) {
     (start.elapsed(), res)
 }
 
+fn crd_body(schema: serde_json::Value) -> String {
+    serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "widgets.example.io"},
+        "spec": {
+            "group": "example.io",
+            "names": {"plural": "widgets", "singular": "widget", "kind": "Widget", "listKind": "WidgetList"},
+            "scope": "Namespaced",
+            "versions": [{"name": "v1", "served": true, "storage": true,
+                          "schema": {"openAPIV3Schema": schema}}]
+        }
+    })
+    .to_string()
+}
+
+async fn get_status(app: &axum::Router, uri: &str) -> axum::http::StatusCode {
+    use tower::ServiceExt as _;
+    let req = axum::http::Request::builder()
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, "Bearer root-token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A CRD write whose pattern budget check takes a long time must not stall the async
+/// runtime: with one runtime thread, running the check inline would hold every other
+/// request (health probes, kubelet heartbeats) until the compile finished.
+#[test]
+fn slow_crd_write_does_not_stall_other_requests_on_the_runtime() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let state = super::stack_budget_tests::root_state();
+    rt.block_on(async {
+        super::test_support::seed_namespace(&state, "default").await;
+        let app = super::stack_budget_tests::production_app(state).await;
+        let props: serde_json::Map<_, _> = (0..40)
+            .map(|i| {
+                (
+                    format!("f{i:05}"),
+                    serde_json::json!({"type": "string", "pattern": "[a-z]{2000}"}),
+                )
+            })
+            .collect();
+        let body = crd_body(serde_json::json!({"type": "object", "properties": props}));
+
+        let start = Instant::now();
+        let post_app = app.clone();
+        let post = tokio::spawn(async move {
+            let status = super::stack_budget_tests::send(
+                &post_app,
+                "POST",
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                "application/json",
+                body,
+            )
+            .await;
+            (status, start.elapsed())
+        });
+        let get_start = Instant::now();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            get_status(&app, "/api/v1/namespaces/default/configmaps").await,
+            axum::http::StatusCode::OK
+        );
+        let cheap = get_start.elapsed();
+
+        let (status, slow) = post.await.unwrap();
+        eprintln!("cheap={cheap:?} crd_write={slow:?} status={status}");
+        assert!(
+            slow > Duration::from_millis(100),
+            "the CRD write must be slow enough ({slow:?}) for this test to prove anything"
+        );
+        assert!(
+            cheap < slow / 2,
+            "configmap list took {cheap:?}, CRD write at {slow:?}: the CRD budget check \
+             ran on the async runtime and stalled it"
+        );
+    });
+}
+
+/// Reviewer's unmeasured case: ~2000 patterns each compiling just above the 4 KiB floor,
+/// so each pays the full bisection while the sum still approaches the 8 MiB cap.
+#[test]
+#[ignore = "timing PoC; run with --release --ignored --nocapture"]
+fn measure_admission_cost_of_patterns_just_above_the_floor() {
+    let global = Instant::now();
+    let size_of = |p: &str| {
+        let mut t = 0;
+        super::crd::check_pattern_compile_budget(&schema_with(&[p]), "s", &mut t).unwrap();
+        t
+    };
+    let mut n = 1;
+    while size_of(&format!("[a-z]{{{n}}}")) <= 4 << 10 {
+        n *= 2;
+    }
+    let (mut lo, mut hi) = (n / 2, n);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if size_of(&format!("[a-z]{{{mid}}}")) <= 4 << 10 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let base = format!("[a-z]{{{hi}}}");
+    eprintln!(
+        "POC near-floor pattern {base} compiles to {} B",
+        size_of(&base)
+    );
+    let patterns: Vec<String> = (0..2000)
+        .map(|i| format!("{base}{}", "a".repeat(i % 3)))
+        .collect();
+    let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let schema = schema_with(&refs);
+    let t0 = Instant::now();
+    let mut total = 0;
+    let res = super::crd::check_pattern_compile_budget(&schema, "s", &mut total);
+    eprintln!(
+        "POC near-floor x2000 budget_check={:.2}s total={total}B ok={}",
+        t0.elapsed().as_secs_f64(),
+        res.is_ok()
+    );
+    assert!(global.elapsed() < WALL_CAP, "exceeded hard cap");
+}
+
 fn short(e: &str) -> String {
     e.chars().take(70).collect()
 }
