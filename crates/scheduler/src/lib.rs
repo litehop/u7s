@@ -464,6 +464,7 @@ pub struct Toleration {
 #[derive(Debug, Default, Deserialize)]
 struct PodMetadata {
     name: Option<String>,
+    uid: Option<String>,
     namespace: Option<String>,
     #[serde(default)]
     labels: std::collections::HashMap<String, String>,
@@ -511,6 +512,9 @@ struct PodObject {
 pub struct PendingPod {
     pub namespace: String,
     pub pod_name: String,
+    /// `metadata.uid` of the pod this decision is for; distinguishes it from a
+    /// same-name recreation.
+    pub uid: String,
     /// The pod's `spec.nodeSelector` map (empty if absent).
     pub node_selector: std::collections::HashMap<String, String>,
     /// The pod's `spec.priority`, defaulting to 0 (the lowest rung) when
@@ -600,6 +604,12 @@ pub struct PendingPod {
 }
 
 impl PendingPod {
+    /// Dedup key for `in_flight`: includes the UID so a same-name recreated
+    /// pod is a distinct entry from a stale bind still running for its predecessor.
+    pub fn in_flight_key(&self) -> String {
+        in_flight_key(&self.namespace, &self.pod_name, &self.uid)
+    }
+
     /// Every CSI driver this pod's volumes need: inline and unbound-PVC
     /// drivers plus bound PVCs' (`csi_volume_counts`' keys).
     fn needed_csi_drivers(&self) -> impl Iterator<Item = &String> {
@@ -607,6 +617,10 @@ impl PendingPod {
             .iter()
             .chain(self.csi_volume_counts.keys())
     }
+}
+
+pub fn in_flight_key(namespace: &str, pod_name: &str, uid: &str) -> String {
+    format!("{namespace}/{pod_name}/{uid}")
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -698,6 +712,7 @@ fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
     Some(PendingPod {
         namespace,
         pod_name: pod_name.to_owned(),
+        uid: object.metadata.uid.unwrap_or_default(),
         node_selector,
         priority,
         tolerations,
@@ -1038,10 +1053,8 @@ pub fn pods_needing_resync(
     items
         .iter()
         .filter(|item| {
-            needs_scheduling_pod(item).is_some_and(|pending| {
-                let key = format!("{}/{}", pending.namespace, pending.pod_name);
-                should_schedule(in_flight, &key)
-            })
+            needs_scheduling_pod(item)
+                .is_some_and(|pending| should_schedule(in_flight, &pending.in_flight_key()))
         })
         .map(|item| serde_json::json!({"type": "MODIFIED", "object": item}))
         .collect()
@@ -1417,6 +1430,9 @@ struct PreemptionPodListItem {
 /// — see `NodeTally::assume`'s doc comment for why the latter matters.
 #[derive(Debug, Clone)]
 struct TalliedPod {
+    /// `metadata.uid` of the pod this entry accounts for; lets a stale decision for a
+    /// same-name predecessor avoid releasing the recreated pod's reservation.
+    uid: String,
     node_name: String,
     namespace: String,
     labels: std::collections::HashMap<String, String>,
@@ -1513,7 +1529,7 @@ impl PreemptionWaiters {
     fn clear(&mut self) -> Vec<String> {
         self.plans
             .drain(..)
-            .map(|p| format!("{}/{}", p.pod.namespace, p.pod.pod_name))
+            .map(|p| p.pod.in_flight_key())
             .collect()
     }
 }
@@ -1656,7 +1672,10 @@ impl FailureBackoff {
                 let shift = s.failures.saturating_sub(1).min(8);
                 let delay = (POD_INITIAL_BACKOFF * (1u32 << shift)).min(POD_MAX_BACKOFF);
                 let expiry = s.last_attempt + delay;
-                (now < expiry).then(|| (k.clone(), expiry - now))
+                (now < expiry).then(|| {
+                    let (namespace, pod_name) = k.split_once('/').unwrap_or(("", k));
+                    (in_flight_key(namespace, pod_name, &s.uid), expiry - now)
+                })
             })
             .collect()
     }
@@ -1857,6 +1876,7 @@ impl NodeTally {
             .metadata
             .namespace
             .unwrap_or_else(|| "default".to_owned());
+        let uid = watch_event.object.metadata.uid.unwrap_or_default();
         let labels = watch_event.object.metadata.labels;
         let key = format!("{namespace}/{name}");
 
@@ -1893,6 +1913,7 @@ impl NodeTally {
                 self.insert_pod(
                     key,
                     TalliedPod {
+                        uid,
                         node_name,
                         namespace,
                         labels,
@@ -1961,6 +1982,7 @@ impl NodeTally {
         &mut self,
         namespace: &str,
         pod_name: &str,
+        uid: &str,
         node_name: &str,
         priority: i32,
         requests: ResourceRequests,
@@ -1976,6 +1998,7 @@ impl NodeTally {
         self.insert_pod(
             format!("{namespace}/{pod_name}"),
             TalliedPod {
+                uid: uid.to_owned(),
                 node_name: node_name.to_owned(),
                 namespace: namespace.to_owned(),
                 labels,
@@ -1994,6 +2017,15 @@ impl NodeTally {
     /// anticipated does not actually go through.
     pub fn remove(&mut self, namespace: &str, pod_name: &str) {
         self.remove_pod(&format!("{namespace}/{pod_name}"));
+    }
+
+    /// Remove `namespace/pod_name` only if the tallied entry belongs to `uid`. A decision
+    /// for a deleted pod must not release the reservation of a same-name recreation.
+    pub fn remove_if_uid(&mut self, namespace: &str, pod_name: &str, uid: &str) {
+        let key = format!("{namespace}/{pod_name}");
+        if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
+            self.remove_pod(&key);
+        }
     }
 
     /// Drop all tallied state. Called on watch reconnect: `POD_WATCH_PATH`'s
@@ -3871,6 +3903,7 @@ fn select_and_reserve_node(
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
+        &pod.uid,
         &node,
         pod.priority,
         pod.requests.clone(),
@@ -4254,6 +4287,7 @@ fn verify_and_reserve_preemption(
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
+        &pod.uid,
         &plan.node_name,
         pod.priority,
         pod.requests.clone(),
@@ -4335,6 +4369,8 @@ struct Binding<'a> {
 struct BindingMeta<'a> {
     name: &'a str,
     namespace: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    uid: &'a str,
 }
 
 /// Build the binding path for a pod in a given namespace.
@@ -4349,13 +4385,14 @@ pub fn binding_path(namespace: &str, pod_name: &str) -> String {
 ///
 /// Pure function so the payload shape can be verified in tests.
 /// Uses typed structs so field renames are compile errors, not silent bugs.
-pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Value {
+pub fn binding_payload(namespace: &str, pod_name: &str, uid: &str, node_name: &str) -> Value {
     let binding = Binding {
         api_version: "v1",
         kind: "Binding",
         metadata: BindingMeta {
             name: pod_name,
             namespace,
+            uid,
         },
         target: BindingTarget {
             api_version: "v1",
@@ -4387,17 +4424,24 @@ pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Valu
 pub enum BindError {
     #[error("{0}")]
     AlreadyAssigned(String),
+    /// The pod was deleted and recreated since this bind was decided: the
+    /// apiserver refused the UID precondition. The decision belongs to a pod
+    /// that no longer exists; nothing may be patched or rolled back by name,
+    /// because that name now denotes the new pod.
+    #[error("{0}")]
+    StalePod(String),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
 /// True when `err` is a bind rejected because the pod was already assigned
-/// to a node — see `BindError::AlreadyAssigned`. Extracted as a pure
+/// to a node or has been recreated since — see `BindError::AlreadyAssigned`
+/// and `BindError::StalePod`. Extracted as a pure
 /// predicate (mirroring `should_retry_without_preempting`) so the "this
 /// specific outcome is a benign no-op, not a failure" classification can be
 /// unit-tested without spinning up `handle_pod_event`'s full async task.
-pub fn is_bind_already_assigned(err: &BindError) -> bool {
-    matches!(err, BindError::AlreadyAssigned(_))
+pub fn is_bind_noop(err: &BindError) -> bool {
+    matches!(err, BindError::AlreadyAssigned(_) | BindError::StalePod(_))
 }
 
 /// Classify a bind response status code and body, returning Err on non-2xx.
@@ -4418,6 +4462,11 @@ pub fn check_bind_response(status: u16, body: &str) -> Result<(), BindError> {
     if status == 409 && body.contains("already assigned to node") {
         return Err(BindError::AlreadyAssigned(format!(
             "bind rejected with HTTP 409 (pod already assigned elsewhere): {body}"
+        )));
+    }
+    if status == 409 && body.contains("UID in precondition") {
+        return Err(BindError::StalePod(format!(
+            "bind rejected with HTTP 409 (pod recreated since the decision): {body}"
         )));
     }
     Err(BindError::Other(anyhow::anyhow!(
@@ -5231,10 +5280,11 @@ pub async fn bind_pod(
     client: &ApiClient,
     namespace: &str,
     pod_name: &str,
+    uid: &str,
     node_name: &str,
 ) -> Result<(), BindError> {
     let path = binding_path(namespace, pod_name);
-    let payload = binding_payload(namespace, pod_name, node_name);
+    let payload = binding_payload(namespace, pod_name, uid, node_name);
 
     let start = std::time::Instant::now();
     let (status, body) = http_post_json(client, &path, &payload).await?;
@@ -5664,7 +5714,7 @@ mod tests {
         assert!(result.is_err(), "500 must return Err");
     }
 
-    // check_bind_response/is_bind_already_assigned tests — a 409 whose body
+    // check_bind_response/is_bind_noop tests — a 409 whose body
     // says the pod is "already assigned to node" means an EARLIER bind of
     // this exact pod already succeeded; this is a benign no-op, not a
     // scheduling failure. Before BindError existed, main.rs's caller treated
@@ -5683,7 +5733,7 @@ mod tests {
         );
         let err = result.expect_err("a 409 must still be Err, just classified differently");
         assert!(
-            is_bind_already_assigned(&err),
+            is_bind_noop(&err),
             "a 409 whose body says the pod is already assigned to a node must classify as \
              AlreadyAssigned, not a generic bind failure — the caller relies on this to skip \
              the PodScheduled=False patch/FailedScheduling event/tally rollback that would \
@@ -5700,7 +5750,7 @@ mod tests {
         let result = check_bind_response(409, "AlreadyExists");
         let err = result.expect_err("409 must still be Err");
         assert!(
-            !is_bind_already_assigned(&err),
+            !is_bind_noop(&err),
             "a 409 without the already-assigned-to-node message must classify as Other, \
              not AlreadyAssigned"
         );
@@ -5714,7 +5764,7 @@ mod tests {
         let result = check_bind_response(500, "Pod is already assigned to node worker-1");
         let err = result.expect_err("500 must still be Err");
         assert!(
-            !is_bind_already_assigned(&err),
+            !is_bind_noop(&err),
             "a non-409 status must never classify as AlreadyAssigned, regardless of body text"
         );
     }
@@ -6332,24 +6382,25 @@ mod tests {
     }
 
     /// A pod deleted and recreated under the same name must be scheduled from
-    /// its own list entry (new UID) once the predecessor's bind releases the
-    /// key; the scheduler keeps no UID-agnostic cache that could resurrect the
-    /// old pod, so a missed delete cannot strand or mis-route the new one.
+    /// its own list entry (new UID) even while the predecessor's bind is still
+    /// in flight: sharing one dedup entry would strand the new pod until the
+    /// stale bind finished.
     #[test]
     fn pods_needing_resync_schedules_same_name_recreated_pod_with_its_new_uid() {
         let items = vec![json!({
             "metadata": { "name": "web-0", "namespace": "default", "uid": "new-uid" },
             "spec": {}
         })];
-        let mut in_flight = std::collections::HashSet::from(["default/web-0".to_owned()]);
-        assert!(
-            pods_needing_resync(&items, &in_flight).is_empty(),
-            "the predecessor's in-flight bind owns the key until it finishes"
-        );
-        in_flight.clear();
+        let mut in_flight =
+            std::collections::HashSet::from([in_flight_key("default", "web-0", "old-uid")]);
         let events = pods_needing_resync(&items, &in_flight);
         assert_eq!(events.len(), 1, "recreated pod must not stay stranded");
         assert_eq!(events[0]["object"]["metadata"]["uid"], "new-uid");
+        in_flight.insert(in_flight_key("default", "web-0", "new-uid"));
+        assert!(
+            pods_needing_resync(&items, &in_flight).is_empty(),
+            "the recreated pod's own in-flight bind must still dedup its resync"
+        );
     }
 
     /// Regression for the resync GET's dropped `fieldSelector=spec.nodeName=`:
@@ -6408,11 +6459,11 @@ mod tests {
         // attempt into a 409 Conflict — the exact double-schedule the
         // in_flight guard exists to prevent.
         let items = vec![json!({
-            "metadata": { "name": "stranded-pod", "namespace": "kube-system" },
+            "metadata": { "name": "stranded-pod", "namespace": "kube-system", "uid": "u1" },
             "spec": { "nodeName": "" }
         })];
         let mut in_flight = std::collections::HashSet::new();
-        in_flight.insert("kube-system/stranded-pod".to_owned());
+        in_flight.insert(in_flight_key("kube-system", "stranded-pod", "u1"));
         assert!(
             pods_needing_resync(&items, &in_flight).is_empty(),
             "a pod already in in_flight must be skipped by resync, not double-scheduled"
@@ -6477,12 +6528,12 @@ mod tests {
                 "spec": { "nodeName": "", "schedulingGates": [{"name": "example.com/gate"}] }
             }),
             json!({
-                "metadata": { "name": "in-flight", "namespace": "default" },
+                "metadata": { "name": "in-flight", "namespace": "default", "uid": "u2" },
                 "spec": { "nodeName": "" }
             }),
         ];
         let mut in_flight = std::collections::HashSet::new();
-        in_flight.insert("default/in-flight".to_owned());
+        in_flight.insert(in_flight_key("default", "in-flight", "u2"));
         let events = pods_needing_resync(&items, &in_flight);
         let names: std::collections::BTreeSet<&str> = events
             .iter()
@@ -7130,22 +7181,45 @@ mod tests {
 
     #[test]
     fn binding_payload_has_correct_api_version_and_kind() {
-        let payload = binding_payload("default", "my-pod", "node-1");
+        let payload = binding_payload("default", "my-pod", "uid-1", "node-1");
         assert_eq!(payload["apiVersion"], "v1");
         assert_eq!(payload["kind"], "Binding");
     }
 
     #[test]
     fn binding_payload_target_references_correct_node() {
-        let payload = binding_payload("staging", "web-pod", "worker-2");
+        let payload = binding_payload("staging", "web-pod", "uid-1", "worker-2");
         assert_eq!(payload["target"]["kind"], "Node");
         assert_eq!(payload["target"]["name"], "worker-2");
         assert_eq!(payload["target"]["apiVersion"], "v1");
     }
 
     #[test]
+    fn binding_payload_carries_the_scheduled_pods_uid() {
+        let payload = binding_payload("default", "web-0", "uid-a", "node-0");
+        assert_eq!(
+            payload["metadata"]["uid"], "uid-a",
+            "without the UID the apiserver cannot refuse a bind decided for a pod that was \
+             since recreated under the same name"
+        );
+    }
+
+    #[test]
+    fn uid_precondition_conflict_is_a_noop_not_a_scheduling_failure() {
+        let err = check_bind_response(
+            409,
+            "Precondition failed: UID in precondition: a, UID in object meta: b",
+        )
+        .expect_err("409 must be Err");
+        assert!(
+            matches!(err, BindError::StalePod(_)) && is_bind_noop(&err),
+            "a stale-UID bind must not be reported as FailedScheduling on the recreated pod"
+        );
+    }
+
+    #[test]
     fn binding_payload_metadata_matches_pod_and_namespace() {
-        let payload = binding_payload("kube-system", "dns-pod", "node-0");
+        let payload = binding_payload("kube-system", "dns-pod", "uid-1", "node-0");
         assert_eq!(payload["metadata"]["name"], "dns-pod");
         assert_eq!(payload["metadata"]["namespace"], "kube-system");
     }
@@ -8689,6 +8763,7 @@ mod tests {
         PendingPod {
             namespace: "default".to_owned(),
             pod_name: "pod".to_owned(),
+            uid: "uid-pod".to_owned(),
             node_selector: Default::default(),
             priority: 0,
             tolerations: Vec::new(),
@@ -8840,6 +8915,7 @@ mod tests {
             tally.assume(
                 "default",
                 &format!("besteffort-{i}"),
+                "",
                 &chosen,
                 0,
                 ResourceRequests::default(),
@@ -9014,6 +9090,7 @@ mod tests {
         tally.assume(
             "default",
             "filler",
+            "",
             "worker-0",
             0,
             requests(5600, 0, 0),
@@ -9131,6 +9208,7 @@ mod tests {
             guard.assume(
                 "default",
                 "victim-a",
+                "",
                 "worker-0",
                 0,
                 requests(1000, 0, 0),
@@ -9141,6 +9219,7 @@ mod tests {
             guard.assume(
                 "default",
                 "victim-b",
+                "",
                 "worker-0",
                 0,
                 requests(1000, 0, 0),
@@ -9218,6 +9297,7 @@ mod tests {
                 guard.assume(
                     "default",
                     &format!("filler-{i}"),
+                    "",
                     "worker-0",
                     100,
                     requests(1000, 0, 0),
@@ -9329,6 +9409,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-a",
+                "",
                 "worker-0",
                 100,
                 requests(1000, 0, 0),
@@ -9339,6 +9420,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "worker-0",
                 100,
                 requests(1000, 0, 0),
@@ -9403,6 +9485,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "filler-a",
+            "",
             "worker-0",
             100,
             requests(1000, 0, 0),
@@ -9437,6 +9520,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "filler-a",
+            "",
             "worker-0",
             100,
             requests(1000, 0, 0),
@@ -9539,6 +9623,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a",
+                "",
                 "node-a",
                 0,
                 ResourceRequests::default(),
@@ -9553,6 +9638,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9641,6 +9727,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a1",
+                "",
                 "node-a1",
                 0,
                 ResourceRequests::default(),
@@ -9655,6 +9742,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a2",
+                "",
                 "node-a2",
                 1000,
                 ResourceRequests::default(),
@@ -9667,6 +9755,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9743,6 +9832,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a",
+                "",
                 "node-a",
                 0,
                 ResourceRequests::default(),
@@ -9753,6 +9843,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9794,6 +9885,7 @@ mod tests {
         tally.assume(
             "default",
             "filler",
+            "",
             "worker-0",
             0,
             requests(8000, 0, 0),
@@ -9874,6 +9966,7 @@ mod tests {
         tally.assume(
             "default",
             "c",
+            "",
             "worker-0",
             0,
             requests(500, 0, 0),
@@ -9921,6 +10014,7 @@ mod tests {
         tally.assume(
             "default",
             "d",
+            "",
             "worker-3",
             0,
             requests(500, 0, 0),
@@ -9952,6 +10046,7 @@ mod tests {
         tally.assume(
             "default",
             "e",
+            "",
             "worker-9",
             0,
             requests(500, 0, 0),
@@ -10017,6 +10112,7 @@ mod tests {
         tally.assume(
             "default",
             "preemptor",
+            "",
             "worker-0",
             1000,
             requests(1000, 0, 0),
@@ -10250,6 +10346,7 @@ mod tests {
         tally.assume(
             "default",
             "pod-a",
+            "",
             &chosen,
             0,
             ResourceRequests::default(),
@@ -10435,6 +10532,7 @@ mod tests {
         tally.assume(
             "default",
             "preemptor-pod",
+            "",
             "worker-0",
             1000,
             ResourceRequests::default(),
@@ -10535,7 +10633,7 @@ mod tests {
 
         assert_eq!(
             abandoned,
-            vec!["default/preemptor-pod".to_owned()],
+            vec!["default/preemptor-pod/uid-pod".to_owned()],
             "clear must report every waiting plan's pod key it just dropped, so the caller \
              can release it from in_flight — losing this silently strands that pod as \
              permanently deduped"
@@ -10569,6 +10667,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "preemptor",
+            "",
             "worker-0",
             1000,
             pod.requests.clone(),
@@ -10590,6 +10689,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "unrelated-pod",
+            "",
             "worker-0",
             0,
             requests(1000, 0, 0),
@@ -12658,6 +12758,7 @@ mod tests {
         tally.assume(
             "default",
             "pod-a",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -12940,6 +13041,7 @@ mod tests {
             tally.assume(
                 namespace,
                 "holder",
+                "",
                 "worker-0",
                 0,
                 ResourceRequests::default(),
@@ -13028,6 +13130,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "pod1",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13083,6 +13186,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "team-a",
             "pod1",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13150,6 +13254,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "low-priority-pod",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13217,6 +13322,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "low-priority-pod",
+            "",
             "lima-node-3",
             0,
             ResourceRequests::default(),

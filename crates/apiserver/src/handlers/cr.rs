@@ -802,7 +802,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     meta.generation = Some(1);
     meta.creation_timestamp = Some(utc_now_rfc3339());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_deletion_fields(obj, None);
+    crate::handlers::generic::pin_server_owned_metadata(obj, None);
 }
 
 /// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
@@ -946,7 +946,7 @@ fn resolve_cr_metadata(
         incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
     incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_deletion_fields(incoming, Some(stored));
+    crate::handlers::generic::pin_server_owned_metadata(incoming, Some(stored));
     Ok(())
 }
 
@@ -3430,6 +3430,7 @@ pub async fn create_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -3502,6 +3503,7 @@ pub async fn create_cr<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: is_dry_run_header(&headers),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -3652,8 +3654,10 @@ pub async fn replace_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
@@ -3805,7 +3809,7 @@ pub async fn delete_cr<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     // This is what the conformance test "deny custom resource create/update/delete" exercises
     // for the delete case: a Fail-policy webhook must be able to reject the deletion.
     let admission_ctx = AdmissionContext {
@@ -3822,8 +3826,9 @@ pub async fn delete_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -4027,8 +4032,9 @@ pub async fn delete_collection_cr<S: Store>(
                     "extra": user.extra,
                 })),
                 dry_run,
+                options: None,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.
@@ -4529,6 +4535,7 @@ pub async fn create_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -4625,6 +4632,7 @@ pub async fn create_cr_namespaced<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: is_dry_run_header(&headers),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -4796,8 +4804,10 @@ pub async fn replace_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
@@ -4900,7 +4910,7 @@ pub async fn delete_cr_namespaced<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     let admission_ctx = AdmissionContext {
         group: &group,
         version: &version,
@@ -4915,8 +4925,9 @@ pub async fn delete_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -5133,8 +5144,9 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     "extra": user.extra,
                 })),
                 dry_run,
+                options: None,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.
@@ -5343,6 +5355,7 @@ pub async fn patch_cr<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -5512,6 +5525,7 @@ pub async fn patch_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     if ctx.has_status_subresource {
@@ -5527,7 +5541,7 @@ pub async fn patch_cr<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -5663,6 +5677,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -5874,6 +5889,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     if ctx.has_status_subresource {
@@ -5889,7 +5905,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;

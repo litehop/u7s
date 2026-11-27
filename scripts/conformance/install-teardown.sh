@@ -56,5 +56,6 @@ limactl shell "$VM_NAME" sudo bash -c '
   done
   leftovers=$(systemctl list-units --all --plain --no-legend "u7s-*" | awk "{print \$1}")
   [ -z "$leftovers" ] || { echo "units still present: $leftovers" >&2; exit 1; }
+  rm -f '"$INSTALL_STATE_MARKER"'
 '
 echo "[install-teardown] done: $VM_NAME has no u7s units; run the host rig with run-all.sh --stack-only"

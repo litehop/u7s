@@ -199,6 +199,9 @@ pub struct AdmissionRequest {
     pub object: Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_object: Option<Arc<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub options: serde_json::Value,
+    pub dry_run: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_info: Option<serde_json::Value>,
 }
@@ -552,21 +555,24 @@ fn webhook_match_condition_request(
     }
     req.insert("userInfo".into(), Value::Object(user_info));
     req.insert("dryRun".into(), Value::Bool(ctx.dry_run));
-    // The operation's options object; connect options have no scheme kind to report.
-    let options_kind = match ctx.operation {
-        "CREATE" => Some("CreateOptions"),
-        "UPDATE" => Some("UpdateOptions"),
-        "DELETE" => Some("DeleteOptions"),
-        _ => None,
-    };
-    req.insert(
-        "options".into(),
-        options_kind.map_or(
-            Value::Null,
-            |k| json!({"apiVersion": "meta.k8s.io/v1", "kind": k}),
-        ),
-    );
+    req.insert("options".into(), request_options(ctx));
     Value::Object(req)
+}
+
+/// The operation's options object: what the client sent when `ctx.options` carries it, else a
+/// bare `meta.k8s.io/v1` stub of the operation's kind. Connect options have no scheme kind to
+/// report.
+fn request_options(ctx: &AdmissionContext<'_>) -> serde_json::Value {
+    if let Some(options) = ctx.options {
+        return options.clone();
+    }
+    let kind = match ctx.operation {
+        "CREATE" => "CreateOptions",
+        "UPDATE" => "UpdateOptions",
+        "DELETE" => "DeleteOptions",
+        _ => return serde_json::Value::Null,
+    };
+    serde_json::json!({"apiVersion": "meta.k8s.io/v1", "kind": kind})
 }
 
 /// Fetch the namespace object labels from the store.
@@ -1040,6 +1046,9 @@ pub struct AdmissionContext<'a> {
     pub user_info: Option<serde_json::Value>,
     /// Whether this is a dry-run request. Exposed as `request.dryRun` in VAP CEL.
     pub dry_run: bool,
+    /// The operation's options as the API client sent them (`DeleteOptions` on DELETE).
+    /// `None` reports a bare `meta.k8s.io/v1` options stub of the operation's kind.
+    pub options: Option<&'a serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,6 +1208,12 @@ pub fn build_review(
         "UPDATE" | "DELETE" => old_object.map(Arc::clone),
         _ => None,
     };
+    // Upstream reports no new object on DELETE: webhooks detect it by `object` being null.
+    let request_object = if ctx.operation == "DELETE" {
+        Arc::new(serde_json::Value::Null)
+    } else {
+        Arc::clone(object)
+    };
     let (kind, resource, sub_resource) = request_kind_resource(ctx, object);
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
@@ -1214,8 +1229,10 @@ pub fn build_review(
             name: ctx.name.to_string(),
             namespace: ctx.namespace.map(|s| s.to_string()),
             operation: ctx.operation.to_string(),
-            object: Arc::clone(object),
+            object: request_object,
             old_object,
+            options: request_options(ctx),
+            dry_run: ctx.dry_run,
             user_info: ctx.user_info.clone(),
         }),
         response: None,
@@ -1838,14 +1855,16 @@ async fn call_webhook(
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
-fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Result<(), StatusError> {
+fn decode_webhook_patch(patch_b64: &str) -> Result<serde_json::Value, StatusError> {
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, patch_b64)
         .map_err(|e| Status::bad_request(format!("webhook patch base64 decode error: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|e| Status::bad_request(format!("webhook patch JSON parse error: {e}")))?;
+    serde_json::from_slice(&decoded)
+        .map_err(|e| Status::bad_request(format!("webhook patch JSON parse error: {e}")))
+}
 
-    crate::handlers::json_patch::apply_json_patch(object, &patch)
+fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Result<(), StatusError> {
+    crate::handlers::json_patch::apply_json_patch(object, &decode_webhook_patch(patch_b64)?)
 }
 
 /// Run one webhook entry against the object. Returns the (possibly mutated) object
@@ -2030,6 +2049,20 @@ async fn invoke_mutating_webhook<S: Store>(
             // Apply patch if present.
             if let Some(patch_b64) = resp.patch.as_deref() {
                 if !patch_b64.is_empty() {
+                    // A DELETE has no object to persist a patch to; upstream refuses any
+                    // non-empty patch, whatever the webhook's failurePolicy.
+                    if ctx.operation == "DELETE" {
+                        if decode_webhook_patch(patch_b64)?
+                            .as_array()
+                            .is_some_and(|ops| !ops.is_empty())
+                        {
+                            return Err(Status::internal_actionable(format!(
+                                "admission webhook \"{}\" attempted to modify the object, which is not supported for this operation",
+                                webhook.name
+                            )));
+                        }
+                        return Ok((None, false));
+                    }
                     let mut mutated = seen.as_ref().clone();
                     apply_webhook_patch(&mut mutated, patch_b64)?;
                     if let RuleMatch::Equivalent { crd, .. } = &matched {
@@ -3723,6 +3756,34 @@ pub async fn mutating_admission_configured<S: Store>(state: &AppState<S>) -> boo
         || !fetch_mutating_policies(state).await.is_empty()
 }
 
+/// The one admission convergence point for DELETE: mutating webhooks (which may only allow or
+/// deny, never patch, as no object is written) then validating webhooks and policies, both
+/// seeing `existing` as the old object and `options` as the request's `DeleteOptions`.
+/// `ctx.operation` must be "DELETE".
+pub async fn admit_delete<S: Store>(
+    state: &AppState<S>,
+    existing: &serde_json::Value,
+    options: &crate::types::DeleteOptions,
+    ctx: &AdmissionContext<'_>,
+) -> Result<(), StatusError> {
+    let mut options_json = serde_json::to_value(options).unwrap_or_default();
+    options_json["apiVersion"] = "meta.k8s.io/v1".into();
+    options_json["kind"] = "DeleteOptions".into();
+    let ctx = AdmissionContext {
+        group: ctx.group,
+        version: ctx.version,
+        resource: ctx.resource,
+        name: ctx.name,
+        namespace: ctx.namespace,
+        operation: ctx.operation,
+        user_info: ctx.user_info.clone(),
+        dry_run: ctx.dry_run,
+        options: Some(&options_json),
+    };
+    run_mutating_webhooks(state, existing.clone(), Some(existing), &ctx).await?;
+    run_validating_webhooks(state, existing, Some(existing), &ctx).await
+}
+
 /// The request a write runs admission as: the GVR it is admitted under (`resource` is
 /// `resource/subresource` for a subresource, e.g. `pods/status`), the target object, and who
 /// asked.
@@ -3770,6 +3831,7 @@ pub async fn admit_write<S: Store>(
             "extra": target.user.map(|u| &u.extra),
         })),
         dry_run: target.dry_run,
+        options: None,
     };
     let mutated = run_mutating_webhooks(state, candidate, old, &ctx).await?;
     let admitted = strategy(mutated)?;
@@ -3844,6 +3906,7 @@ mod tests {
             operation: "UPDATE",
             user_info: None,
             dry_run: false,
+            options: None,
         }
     }
 
@@ -3935,6 +3998,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         assert!(
             !is_webhook_configuration_resource(&ctx),
@@ -4007,6 +4071,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         // Must succeed without invoking any webhook (skipped by deadlock prevention).
         let result = run_mutating_webhooks(&state, new_mwc.clone(), None, &ctx).await;
@@ -4070,6 +4135,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &new_vwc, None, &ctx).await;
         assert!(
@@ -4232,6 +4298,7 @@ mod tests {
                 operation: "CREATE",
                 user_info: None,
                 dry_run: false,
+                options: None,
             };
             let obj = json!({"apiVersion": "example.com/v2", "kind": "Widget",
                 "metadata": {"name": "w"}});
@@ -4309,6 +4376,7 @@ mod tests {
             operation: "DELETE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result =
             run_validating_webhooks(&state, &existing_vwc, Some(&existing_vwc), &ctx).await;
@@ -4957,6 +5025,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
         assert!(result.is_ok(), "no webhooks must not fail");
@@ -4980,6 +5049,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(result.is_ok(), "no webhooks must return Ok");
@@ -5037,6 +5107,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
@@ -5160,6 +5231,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let review = build_review(
             "uid-1",
@@ -5187,6 +5259,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let review = build_review(
             "uid-2",
@@ -5218,6 +5291,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let review = build_review("uid-3", &ctx, &obj, None);
         let resp = mock_call_webhook(patch_handler(), &review).await;
@@ -5290,6 +5364,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -5353,6 +5428,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -5434,6 +5510,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
@@ -5491,6 +5568,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
@@ -5582,6 +5660,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
@@ -5700,6 +5779,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -6202,6 +6282,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -6628,6 +6709,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -6714,6 +6796,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -6784,6 +6867,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         // The webhook is invoked at https://my-webhook-svc.webhook-ns.svc:8443/mutate,
         // fails to connect (no cluster in unit tests), but failurePolicy=Ignore means
@@ -6977,6 +7061,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
@@ -7075,6 +7160,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
@@ -7165,6 +7251,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: true,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(
@@ -7247,6 +7334,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: true,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(
@@ -7328,6 +7416,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: true,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(
@@ -7408,6 +7497,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: true,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(
@@ -7479,6 +7569,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
         assert!(
@@ -7584,6 +7675,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, configmap, None, &ctx).await;
@@ -7759,6 +7851,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let obj = Arc::new(serde_json::json!({
             "apiVersion": "apps/v1",
@@ -7798,6 +7891,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         // Object without a "kind" field.
         let obj = Arc::new(serde_json::json!({"metadata": {"name": "my-pod"}}));
@@ -7829,6 +7923,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let obj = Arc::new(serde_json::json!({"kind": "Pod", "apiVersion": "v1"}));
         let review = build_review("uid-plain-resource", &ctx, &obj, None);
@@ -7870,6 +7965,7 @@ mod tests {
                 serde_json::json!({"username": "alice", "groups": ["system:authenticated"]}),
             ),
             dry_run: false,
+            options: None,
         };
         let object = Arc::new(serde_json::json!({
             "apiVersion": "apps/v1",
@@ -7886,7 +7982,7 @@ mod tests {
         let review = build_review("wire-stability-uid", &ctx, &object, Some(&old_object));
 
         let actual = serde_json::to_string(&review).expect("AdmissionReview must serialize");
-        let expected = "{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"request\":{\"uid\":\"wire-stability-uid\",\"kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"resource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"requestKind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"requestResource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"name\":\"my-deploy\",\"namespace\":\"default\",\"operation\":\"UPDATE\",\"object\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":3}},\"oldObject\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":1}},\"userInfo\":{\"groups\":[\"system:authenticated\"],\"username\":\"alice\"}}}";
+        let expected = "{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"request\":{\"uid\":\"wire-stability-uid\",\"kind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"resource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"requestKind\":{\"group\":\"apps\",\"version\":\"v1\",\"kind\":\"Deployment\"},\"requestResource\":{\"group\":\"apps\",\"version\":\"v1\",\"resource\":\"deployments\"},\"name\":\"my-deploy\",\"namespace\":\"default\",\"operation\":\"UPDATE\",\"object\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":3}},\"oldObject\":{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"name\":\"my-deploy\"},\"spec\":{\"replicas\":1}},\"options\":{\"apiVersion\":\"meta.k8s.io/v1\",\"kind\":\"UpdateOptions\"},\"dryRun\":false,\"userInfo\":{\"groups\":[\"system:authenticated\"],\"username\":\"alice\"}}}";
         assert_eq!(
             actual, expected,
             "AdmissionReview wire bytes changed — a webhook consumer parsing a fixed \
@@ -8004,6 +8100,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -8078,6 +8175,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -8145,6 +8243,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
@@ -8216,6 +8315,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -8288,6 +8388,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
@@ -8353,6 +8454,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
@@ -8554,6 +8656,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         run_mutating_webhooks(&state, obj.clone(), None, &ctx)
@@ -8862,6 +8965,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
@@ -8958,6 +9062,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, cm.clone(), None, &ctx).await;
@@ -9038,6 +9143,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
@@ -9131,6 +9237,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
@@ -9256,6 +9363,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result_other = run_mutating_webhooks(&state, deploy_other, None, &ctx_other).await;
         assert!(result_other.is_ok(), "pipeline must succeed");
@@ -9281,6 +9389,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result_scoped = run_mutating_webhooks(&state, deploy_scoped, None, &ctx_scoped).await;
         assert!(result_scoped.is_ok(), "pipeline must succeed");
@@ -9614,6 +9723,7 @@ mod tests {
             },
             user_info: None,
             dry_run: false,
+            options: None,
         };
         run_mutating_webhooks(&state, object, old_object.as_ref(), &ctx).await
     }
@@ -10729,6 +10839,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &deploy_even, None, &ctx).await;
         assert!(
@@ -10833,6 +10944,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &deploy_odd, None, &ctx).await;
         assert!(
@@ -10979,6 +11091,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &deploy_even, None, &ctx).await;
         let err = result.expect_err(
@@ -11250,6 +11363,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &new_vap, None, &ctx).await;
         assert!(
@@ -11330,6 +11444,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
         assert!(
@@ -11402,6 +11517,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &pod, None, &ctx).await;
         assert!(
@@ -11458,6 +11574,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         run_validating_webhooks(&state, &pod, None, &ctx).await
     }
@@ -11736,6 +11853,7 @@ mod tests {
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         run_validating_webhooks(&state, &object, None, &ctx).await
     }
@@ -11816,6 +11934,7 @@ mod tests {
             user_info: Some(json!({"username": "alice", "uid": "", "groups": [],
                 "extra": {"k": ["v"]}})),
             dry_run: true,
+            options: None,
         };
         let pod = json!({"apiVersion": "v1", "kind": "Pod"});
         assert_eq!(
@@ -11842,6 +11961,7 @@ mod tests {
             operation: "CONNECT",
             user_info: None,
             dry_run: false,
+            options: None,
             ..ctx
         };
         let req = webhook_match_condition_request(&cluster, &json!({"kind": "Node"}));
@@ -12438,6 +12558,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
@@ -12562,6 +12683,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
@@ -12692,6 +12814,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &deploy, None, &ctx).await;
@@ -12784,6 +12907,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &node, None, &ctx).await;
@@ -12882,6 +13006,7 @@ quoted""" && object.b == '''x'y'''"#,
                 "groups": ["system:nodes", "system:authenticated"]
             })),
             dry_run: false,
+            options: None,
         };
         let result_matching = run_validating_webhooks(&state, &node, None, &ctx_matching).await;
         assert!(
@@ -12904,6 +13029,7 @@ quoted""" && object.b == '''x'y'''"#,
                 "groups": ["system:nodes", "system:authenticated"]
             })),
             dry_run: false,
+            options: None,
         };
         let result_other = run_validating_webhooks(&state, &node, None, &ctx_other).await;
         assert!(
@@ -13032,6 +13158,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: Some(node_bound_user.clone()),
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &matching_cm, None, &ctx).await;
         assert!(
@@ -13051,6 +13178,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: Some(node_bound_user.clone()),
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &mismatched_cm, None, &ctx).await;
         let err = result.expect_err(
@@ -13077,6 +13205,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "DELETE",
             user_info: Some(node_bound_user.clone()),
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &matching_cm, Some(&matching_cm), &ctx).await;
         assert!(
@@ -13095,6 +13224,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "DELETE",
             user_info: Some(node_bound_user),
             dry_run: false,
+            options: None,
         };
         let result =
             run_validating_webhooks(&state, &mismatched_cm, Some(&mismatched_cm), &ctx).await;
@@ -13115,6 +13245,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: Some(unbound_user),
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &matching_cm, None, &ctx).await;
         let err = result.expect_err("a user with no node claim must be denied");
@@ -13207,6 +13338,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: Some(json!({"username": "alice", "uid": "", "groups": []})),
             dry_run: false,
+            options: None,
         };
         let result_alice = run_validating_webhooks(&state, &cm, None, &ctx_alice).await;
         assert!(
@@ -13225,6 +13357,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result_none = run_validating_webhooks(&state, &cm, None, &ctx_none).await;
         assert!(
@@ -13349,6 +13482,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         // The marker Deployment (replicas=3) must be ALLOWED because 3 > 1 = true.
@@ -13513,6 +13647,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &marker, None, &ctx).await;
@@ -13684,6 +13819,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "UPDATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &retrieved, None, &ctx).await;
@@ -13801,6 +13937,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &deploy, None, &ctx).await;
@@ -13889,6 +14026,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &node, None, &ctx).await;
@@ -13965,6 +14103,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
@@ -14028,6 +14167,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let review = build_review("uid-proxy-test", &ctx, &obj, None);
         let webhook_url = format!("{base_url}/webhook");
@@ -14583,6 +14723,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "UPDATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &new_obj, Some(&old_obj), &ctx).await;
@@ -14685,6 +14826,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CONNECT",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let attach_options = serde_json::json!({
             "kind": "PodAttachOptions",
@@ -15056,6 +15198,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         // run_validating_webhooks calls fetch_validating_configs internally.
         // The rule mismatch means the webhook is skipped, so this returns Ok regardless of
@@ -15243,6 +15386,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_mutating_webhooks(&state, configmap, None, &ctx).await;
@@ -15344,6 +15488,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
 
         let result = run_validating_webhooks(&state, &deployment, None, &ctx).await;
@@ -15416,6 +15561,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &node, None, &cluster_scoped_ctx).await;
         assert!(
@@ -15438,6 +15584,7 @@ quoted""" && object.b == '''x'y'''"#,
             operation: "CREATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let result = run_validating_webhooks(&state, &pod, None, &namespaced_ctx).await;
         assert!(

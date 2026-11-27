@@ -209,7 +209,7 @@ pub(crate) async fn create_namespace<S: Store>(
     }
 
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj.body, None);
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, None);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -226,6 +226,7 @@ pub(crate) async fn create_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks — see create_resource's identical call
@@ -418,10 +419,6 @@ pub(crate) async fn replace_namespace<S: Store>(
                 )));
             }
         }
-        crate::handlers::generic::pin_server_owned_deletion_fields(
-            &mut obj.body,
-            stored_obj.as_ref(),
-        );
 
         // Admission webhook pipeline (mutating then validating), threading the pre-existing
         // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
@@ -441,6 +438,7 @@ pub(crate) async fn replace_namespace<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
@@ -457,6 +455,8 @@ pub(crate) async fn replace_namespace<S: Store>(
                 obj.body.as_object_mut().map(|m| m.remove("status"));
             }
         }
+
+        crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, stored_obj.as_ref());
 
         run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
         crate::field_manager::WriteIdentity::new(None, &headers).record(
@@ -592,7 +592,6 @@ pub(crate) async fn patch_namespace<S: Store>(
     crate::patch::merge_patch(&mut current.body, &patch);
 
     current.body["metadata"]["uid"] = stored_uid;
-    super::generic::pin_server_owned_deletion_fields(&mut current.body, Some(&pre_patch_obj));
     super::json_patch::enforce_patch_identity(&mut current.body, &name, None)?;
 
     if stored_status.is_null() {
@@ -619,9 +618,11 @@ pub(crate) async fn patch_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run: patch_query.is_dry_run(),
+        options: None,
     };
     current.body =
         run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
+    super::generic::pin_server_owned_metadata(&mut current.body, Some(&pre_patch_obj));
 
     // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
     // forged/scalar status the earlier restore already discarded, and this is the last point
@@ -1142,7 +1143,7 @@ pub(crate) async fn delete_namespace<S: Store>(
     )
     .map_err(|e| e.into_status("", "namespaces", &name, "Namespace"))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     // Run once here, before branching into soft-delete/finalizer logic below, matching every
     // other delete handler's single admission point.
     let admission_ctx = AdmissionContext {
@@ -1159,8 +1160,9 @@ pub(crate) async fn delete_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // apply_delete_policy already stamped status.phase=Terminating in place

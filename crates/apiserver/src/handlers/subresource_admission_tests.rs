@@ -2003,10 +2003,6 @@ pub(crate) mod cases {
                         ("widgets/status", "UPDATE"),
                         ("widgets/scale", "UPDATE"),
                     ] {
-                        // u7s never runs mutating webhooks on DELETE (upstream does); tracked separately.
-                        if mutating && op == "DELETE" {
-                            continue;
-                        }
                         cells += 1;
                         let label = format!(
                             "mutating={mutating} policy={policy:?} request={request_version} \
@@ -2141,10 +2137,195 @@ pub(crate) mod cases {
                 }
             }
         }
-        assert_eq!(
-            cells,
-            (2 * 5 - 1) * 3 * 2,
-            "every matrix cell must have run"
-        );
+        assert_eq!(cells, 2 * 5 * 3 * 2, "every matrix cell must have run");
+    }
+
+    /// A DELETE writes no object, so a mutating webhook that returns a patch for it has
+    /// nothing to apply it to: upstream fails the request instead of silently dropping the
+    /// patch, and a webhook that patches nothing (`[]`) is still allowed. Checked on a built-in
+    /// and a custom resource, the two delete families with separate handlers.
+    #[tokio::test]
+    async fn mutating_webhook_patch_on_delete_is_rejected_and_the_object_survives() {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let patch = b64(r#"[{"op":"add","path":"/metadata/labels","value":{"a":"b"}}]"#);
+        let empty = b64("[]");
+        for (kind, group, resource, uri, key) in [
+            (
+                "configmap",
+                "",
+                "configmaps",
+                "/api/v1/namespaces/default/configmaps/cm",
+                "/registry/configmaps/default/cm",
+            ),
+            (
+                "widget",
+                "example.com",
+                "widgets",
+                "/apis/example.com/v1/namespaces/default/widgets/w",
+                "/registry/cr/example.com/widgets/default/w",
+            ),
+        ] {
+            for (patch, rejected) in [(&patch, true), (&empty, false)] {
+                let c = Cluster::new().await;
+                if kind == "widget" {
+                    c.create(
+                        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                        widgets_v1_v2_crd(None),
+                    )
+                    .await;
+                    c.create(&widgets_at("v1"), widget_at("v1", json!({"size": 1})))
+                        .await;
+                } else {
+                    c.create(
+                        "/api/v1/namespaces/default/configmaps",
+                        json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm"}}),
+                    )
+                    .await;
+                }
+                let patch = patch.clone();
+                let hook = spawn_hook(
+                    move |_| json!({"allowed": true, "patchType": "JSONPatch", "patch": patch}),
+                )
+                .await;
+                register_webhook_for(
+                    &c.store,
+                    true,
+                    "p",
+                    &hook.url,
+                    group,
+                    "v1",
+                    None,
+                    &[resource],
+                    &["DELETE"],
+                )
+                .await;
+                let (status, resp) = c.call("DELETE", uri, "application/json", json!({})).await;
+                let label = format!("{kind} patch rejected={rejected}: {status} {resp}");
+                assert_eq!(
+                    hook.requests().len(),
+                    1,
+                    "{label}: webhook must be called on DELETE"
+                );
+                if rejected {
+                    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{label}");
+                    assert_eq!(
+                        resp["message"],
+                        "Internal error occurred: admission webhook \"p.example.com\" attempted to modify the object, which is not supported for this operation",
+                        "{label}"
+                    );
+                    assert!(
+                        c.store.get(key).await.unwrap().is_some(),
+                        "{label}: object must survive"
+                    );
+                } else {
+                    assert!(status.is_success(), "{label}");
+                    assert!(c.store.get(key).await.unwrap().is_none(), "{label}");
+                }
+            }
+        }
+    }
+
+    /// Webhooks detect a DELETE by `object` being null and read the client's grace period and
+    /// propagation policy from `options`; sending the stored object as `object` or a bare options
+    /// stub makes a policy misclassify the request or lose the delete semantics it enforces.
+    /// Every delete family (built-in, cluster-scoped built-in, namespaced CR, cluster CR) and both
+    /// webhook kinds must see upstream's shape.
+    #[tokio::test]
+    async fn delete_review_has_null_object_stored_old_object_and_the_clients_delete_options() {
+        let sent =
+            json!({"gracePeriodSeconds": 7, "propagationPolicy": "Background", "dryRun": ["All"]});
+        for (group, resource, kind, create_uri, uri) in [
+            (
+                "",
+                "configmaps",
+                "ConfigMap",
+                "/api/v1/namespaces/default/configmaps",
+                "/api/v1/namespaces/default/configmaps/o",
+            ),
+            (
+                "",
+                "namespaces",
+                "Namespace",
+                "/api/v1/namespaces",
+                "/api/v1/namespaces/o",
+            ),
+            (
+                "example.com",
+                "widgets",
+                "Widget",
+                "/apis/example.com/v1/namespaces/default/widgets",
+                "/apis/example.com/v1/namespaces/default/widgets/o",
+            ),
+            (
+                "example.com",
+                "gadgets",
+                "Gadget",
+                "/apis/example.com/v1/gadgets",
+                "/apis/example.com/v1/gadgets/o",
+            ),
+        ] {
+            for mutating in [true, false] {
+                let c = Cluster::new().await;
+                if group == "example.com" {
+                    let scope = if resource == "widgets" {
+                        "Namespaced"
+                    } else {
+                        "Cluster"
+                    };
+                    c.create(
+                        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                        crd(resource, kind, scope),
+                    )
+                    .await;
+                }
+                let api_version = if group.is_empty() {
+                    "v1".to_string()
+                } else {
+                    format!("{group}/v1")
+                };
+                c.create(
+                    create_uri,
+                    json!({"apiVersion": api_version, "kind": kind, "metadata": {"name": "o"}}),
+                )
+                .await;
+                let hook = spawn_hook(|_| json!({"allowed": true})).await;
+                register_webhook(
+                    &c.store,
+                    mutating,
+                    "d",
+                    &hook.url,
+                    group,
+                    &[resource],
+                    &["DELETE"],
+                )
+                .await;
+
+                let (status, resp) = c
+                    .call("DELETE", uri, "application/json", sent.clone())
+                    .await;
+                let label = format!("{resource} mutating={mutating}: {status} {resp}");
+                assert!(status.is_success(), "{label}");
+
+                let reqs = hook.requests();
+                assert_eq!(reqs.len(), 1, "{label}: {reqs:?}");
+                let r = &reqs[0];
+                assert_eq!(r["operation"], "DELETE", "{label}");
+                assert!(
+                    r["object"].is_null(),
+                    "{label}: object must be null on DELETE: {r}"
+                );
+                assert_eq!(r["oldObject"]["metadata"]["name"], "o", "{label}: {r}");
+                assert_eq!(r["oldObject"]["kind"], kind, "{label}: {r}");
+                assert_eq!(r["dryRun"], true, "{label}: {r}");
+                assert_eq!(
+                    r["options"],
+                    json!({"apiVersion": "meta.k8s.io/v1", "kind": "DeleteOptions",
+                        "gracePeriodSeconds": 7, "propagationPolicy": "Background",
+                        "dryRun": ["All"]}),
+                    "{label}: options must be the full DeleteOptions the client sent"
+                );
+            }
+        }
     }
 }

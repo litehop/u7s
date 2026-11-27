@@ -34,6 +34,7 @@ fn admission_context() -> AdmissionContext<'static> {
         operation: "UPDATE",
         user_info: None,
         dry_run: false,
+        options: None,
     }
 }
 

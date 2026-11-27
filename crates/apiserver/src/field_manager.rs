@@ -993,17 +993,23 @@ fn validate_delete_options(opts: &DeleteOptions) -> Vec<FieldError> {
 /// Upstream's `ParameterCodec.DecodeParameters` into `DeleteOptions`, used only when the
 /// request has no body. `orphanDependents` follows apimachinery's bool conversion: "0" and
 /// any case of "false" are false, every other value (including empty) is true.
-fn delete_options_from_query(query: &[(String, String)]) -> DeleteOptions {
+fn delete_options_from_query(query: &[(String, String)]) -> Result<DeleteOptions, String> {
     let first = |k: &str| query.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let dry_run = query_dry_run(query);
-    DeleteOptions {
+    let grace_period_seconds = first("gracePeriodSeconds")
+        .map(|v| {
+            v.parse::<i64>()
+                .map_err(|e| format!("unable to decode query: gracePeriodSeconds {v:?}: {e}"))
+        })
+        .transpose()?;
+    Ok(DeleteOptions {
         propagation_policy: first("propagationPolicy").map(String::from),
         orphan_dependents: first("orphanDependents")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false"))),
-        grace_period_seconds: None,
+        grace_period_seconds,
         preconditions: None,
         dry_run: (!dry_run.is_empty()).then(|| dry_run.into_iter().map(String::from).collect()),
-    }
+    })
 }
 
 /// The JSON body handlers decode `DeleteOptions` from, carrying the query-supplied options.
@@ -1014,6 +1020,9 @@ fn delete_options_body(opts: &DeleteOptions) -> Vec<u8> {
     }
     if let Some(o) = opts.orphan_dependents {
         body["orphanDependents"] = json!(o);
+    }
+    if let Some(g) = opts.grace_period_seconds {
+        body["gracePeriodSeconds"] = json!(g);
     }
     if let Some(d) = &opts.dry_run {
         body["dryRun"] = json!(d);
@@ -1072,7 +1081,10 @@ async fn resolve_delete_options(
             .remove(crate::handlers::json_patch::DRY_RUN_HEADER);
     }
     let opts = if from_query {
-        Some(delete_options_from_query(query))
+        Some(
+            delete_options_from_query(query)
+                .map_err(|msg| Box::new(crate::status::Status::bad_request(msg).into_response()))?,
+        )
     } else {
         crate::util::extract_body_quiet(&raw, crate::util::content_type(&parts.headers))
             .ok()
@@ -1089,6 +1101,7 @@ async fn resolve_delete_options(
         if from_query
             && (opts.propagation_policy.is_some()
                 || opts.orphan_dependents.is_some()
+                || opts.grace_period_seconds.is_some()
                 || opts.dry_run.is_some())
         {
             out = delete_options_body(&opts).into();
@@ -2154,12 +2167,45 @@ mod tests {
         /// treat "no body" as "no explicit propagation intent" would see one.
         #[tokio::test]
         async fn delete_without_options_is_passed_through_unchanged() {
-            for uri in ["/x", "/x?gracePeriodSeconds=0", "/x?unrelated=1"] {
+            for uri in ["/x", "/x?unrelated=1"] {
                 let (status, echoed, ct) = delete_echo(uri, None, Vec::new()).await;
                 assert_eq!(status, 200, "{uri}");
                 assert_eq!(echoed, Value::Null, "{uri}: body must stay empty");
                 assert_eq!(ct, None, "{uri}");
             }
+        }
+
+        /// `kubectl delete --grace-period=N --raw`-style requests carry the period only in the
+        /// query; the handlers read DeleteOptions from the body alone, so dropping it here
+        /// silently turns a forced `0` into the default grace period.
+        #[tokio::test]
+        async fn delete_query_grace_period_reaches_handlers_and_a_body_wins() {
+            for (value, want) in [("0", 0), ("30", 30), ("-1", -1)] {
+                let (status, echoed, _) =
+                    delete_echo(&format!("/x?gracePeriodSeconds={value}"), None, Vec::new()).await;
+                assert_eq!(status, 200);
+                assert_eq!(
+                    echoed["gracePeriodSeconds"], want,
+                    "?gracePeriodSeconds={value}"
+                );
+            }
+            let (_, echoed, _) = delete_echo(
+                "/x?gracePeriodSeconds=5",
+                Some("application/json"),
+                br#"{"gracePeriodSeconds":9}"#.to_vec(),
+            )
+            .await;
+            assert_eq!(
+                echoed["gracePeriodSeconds"], 9,
+                "a body suppresses the query"
+            );
+        }
+
+        /// A non-numeric period is the client's mistake (400), not a silent default.
+        #[tokio::test]
+        async fn delete_query_grace_period_that_is_not_an_integer_is_400() {
+            let (status, _, _) = delete_echo("/x?gracePeriodSeconds=soon", None, Vec::new()).await;
+            assert_eq!(status, 400);
         }
 
         /// Mirrors the delete handlers' dry-run decision (`body.is_dry_run() || header`)

@@ -3,7 +3,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use u7s_apiserver::record_request_total;
+use u7s_apiserver::{record_request_total, user_label};
 
 /// Number of concurrent threads hammering the same label combo — matches the plan's stated
 /// concern (sub-bead 2 will call this from every request, so N simultaneous requests for the
@@ -31,6 +31,9 @@ fn bench_single_threaded(c: &mut Criterion) {
                 black_box("pods"),
                 black_box("namespace"),
                 black_box("200"),
+                user_label(black_box(
+                    "system:serviceaccount:kube-system:job-controller",
+                )),
             );
         });
     });
@@ -48,7 +51,15 @@ fn bench_single_threaded(c: &mut Criterion) {
 fn bench_concurrent_same_label_combo(c: &mut Criterion) {
     // Prime the series once outside the timed loop so every sample measures steady-state
     // fetch_add contention, not the one-time write-lock cost of first-touch registration.
-    record_request_total("get", "core", "v1", "pods", "namespace", "200");
+    record_request_total(
+        "get",
+        "core",
+        "v1",
+        "pods",
+        "namespace",
+        "200",
+        "job-controller",
+    );
 
     let elements_per_iter = CONCURRENT_THREADS as u64 * INCREMENTS_PER_THREAD;
     let mut group = c.benchmark_group("record_request_total_concurrent");
@@ -73,6 +84,9 @@ fn bench_concurrent_same_label_combo(c: &mut Criterion) {
                                         black_box("pods"),
                                         black_box("namespace"),
                                         black_box("200"),
+                                        user_label(black_box(
+                                            "system:serviceaccount:kube-system:job-controller",
+                                        )),
                                     );
                                 }
                             });

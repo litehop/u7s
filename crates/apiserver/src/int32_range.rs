@@ -593,6 +593,7 @@ mod tests {
             operation: "UPDATE",
             user_info: None,
             dry_run: false,
+            options: None,
         };
         let svc = json!({"spec": {"ports": [{"port": 4294967318u64}]}});
         let err = validate_write(&state, &update_ctx("services"), &svc)
