@@ -411,6 +411,34 @@ fn measure_single_pattern_compile_cost() {
     });
 }
 
+/// Cost paid before any compiled-size check: boon's ECMA rewrite re-parses the whole
+/// pattern once per `\d`/`\w`/`\s`, so a source made only of those is its worst case.
+/// A unit stops growing once one run exceeds 5 s so the sweep stays under `WALL_CAP`.
+#[test]
+#[ignore = "timing PoC; run with --release --ignored --nocapture"]
+fn measure_pre_compile_cost_by_source_length() {
+    for (name, unit) in [("lit", "a"), ("d", "\\d"), ("s", "\\s")] {
+        for kib in [1usize, 2, 4, 8, 64, 256] {
+            let p = unit.repeat(kib * 1024 / unit.len());
+            let t0 = Instant::now();
+            let budget = super::crd::check_pattern_compile_budget(&schema_with(&[&p]), "s", &mut 0);
+            let budget_t = t0.elapsed();
+            let (boon_t, boon_res) = compile(std::slice::from_ref(&p));
+            eprintln!(
+                "POC src={kib}KiB unit={name} budget_check={:.1}ms budget_ok={} boon_compile={:.1}ms boon_ok={}",
+                budget_t.as_secs_f64() * 1e3,
+                budget.is_ok(),
+                boon_t.as_secs_f64() * 1e3,
+                boon_res.is_ok()
+            );
+            if boon_t + budget_t > Duration::from_secs(5) {
+                eprintln!("POC unit={name} stopping after {kib}KiB: over 5s");
+                break;
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "measurement only; run with --ignored --nocapture"]
 fn measure_many_pattern_crd_compile_cost() {
