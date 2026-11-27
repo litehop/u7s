@@ -71,10 +71,11 @@ async fn bind_reserved_node(
     .await
     {
         if !is_bind_noop(&e) {
-            tally
-                .lock()
-                .expect("tally lock poisoned")
-                .remove(&pending.namespace, &pending.pod_name);
+            tally.lock().expect("tally lock poisoned").remove_if_uid(
+                &pending.namespace,
+                &pending.pod_name,
+                &pending.uid,
+            );
         }
         return Err(e);
     }
@@ -227,7 +228,7 @@ async fn preempt_and_pick_node(
                 // every future preemption plan's candidate pool forever,
                 // even though nothing is actually still trying to evict them.
                 let mut guard = tally.lock().expect("tally lock poisoned");
-                guard.remove(&pending.namespace, &pending.pod_name);
+                guard.remove_if_uid(&pending.namespace, &pending.pod_name, &pending.uid);
                 guard.release_victims(&plan.victims);
                 last_err = Some(PreemptionFailure::Fail(e));
             }
@@ -320,10 +321,11 @@ async fn attempt_deferred_bind(
                     "deferred bind for {key}: node {node_name} no longer exists — \
                      leaving pod Pending for the periodic resync to re-plan"
                 );
-                tally
-                    .lock()
-                    .expect("tally lock poisoned")
-                    .remove(&pending.namespace, &pending.pod_name);
+                tally.lock().expect("tally lock poisoned").remove_if_uid(
+                    &pending.namespace,
+                    &pending.pod_name,
+                    &pending.uid,
+                );
                 return;
             }
         };
@@ -333,10 +335,11 @@ async fn attempt_deferred_bind(
                  (capacity drifted while waiting for the victim's real removal) — \
                  leaving pod Pending for the periodic resync to re-plan"
             );
-            tally
-                .lock()
-                .expect("tally lock poisoned")
-                .remove(&pending.namespace, &pending.pod_name);
+            tally.lock().expect("tally lock poisoned").remove_if_uid(
+                &pending.namespace,
+                &pending.pod_name,
+                &pending.uid,
+            );
             return;
         }
         info!(
@@ -1239,11 +1242,17 @@ fn handle_pod_event(
                     // emit FailedScheduling onto a pod that is actually
                     // running fine, and do not roll back its tally
                     // reservation (see `bind_reserved_node`'s doc comment).
-                    info!(
-                        "bind for {key} rejected as already-assigned: {e} — pod is already \
-                         correctly bound from an earlier bind; treating as a no-op, not a \
-                         scheduling failure"
-                    );
+                    match &e {
+                        BindError::StalePod(_) => info!(
+                            "bind for {key} rejected as stale (pod recreated since the \
+                             decision): {e} — treating as a no-op, not a scheduling failure"
+                        ),
+                        _ => info!(
+                            "bind for {key} rejected as already-assigned: {e} — pod is already \
+                             correctly bound from an earlier bind; treating as a no-op, not a \
+                             scheduling failure"
+                        ),
+                    }
                     SchedulingOutcome::Skipped
                 }
                 Err(e) => SchedulingOutcome::Done(Err(e.into())),
@@ -2149,6 +2158,7 @@ mod tests {
             guard.assume(
                 "default",
                 "victim",
+                "",
                 "worker-0",
                 0,
                 ResourceRequests {
@@ -2162,6 +2172,7 @@ mod tests {
             guard.assume(
                 "default",
                 "bystander",
+                "",
                 "worker-1",
                 0,
                 ResourceRequests {
@@ -2477,6 +2488,79 @@ mod tests {
         );
     }
 
+    /// A deferred preemption plan decided for a pod that has since been deleted and
+    /// recreated under the same name must not release the recreated pod's tally
+    /// reservation when it gives up — releasing it would let another pod take the
+    /// capacity the new pod's own scheduling attempt just reserved.
+    #[tokio::test]
+    async fn stale_deferred_plan_giving_up_keeps_recreated_pods_reservation() {
+        let (client, _counts) = spawn_bind_outcome_mock_server(201, "{}").await;
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        let pod_with_uid = |uid: &str| {
+            let mut ev = bind_outcome_test_pod_event();
+            ev["object"]["metadata"]["uid"] = json!(uid);
+            needs_scheduling(&ev).expect("pending pod")
+        };
+        let old = pod_with_uid("uid-old");
+        let new = pod_with_uid("uid-new");
+        {
+            let mut guard = tally.lock().expect("tally lock poisoned");
+            guard.apply_node_event(&json!({
+                "type": "ADDED",
+                "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "1000m"}}}
+            }));
+            guard.assume(
+                &new.namespace,
+                &new.pod_name,
+                &new.uid,
+                "worker-0",
+                0,
+                new.requests.clone(),
+                Vec::new(),
+                std::collections::HashMap::new(),
+                Vec::new(),
+            );
+        }
+
+        attempt_deferred_bind(
+            &client,
+            &tally,
+            &in_flight,
+            old.clone(),
+            "node-that-vanished".to_owned(),
+        )
+        .await;
+        let on_worker = |tally: &Mutex<NodeTally>| {
+            tally
+                .lock()
+                .expect("tally lock poisoned")
+                .pods_on("worker-0")
+                .len()
+        };
+        assert_eq!(
+            on_worker(&tally),
+            1,
+            "a stale plan whose node vanished must not drop the recreated pod's reservation"
+        );
+
+        let tiny = json!({
+            "type": "ADDED",
+            "object": {"metadata": {"name": "worker-0"}, "status": {"allocatable": {"cpu": "10m"}}}
+        });
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .apply_node_event(&tiny);
+        attempt_deferred_bind(&client, &tally, &in_flight, old, "worker-0".to_owned()).await;
+        assert_eq!(
+            on_worker(&tally),
+            1,
+            "a stale plan whose reservation no longer fits must not drop the recreated pod's \
+             reservation"
+        );
+    }
+
     /// A bind decided for a pod that was deleted and recreated under the same name
     /// while the bind was in flight must (1) not be deduped against the recreated pod,
     /// so the new pod gets its own scheduling attempt, (2) carry its own UID so the
@@ -2489,7 +2573,7 @@ mod tests {
 
         let (client, counts) = spawn_bind_outcome_mock_server(
             409,
-            r#"{"kind":"Status","status":"Failure","message":"Operation cannot be fulfilled on pods/binding \"web-0\": Precondition failed: UID in precondition: uid-old, UID in object meta: uid-new. The object might have been deleted and then recreated","reason":"Conflict","code":409}"#,
+            r#"{"kind":"Status","status":"Failure","message":"Operation cannot be fulfilled on pods \"web-0\": StorageError: invalid object, Code: 4, Key: /registry/pods/default/web-0, ResourceVersion: 0, AdditionalErrorMsg: Precondition failed: UID in precondition: uid-old, UID in object meta: uid-new","reason":"Conflict","code":409}"#,
         )
         .await;
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
