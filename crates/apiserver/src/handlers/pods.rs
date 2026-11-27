@@ -17018,6 +17018,13 @@ mod handler_tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
+        let err = u7s_scheduler::check_bind_response(409, &String::from_utf8_lossy(&body))
+            .expect_err("a 409 must be an error");
+        assert!(
+            matches!(err, u7s_scheduler::BindError::StalePod(_)),
+            "the scheduler must classify this apiserver's real stale-UID 409 as StalePod, else a \
+             recreated pod's reservation is rolled back by name: {err:?}"
+        );
         let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             status["message"],
@@ -17092,6 +17099,13 @@ mod handler_tests {
                 .contains("Precondition failed: ResourceVersion in precondition: 999"),
             "unexpected message: {status}"
         );
+        let err = u7s_scheduler::check_bind_response(409, &status.to_string())
+            .expect_err("a 409 must be an error");
+        assert!(
+            matches!(err, u7s_scheduler::BindError::Other(_)),
+            "a stale-RV 409 means the same pod changed, not that it was recreated: it must stay \
+             a retryable failure, not StalePod: {err:?}"
+        );
         let stored = store
             .get("/registry/pods/default/rv-pod")
             .await
@@ -17112,6 +17126,46 @@ mod handler_tests {
             "a bind whose resourceVersion matches the stored pod must succeed: {}",
             String::from_utf8_lossy(&body)
         );
+    }
+
+    /// An empty `metadata.resourceVersion` means "no precondition", as for an empty UID: clients
+    /// that serialize an unset field as "" must still bind.
+    #[tokio::test]
+    async fn bind_with_empty_resource_version_still_binds() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "empty-rv", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/empty-rv/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Binding",
+                "metadata": {"name": "empty-rv", "namespace": "default", "resourceVersion": ""},
+                "target": {"kind": "Node", "name": "worker-1"}
+            })))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "an empty resourceVersion must not be treated as a precondition"
+        );
+        let stored = store
+            .get("/registry/pods/default/empty-rv")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["spec"]["nodeName"], "worker-1");
     }
 
     /// `POST /binding?dryRun=All` must return the would-be bound pod (201, spec.nodeName set
