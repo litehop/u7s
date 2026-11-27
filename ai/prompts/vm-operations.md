@@ -288,6 +288,10 @@ scripts/conformance/run-all.sh --install --vm <VM> --port <PORT> --kubelet-port 
 
 - Use `--reset` for sign-off: without it an existing VM is unrigged and install.sh is re-run
   on it (an in-place upgrade, not a first install).
+- Without `--reset`, a VM (`--vm` and every `--extra-node`) left in host-rig state (the rig's
+  `kubelet.service.d/u7s.conf` drop-in, or the legacy `kube-proxy.service`) is unrigged
+  automatically with `lima-unrig.sh` before the build, and the host rig's processes are reaped;
+  a probe or unrig failure aborts the run. Never clear it by hand.
 - `--focus`, `--stack-only`, `--all-e2e`, `--procs`, `--k8s-version`, `--network` work as
   on the rig; a bare run is the full suite. Host-rig-only options (`--binary`, `--profile`,
   `--pki-test-*`, `--extra-node`, `--dual-stack`, `--embedded-scheduler`, ...) are rejected.
