@@ -13,20 +13,19 @@ trim validation and memory gate are done. Phase 2 design:
 ## Operator decision (2026-11-25) and what follows
 
 Operator: no high-risk KCM operations; start small, scalable; verify locally;
-ship only after measured benefit and conformance parity, and not soon. The mapping below is the mayor's reading.
-
+ship only after measured benefit and conformance parity, and not soon.
 | # | Question | Status |
 |---|---|---|
-| D1 | Trim shipped Go KCM `--controllers` | Moot until ship time; shipped Go KCM unchanged |
+| D1 | Trim shipped Go KCM `--controllers` | Moot until ship time |
 | D2 | Client-stack rule (lowest idle anon at 10k pods, fewer crates within 10%) | Adopted |
-| D3 | Phase 6 total KCM anon target (25 MiB) | Ship-time check; number set then |
+| D3 | Phase 6 total KCM anon target (25 MiB) | Ship-time check |
 | D4 | Order | Controllers with strong e2e coverage first; GC, namespace, node-lifecycle stay Go until evidence |
 | D5 | Metadata-only WATCH | Resolved: JSON PartialObjectMetadata works; gaps in `mayor-ju5k1`, `mayor-ynnoq` |
 | D6 | Drop specs the trim breaks | Moot until ship time |
 | D7 | Multi-node specs | Lima, locally; no CI investment yet |
 | D8 | Cadence | Local phases merge on `--focus` plus unit gates; full 2-node suite before shipping |
 
-Ship gate: measured benefit versus shipped Go KCM and full 2-node conformance.
+Ship gate: measured benefit versus shipped Go KCM and full 2-node conformance. Until then nothing ships in `install.sh` or releases. The gates and phases below are the local verification regime, not a shipping plan.
 
 ## Phase 0 gate: PASS (#2300)
 
@@ -49,7 +48,7 @@ Client stack: C, own hardened hyper informer; seat pools #2284.
 
 ## Phase plan
 
-Ordered by coverage and risk; heavy shared-Pod consumers last to shorten the
+Ordered by coverage and risk; heavy shared-Pod consumers last, shortening the
 duplicate Go Pod cache.
 
 | Phase | Controllers | Why here |
@@ -91,7 +90,7 @@ Metric: `Pss_Anon` (`smaps_rollup`) for KCM-Go, KCM-Rust and apiserver,
 
 ## Verification protocol
 
-Sonobuoy stays authoritative via these invariants:
+Sonobuoy stays authoritative:
 
 1. `scripts/conformance/guard.sha256` pins the e2e binary, plugin config,
    skip/focus lists, focus registry, baselines and N. `guard-check.sh`
@@ -128,15 +127,14 @@ Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3),
 `run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed and passed, spec sets identical.
 The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
-it stays; the trim is 10 controllers. Two 2-node 10-controller trim runs
+the trim is 10 controllers. Two 2-node 10-controller trim runs
 (`--kcm-mode T`): spec and failure sets (empty) equal baseline. A tcp:8080 liveness-probe
-failure seen once on a single-node run did not reproduce in 4 two-node runs; cause unestablished.
+failure seen once on a single-node run did not reproduce in 4 two-node runs (R 2/2, T 2/2); cause unestablished.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 
 ## Open and needs-data
 
-- Rust fixed cost and bytes/pod: unmeasured.
 - Embedded-in-apiserver alternative: re-measure each phase end; raise to the
   operator if the estimated saving is at least 4 MiB.
 - Wedged-but-alive controller detection: `mayor-n6njd`.
