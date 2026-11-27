@@ -97,6 +97,9 @@
 #   tag archive/<bead>-findings (pushed to origin); if that fails the branch
 #   is kept.
 # STEP G: reap fix-round worktrees on non-worker branch names (see below).
+# STEP I: kill `until ! pgrep -f "<pattern>"` wait loops whose pattern matches
+#   nothing but wait loops (they match themselves and never exit). Loops with
+#   a live target are never touched.
 # STEP H: read-only. Report loudly when the latest completed `audit.yaml`
 #   decisive run on main is red (`failure`/`timed_out`/`startup_failure`) (run URL plus any RUSTSEC-/GHSA- ids from
 #   its log). The audit is deliberately non-blocking for PRs, so this is
@@ -927,6 +930,57 @@ step_h_main_audit() {
   return "$AUDIT_FAILING_RC"
 }
 
+# ---------------------------------------------------------------------------
+# STEP I -- orphaned self-matching wait loops.
+# `until ! pgrep -f "<pattern>"; do sleep N; done` matches its own command
+# line, so it never exits. Kill such a loop only when no process outside the
+# set of loops matches its pattern. A loop's owner can't be reliably read from
+# its command line, so --live-agents is not consulted: "the target is still
+# running" is the safety condition, and a live target is never touched.
+# ---------------------------------------------------------------------------
+wait_loop_lines() {
+  ps -axo pid=,command= | grep -F 'until ! pgrep -f' | grep -v 'grep -F' || true
+}
+
+wait_loop_pattern() {
+  local re='until ! pgrep -f (-- )?("([^"]*)"|'"'"'([^'"'"']*)'"'"')'
+  if [[ "$1" =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+  fi
+}
+
+step_i_orphaned_wait_loops() {
+  local lines line pid pattern p other
+  local loop_pids=" "
+  lines=$(wait_loop_lines)
+  [ -z "$lines" ] && return 0
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pid=$(awk '{print $1}' <<< "$line")
+    loop_pids+="$pid "
+  done <<< "$lines"
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    pid=$(awk '{print $1}' <<< "$line")
+    pattern=$(wait_loop_pattern "$line")
+    [ -z "$pattern" ] && continue
+    other=""
+    for p in $(pgrep -f -- "$pattern" || true); do
+      case "$loop_pids" in *" $p "*) continue ;; esac
+      [ "$p" = "$$" ] && continue
+      other="$p"
+      break
+    done
+    if [ -n "$other" ]; then
+      continue
+    fi
+    echo "worktree-hygiene: STEP I: killing orphaned wait loop pid=$pid (nothing but wait loops matches pgrep -f '$pattern')"
+    run_cmd kill "$pid"
+  done <<< "$lines"
+}
+
 main() {
   local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
@@ -989,6 +1043,7 @@ main() {
   step_e_stale_findings
   step_f_orphaned_origin_branches
   step_g_fix_round_worktrees || rc=1
+  step_i_orphaned_wait_loops
   local audit_rc=0
   step_h_main_audit || audit_rc=$?
   exit $(( rc | audit_rc ))

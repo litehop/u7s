@@ -1386,6 +1386,49 @@ assert "destructive steps label their output with the step so the log names what
   "$(printf '%s\n' "$P_OUT" | drain_grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# STEP I: orphaned self-matching `until ! pgrep -f` wait loops (stubbed ps/pgrep).
+# ---------------------------------------------------------------------------
+WL_BIN="$SANDBOX_ROOT/wl-bin"
+mkdir -p "$WL_BIN"
+cat > "$WL_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$STUB_PS"
+STUB
+cat > "$WL_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$STUB_PS" | grep -E -- "${@: -1}" | awk '{print $1}'
+STUB
+chmod +x "$WL_BIN/ps" "$WL_BIN/pgrep"
+wl_loop() {  # pid pattern
+  echo "$1 /bin/zsh -c until ! pgrep -f \"$2\" >/dev/null; do sleep 15; done"
+}
+step_i_dry() {  # ps lines -> every "would run:" line of a dry-run STEP I
+  local out
+  out=$(
+    export DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$SA_REAL" STUB_PS="$1"
+    export PATH="$WL_BIN:$PATH"
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+    step_i_orphaned_wait_loops 2>&1
+  )
+  printf '%s\n' "$out" | grep 'would run:' || true
+}
+WL_TARGET="9001 bash scripts/conformance/run-all.sh --vm alpha"
+assert "STEP I: a wait loop whose target exited is killed -- it matches only itself and would hang its worker forever" \
+  "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha')")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a wait loop whose target is still running is kept -- killing it would end a legitimate wait early" \
+  "$([ -z "$(step_i_dry "$WL_TARGET
+$(wl_loop 9100 'run-all.sh --vm alpha')")" ] && echo 1 || echo 0)"
+WL_TWO="$(wl_loop 9100 'run-all.sh --vm alpha')
+$(wl_loop 9101 'run-all.sh --vm alpha')"
+assert "STEP I: a pattern matched only by other wait loops counts as dead -- both loops are killed, not each keeping the other alive" \
+  "$([ "$(step_i_dry "$WL_TWO" | sort | tr '\n' ' ')" = "[dry-run] would run: kill 9100 [dry-run] would run: kill 9101 " ] && echo 1 || echo 0)"
+assert "STEP I: with two loops on different targets only the dead target's loop is killed" \
+  "$([ "$(step_i_dry "$WL_TARGET
+$(wl_loop 9100 'run-all.sh --vm alpha')
+$(wl_loop 9101 'run-all.sh --vm beta')")" = "[dry-run] would run: kill 9101" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
