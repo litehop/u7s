@@ -1831,7 +1831,14 @@ pub struct NodeTally {
     nodes: std::collections::BTreeMap<String, NodeItem>,
     /// Unschedulable-pod backoff and Event dedupe — see `FailureBackoff`.
     pub failures: FailureBackoff,
+    /// "namespace/name" -> (UID, when its DELETED was applied) of the latest pod incarnation seen
+    /// deleted. A scheduling attempt still in flight for that incarnation must not register
+    /// per-pod state afterwards: nothing would ever clean it up. Entries older than
+    /// `DELETED_POD_TTL` are pruned; no attempt outlives that.
+    deleted_pods: std::collections::HashMap<String, (String, std::time::Instant)>,
 }
+
+const DELETED_POD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
 /// `NodeTally::resolve_csi_driver`.
@@ -1934,6 +1941,12 @@ impl NodeTally {
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_event_pod(&key, &uid);
             self.failures.clear(&key, &uid);
+            if !uid.is_empty() {
+                let now = std::time::Instant::now();
+                self.deleted_pods
+                    .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
+                self.deleted_pods.insert(key.clone(), (uid.clone(), now));
+            }
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key, &uid);
             return self.waiters.resolve(&key, &uid);
@@ -2077,6 +2090,27 @@ impl NodeTally {
         if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
             self.remove_pod(&key);
         }
+    }
+
+    fn is_deleted_incarnation(&self, key: &str, uid: &str) -> bool {
+        !uid.is_empty() && self.deleted_pods.get(key).is_some_and(|(u, _)| u == uid)
+    }
+
+    /// Record a failed scheduling attempt for the pod in `event`; returns whether a
+    /// FailedScheduling Event should be posted. Nothing is recorded (and no Event posted) when
+    /// that pod incarnation was already seen deleted, or its backoff would leak.
+    pub fn record_scheduling_failure(
+        &mut self,
+        key: &str,
+        event: &Value,
+        message: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        let uid = event_uid(event);
+        if self.is_deleted_incarnation(key, uid) {
+            return false;
+        }
+        self.failures.record_failure(key, uid, message, now)
     }
 
     /// Forget `key`'s failure backoff after its pod (the one in `event`) was scheduled.
@@ -2406,6 +2440,9 @@ impl NodeTally {
         pod_key: String,
         uid: String,
     ) {
+        if self.is_deleted_incarnation(&pod_key, &uid) {
+            return;
+        }
         self.pvc_waiters
             .register(pvc_key(namespace, pvc_name), pod_key, uid);
     }
@@ -11124,6 +11161,60 @@ mod tests {
             1,
             "the recreated pod lost its backoff to a stale DELETED"
         );
+    }
+
+    /// An attempt still in flight when its pod's DELETED is processed would
+    /// otherwise register a backoff entry and PVC waiter nothing ever removes.
+    #[test]
+    fn late_in_flight_attempt_for_a_deleted_pod_registers_no_backoff_or_pvc_waiter() {
+        let mut tally = NodeTally::default();
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        let emit = tally.record_scheduling_failure(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-old"), json!({})),
+            "0/1 nodes available",
+            std::time::Instant::now(),
+        );
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-old".to_owned(),
+        );
+        assert!(!emit, "no Event for a pod that no longer exists");
+        assert!(
+            tally
+                .failures
+                .backed_off(std::time::Instant::now())
+                .is_empty(),
+            "a deleted pod's late failure leaked a backoff entry"
+        );
+        assert!(
+            tally.apply_pvc_event(&pvc_added()).is_empty(),
+            "a deleted pod's late PVC wait leaked a waiter"
+        );
+    }
+
+    /// The tombstone is per incarnation: a same-name recreation still gets
+    /// its backoff and PVC waiter.
+    #[test]
+    fn deleted_incarnation_tombstone_does_not_block_the_recreated_pod() {
+        let mut tally = NodeTally::default();
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        let new = pod_event("ADDED", Some("uid-new"), json!({}));
+        assert!(tally.record_scheduling_failure(
+            "default/web-0",
+            &new,
+            "0/1 nodes available",
+            std::time::Instant::now()
+        ));
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-new".to_owned(),
+        );
+        assert_eq!(tally.apply_pvc_event(&pvc_added()).len(), 1);
     }
 
     /// A late DELETED for the old incarnation must not drop the recreated

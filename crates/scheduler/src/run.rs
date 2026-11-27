@@ -1319,14 +1319,10 @@ fn handle_pod_event(
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
-                let uid = event["object"]["metadata"]["uid"]
-                    .as_str()
-                    .unwrap_or_default();
                 emit_event = tally_clone
                     .lock()
                     .expect("tally lock poisoned")
-                    .failures
-                    .record_failure(&key, uid, &message, std::time::Instant::now());
+                    .record_scheduling_failure(&key, &event, &message, std::time::Instant::now());
                 ("FailedScheduling", message, "Warning")
             }
         };
