@@ -2333,6 +2333,253 @@ pub(crate) mod cases {
         }
     }
 
+    /// A webhook (or CEL policy) that keys on `options.fieldManager`, `options.dryRun` or
+    /// `options.fieldValidation` never sees them if CREATE/UPDATE reviews carry a bare options
+    /// stub. Every write family (generic, namespace, CRD, CR, pod, subresource) and verb (POST,
+    /// PUT, merge/apply PATCH) must report the client's options under the kind of the admission
+    /// operation: PATCH is admitted as UpdateOptions, or CreateOptions when it creates.
+    #[tokio::test]
+    async fn create_and_update_reviews_carry_the_clients_options_for_every_write_family() {
+        let cm = |name: &str| json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": name}});
+        let cm_uri = "/api/v1/namespaces/default/configmaps";
+        let widgets = "/apis/example.com/v1/namespaces/default/widgets";
+        let cells = vec![
+            (
+                "POST cm",
+                "",
+                "configmaps",
+                "CREATE",
+                cm_uri.into(),
+                "POST",
+                cm("n"),
+                "",
+            ),
+            (
+                "PUT cm",
+                "",
+                "configmaps",
+                "UPDATE",
+                format!("{cm_uri}/o"),
+                "PUT",
+                cm("o"),
+                "cm",
+            ),
+            (
+                "merge-PATCH cm",
+                "",
+                "configmaps",
+                "UPDATE",
+                format!("{cm_uri}/o"),
+                "PATCH",
+                json!({"data": {"k": "v"}}),
+                "cm",
+            ),
+            (
+                "apply-PATCH cm",
+                "",
+                "configmaps",
+                "UPDATE",
+                format!("{cm_uri}/o"),
+                "APPLY",
+                cm("o"),
+                "cm",
+            ),
+            (
+                "POST namespace",
+                "",
+                "namespaces",
+                "CREATE",
+                "/api/v1/namespaces".into(),
+                "POST",
+                json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "n"}}),
+                "",
+            ),
+            (
+                "POST crd",
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                "CREATE",
+                "/apis/apiextensions.k8s.io/v1/customresourcedefinitions".into(),
+                "POST",
+                crd("widgets", "Widget", "Namespaced"),
+                "",
+            ),
+            (
+                "POST cr",
+                "example.com",
+                "widgets",
+                "CREATE",
+                widgets.into(),
+                "POST",
+                json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": {"name": "w"}}),
+                "crd",
+            ),
+            (
+                "PUT cr",
+                "example.com",
+                "widgets",
+                "UPDATE",
+                format!("{widgets}/w"),
+                "PUT",
+                json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                    "metadata": {"name": "w", "resourceVersion": "$rv"}, "spec": {"a": 1}}),
+                "cr",
+            ),
+            (
+                "POST pod",
+                "",
+                "pods",
+                "CREATE",
+                "/api/v1/namespaces/default/pods".into(),
+                "POST",
+                json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "n"},
+                    "spec": {"containers": [{"name": "app", "image": "nginx"}]}}),
+                "",
+            ),
+            (
+                "PUT pods/status",
+                "",
+                "pods/status",
+                "UPDATE",
+                "/api/v1/namespaces/default/pods/p/status".into(),
+                "PUT",
+                json!({"status": {"phase": "Running"}}),
+                "pod",
+            ),
+        ];
+        for (label, group, resource, op, uri, method, mut body, seed) in cells {
+            let c = Cluster::new().await;
+            if matches!(seed, "crd" | "cr") {
+                c.create(
+                    "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                    crd("widgets", "Widget", "Namespaced"),
+                )
+                .await;
+            }
+            match seed {
+                "cm" => c.create(cm_uri, cm("o")).await,
+                "pod" => c.create_pod("p").await,
+                "cr" => {
+                    c.create(
+                        widgets,
+                        json!({"apiVersion": "example.com/v1", "kind": "Widget",
+                            "metadata": {"name": "w"}}),
+                    )
+                    .await
+                }
+                _ => {}
+            }
+            if body["metadata"]["resourceVersion"] == "$rv" {
+                body["metadata"]["resourceVersion"] = json!(
+                    c.stored_rv("/registry/cr/example.com/widgets/default/w")
+                        .await
+                );
+            }
+            let hook = spawn_hook(|_| json!({"allowed": true})).await;
+            for mutating in [true, false] {
+                register_webhook(
+                    &c.store,
+                    mutating,
+                    if mutating { "m" } else { "v" },
+                    &hook.url,
+                    group,
+                    &[resource],
+                    &[op],
+                )
+                .await;
+            }
+            let (method, content_type) = match method {
+                "APPLY" => ("PATCH", "application/apply-patch+yaml"),
+                "PATCH" => ("PATCH", MERGE),
+                m => (m, "application/json"),
+            };
+            let uri = format!("{uri}?fieldManager=my-mgr&fieldValidation=Ignore&dryRun=All");
+            let (status, resp) = c.call(method, &uri, content_type, body).await;
+            assert!(status.is_success(), "{label}: {status} {resp}");
+
+            let reqs = hook.requests();
+            assert_eq!(reqs.len(), 2, "{label}: mutating and validating: {reqs:?}");
+            let kind = if op == "CREATE" {
+                "CreateOptions"
+            } else {
+                "UpdateOptions"
+            };
+            for r in &reqs {
+                assert_eq!(r["operation"], op, "{label}: {r}");
+                assert_eq!(
+                    r["options"],
+                    json!({"apiVersion": "meta.k8s.io/v1", "kind": kind,
+                        "fieldManager": "my-mgr", "fieldValidation": "Ignore",
+                        "dryRun": ["All"]}),
+                    "{label}: options must be what the client sent"
+                );
+            }
+        }
+    }
+
+    /// CEL sees the same options as webhooks: a policy that requires
+    /// `request.options.fieldManager` to be set (to stop anonymous writers) cannot work
+    /// against a stub.
+    #[tokio::test]
+    async fn vap_sees_the_clients_create_options_in_request_options() {
+        let c = Cluster::new().await;
+        put_registry(
+            &c.store,
+            "validatingadmissionpolicies/p",
+            json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicy",
+                "metadata": {"name": "p"},
+                "spec": {
+                    "matchConstraints": {"resourceRules": [{
+                        "apiGroups": [""], "apiVersions": ["*"],
+                        "operations": ["CREATE"], "resources": ["configmaps"]
+                    }]},
+                    "validations": [{"expression":
+                        "request.options.kind == 'CreateOptions' && \
+                         request.options.fieldManager == 'my-mgr'"}]
+                }
+            }),
+        )
+        .await;
+        put_registry(
+            &c.store,
+            "validatingadmissionpolicybindings/p",
+            json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": "ValidatingAdmissionPolicyBinding",
+                "metadata": {"name": "p"},
+                "spec": {"policyName": "p", "validationActions": ["Deny"]}
+            }),
+        )
+        .await;
+        let body =
+            |n: &str| json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": n}});
+        let uri = "/api/v1/namespaces/default/configmaps";
+        let (status, resp) = c
+            .call(
+                "POST",
+                &format!("{uri}?fieldManager=my-mgr"),
+                "application/json",
+                body("a"),
+            )
+            .await;
+        assert!(status.is_success(), "{status} {resp}");
+        let (status, _) = c
+            .call(
+                "POST",
+                &format!("{uri}?fieldManager=other"),
+                "application/json",
+                body("b"),
+            )
+            .await;
+        assert!(
+            !status.is_success(),
+            "the policy must deny a different manager"
+        );
+    }
+
     /// A ValidatingAdmissionPolicy written for upstream's DELETE contract (`object == null`, the
     /// stored object only as `oldObject`) must admit the delete; binding `object` to the stored
     /// object makes every such policy deny deletes it should allow, or lets `object.metadata`
