@@ -559,9 +559,50 @@ fn webhook_match_condition_request(
     Value::Object(req)
 }
 
-/// The operation's options object: what the client sent when `ctx.options` carries it, else a
-/// bare `meta.k8s.io/v1` stub of the operation's kind. Connect options have no scheme kind to
-/// report.
+tokio::task_local! {
+    static REQUEST_QUERY: String;
+}
+
+/// Run `fut` with the request's raw query string available to admission, so CREATE and UPDATE
+/// reviews carry the client's options without every write handler threading them through.
+pub(crate) async fn with_request_query<F: std::future::Future>(
+    query: Option<&str>,
+    fut: F,
+) -> F::Output {
+    REQUEST_QUERY
+        .scope(query.unwrap_or_default().to_owned(), fut)
+        .await
+}
+
+/// `CreateOptions`/`UpdateOptions` for the request being admitted: `dryRun`, `fieldManager` and
+/// `fieldValidation` as the client sent them. A PATCH is admitted with the same
+/// kind as the operation it becomes (upstream `patchToCreateOptions`/`patchToUpdateOptions`
+/// copy exactly these three fields).
+fn write_options(kind: &str, query: &str) -> serde_json::Value {
+    let mut options = serde_json::Map::new();
+    options.insert("apiVersion".into(), "meta.k8s.io/v1".into());
+    options.insert("kind".into(), kind.into());
+    let mut dry_run = Vec::new();
+    for (key, value) in
+        serde_urlencoded::from_str::<Vec<(String, String)>>(query).unwrap_or_default()
+    {
+        match key.as_str() {
+            "dryRun" => dry_run.push(serde_json::Value::String(value)),
+            "fieldManager" | "fieldValidation" if !value.is_empty() => {
+                options.insert(key, value.into());
+            }
+            _ => {}
+        }
+    }
+    if !dry_run.is_empty() {
+        options.insert("dryRun".into(), dry_run.into());
+    }
+    serde_json::Value::Object(options)
+}
+
+/// The operation's options object: what the client sent when `ctx.options` carries it, else
+/// (CREATE/UPDATE) the options decoded from the request's query, else a bare `meta.k8s.io/v1`
+/// stub of the operation's kind. Connect options have no scheme kind to report.
 fn request_options(ctx: &AdmissionContext<'_>) -> serde_json::Value {
     if let Some(options) = ctx.options {
         return options.clone();
@@ -569,10 +610,14 @@ fn request_options(ctx: &AdmissionContext<'_>) -> serde_json::Value {
     let kind = match ctx.operation {
         "CREATE" => "CreateOptions",
         "UPDATE" => "UpdateOptions",
-        "DELETE" => "DeleteOptions",
+        "DELETE" => {
+            return serde_json::json!({"apiVersion": "meta.k8s.io/v1", "kind": "DeleteOptions"})
+        }
         _ => return serde_json::Value::Null,
     };
-    serde_json::json!({"apiVersion": "meta.k8s.io/v1", "kind": kind})
+    REQUEST_QUERY
+        .try_with(|query| write_options(kind, query))
+        .unwrap_or_else(|_| write_options(kind, ""))
 }
 
 /// Fetch the namespace object labels from the store.
@@ -2226,6 +2271,13 @@ impl<'a> PolicyInputs<'a> {
         'a: 'e,
     {
         use cel_runtime::Value;
+        // A DELETE has no new object: upstream binds `object` to null and the stored object
+        // is `oldObject` only.
+        let object = if self.request["operation"] == "DELETE" {
+            &NULL_PARAMS
+        } else {
+            object
+        };
         let mut roots = vec![
             ("object", Value::from_json(object)),
             ("oldObject", Value::from_json(self.old_object)),

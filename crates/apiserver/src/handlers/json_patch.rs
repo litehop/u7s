@@ -123,7 +123,8 @@ pub(crate) async fn inject_dry_run_header(
             HeaderValue::from_static("true"),
         );
     }
-    next.run(req).await
+    let query = req.uri().query().map(str::to_owned);
+    crate::admission::with_request_query(query.as_deref(), next.run(req)).await
 }
 
 // ---------------------------------------------------------------------------
