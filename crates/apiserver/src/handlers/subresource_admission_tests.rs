@@ -2333,6 +2333,68 @@ pub(crate) mod cases {
         }
     }
 
+    /// A ValidatingAdmissionPolicy written for upstream's DELETE contract (`object == null`, the
+    /// stored object only as `oldObject`) must admit the delete; binding `object` to the stored
+    /// object makes every such policy deny deletes it should allow, or lets `object.metadata`
+    /// checks silently inspect the wrong operand. The second expression proves the policy does
+    /// run on DELETE, so the first admit is not vacuous.
+    #[tokio::test]
+    async fn vap_on_delete_sees_object_null_and_the_stored_object_as_old_object() {
+        for (expression, allowed) in [
+            ("object == null && oldObject.metadata.name == 'o'", true),
+            ("oldObject.metadata.name == 'other'", false),
+        ] {
+            let c = Cluster::new().await;
+            c.create(
+                "/api/v1/namespaces/default/configmaps",
+                json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "o"}}),
+            )
+            .await;
+            put_registry(
+                &c.store,
+                "validatingadmissionpolicies/p",
+                json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1",
+                    "kind": "ValidatingAdmissionPolicy",
+                    "metadata": {"name": "p"},
+                    "spec": {
+                        "matchConstraints": {"resourceRules": [{
+                            "apiGroups": [""], "apiVersions": ["*"],
+                            "operations": ["DELETE"], "resources": ["configmaps"]
+                        }]},
+                        "validations": [{"expression": expression}]
+                    }
+                }),
+            )
+            .await;
+            put_registry(
+                &c.store,
+                "validatingadmissionpolicybindings/p",
+                json!({
+                    "apiVersion": "admissionregistration.k8s.io/v1",
+                    "kind": "ValidatingAdmissionPolicyBinding",
+                    "metadata": {"name": "p"},
+                    "spec": {"policyName": "p", "validationActions": ["Deny"]}
+                }),
+            )
+            .await;
+
+            let (status, resp) = c
+                .call(
+                    "DELETE",
+                    "/api/v1/namespaces/default/configmaps/o",
+                    "application/json",
+                    Value::Null,
+                )
+                .await;
+            assert_eq!(
+                status.is_success(),
+                allowed,
+                "{expression}: {status} {resp}"
+            );
+        }
+    }
+
     /// A webhook that gates collection deletes sees one request per stored item, each with that
     /// item as `oldObject` and `object` null; a single call carrying the whole list, or the same
     /// item twice, makes the policy judge the wrong objects.

@@ -2226,6 +2226,13 @@ impl<'a> PolicyInputs<'a> {
         'a: 'e,
     {
         use cel_runtime::Value;
+        // A DELETE has no new object: upstream binds `object` to null and the stored object
+        // is `oldObject` only.
+        let object = if self.request["operation"] == "DELETE" {
+            &NULL_PARAMS
+        } else {
+            object
+        };
         let mut roots = vec![
             ("object", Value::from_json(object)),
             ("oldObject", Value::from_json(self.old_object)),
