@@ -203,7 +203,7 @@ async fn preempt_and_pick_node(
                 plan.node_name
             );
         }
-        match evict_victims(client, &plan.victims, tally, pod_name).await {
+        match evict_victims(client, &plan.victim_uids, tally, pod_name).await {
             Ok(evicted) => {
                 // Every victim in `plan.victims` has had its graceful DELETE
                 // acknowledged — NOT confirmed physically gone (see this
@@ -239,28 +239,24 @@ async fn preempt_and_pick_node(
     }
 }
 
-/// Evict every pod in `victims` ("namespace/name" keys), stamping the
-/// DisruptionTarget condition on each first (best-effort, mirrors upstream
-/// kube-scheduler). Split out of `preempt_and_pick_node` so a mid-loop
-/// eviction failure is a single `?` there, making the reservation-rollback
-/// path easy to see. Returns each evicted victim as `(key, uid)` (empty uid if
-/// it was not tallied), so the deferred bind waits for that incarnation's removal.
+/// Evict every `(key, uid)` in `victims` ("namespace/name" keys, UIDs captured when the plan
+/// was committed), stamping the DisruptionTarget condition on each first (best-effort, mirrors
+/// upstream kube-scheduler). Split out of `preempt_and_pick_node` so a mid-loop eviction
+/// failure is a single `?` there, making the reservation-rollback path easy to see. A victim
+/// recreated since the plan is never deleted: its DELETE is refused by UID precondition and the
+/// loop stops with an error, evicting nothing further. Returns each evicted victim as `(key,
+/// uid)`, so the deferred bind waits for that incarnation's removal.
 async fn evict_victims(
     client: &ApiClient,
-    victims: &[String],
+    victims: &[(String, String)],
     tally: &Mutex<NodeTally>,
     pod_name: &str,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let mut evicted = Vec::with_capacity(victims.len());
-    for victim in victims {
+    for (victim, victim_uid) in victims {
         let Some((v_ns, v_name)) = victim.split_once('/') else {
             continue;
         };
-        let victim_uid = tally
-            .lock()
-            .expect("tally lock poisoned")
-            .tallied_uid(v_ns, v_name);
-        // Best-effort: mirrors upstream kube-scheduler, which stamps
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
         // for the higher-priority pod matters more than the condition.
@@ -271,16 +267,14 @@ async fn evict_victims(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
             );
         }
-        delete_pod(client, v_ns, v_name).await?;
+        delete_pod(client, v_ns, v_name, victim_uid).await?;
         // By UID: a same-name pod recreated while the DELETE was in flight must keep its
         // reservation.
-        if let Some(uid) = &victim_uid {
-            tally
-                .lock()
-                .expect("tally lock poisoned")
-                .remove_if_uid(v_ns, v_name, uid);
-        }
-        evicted.push((victim.clone(), victim_uid.unwrap_or_default()));
+        tally
+            .lock()
+            .expect("tally lock poisoned")
+            .remove_if_uid(v_ns, v_name, victim_uid);
+        evicted.push((victim.clone(), victim_uid.clone()));
     }
     Ok(evicted)
 }
@@ -1293,13 +1287,7 @@ fn handle_pod_event(
                 tally_clone
                     .lock()
                     .expect("tally lock poisoned")
-                    .failures
-                    .clear(
-                        &key,
-                        event["object"]["metadata"]["uid"]
-                            .as_str()
-                            .unwrap_or_default(),
-                    );
+                    .clear_backoff_after_schedule(&key, &event);
                 (
                     "Scheduled",
                     format!("Successfully assigned {namespace}/{pod_name} to {node}"),
@@ -1325,14 +1313,10 @@ fn handle_pod_event(
                         error!("failed to set PodScheduled=False status for {key}: {patch_err}");
                     }
                 }
-                let uid = event["object"]["metadata"]["uid"]
-                    .as_str()
-                    .unwrap_or_default();
                 emit_event = tally_clone
                     .lock()
                     .expect("tally lock poisoned")
-                    .failures
-                    .record_failure(&key, uid, &message, std::time::Instant::now());
+                    .record_scheduling_failure(&key, &event, &message, std::time::Instant::now());
                 ("FailedScheduling", message, "Warning")
             }
         };
@@ -2299,6 +2283,10 @@ mod tests {
         bind_bodies: Mutex<Vec<String>>,
         /// Runs once when a DELETE arrives, before its response is written.
         on_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        delete_bodies: Mutex<Vec<String>>,
+        /// UID of the victim pod as the mock apiserver sees it: a DELETE whose
+        /// `preconditions.uid` differs is refused with the 409 the real apiserver returns.
+        live_victim_uid: Mutex<Option<String>>,
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
@@ -2370,41 +2358,61 @@ mod tests {
                     let method = parts.next().unwrap_or("");
                     let path = parts.next().unwrap_or("");
 
-                    let (status_line, body): (String, String) =
-                        if method == "POST" && path.ends_with("/binding") {
-                            counts.bind.fetch_add(1, Ordering::SeqCst);
-                            counts.bind_bodies.lock().unwrap().push(
-                                request
-                                    .split("\r\n\r\n")
-                                    .nth(1)
-                                    .unwrap_or_default()
-                                    .to_owned(),
-                            );
-                            (format!("{bind_status} bind-response"), bind_body.to_owned())
-                        } else if method == "PATCH" && path.ends_with("/status") {
-                            counts.patch_status.fetch_add(1, Ordering::SeqCst);
-                            (
+                    let (status_line, body): (String, String) = if method == "POST"
+                        && path.ends_with("/binding")
+                    {
+                        counts.bind.fetch_add(1, Ordering::SeqCst);
+                        counts.bind_bodies.lock().unwrap().push(
+                            request
+                                .split("\r\n\r\n")
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_owned(),
+                        );
+                        (format!("{bind_status} bind-response"), bind_body.to_owned())
+                    } else if method == "PATCH" && path.ends_with("/status") {
+                        counts.patch_status.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    } else if method == "DELETE" {
+                        let hook = counts.on_delete.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                        let sent_body = request
+                            .split("\r\n\r\n")
+                            .nth(1)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let sent_uid = serde_json::from_str::<serde_json::Value>(&sent_body)
+                            .ok()
+                            .and_then(|v| v["preconditions"]["uid"].as_str().map(str::to_owned));
+                        counts.delete_bodies.lock().unwrap().push(sent_body);
+                        let live = counts.live_victim_uid.lock().unwrap().clone();
+                        match live {
+                            Some(live) if sent_uid.as_deref().is_some_and(|u| u != live) => (
+                                "409 Conflict".to_owned(),
+                                format!(
+                                    r#"{{"kind":"Status","reason":"Conflict","message":"Precondition failed: UID in precondition: {}, UID in object meta: {live}"}}"#,
+                                    sent_uid.unwrap_or_default()
+                                ),
+                            ),
+                            _ => (
                                 "200 OK".to_owned(),
                                 r#"{"kind":"Status","status":"Success"}"#.to_owned(),
-                            )
-                        } else if method == "DELETE" {
-                            let hook = counts.on_delete.lock().unwrap().take();
-                            if let Some(hook) = hook {
-                                hook();
-                            }
-                            (
-                                "200 OK".to_owned(),
-                                r#"{"kind":"Status","status":"Success"}"#.to_owned(),
-                            )
-                        } else if method == "POST" && path.ends_with("/events") {
-                            counts.event.fetch_add(1, Ordering::SeqCst);
-                            ("201 Created".to_owned(), r#"{"kind":"Event"}"#.to_owned())
-                        } else {
-                            (
-                                "200 OK".to_owned(),
-                                r#"{"kind":"Status","status":"Success"}"#.to_owned(),
-                            )
-                        };
+                            ),
+                        }
+                    } else if method == "POST" && path.ends_with("/events") {
+                        counts.event.fetch_add(1, Ordering::SeqCst);
+                        ("201 Created".to_owned(), r#"{"kind":"Event"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK".to_owned(),
+                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        )
+                    };
 
                     let resp = format!(
                         "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
@@ -2476,14 +2484,68 @@ mod tests {
             t.apply_event(&bound_pod_event("ADDED", "uid-new"));
         }));
 
-        evict_victims(&client, &["default/victim".to_owned()], &tally, "preemptor")
-            .await
-            .expect("eviction succeeds");
+        evict_victims(
+            &client,
+            &[("default/victim".to_owned(), "uid-old".to_owned())],
+            &tally,
+            "preemptor",
+        )
+        .await
+        .expect("eviction succeeds");
 
         assert_eq!(
             tally.lock().unwrap().tallied_uid("default", "victim"),
             Some("uid-new".to_owned()),
             "the recreated pod's reservation must survive the old pod's eviction cleanup"
+        );
+    }
+
+    /// A victim deleted and recreated under the same name between plan and evict: the new pod must
+    /// not be evicted for a plan made about its predecessor, nothing further is evicted, and the
+    /// new pod's reservation survives, or a healthy workload dies for a preemption that never
+    /// needed it.
+    #[tokio::test]
+    async fn victim_recreated_between_plan_and_evict_is_not_evicted() {
+        let (client, counts) = spawn_bind_outcome_mock_server(201, "{}").await;
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+        tally
+            .lock()
+            .unwrap()
+            .apply_event(&bound_pod_event("ADDED", "uid-old"));
+        let planned = vec![
+            ("default/victim".to_owned(), "uid-old".to_owned()),
+            ("default/other".to_owned(), "uid-other".to_owned()),
+        ];
+        {
+            let mut t = tally.lock().unwrap();
+            t.apply_event(&bound_pod_event("DELETED", "uid-old"));
+            t.apply_event(&bound_pod_event("ADDED", "uid-new"));
+        }
+        *counts.live_victim_uid.lock().unwrap() = Some("uid-new".to_owned());
+
+        let err = evict_victims(&client, &planned, &tally, "preemptor")
+            .await
+            .expect_err("a recreated victim must abort the eviction");
+
+        assert!(
+            format!("{err:#}").contains("recreated"),
+            "unexpected error: {err:#}"
+        );
+        let bodies = counts.delete_bodies.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "nothing may be evicted after the stale victim: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains(r#""uid":"uid-old""#),
+            "the DELETE must carry the plan-time UID precondition: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            tally.lock().unwrap().tallied_uid("default", "victim"),
+            Some("uid-new".to_owned()),
+            "the recreated pod's reservation must survive the refused eviction"
         );
     }
 

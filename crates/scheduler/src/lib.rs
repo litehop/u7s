@@ -62,8 +62,10 @@ pub async fn http_post_json(
 pub async fn http_delete(
     client: &HyperApiClient,
     path: &str,
+    options: &Value,
 ) -> anyhow::Result<(StatusCode, String)> {
-    client.request(Method::DELETE, path, None).await
+    let body_str = serde_json::to_string(options)?;
+    client.request(Method::DELETE, path, Some(body_str)).await
 }
 
 /// PATCH with `application/strategic-merge-patch+json`, the content type
@@ -1458,6 +1460,13 @@ fn same_incarnation(known_uid: &str, event_uid: &str) -> bool {
     known_uid.is_empty() || event_uid.is_empty() || known_uid == event_uid
 }
 
+/// `metadata.uid` of a raw pod event, empty if absent.
+pub fn event_uid(event: &Value) -> &str {
+    event["object"]["metadata"]["uid"]
+        .as_str()
+        .unwrap_or_default()
+}
+
 /// A preemption plan whose victims have all had their graceful DELETE issued
 /// (see `delete_pod`'s doc comment) but not yet confirmed PHYSICALLY gone by
 /// a real watch event from the kubelet actually running them.
@@ -1824,7 +1833,14 @@ pub struct NodeTally {
     nodes: std::collections::BTreeMap<String, NodeItem>,
     /// Unschedulable-pod backoff and Event dedupe — see `FailureBackoff`.
     pub failures: FailureBackoff,
+    /// "namespace/name" -> (UID, when its DELETED was applied) of the latest pod incarnation seen
+    /// deleted. A scheduling attempt still in flight for that incarnation must not register
+    /// per-pod state afterwards: nothing would ever clean it up. Entries older than
+    /// `DELETED_POD_TTL` are pruned; no attempt outlives that.
+    deleted_pods: std::collections::HashMap<String, (String, std::time::Instant)>,
 }
+
+const DELETED_POD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
 /// `NodeTally::resolve_csi_driver`.
@@ -1927,6 +1943,12 @@ impl NodeTally {
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_event_pod(&key, &uid);
             self.failures.clear(&key, &uid);
+            if !uid.is_empty() {
+                let now = std::time::Instant::now();
+                self.deleted_pods
+                    .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
+                self.deleted_pods.insert(key.clone(), (uid.clone(), now));
+            }
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key, &uid);
             return self.waiters.resolve(&key, &uid);
@@ -2070,6 +2092,33 @@ impl NodeTally {
         if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
             self.remove_pod(&key);
         }
+    }
+
+    fn is_deleted_incarnation(&self, key: &str, uid: &str) -> bool {
+        !uid.is_empty() && self.deleted_pods.get(key).is_some_and(|(u, _)| u == uid)
+    }
+
+    /// Record a failed scheduling attempt for the pod in `event`; returns whether a
+    /// FailedScheduling Event should be posted. Nothing is recorded (and no Event posted) when
+    /// that pod incarnation was already seen deleted, or its backoff would leak.
+    pub fn record_scheduling_failure(
+        &mut self,
+        key: &str,
+        event: &Value,
+        message: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        let uid = event_uid(event);
+        if self.is_deleted_incarnation(key, uid) {
+            return false;
+        }
+        self.failures.record_failure(key, uid, message, now)
+    }
+
+    /// Forget `key`'s failure backoff after its pod (the one in `event`) was scheduled.
+    /// A decision for a deleted incarnation must not clear the recreated pod's backoff.
+    pub fn clear_backoff_after_schedule(&mut self, key: &str, event: &Value) {
+        self.failures.clear(key, event_uid(event));
     }
 
     /// UID of the tallied pod `namespace/pod_name`, if any.
@@ -2393,6 +2442,9 @@ impl NodeTally {
         pod_key: String,
         uid: String,
     ) {
+        if self.is_deleted_incarnation(&pod_key, &uid) {
+            return;
+        }
         self.pvc_waiters
             .register(pvc_key(namespace, pvc_name), pod_key, uid);
     }
@@ -3988,10 +4040,14 @@ pub fn should_retry_without_preempting(err: &PickNodeError) -> bool {
 
 /// A viable preemption outcome: the node to bind the pending pod to, and the
 /// "namespace/name" keys of the pods that must be evicted first to free a slot.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct PreemptionPlan {
     pub node_name: String,
     pub victims: Vec<String>,
+    /// `(key, uid)` of each victim still tallied when the plan was committed
+    /// (`verify_and_reserve_preemption`). Eviction deletes exactly these
+    /// incarnations; a victim already gone at commit time is not evicted.
+    pub victim_uids: Vec<(String, String)>,
 }
 
 /// Search every node that qualifies for `pod` (see `node_qualifies_for_pod`)
@@ -4084,10 +4140,10 @@ pub fn find_preemption_plan(
         .expect("tally lock poisoned")
         .tallied_pod_labels();
 
-    let (index, plan) =
+    let (index, mut plan) =
         find_preemption_candidate(&list, pod, &tallied_pods, &node_labels_by_name, tally)
             .ok_or(FindPreemptionPlanError::NoViablePlan)?;
-    verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
+    plan.victim_uids = verify_and_reserve_preemption(pod, &list.items[index], &plan, tally)
         .map_err(|_| FindPreemptionPlanError::NoViablePlan)?;
 
     Ok(plan)
@@ -4249,6 +4305,7 @@ fn find_preemption_candidate(
                 PreemptionPlan {
                     node_name: node_name.clone(),
                     victims,
+                    victim_uids: Vec::new(),
                 },
             ));
         }
@@ -4286,7 +4343,7 @@ fn verify_and_reserve_preemption(
     node: &NodeItem,
     plan: &PreemptionPlan,
     tally: &std::sync::Mutex<NodeTally>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
     let capacity = pod_count_capacity(node);
     let mut tally_guard = tally.lock().expect("tally lock poisoned");
     let current_pods = tally_guard.pods_on(&plan.node_name);
@@ -4355,8 +4412,16 @@ fn verify_and_reserve_preemption(
     // Claim the victims under this SAME lock acquisition, not a later one —
     // otherwise a fresher concurrent plan's search could still see them as
     // available in the gap between this commit and a separate claim call.
+    let victim_uids = plan
+        .victims
+        .iter()
+        .filter_map(|key| {
+            let (ns, name) = key.split_once('/')?;
+            Some((key.clone(), tally_guard.tallied_uid(ns, name)?))
+        })
+        .collect();
     tally_guard.claim_victims(&plan.victims);
-    Ok(())
+    Ok(victim_uids)
 }
 
 /// Re-check, under the CURRENT tally, that `pod`'s already-`assume`d
@@ -5648,16 +5713,43 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
 /// upstream's e2e preemption test (`test/e2e/scheduling/preemption.go`,
 /// 1s poll interval) to ever observe the intermediate
 /// "DeletionTimestamp set, still Gettable" state it asserts on.
-pub async fn delete_pod(client: &ApiClient, namespace: &str, pod_name: &str) -> anyhow::Result<()> {
+///
+/// The DELETE carries a UID precondition: the victim named by the plan may
+/// since have been deleted and recreated under the same name, and the new pod
+/// must not be evicted for a plan made about its predecessor. A refused
+/// precondition is an error, so the caller rolls the plan back and re-plans
+/// instead of treating the freed capacity as real. Upstream's
+/// `util.DeletePod` (pkg/scheduler/util/utils.go) sends empty `DeleteOptions{}`;
+/// the precondition is a deliberate tightening.
+pub async fn delete_pod(
+    client: &ApiClient,
+    namespace: &str,
+    pod_name: &str,
+    uid: &str,
+) -> anyhow::Result<()> {
     let path = delete_pod_path(namespace, pod_name);
     let start = std::time::Instant::now();
-    let (status, body) = http_delete(client, &path).await?;
+    let (status, body) = http_delete(client, &path, &victim_delete_options(uid)).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
+    if status == StatusCode::CONFLICT && body.contains("UID in precondition") {
+        bail!(
+            "victim {namespace}/{pod_name} was recreated since the plan (uid {uid} is gone): {body}"
+        );
+    }
     check_delete_response(status.as_u16())
         .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     info!("evicted pod {namespace}/{pod_name} (preemption)");
     Ok(())
+}
+
+/// `DeleteOptions` pinning the DELETE to one pod incarnation.
+pub fn victim_delete_options(uid: &str) -> Value {
+    serde_json::json!({
+        "kind": "DeleteOptions",
+        "apiVersion": "v1",
+        "preconditions": { "uid": uid },
+    })
 }
 
 /// Build the status-subresource PATCH path for a pod.
@@ -9344,6 +9436,7 @@ mod tests {
                 let plan = PreemptionPlan {
                     node_name: "worker-0".to_owned(),
                     victims: vec!["default/victim-a".to_owned(), "default/victim-b".to_owned()],
+                    ..Default::default()
                 };
                 std::thread::spawn(move || {
                     // Line every contender up so as many as possible call
@@ -9442,6 +9535,7 @@ mod tests {
                         let plan = PreemptionPlan {
                             node_name: "worker-0".to_owned(),
                             victims,
+                            ..Default::default()
                         };
                         if verify_and_reserve_preemption(&pod, &node, &plan, &tally).is_ok() {
                             return Some(plan.victims);
@@ -9541,6 +9635,7 @@ mod tests {
             // Named explicitly (not searched) so this test does not depend
             // on NodeTally's HashMap iteration order to pick filler-a.
             victims: vec!["default/filler-a".to_owned()],
+            ..Default::default()
         };
         verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
             .expect("evicting filler-a frees exactly enough room for preemptor-1");
@@ -9566,6 +9661,41 @@ mod tests {
              yet-evicted plan, so the second plan must fall through to the \
              only other eligible candidate (filler-b), never re-select \
              filler-a — got {victims2:?}"
+        );
+    }
+
+    /// The victim UIDs a plan evicts are the ones tallied when it is committed, not
+    /// whatever same-name pod exists when eviction later runs.
+    #[test]
+    fn committed_plan_records_the_victims_uid_at_plan_time() {
+        let tally = std::sync::Mutex::new(NodeTally::default());
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "filler-a",
+            "uid-planned",
+            "worker-0",
+            100,
+            requests(1000, 0, 0),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        let mut node = make_node_with_capacity("worker-0", &[], "110");
+        node.status.allocatable.cpu = "1".to_owned();
+        let mut pod = empty_pending_pod();
+        pod.priority = 1000;
+        pod.requests = requests(1000, 0, 0);
+        let plan = PreemptionPlan {
+            node_name: "worker-0".to_owned(),
+            victims: vec!["default/filler-a".to_owned(), "default/gone".to_owned()],
+            ..Default::default()
+        };
+        let uids = verify_and_reserve_preemption(&pod, &node, &plan, &tally)
+            .expect("evicting filler-a frees enough room");
+        assert_eq!(
+            uids,
+            vec![("default/filler-a".to_owned(), "uid-planned".to_owned())],
+            "an untallied victim is already gone and must not be evicted by name"
         );
     }
 
@@ -9601,6 +9731,7 @@ mod tests {
         let plan1 = PreemptionPlan {
             node_name: "worker-0".to_owned(),
             victims: vec!["default/filler-a".to_owned()],
+            ..Default::default()
         };
         verify_and_reserve_preemption(&pod1, &node, &plan1, &tally)
             .expect("evicting filler-a frees exactly enough room for preemptor-1");
@@ -11113,6 +11244,60 @@ mod tests {
         );
     }
 
+    /// An attempt still in flight when its pod's DELETED is processed would
+    /// otherwise register a backoff entry and PVC waiter nothing ever removes.
+    #[test]
+    fn late_in_flight_attempt_for_a_deleted_pod_registers_no_backoff_or_pvc_waiter() {
+        let mut tally = NodeTally::default();
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        let emit = tally.record_scheduling_failure(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-old"), json!({})),
+            "0/1 nodes available",
+            std::time::Instant::now(),
+        );
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-old".to_owned(),
+        );
+        assert!(!emit, "no Event for a pod that no longer exists");
+        assert!(
+            tally
+                .failures
+                .backed_off(std::time::Instant::now())
+                .is_empty(),
+            "a deleted pod's late failure leaked a backoff entry"
+        );
+        assert!(
+            tally.apply_pvc_event(&pvc_added()).is_empty(),
+            "a deleted pod's late PVC wait leaked a waiter"
+        );
+    }
+
+    /// The tombstone is per incarnation: a same-name recreation still gets
+    /// its backoff and PVC waiter.
+    #[test]
+    fn deleted_incarnation_tombstone_does_not_block_the_recreated_pod() {
+        let mut tally = NodeTally::default();
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        let new = pod_event("ADDED", Some("uid-new"), json!({}));
+        assert!(tally.record_scheduling_failure(
+            "default/web-0",
+            &new,
+            "0/1 nodes available",
+            std::time::Instant::now()
+        ));
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-new".to_owned(),
+        );
+        assert_eq!(tally.apply_pvc_event(&pvc_added()).len(), 1);
+    }
+
     /// A late DELETED for the old incarnation must not drop the recreated
     /// pod's PVC waiter: the pod would never be re-driven when its PVC
     /// appears and would wait out the full resync interval.
@@ -11165,6 +11350,63 @@ mod tests {
             1,
             "the recreated pod lost its PVC waiter to a stale bound event"
         );
+    }
+
+    /// A late terminal-phase event of the old incarnation must not free the
+    /// recreated pod's tally slot, PVC waiter or bind waiter: the preemptor
+    /// would bind before the new victim is really gone.
+    #[test]
+    fn stale_terminal_event_of_old_uid_keeps_recreated_pods_slot_and_waiters() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        let bound = json!({ "spec": { "nodeName": "worker-0" }, "status": { "phase": "Running" } });
+        let _ = tally.apply_event(&pod_event("MODIFIED", Some("uid-new"), bound));
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            "uid-new".to_owned(),
+        );
+        let done =
+            json!({ "spec": { "nodeName": "worker-0" }, "status": { "phase": "Succeeded" } });
+        let ready = tally.apply_event(&pod_event("MODIFIED", Some("uid-old"), done));
+        assert!(
+            ready.is_empty(),
+            "a stale terminal event released a deferred bind"
+        );
+        assert_eq!(
+            tally.tallied_uid("default", "web-0").as_deref(),
+            Some("uid-new"),
+            "a stale terminal event freed the recreated pod's slot"
+        );
+        assert_eq!(
+            tally.apply_pvc_event(&pvc_added()).len(),
+            1,
+            "a stale terminal event dropped the recreated pod's PVC waiter"
+        );
+    }
+
+    /// A scheduling success reported for the deleted incarnation must not
+    /// clear the recreated pod's backoff, or it is retried immediately.
+    #[test]
+    fn scheduling_success_of_old_uid_keeps_recreated_pods_backoff() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        tally.clear_backoff_after_schedule(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-old"), json!({})),
+        );
+        assert_eq!(
+            tally.failures.backed_off(std::time::Instant::now()).len(),
+            1,
+            "the recreated pod lost its backoff to the old incarnation's success"
+        );
+        tally.clear_backoff_after_schedule(
+            "default/web-0",
+            &pod_event("ADDED", Some("uid-new"), json!({})),
+        );
+        assert!(tally
+            .failures
+            .backed_off(std::time::Instant::now())
+            .is_empty());
     }
 
     /// The ordinary order (the registered incarnation is the one deleted) must
@@ -12412,7 +12654,7 @@ mod tests {
             tokio_rustls::TlsConnector::from(Arc::new(client_config)),
             format!("https://127.0.0.1:{port}"),
         );
-        delete_pod(&client, "default", "victim")
+        delete_pod(&client, "default", "victim", "uid-1")
             .await
             .expect("delete_pod must succeed against a mock server that returns 200");
 
@@ -13207,6 +13449,7 @@ mod tests {
                 let plan = PreemptionPlan {
                     node_name: "worker-0".to_owned(),
                     victims: Vec::new(),
+                    ..Default::default()
                 };
                 std::thread::spawn(move || {
                     barrier.wait();
