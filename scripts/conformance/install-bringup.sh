@@ -7,9 +7,12 @@
 # Usage: scripts/conformance/install-bringup.sh --vm <name> --tarball <path under ~>
 #          [--port <N>] [--kubelet-port <N>] [--workdir <path>] [--network <name>]
 #          [--rust-log <filter>] [--extra-node <vm> --extra-kubelet-port <N>]
+#          [--wipe-extra-node]
 #
 # --extra-node joins a 2nd VM through install.sh's own flow: --mint-join-token on the control
-# plane, then --join on the extra VM (same network, same tarball).
+# plane, then --join on the extra VM (same network, same tarball). A VM that already joined
+# is upgraded in place (install.sh with no --join); --wipe-extra-node instead deletes its
+# Node and state and re-joins it, logging the wipe.
 #
 # Writes <workdir>/kubeconfig (127.0.0.1:<port>, an ssh tunnel to the VM's apiserver, pid in
 # <workdir>/install-tunnel.pid) and <workdir>/e2e-ssh/ (key for [Disruptive] specs).
@@ -31,6 +34,7 @@ TARBALL=""
 RUST_LOG_FILTER=""
 EXTRA_NODE=""
 EXTRA_KUBELET_PORT=""
+WIPE_EXTRA_NODE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) VM_NAME="$2"; shift 2 ;;
@@ -42,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --rust-log) RUST_LOG_FILTER="$2"; shift 2 ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
+    --wipe-extra-node) WIPE_EXTRA_NODE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -140,20 +145,27 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$VM_NAM
 
 # ── extra node: install.sh's own join flow ───────────────────────────────────
 if [ -n "$EXTRA_NODE" ]; then
-  banner "install.sh --mint-join-token on $VM_NAME, then --join on $EXTRA_NODE"
-  # --join is one-shot and refuses a joined worker: a re-run clears the worker first, as
-  # install.sh's own re-join instructions say (delete the Node, stop kubelet, rm -rf state).
-  kubectl --kubeconfig="$KUBECONFIG_PATH" delete "node/$EXTRA_NODE" --ignore-not-found --wait=false
-  limactl shell "$EXTRA_NODE" sudo bash -c "systemctl stop kubelet 2>/dev/null || true; rm -rf $VM_STATE_DIR"
-  mint="$(limactl shell "$VM_NAME" sudo bash "$REPO/scripts/install.sh" --mint-join-token)"
-  { read -r join_url; read -r join_token; read -r ca_hash; } < <(join_fields_from_mint_output <<<"$mint") \
-    || { echo "error: could not parse --mint-join-token output" >&2; exit 1; }
-  unset mint
-  # The token travels on stdin only, never argv.
-  printf '%s\n' "$join_token" | bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- \
-    --join "$join_url" --token - --ca-cert-hash "$ca_hash" --tarball "$TARBALL" --node-name "$EXTRA_NODE"
-  unset join_token
-  kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$EXTRA_NODE" --timeout=300s
+  if [ "$WIPE_EXTRA_NODE" = 1 ]; then
+    banner "WIPING $EXTRA_NODE (--wipe-extra-node): deleting its Node and $VM_STATE_DIR; the upgrade-in-place path is NOT exercised"
+    kubectl --kubeconfig="$KUBECONFIG_PATH" delete "node/$EXTRA_NODE" --ignore-not-found --wait=false
+    limactl shell "$EXTRA_NODE" sudo bash -c "systemctl stop kubelet 2>/dev/null || true; rm -rf $VM_STATE_DIR"
+  fi
+  if limactl shell "$EXTRA_NODE" sudo test -s "$VM_STATE_DIR/kubeconfig"; then
+    banner "install.sh upgrade in place on $EXTRA_NODE (already joined; no token)"
+    bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- --tarball "$TARBALL" --node-name "$EXTRA_NODE"
+    kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$EXTRA_NODE" --timeout=300s
+  else
+    banner "install.sh --mint-join-token on $VM_NAME, then --join on $EXTRA_NODE"
+    mint="$(limactl shell "$VM_NAME" sudo bash "$REPO/scripts/install.sh" --mint-join-token)"
+    { read -r join_url; read -r join_token; read -r ca_hash; } < <(join_fields_from_mint_output <<<"$mint") \
+      || { echo "error: could not parse --mint-join-token output" >&2; exit 1; }
+    unset mint
+    # The token travels on stdin only, never argv.
+    printf '%s\n' "$join_token" | bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- \
+      --join "$join_url" --token - --ca-cert-hash "$ca_hash" --tarball "$TARBALL" --node-name "$EXTRA_NODE"
+    unset join_token
+    kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$EXTRA_NODE" --timeout=300s
+  fi
 fi
 
 # ── [Disruptive] ssh key (same credential the host rig provisions) ───────────
