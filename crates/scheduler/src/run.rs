@@ -37,7 +37,7 @@ use crate::{
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, ApiClient, BindError,
-    NodeTally, PendingPod, PodList,
+    NodeTally, PendingPod, PodList, PodRecreated,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -257,24 +257,36 @@ async fn evict_victims(
         let Some((v_ns, v_name)) = victim.split_once('/') else {
             continue;
         };
+        // Best-effort: mirrors upstream kube-scheduler, which stamps
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
         // for the higher-priority pod matters more than the condition.
-        if let Err(e) =
-            patch_pod_status(client, v_ns, v_name, &disruption_target_patch(pod_name)).await
+        if let Err(e) = patch_pod_status(
+            client,
+            v_ns,
+            v_name,
+            &disruption_target_patch(pod_name, victim_uid),
+        )
+        .await
         {
+            if e.downcast_ref::<PodRecreated>().is_some() {
+                anyhow::bail!(
+                    "victim {v_ns}/{v_name} was recreated since the plan (uid {victim_uid} is \
+                     gone): {e}"
+                );
+            }
             error!(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
             );
         }
-        delete_pod(client, v_ns, v_name, victim_uid).await?;
+        let deleted_uid = delete_pod(client, v_ns, v_name, victim_uid).await?;
         // By UID: a same-name pod recreated while the DELETE was in flight must keep its
         // reservation.
         tally
             .lock()
             .expect("tally lock poisoned")
-            .remove_if_uid(v_ns, v_name, victim_uid);
-        evicted.push((victim.clone(), victim_uid.clone()));
+            .remove_if_uid(v_ns, v_name, &deleted_uid);
+        evicted.push((victim.clone(), deleted_uid));
     }
     Ok(evicted)
 }
@@ -2287,6 +2299,8 @@ mod tests {
         /// UID of the victim pod as the mock apiserver sees it: a DELETE whose
         /// `preconditions.uid` differs is refused with the 409 the real apiserver returns.
         live_victim_uid: Mutex<Option<String>>,
+        /// Live UID of the pod each accepted status PATCH landed on.
+        stamped_pods: Mutex<Vec<String>>,
     }
 
     /// Spin up an in-process TLS mock server for the two bind-outcome tests
@@ -2372,10 +2386,31 @@ mod tests {
                         (format!("{bind_status} bind-response"), bind_body.to_owned())
                     } else if method == "PATCH" && path.ends_with("/status") {
                         counts.patch_status.fetch_add(1, Ordering::SeqCst);
-                        (
-                            "200 OK".to_owned(),
-                            r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                        let sent_uid = serde_json::from_str::<serde_json::Value>(
+                            request.split("\r\n\r\n").nth(1).unwrap_or_default(),
                         )
+                        .ok()
+                        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned));
+                        let live = counts.live_victim_uid.lock().unwrap().clone();
+                        match (live, sent_uid) {
+                            (Some(live), Some(sent)) if sent != live => (
+                                "422 Unprocessable Entity".to_owned(),
+                                format!(
+                                    r#"{{"kind":"Status","reason":"Invalid","code":422,"message":"Pod \"p\" is invalid: metadata.uid: Invalid value: \"{sent}\": field is immutable"}}"#
+                                ),
+                            ),
+                            (live, _) => {
+                                counts
+                                    .stamped_pods
+                                    .lock()
+                                    .unwrap()
+                                    .push(live.unwrap_or_default());
+                                (
+                                    "200 OK".to_owned(),
+                                    r#"{"kind":"Status","status":"Success"}"#.to_owned(),
+                                )
+                            }
+                        }
                     } else if method == "DELETE" {
                         let hook = counts.on_delete.lock().unwrap().take();
                         if let Some(hook) = hook {
@@ -2399,7 +2434,11 @@ mod tests {
                                     sent_uid.unwrap_or_default()
                                 ),
                             ),
-                            _ => (
+                            Some(live) => (
+                                "200 OK".to_owned(),
+                                format!(r#"{{"kind":"Pod","metadata":{{"uid":"{live}"}}}}"#),
+                            ),
+                            None => (
                                 "200 OK".to_owned(),
                                 r#"{"kind":"Status","status":"Success"}"#.to_owned(),
                             ),
@@ -2531,21 +2570,54 @@ mod tests {
             format!("{err:#}").contains("recreated"),
             "unexpected error: {err:#}"
         );
-        let bodies = counts.delete_bodies.lock().unwrap().clone();
-        assert_eq!(
-            bodies.len(),
-            1,
-            "nothing may be evicted after the stale victim: {bodies:?}"
-        );
+        let stamped = counts.stamped_pods.lock().unwrap().clone();
         assert!(
-            bodies[0].contains(r#""uid":"uid-old""#),
-            "the DELETE must carry the plan-time UID precondition: {}",
-            bodies[0]
+            stamped.is_empty(),
+            "the recreated pod must not be marked DisruptionTarget for a plan about its \
+             predecessor: {stamped:?}"
+        );
+        let bodies = counts.delete_bodies.lock().unwrap().clone();
+        assert!(
+            bodies.is_empty(),
+            "the 422 on the DisruptionTarget patch already proves the victim was recreated, so \
+             nothing may be deleted, the stale victim or any later one: {bodies:?}"
         );
         assert_eq!(
             tally.lock().unwrap().tallied_uid("default", "victim"),
             Some("uid-new".to_owned()),
             "the recreated pod's reservation must survive the refused eviction"
+        );
+    }
+
+    /// A victim whose UID the tally never learned: the apiserver refuses any stored UID against
+    /// `preconditions.uid=""`, so sending it would abort every such eviction. The DELETE goes
+    /// out unconditionally and the UID the apiserver reports for the deleted pod is what the
+    /// bind waiter is registered with, so a same-name recreation cannot release it.
+    #[tokio::test]
+    async fn victim_with_unknown_uid_is_evicted_without_precondition_and_learns_its_uid() {
+        let (client, counts) = spawn_bind_outcome_mock_server(201, "{}").await;
+        *counts.live_victim_uid.lock().unwrap() = Some("uid-live".to_owned());
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+
+        let evicted = evict_victims(
+            &client,
+            &[("default/victim".to_owned(), String::new())],
+            &tally,
+            "preemptor",
+        )
+        .await
+        .expect("an unknown-UID victim must still be evictable");
+
+        let bodies = counts.delete_bodies.lock().unwrap().clone();
+        assert!(
+            !bodies[0].contains("preconditions"),
+            "an empty UID precondition always mismatches and would abort the eviction: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            evicted,
+            vec![("default/victim".to_owned(), "uid-live".to_owned())],
+            "the waiter must be keyed to the incarnation actually deleted"
         );
     }
 

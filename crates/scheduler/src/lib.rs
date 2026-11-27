@@ -1836,11 +1836,19 @@ pub struct NodeTally {
     /// "namespace/name" -> (UID, when its DELETED was applied) of the latest pod incarnation seen
     /// deleted. A scheduling attempt still in flight for that incarnation must not register
     /// per-pod state afterwards: nothing would ever clean it up. Entries older than
-    /// `DELETED_POD_TTL` are pruned; no attempt outlives that.
+    /// `DELETED_POD_TTL` are pruned, and at most `DELETED_POD_CAP` are kept.
     deleted_pods: std::collections::HashMap<String, (String, std::time::Instant)>,
 }
 
+/// Far above every interval the tombstone must outlast: `RESYNC_INTERVAL` (30s, the PVC-waiter
+/// re-drive), `POD_MAX_BACKOFF` (10s) and `FAILED_EVENT_REPEAT_WINDOW` (60s, the longest) apply
+/// per scheduling attempt, and an attempt is a bounded run of API calls
+/// (`MAX_PREEMPTION_ATTEMPTS` = 5 plans, each a handful of requests). 600s is 10x the longest.
 const DELETED_POD_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A churn burst can delete more pods than fit in the TTL window; the oldest tombstones go
+/// first since their attempts are the likeliest to have finished.
+const DELETED_POD_CAP: usize = 10_000;
 
 /// A PVC's fields needed to resolve its backing CSI driver — see
 /// `NodeTally::resolve_csi_driver`.
@@ -1944,10 +1952,7 @@ impl NodeTally {
             self.remove_event_pod(&key, &uid);
             self.failures.clear(&key, &uid);
             if !uid.is_empty() {
-                let now = std::time::Instant::now();
-                self.deleted_pods
-                    .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
-                self.deleted_pods.insert(key.clone(), (uid.clone(), now));
+                self.tombstone(&key, &uid, std::time::Instant::now());
             }
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key, &uid);
@@ -2092,6 +2097,23 @@ impl NodeTally {
         if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
             self.remove_pod(&key);
         }
+    }
+
+    fn tombstone(&mut self, key: &str, uid: &str, now: std::time::Instant) {
+        self.deleted_pods
+            .retain(|_, (_, at)| now.duration_since(*at) < DELETED_POD_TTL);
+        if self.deleted_pods.len() >= DELETED_POD_CAP && !self.deleted_pods.contains_key(key) {
+            let oldest = self
+                .deleted_pods
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.deleted_pods.remove(&oldest);
+            }
+        }
+        self.deleted_pods
+            .insert(key.to_owned(), (uid.to_owned(), now));
     }
 
     fn is_deleted_incarnation(&self, key: &str, uid: &str) -> bool {
@@ -4566,6 +4588,14 @@ pub fn is_bind_noop(err: &BindError) -> bool {
     matches!(err, BindError::AlreadyAssigned(_) | BindError::StalePod(_))
 }
 
+/// Whether a write was refused because its `metadata.uid` precondition named a pod incarnation
+/// that is no longer the stored one: the apiserver's 409 carries upstream's
+/// `Precondition failed: UID in precondition: ...` text. A resourceVersion precondition 409 is
+/// a different, retryable conflict and does not match.
+pub fn is_uid_precondition_conflict(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("UID in precondition")
+}
+
 /// Classify a bind response status code and body, returning Err on non-2xx.
 ///
 /// Extracted as a pure function so the classification logic can be
@@ -4586,7 +4616,7 @@ pub fn check_bind_response(status: u16, body: &str) -> Result<(), BindError> {
             "bind rejected with HTTP 409 (pod already assigned elsewhere): {body}"
         )));
     }
-    if status == 409 && body.contains("UID in precondition") {
+    if is_uid_precondition_conflict(status, body) {
         return Err(BindError::StalePod(format!(
             "bind rejected with HTTP 409 (pod recreated since the decision): {body}"
         )));
@@ -5658,8 +5688,13 @@ const PREEMPTION_BY_SCHEDULER_REASON: &str = "PreemptionByScheduler";
 /// (test/e2e/framework/pod/resource.go) only checks the condition's `type`,
 /// but a made-up reason would misrepresent to `kubectl describe pod` who
 /// evicted the pod and why.
-pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
-    serde_json::json!({
+///
+/// A non-empty `victim_uid` pins the patch to that incarnation through `metadata.uid` (the
+/// pod status endpoint takes no JSON Patch, so a `test` op is not available; the kubelet's own
+/// status patches use the same body field): the victim may have been recreated since the
+/// plan, and the new pod must not be marked disrupted.
+pub fn disruption_target_patch(pending_pod_name: &str, victim_uid: &str) -> Value {
+    let mut patch = serde_json::json!({
         "status": {
             "conditions": [{
                 "type": "DisruptionTarget",
@@ -5670,7 +5705,11 @@ pub fn disruption_target_patch(pending_pod_name: &str) -> Value {
                 ),
             }]
         }
-    })
+    });
+    if !victim_uid.is_empty() {
+        patch["metadata"] = serde_json::json!({ "uid": victim_uid });
+    }
+    patch
 }
 
 /// Build the status-subresource PATCH that stamps `status.nominatedNodeName`
@@ -5720,19 +5759,25 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
 /// precondition is an error, so the caller rolls the plan back and re-plans
 /// instead of treating the freed capacity as real. Upstream's
 /// `util.DeletePod` (pkg/scheduler/util/utils.go) sends empty `DeleteOptions{}`;
-/// the precondition is a deliberate tightening.
+/// the precondition is a deliberate tightening. An empty `uid` (victim never
+/// tallied with one) sends no precondition, as the apiserver would refuse any
+/// stored UID against `""`.
+///
+/// Returns the UID of the incarnation deleted: `uid` itself, or for an empty `uid` the one
+/// the apiserver reports in its response (empty if it reports none), so a bind waiter can
+/// tell that incarnation's removal from a same-name recreation's.
 pub async fn delete_pod(
     client: &ApiClient,
     namespace: &str,
     pod_name: &str,
     uid: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let path = delete_pod_path(namespace, pod_name);
     let start = std::time::Instant::now();
     let (status, body) = http_delete(client, &path, &victim_delete_options(uid)).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
-    if status == StatusCode::CONFLICT && body.contains("UID in precondition") {
+    if is_uid_precondition_conflict(status.as_u16(), &body) {
         bail!(
             "victim {namespace}/{pod_name} was recreated since the plan (uid {uid} is gone): {body}"
         );
@@ -5740,16 +5785,23 @@ pub async fn delete_pod(
     check_delete_response(status.as_u16())
         .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     info!("evicted pod {namespace}/{pod_name} (preemption)");
-    Ok(())
+    if !uid.is_empty() {
+        return Ok(uid.to_owned());
+    }
+    Ok(serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned))
+        .unwrap_or_default())
 }
 
-/// `DeleteOptions` pinning the DELETE to one pod incarnation.
+/// `DeleteOptions` pinning the DELETE to one pod incarnation, or unconditional when `uid` is
+/// unknown (empty).
 pub fn victim_delete_options(uid: &str) -> Value {
-    serde_json::json!({
-        "kind": "DeleteOptions",
-        "apiVersion": "v1",
-        "preconditions": { "uid": uid },
-    })
+    let mut options = serde_json::json!({ "kind": "DeleteOptions", "apiVersion": "v1" });
+    if !uid.is_empty() {
+        options["preconditions"] = serde_json::json!({ "uid": uid });
+    }
+    options
 }
 
 /// Build the status-subresource PATCH path for a pod.
@@ -5768,7 +5820,29 @@ pub fn check_status_patch_response(status: u16, body: &str) -> anyhow::Result<()
     if (200..300).contains(&status) {
         return Ok(());
     }
+    if is_immutable_uid_rejection(status, body) {
+        return Err(PodRecreated(format!(
+            "status patch rejected with HTTP {status} (pod recreated since the decision): {body}"
+        ))
+        .into());
+    }
     bail!("status patch failed with HTTP {status}: {body}")
+}
+
+/// A status PATCH pinned to a pod's `metadata.uid` that the apiserver refused because the
+/// stored pod has another UID. Found in the error chain of `patch_pod_status`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PodRecreated(pub String);
+
+/// Whether a PATCH was refused because its `metadata.uid` names a pod incarnation that is no
+/// longer the stored one. A PATCH carries no precondition upstream, so the changed UID fails
+/// update validation instead: a 422 whose message is
+/// `metadata.uid: Invalid value: "<uid>": field is immutable`.
+pub fn is_immutable_uid_rejection(status: u16, body: &str) -> bool {
+    status == 422
+        && body.contains("metadata.uid: Invalid value")
+        && body.contains("field is immutable")
 }
 
 /// PATCH a pod's `.status` via .../pods/:name/status.
@@ -5903,6 +5977,47 @@ mod tests {
             "a 409 without the already-assigned-to-node message must classify as Other, \
              not AlreadyAssigned"
         );
+    }
+
+    #[test]
+    fn uid_precondition_conflict_requires_409_and_the_uid_text() {
+        let uid = "409 Precondition failed: UID in precondition: a, UID in object meta: b";
+        assert!(is_uid_precondition_conflict(409, uid));
+        assert!(
+            !is_uid_precondition_conflict(500, uid),
+            "only a 409 is a precondition refusal"
+        );
+        assert!(
+            !is_uid_precondition_conflict(
+                409,
+                "Precondition failed: ResourceVersion in precondition: 1, ResourceVersion in object meta: 2"
+            ),
+            "a stale resourceVersion means the same pod changed, not that it was recreated"
+        );
+    }
+
+    #[test]
+    fn immutable_uid_rejection_requires_422_and_the_immutable_uid_text() {
+        let body = r#"{"message":"Pod \"p\" is invalid: metadata.uid: Invalid value: \"a\": field is immutable"}"#;
+        assert!(is_immutable_uid_rejection(422, body));
+        assert!(
+            !is_immutable_uid_rejection(409, body),
+            "a PATCH has no precondition; only the 422 means the pod was recreated"
+        );
+        assert!(
+            !is_immutable_uid_rejection(
+                422,
+                r#"{"message":"Pod \"p\" is invalid: spec.nodeName: Invalid value: \"a\": field is immutable"}"#
+            ),
+            "another immutable field says nothing about the pod having been recreated"
+        );
+        let err = check_status_patch_response(422, body).expect_err("422 is an error");
+        assert!(
+            err.downcast_ref::<PodRecreated>().is_some(),
+            "evict_victims aborts on this marker; without it a recreated victim is evicted"
+        );
+        let other = check_status_patch_response(500, body).expect_err("500 is an error");
+        assert!(other.downcast_ref::<PodRecreated>().is_none());
     }
 
     #[test]
@@ -10742,6 +10857,34 @@ mod tests {
     // main.rs functions is unit-testable without a live API server.
     // ---------------------------------------------------------------------------
 
+    #[test]
+    fn victim_delete_options_omit_the_precondition_for_an_unknown_uid() {
+        assert!(
+            victim_delete_options("")["preconditions"].is_null(),
+            "preconditions.uid=\"\" is refused against any stored UID"
+        );
+        assert_eq!(victim_delete_options("u")["preconditions"]["uid"], "u");
+    }
+
+    #[test]
+    fn preemption_waiter_with_known_uid_ignores_a_same_name_recreations_removal() {
+        let mut tally = NodeTally::default();
+        tally.register_preemption_waiter(
+            empty_pending_pod(),
+            "worker-0".to_owned(),
+            &[("default/victim".to_owned(), "uid-old".to_owned())],
+        );
+        let gone = |uid: &str| {
+            json!({"type": "DELETED", "object": {"metadata": {
+                "name": "victim", "namespace": "default", "uid": uid}}})
+        };
+        assert!(
+            tally.apply_event(&gone("uid-new")).is_empty(),
+            "a recreated pod's removal must not release the bind onto capacity still held"
+        );
+        assert_eq!(tally.apply_event(&gone("uid-old")).len(), 1);
+    }
+
     /// The core regression: registering a plan (mirroring what
     /// `preempt_and_pick_node` now does instead of binding immediately) must
     /// NOT resolve on an unrelated pod's DELETE, and must resolve on the
@@ -11274,6 +11417,27 @@ mod tests {
             tally.apply_pvc_event(&pvc_added()).is_empty(),
             "a deleted pod's late PVC wait leaked a waiter"
         );
+    }
+
+    /// A burst of deletes inside the TTL window must not grow the scheduler's memory without
+    /// bound, and the pods dropped must be the oldest, not the ones just deleted.
+    #[test]
+    fn deleted_pod_tombstones_stay_capped_under_churn_dropping_the_oldest() {
+        let mut tally = NodeTally::default();
+        let base = std::time::Instant::now();
+        let total = DELETED_POD_CAP + 500;
+        for i in 0..total {
+            tally.tombstone(
+                &format!("default/p{i}"),
+                &format!("uid{i}"),
+                base + std::time::Duration::from_millis(i as u64),
+            );
+            assert!(tally.deleted_pods.len() <= DELETED_POD_CAP);
+        }
+        assert_eq!(tally.deleted_pods.len(), DELETED_POD_CAP);
+        assert!(!tally.is_deleted_incarnation("default/p0", "uid0"));
+        let last = total - 1;
+        assert!(tally.is_deleted_incarnation(&format!("default/p{last}"), &format!("uid{last}")));
     }
 
     /// The tombstone is per incarnation: a same-name recreation still gets
@@ -12680,7 +12844,7 @@ mod tests {
     /// `DisruptionTarget`/`True`/`PreemptionByScheduler`.
     #[test]
     fn disruption_target_patch_sets_condition_type_status_and_reason() {
-        let patch = disruption_target_patch("preemptor-pod");
+        let patch = disruption_target_patch("preemptor-pod", "uid-v");
         let condition = &patch["status"]["conditions"][0];
         assert_eq!(condition["type"], "DisruptionTarget");
         assert_eq!(condition["status"], "True");
@@ -12692,11 +12856,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disruption_target_patch_is_pinned_to_the_victim_uid_when_known() {
+        assert_eq!(
+            disruption_target_patch("p", "uid-v")["metadata"]["uid"],
+            "uid-v",
+            "an unpinned patch stamps a same-name recreation of the victim"
+        );
+        assert!(disruption_target_patch("p", "")["metadata"].is_null());
+    }
+
     /// The message must name the preemptor pod so a user reading `kubectl
     /// describe pod` on the victim can tell which pod displaced it.
     #[test]
     fn disruption_target_patch_message_names_the_preemptor() {
-        let patch = disruption_target_patch("high-priority-pod");
+        let patch = disruption_target_patch("high-priority-pod", "uid-v");
         let message = patch["status"]["conditions"][0]["message"]
             .as_str()
             .expect("message must be a string");

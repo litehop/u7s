@@ -1324,15 +1324,10 @@ pub(crate) async fn delete_pod<S: Store>(
         // running indefinitely while the StatefulSet controller waits for the pod to terminate.
         if !has_finalizers && (already_terminating || force_requested) {
             // Dry-run: validation passed and this is what a real DELETE would hard-delete;
-            // return the would-be Success status without persisting or running the quota
+            // return the would-be deleted object without persisting or running the quota
             // refresh side effect below.
             if dry_run {
-                return Ok(Json(serde_json::json!({
-                    "kind": "Status",
-                    "apiVersion": "v1",
-                    "status": "Success",
-                    "code": 200
-                })));
+                return Ok(Json(obj.body));
             }
             // Hard-delete: pod is already Terminating, or the caller forced it, and all
             // finalizers are gone. Conditional on the revision read, so a finalizer re-added
@@ -1360,12 +1355,8 @@ pub(crate) async fn delete_pod<S: Store>(
             let _quota_lock = state.quota_admission_locks.lock(ns.as_str()).await;
             crate::quota::record_pod_removed(&state, ns.as_str(), &obj.body).await;
 
-            return Ok(Json(serde_json::json!({
-                "kind": "Status",
-                "apiVersion": "v1",
-                "status": "Success",
-                "code": 200
-            })));
+            // The pod store returns the deleted object, so the caller learns the UID it removed.
+            return Ok(Json(obj.body));
         }
 
         if already_terminating {
@@ -2687,6 +2678,20 @@ pub(crate) async fn replace_pod_status<S: Store>(
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        // `DefaultUpdatedObjectInfo` makes a non-empty body uid a storage precondition.
+        if let Some(uid) = incoming_meta.uid.as_deref().filter(|u| !u.is_empty()) {
+            crate::types::Preconditions {
+                uid: Some(uid.to_owned()),
+                resource_version: None,
+            }
+            .check(&current_obj.body)
+            .map_err(|msg| {
+                Status::conflict(format!(
+                    "Operation cannot be fulfilled on pods \"{name}\": StorageError: invalid \
+                     object, Code: 4, Key: {key}, ResourceVersion: 0, AdditionalErrorMsg: {msg}"
+                ))
+            })?;
+        }
         let before_write = current_obj.body.clone();
 
         // Typed dispatch: Pod is always registered in status_dispatch (mirrors
@@ -2967,6 +2972,20 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
     }
 }
 
+/// Upstream's 422 for a `metadata.uid` that differs from the stored one
+/// (`ValidateImmutableField` in `ValidateObjectMetaUpdate`).
+fn immutable_uid_error(name: &str, uid: &str) -> crate::status::StatusError {
+    let cause = format!("Invalid value: \"{uid}\": field is immutable");
+    let mut err =
+        Status::unprocessable_entity(format!("Pod \"{name}\" is invalid: metadata.uid: {cause}"));
+    err.1.details = Some(Box::new(serde_json::json!({
+        "name": name,
+        "kind": "Pod",
+        "causes": [{"reason": "FieldValueInvalid", "message": cause, "field": "metadata.uid"}]
+    })));
+    err
+}
+
 pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -3020,6 +3039,14 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        // A PATCH carries no precondition upstream; a `metadata.uid` naming another incarnation
+        // fails `ValidateObjectMetaUpdate` as an immutable-field 422.
+        if let Some(uid) = patch["metadata"]["uid"].as_str().filter(|u| !u.is_empty()) {
+            if current_obj.body["metadata"]["uid"].as_str() != Some(uid) {
+                return Err(immutable_uid_error(&name, uid));
+            }
+        }
 
         let before_write = current_obj.body.clone();
         let ssa_plan = super::status::plan_status_apply(
@@ -16263,6 +16290,199 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A status patch pinned to `metadata.uid` must not land on a same-name recreation: the
+    /// scheduler stamps DisruptionTarget on a preemption victim this way, and the new pod must
+    /// not be marked as disrupted for a plan made about its predecessor.
+    #[tokio::test]
+    async fn patch_pod_status_with_stale_uid_is_a_422_immutable_and_leaves_the_pod_untouched() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1", "uid": "uid-new"
+            }}),
+        )
+        .await;
+        let patch_with = |uid: &str| {
+            let state = state.clone();
+            let body = serde_json::json!({
+                "metadata": {"uid": uid},
+                "status": {"conditions": [{"type": "DisruptionTarget", "status": "True"}]}
+            });
+            async move {
+                patch_pod_status(
+                    State(state),
+                    Path(("default".to_string(), "my-pod".to_string())),
+                    None,
+                    {
+                        let mut h = HeaderMap::new();
+                        h.insert(
+                            header::CONTENT_TYPE,
+                            "application/strategic-merge-patch+json".parse().unwrap(),
+                        );
+                        h
+                    },
+                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+
+        let err = patch_with("uid-old")
+            .await
+            .expect_err("a patch pinned to a replaced UID must be refused");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1.reason, "Invalid");
+        assert_eq!(
+            err.1.message,
+            "Pod \"my-pod\" is invalid: metadata.uid: Invalid value: \"uid-old\": field is immutable"
+        );
+        let body = serde_json::to_string(&err.1).unwrap();
+        assert!(
+            u7s_scheduler::is_immutable_uid_rejection(422, &body),
+            "the scheduler must recognise the apiserver's real 422, else a recreated preemption \
+             victim is not told apart from a failed condition patch: {body}"
+        );
+        assert!(
+            u7s_scheduler::check_status_patch_response(422, &body)
+                .expect_err("422 is an error")
+                .downcast_ref::<u7s_scheduler::PodRecreated>()
+                .is_some(),
+            "the scheduler must abort the eviction on the apiserver's real 422: {body}"
+        );
+        assert!(
+            !u7s_scheduler::is_uid_precondition_conflict(422, &body),
+            "a PATCH has no precondition: {body}"
+        );
+        assert_eq!(
+            err.1.details.as_ref().unwrap()["causes"][0]["field"],
+            "metadata.uid"
+        );
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            stored["status"]["conditions"].is_null(),
+            "the refused patch must not stamp the recreated pod: {stored}"
+        );
+
+        patch_with("uid-new")
+            .await
+            .expect("a patch pinned to the live UID applies");
+    }
+
+    /// A PUT carries its body uid as a storage precondition (409), unlike a PATCH (422): a stale
+    /// writer holding a deleted pod's snapshot must not overwrite the recreation's status.
+    #[tokio::test]
+    async fn replace_pod_status_with_stale_uid_is_a_409_precondition_failure() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1", "uid": "uid-new"
+            }}),
+        )
+        .await;
+        let put_with = |uid: &str| {
+            let state = state.clone();
+            let body = serde_json::json!({
+                "metadata": {"uid": uid},
+                "status": {"phase": "Running"}
+            });
+            async move {
+                replace_pod_status(
+                    State(state),
+                    Path(("default".to_string(), "my-pod".to_string())),
+                    None,
+                    {
+                        let mut h = HeaderMap::new();
+                        h.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                        h
+                    },
+                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(|_| ())
+            }
+        };
+
+        let err = put_with("uid-old")
+            .await
+            .expect_err("a PUT carrying a replaced UID must be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            err.1.message,
+            "Operation cannot be fulfilled on pods \"my-pod\": StorageError: invalid object, \
+             Code: 4, Key: /registry/pods/default/my-pod, ResourceVersion: 0, \
+             AdditionalErrorMsg: Precondition failed: UID in precondition: uid-old, UID in \
+             object meta: uid-new"
+        );
+        let stored = store
+            .get("/registry/pods/default/my-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored["status"]["phase"], "Pending",
+            "the refused PUT must not touch the recreated pod"
+        );
+
+        put_with("uid-new")
+            .await
+            .expect("a PUT with the live UID applies");
+        put_with("")
+            .await
+            .expect("a PUT with no UID is unconditioned");
+    }
+
+    /// The pod store returns the deleted object (`ReturnDeletedObject`), so the scheduler learns
+    /// the UID of the incarnation an unconditional hard delete removed.
+    #[tokio::test]
+    async fn hard_delete_pod_returns_the_deleted_object_with_its_uid() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {
+                "name": "my-pod", "namespace": "default", "resourceVersion": "1", "uid": "uid-1"
+            }}),
+        )
+        .await;
+        let resp = delete_pod(
+            State(state),
+            Path(("default".to_string(), "my-pod".to_string())),
+            auth_layer(),
+            HeaderMap::new(),
+            Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string()),
+        )
+        .await
+        .expect("hard delete succeeds")
+        .into_response();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let deleted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(deleted["kind"], "Pod");
+        assert_eq!(
+            deleted["metadata"]["uid"], "uid-1",
+            "an empty UID here makes the scheduler's bind waiter unable to tell the deleted \
+             pod from a same-name recreation"
+        );
     }
 
     async fn pod_status_apply(
