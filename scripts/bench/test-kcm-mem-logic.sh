@@ -100,6 +100,21 @@ check "an A/B run that ends normally leaves no KCM drop-in (mode R), so the next
   absent "$(kcm_revert_probe exit)"
 check "an A/B run killed by TERM leaves no KCM drop-in (mode R), so an interrupted run cannot leak the trim" \
   absent "$(kcm_revert_probe signal)"
+kcm_hang_probe() {
+  local start=$SECONDS
+  (
+    limactl() { sleep 60; }
+    KCM_REVERT_TIMEOUT_S=2
+    kcm_mode_revert_on_exit deadvm
+    exit 0
+  ) 2>"$T/hang.err"
+  echo "$((SECONDS - start))"
+}
+hang_s="$(kcm_hang_probe)"
+[ "$hang_s" -lt 20 ]
+check "a dead VM (limactl hangs) cannot hang the exit-trap revert past KCM_REVERT_TIMEOUT_S, so a driver never wedges at exit (took ${hang_s}s)" "0" "$?"
+grep -q "revert to R timed out" "$T/hang.err"
+check "an expired revert warns, so the operator knows teardown must clear the drop-in" "0" "$?"
 grep -q '^kcm_mode_revert_on_exit "\$VM"$' "$REPO/scripts/bench/kcm-mem-ab.sh"
 check "kcm-mem-ab.sh installs the revert before its first run" "0" "$?"
 
