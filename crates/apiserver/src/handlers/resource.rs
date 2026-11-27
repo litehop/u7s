@@ -27,9 +27,9 @@ use super::field_selector::FieldSelector;
 use super::generic::{
     apply_delete_policy, apply_label_selector, check_clusterrole_escalation, check_crb_escalation,
     check_rb_escalation, check_role_escalation, clear_create_status, decode_continue,
-    generate_name, lookup, parse_label_selector, pin_server_owned_deletion_fields,
-    resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
-    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    generate_name, lookup, parse_label_selector, pin_server_owned_metadata, resolve_valid_name,
+    stamp_metadata, store_err, validate_path_segment, wants_generate_name, CollectionQuery,
+    LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
@@ -924,7 +924,7 @@ pub(crate) async fn replace_resource<S: Store>(
         // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
         // of completing the delete — persisting the object with deletionTimestamp gone and
         // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
 
         if old_object.is_none() && !allows_create_on_update(&group, &plural) {
             return Err(Status::not_found(&group, &plural, &name));
@@ -1761,11 +1761,11 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
-                let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
+                let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
                 crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(Status::patch_error)?;
                 race_plan.remove_dropped_fields(&mut current.body);
-                pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
+                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
@@ -2132,7 +2132,7 @@ pub(crate) async fn do_patch<S: Store>(
         // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
         // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
         let stored_uid = current.body["metadata"]["uid"].clone();
-        let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
+        let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
 
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
@@ -2153,7 +2153,7 @@ pub(crate) async fn do_patch<S: Store>(
             plan.remove_dropped_fields(&mut current.body);
         }
         current.body["metadata"]["uid"] = stored_uid;
-        pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
@@ -4077,7 +4077,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
         // of completing the delete — persisting the object with deletionTimestamp gone and
         // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
 
         // Allocate a clusterIP when a Service transitions away from ExternalName to a
         // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path

@@ -1029,6 +1029,12 @@ pub async fn replace_crd<S: Store>(
     crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
         .as_str()
         .map(str::to_string);
+    if let Some(ts) = existing["metadata"]["creationTimestamp"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
+        crd.metadata.creation_timestamp = ts.to_string();
+    }
 
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
@@ -6669,6 +6675,12 @@ mod ratchet_tests {
         assert!(
             crd["metadata"]["deletionTimestamp"].is_string(),
             "a client PUT must not un-terminate a CRD mid-finalization"
+        );
+        assert!(
+            crd["metadata"]["creationTimestamp"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "a PUT omitting creationTimestamp must keep the stored age"
         );
     }
 

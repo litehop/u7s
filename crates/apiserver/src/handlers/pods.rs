@@ -732,7 +732,7 @@ pub(crate) async fn replace_pod<S: Store>(
 
         // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
         // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
-        super::generic::pin_server_owned_deletion_fields(&mut obj.body, Some(&stored_obj.body));
+        super::generic::pin_server_owned_metadata(&mut obj.body, Some(&stored_obj.body));
 
         // Admission webhook pipeline (mutating then validating).
         let admission_ctx = AdmissionContext {
@@ -1565,7 +1565,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
-        let stored_deletion = super::generic::snapshot_deletion_fields(&current_obj.body);
+        let stored_deletion = super::generic::snapshot_server_owned_metadata(&current_obj.body);
         let rv_before_patch = current_obj.resource_version().map(str::to_owned);
 
         match patch_type {
@@ -1592,10 +1592,7 @@ pub(crate) async fn patch_pod<S: Store>(
         }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
-        super::generic::pin_server_owned_deletion_fields(
-            &mut current_obj.body,
-            Some(&stored_deletion),
-        );
+        super::generic::pin_server_owned_metadata(&mut current_obj.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch

@@ -209,7 +209,7 @@ pub(crate) async fn create_namespace<S: Store>(
     }
 
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj.body, None);
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, None);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -418,10 +418,7 @@ pub(crate) async fn replace_namespace<S: Store>(
                 )));
             }
         }
-        crate::handlers::generic::pin_server_owned_deletion_fields(
-            &mut obj.body,
-            stored_obj.as_ref(),
-        );
+        crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, stored_obj.as_ref());
 
         // Admission webhook pipeline (mutating then validating), threading the pre-existing
         // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
@@ -592,7 +589,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     crate::patch::merge_patch(&mut current.body, &patch);
 
     current.body["metadata"]["uid"] = stored_uid;
-    super::generic::pin_server_owned_deletion_fields(&mut current.body, Some(&pre_patch_obj));
+    super::generic::pin_server_owned_metadata(&mut current.body, Some(&pre_patch_obj));
     super::json_patch::enforce_patch_identity(&mut current.body, &name, None)?;
 
     if stored_status.is_null() {

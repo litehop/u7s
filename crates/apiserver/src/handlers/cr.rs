@@ -802,7 +802,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     meta.generation = Some(1);
     meta.creation_timestamp = Some(utc_now_rfc3339());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_deletion_fields(obj, None);
+    crate::handlers::generic::pin_server_owned_metadata(obj, None);
 }
 
 /// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
@@ -946,7 +946,7 @@ fn resolve_cr_metadata(
         incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
     incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_deletion_fields(incoming, Some(stored));
+    crate::handlers::generic::pin_server_owned_metadata(incoming, Some(stored));
     Ok(())
 }
 
@@ -5527,7 +5527,7 @@ pub async fn patch_cr<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -5889,7 +5889,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
     // value it carries.
     obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_deletion_fields(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
