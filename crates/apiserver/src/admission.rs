@@ -449,6 +449,7 @@ fn namespace_selector_skip_context<'a>(
 pub(crate) fn webhook_match_conditions_pass(
     conditions: &[MatchCondition],
     object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     request: &serde_json::Value,
     webhook_name: &str,
     failure_policy: &str,
@@ -458,9 +459,13 @@ pub(crate) fn webhook_match_conditions_pass(
     // (only ValidatingAdmissionPolicy does) — Null makes any such reference resolve rather
     // than fall through the unbound-identifier fallback further down the parser.
     let no_namespace_object = serde_json::Value::Null;
-    // Same reasoning for `oldObject`: webhook matchConditions aren't threaded an old-object
-    // value here, so Null resolves the identifier instead of erroring the expression.
-    let no_old_object = serde_json::Value::Null;
+    // `object` and `oldObject` are bound exactly as for ValidatingAdmissionPolicy: oldObject
+    // exists on UPDATE and DELETE only, and `object` is null on DELETE.
+    let object = cel_object(request, object);
+    let old_object = match request["operation"].as_str() {
+        Some("UPDATE" | "DELETE") => old_object.unwrap_or(&NULL_PARAMS),
+        _ => &NULL_PARAMS,
+    };
     for cond in conditions {
         match eval_cel_bool_expr(
             &cond.expression,
@@ -468,7 +473,7 @@ pub(crate) fn webhook_match_conditions_pass(
             &vars,
             request,
             &no_namespace_object,
-            &no_old_object,
+            old_object,
         ) {
             Some(false) => return Ok(false),
             Some(true) => {}
@@ -2009,6 +2014,7 @@ async fn invoke_mutating_webhook<S: Store>(
         if !webhook_match_conditions_pass(
             &webhook.match_conditions,
             object,
+            old_object.map(|o| &**o),
             &request_val,
             &webhook.name,
             &webhook.failure_policy,
@@ -2265,6 +2271,19 @@ fn vap_env<'a>(
 /// `params` for a policy that declares a `paramKind` but whose binding supplies no param.
 static NULL_PARAMS: serde_json::Value = serde_json::Value::Null;
 
+/// The CEL `object` root for a request. A DELETE has no new object: upstream binds `object` to
+/// null and the stored object is `oldObject` only.
+fn cel_object<'a>(
+    request: &serde_json::Value,
+    object: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    if request["operation"] == "DELETE" {
+        &NULL_PARAMS
+    } else {
+        object
+    }
+}
+
 /// The request-scoped CEL roots of a ValidatingAdmissionPolicy or MutatingAdmissionPolicy
 /// evaluation besides `object` and `params`, and what backs its `authorizer`.
 struct PolicyInputs<'a> {
@@ -2291,13 +2310,7 @@ impl<'a> PolicyInputs<'a> {
         'a: 'e,
     {
         use cel_runtime::Value;
-        // A DELETE has no new object: upstream binds `object` to null and the stored object
-        // is `oldObject` only.
-        let object = if self.request["operation"] == "DELETE" {
-            &NULL_PARAMS
-        } else {
-            object
-        };
+        let object = cel_object(self.request, object);
         let mut roots = vec![
             ("object", Value::from_json(object)),
             ("oldObject", Value::from_json(self.old_object)),
@@ -3680,6 +3693,7 @@ async fn run_validating_webhooks_inner<S: Store>(
                 if !webhook_match_conditions_pass(
                     &webhook.match_conditions,
                     object,
+                    old_object,
                     &request_val,
                     &webhook.name,
                     &webhook.failure_policy,
@@ -6613,8 +6627,15 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
-                .expect("a false-evaluating condition is not an eval error"),
+            !webhook_match_conditions_pass(
+                &conditions,
+                &object,
+                None,
+                &empty_request(),
+                "wh",
+                "Fail"
+            )
+            .expect("a false-evaluating condition is not an eval error"),
             "a matchCondition evaluating to false must skip the webhook, else it acts on \
              objects it was configured to exclude"
         );
@@ -6632,8 +6653,15 @@ mod tests {
         }];
         let object = json!({"metadata": {"name": "other"}});
         assert!(
-            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
-                .expect("a true-evaluating condition is not an eval error"),
+            webhook_match_conditions_pass(
+                &conditions,
+                &object,
+                None,
+                &empty_request(),
+                "wh",
+                "Fail"
+            )
+            .expect("a true-evaluating condition is not an eval error"),
             "an object not matched by the exclusion expression must still be processed by \
              the webhook"
         );
@@ -6655,8 +6683,15 @@ mod tests {
         ];
         let object = json!({"metadata": {"name": "skip-me"}});
         assert!(
-            !webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail")
-                .expect("all-boolean conditions are not an eval error"),
+            !webhook_match_conditions_pass(
+                &conditions,
+                &object,
+                None,
+                &empty_request(),
+                "wh",
+                "Fail"
+            )
+            .expect("all-boolean conditions are not an eval error"),
             "matchConditions are combined with logical AND; one false condition must skip \
              the webhook regardless of how many other conditions passed"
         );
@@ -6677,8 +6712,14 @@ mod tests {
             expression: "authorizer.group('').resource('pods').check().allowed()".into(),
         }];
         let object = json!({"metadata": {"name": "anything"}});
-        let result =
-            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Fail");
+        let result = webhook_match_conditions_pass(
+            &conditions,
+            &object,
+            None,
+            &empty_request(),
+            "wh",
+            "Fail",
+        );
         assert!(
             result.is_err(),
             "failurePolicy=Fail (the default) must deny the request when a matchCondition \
@@ -6699,8 +6740,14 @@ mod tests {
             expression: "authorizer.group('').resource('pods').check().allowed()".into(),
         }];
         let object = json!({"metadata": {"name": "anything"}});
-        let result =
-            webhook_match_conditions_pass(&conditions, &object, &empty_request(), "wh", "Ignore");
+        let result = webhook_match_conditions_pass(
+            &conditions,
+            &object,
+            None,
+            &empty_request(),
+            "wh",
+            "Ignore",
+        );
         assert!(
             !result.expect("Ignore must not turn an eval error into a request-denying error"),
             "failurePolicy=Ignore must skip the webhook (as if the condition were false) when \
@@ -6714,7 +6761,7 @@ mod tests {
     fn webhook_match_conditions_pass_returns_true_when_no_conditions_configured() {
         let object = json!({"metadata": {"name": "anything"}});
         assert!(
-            webhook_match_conditions_pass(&[], &object, &empty_request(), "wh", "Fail")
+            webhook_match_conditions_pass(&[], &object, None, &empty_request(), "wh", "Fail")
                 .expect("no conditions means no eval error is possible"),
             "absent matchConditions must match everything, same as an absent selector"
         );
@@ -8482,6 +8529,104 @@ mod tests {
             "webhook with a true matchCondition must be invoked; the unreachable URL with \
              failurePolicy=Fail must cause an error"
         );
+    }
+
+    /// Whether a webhook gated by `expression` is invoked for `operation`, for both webhook
+    /// kinds. The unreachable URL with failurePolicy=Fail turns "invoked" into an error.
+    async fn match_condition_invokes_webhooks(
+        operation: &'static str,
+        expression: &str,
+    ) -> [bool; 2] {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        for (kind, prefix) in [
+            (
+                "MutatingWebhookConfiguration",
+                "mutatingwebhookconfigurations",
+            ),
+            (
+                "ValidatingWebhookConfiguration",
+                "validatingwebhookconfigurations",
+            ),
+        ] {
+            let config = json!({
+                "apiVersion": "admissionregistration.k8s.io/v1",
+                "kind": kind,
+                "metadata": {"name": "cfg"},
+                "webhooks": [{
+                    "name": "gated.example.com",
+                    "clientConfig": {"url": "http://127.0.0.1:1"},
+                    "rules": [{"apiGroups": [""], "apiVersions": ["v1"],
+                        "resources": ["configmaps"], "operations": [operation]}],
+                    "failurePolicy": "Fail",
+                    "matchConditions": [{"name": "c", "expression": expression}]
+                }]
+            });
+            store
+                .put(
+                    &format!("/registry/admissionregistration.k8s.io/{prefix}/cfg"),
+                    bytes::Bytes::from(serde_json::to_vec(&config).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let obj = json!({"kind": "ConfigMap", "metadata": {"name": "x"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "x",
+            namespace: Some("default"),
+            operation,
+            user_info: None,
+            dry_run: false,
+            options: None,
+        };
+        let old = (operation != "CREATE").then_some(&obj);
+        let mutating = run_mutating_webhooks(&state, obj.clone(), old, &ctx).await;
+        let validating = run_validating_webhooks(&state, &obj, old, &ctx).await;
+        [mutating.is_err(), validating.is_err()]
+    }
+
+    /// Upstream evaluates webhook matchConditions with the ValidatingAdmissionPolicy activation
+    /// (`object` null on DELETE, `oldObject` only on UPDATE/DELETE). A condition like
+    /// `object == null` on a DELETE webhook misfires - skipping a webhook that should gate the
+    /// delete - if the stored object is bound as `object` instead.
+    #[tokio::test]
+    async fn webhook_match_conditions_bind_object_and_old_object_per_operation() {
+        let cases: [(&str, &str, bool); 13] = [
+            ("CREATE", "object != null", true),
+            ("CREATE", "object == null", false),
+            ("CREATE", "oldObject == null", true),
+            ("CREATE", "oldObject != null", false),
+            ("UPDATE", "object != null", true),
+            ("UPDATE", "object == null", false),
+            ("UPDATE", "oldObject != null", true),
+            ("UPDATE", "oldObject == null", false),
+            ("DELETE", "object == null", true),
+            ("DELETE", "object != null", false),
+            ("DELETE", "oldObject != null", true),
+            ("DELETE", "oldObject == null", false),
+            ("DELETE", "oldObject.metadata.name == 'x'", true),
+        ];
+        for (operation, expression, invoked) in cases {
+            let [mutating, validating] =
+                match_condition_invokes_webhooks(operation, expression).await;
+            assert_eq!(
+                mutating, invoked,
+                "mutating webhook, {operation} `{expression}`: invoked={invoked} expected"
+            );
+            assert_eq!(
+                validating, invoked,
+                "validating webhook, {operation} `{expression}`: invoked={invoked} expected"
+            );
+        }
     }
 
     /// Same matchCondition skip requirement as the mutating case, for validating webhooks.
