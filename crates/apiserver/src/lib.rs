@@ -11807,6 +11807,63 @@ mod tests {
         );
     }
 
+    /// Upstream reads DeleteOptions from the body alone once one is present, so a body whose
+    /// dryRun is empty must really delete even with `?dryRun=All`; a bodyless `?dryRun=All`
+    /// must leave the object. Run through the real router and store: if the query beat the
+    /// body the caller would be told the object is gone while it still exists, or the reverse.
+    #[tokio::test]
+    async fn delete_dry_run_body_beats_query_against_the_real_store() {
+        use axum::http::{Method, Request};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let group = "rbac.authorization.k8s.io";
+        let mut router = build_router(state);
+        for (body, query_survives, name) in [
+            (r#"{"dryRun":[]}"#, false, "body-wins"),
+            ("", true, "query-only"),
+        ] {
+            let key = keys::group_object_key(group, "rolebindings", Some("d"), name);
+            let rb = serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": { "name": name, "namespace": "d" }, "subjects": [],
+                "roleRef": { "apiGroup": group, "kind": "ClusterRole", "name": "x" }
+            });
+            store
+                .put(&key, bytes::Bytes::from(rb.to_string()), Some(0))
+                .await
+                .expect("seed");
+            let mut req = Request::builder()
+                .method(Method::DELETE)
+                .uri(format!(
+                    "/apis/{group}/v1/namespaces/d/rolebindings/{name}?dryRun=All"
+                ))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            req.extensions_mut().insert(auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            });
+            let resp = router.call(req).await.expect("router must not error");
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{name}");
+            let present = store.get(&key).await.expect("get").is_some();
+            assert_eq!(
+                present, query_survives,
+                "{name}: object presence after DELETE with ?dryRun=All and body {body:?}"
+            );
+        }
+    }
+
     /// DELETE /api/v1/namespaces/{ns}/pods must return 200, not 405.
     ///
     /// sonobuoy cleanup sends DELETE /api/v1/namespaces/sonobuoy/pods?labelSelector=sonobuoy-run=<id>

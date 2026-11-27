@@ -3806,7 +3806,7 @@ pub async fn delete_cr<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     // This is what the conformance test "deny custom resource create/update/delete" exercises
     // for the delete case: a Fail-policy webhook must be able to reject the deletion.
     let admission_ctx = AdmissionContext {
@@ -3824,7 +3824,7 @@ pub async fn delete_cr<S: Store>(
         })),
         dry_run,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -4029,7 +4029,7 @@ pub async fn delete_collection_cr<S: Store>(
                 })),
                 dry_run,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.
@@ -4901,7 +4901,7 @@ pub async fn delete_cr_namespaced<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     let admission_ctx = AdmissionContext {
         group: &group,
         version: &version,
@@ -4917,7 +4917,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         })),
         dry_run,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -5135,7 +5135,7 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                 })),
                 dry_run,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.

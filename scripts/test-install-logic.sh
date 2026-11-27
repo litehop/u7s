@@ -1921,10 +1921,43 @@ assert "ca-bundle.pem, when present, is the trust anchor: a cert it does not cha
   "$([ "$bundle_status" -ne 0 ] && echo 1 || echo 0)"
 rm -f "$ok_dir/ca-bundle.pem"
 
+# KCM signs node certs with an intermediate and returns leaf+intermediate in one file;
+# the worker trusts only the root (ca.pem).
+INT_KEY="$UPG_WORK/int.key"
+openssl ecparam -name prime256v1 -genkey -noout -out "$INT_KEY"
+openssl req -new -key "$INT_KEY" -subj "/CN=u7s-intermediate-test" -out "$UPG_WORK/int.csr"
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n' > "$UPG_WORK/int.ext"
+openssl x509 -req -in "$UPG_WORK/int.csr" -CA "$JOIN_CA_DIR/ca.pem" -CAkey "$JOIN_WORK/ca.key" -CAcreateserial -days 30 -extfile "$UPG_WORK/int.ext" -out "$UPG_WORK/int.crt" 2>/dev/null
+openssl x509 -req -in "$UPG_WORK/client.csr" -CA "$UPG_WORK/int.crt" -CAkey "$INT_KEY" -CAcreateserial -days 1 -out "$UPG_WORK/int-leaf.crt" 2>/dev/null
+cat "$UPG_WORK/int-leaf.crt" "$UPG_WORK/int.crt" > "$UPG_WORK/int-chain.crt"
+assert "test setup: the intermediate-signed leaf chains to the root only through the intermediate (otherwise the chain tests below prove nothing)" \
+  "$(openssl verify -CAfile "$JOIN_CA_DIR/ca.pem" "$UPG_WORK/int-leaf.crt" >/dev/null 2>&1 && echo 0 || echo 1)"
+
+int_dir="$(new_worker_state intermediate "$UPG_WORK/int-chain.crt")"
+int_status=0; bash "$VERIFY_RUNNER" "$int_dir" >/dev/null 2>&1 || int_status=$?
+assert "a worker whose client cert is signed by the intermediate (leaf+intermediate in the cert file, root-only ca.pem) passes the pre-upgrade check, so an upgrade-in-place does not demand a re-join of a healthy node" \
+  "$([ "$int_status" -eq 0 ] && echo 1 || echo 0)"
+
+intleaf_dir="$(new_worker_state intermediate-leaf-only "$UPG_WORK/int-leaf.crt")"
+intleaf_status=0; bash "$CURRENT_RUNNER" "$intleaf_dir" >/dev/null 2>&1 || intleaf_status=$?
+assert "the intermediate is only an untrusted chain element: a leaf with no intermediate supplied still fails against the root, so the check keeps verifying the full chain" \
+  "$([ "$intleaf_status" -ne 0 ] && echo 1 || echo 0)"
+
+cp "$UPG_WORK/foreign-ca.crt" "$int_dir/ca.pem"
+intforeign_status=0; bash "$CURRENT_RUNNER" "$int_dir" >/dev/null 2>&1 || intforeign_status=$?
+assert "an intermediate-signed chain is rejected when the root is not the worker's trusted CA (the supplied intermediate must not become a trust anchor)" \
+  "$([ "$intforeign_status" -ne 0 ] && echo 1 || echo 0)"
+
 exp_dir="$(new_worker_state expired "$UPG_WORK/expired.crt")"
 exp_status=0; exp_out="$(bash "$VERIFY_RUNNER" "$exp_dir" 2>&1)" || exp_status=$?
 assert "an expired client identity fails the upgrade with a re-join-with-a-fresh-token message naming the state to clear (a silently restarted kubelet would crash-loop on 401 with no hint)" \
   "$([ "$exp_status" -ne 0 ] && printf '%s' "$exp_out" | drain_grep -q 'expired' && printf '%s' "$exp_out" | drain_grep -qF "rm -rf $exp_dir" && printf '%s' "$exp_out" | drain_grep -q 'fresh token' && echo 1 || echo 0)"
+
+chain_status=0; chain_out="$(bash "$VERIFY_RUNNER" "$foreign_dir" 2>&1)" || chain_status=$?
+assert "an unexpired cert that fails chain verification is reported as a chain/issuer failure with openssl's error, not as expired (a wrong 'expired' message hid a real chain bug)" \
+  "$([ "$chain_status" -ne 0 ] && printf '%s' "$chain_out" | drain_grep -q 'does not chain to the cluster CA' && printf '%s' "$chain_out" | drain_grep -q 'openssl: .*error' && ! printf '%s' "$chain_out" | drain_grep -q 'has expired' && echo 1 || echo 0)"
+assert "an expired cert is not reported as a chain failure" \
+  "$(printf '%s' "$exp_out" | drain_grep -q 'does not chain' && echo 0 || echo 1)"
 
 bothexp_dir="$(new_worker_state both-expired "$UPG_WORK/expired.crt")"
 cp "$UPG_WORK/expired-rotated.crt" "$bothexp_dir/kubelet/pki/kubelet-client-current.pem"

@@ -59,11 +59,34 @@ kcm_mode_apply() {
   limactl shell "$vm" sudo systemctl show -p ExecStart u7s-kcm.service | grep -oE -- '--controllers=[^ ;]+' | sed -n 1p
 }
 
+kcm_kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kcm_kill_tree "$c"; done
+  kill "$1" 2>/dev/null || true
+}
+
+# Runs kcm_mode_apply R and kills it and its children after KCM_REVERT_TIMEOUT_S (macOS has no
+# timeout(1)); a dead VM or Lima ssh mux would otherwise hang the shell's exit forever. Teardown's
+# clear-native-units.sh stays the backstop for the drop-in. Same watchdog as bounded() in
+# scripts/e2e-install/cloud-two-node.sh.
+kcm_mode_revert_bounded() {
+  local vm="$1" secs="${KCM_REVERT_TIMEOUT_S:-120}" p w rc=0
+  kcm_mode_apply "$vm" R >/dev/null &
+  p=$!
+  { sleep "$secs"; kcm_kill_tree "$p"; } >/dev/null 2>&1 &
+  w=$!
+  wait "$p" || rc=$?
+  kcm_kill_tree "$w"
+  wait "$w" 2>/dev/null || true
+  [ "$rc" -lt 128 ] || { echo "kcm-mode: revert to R timed out after ${secs}s on $vm; teardown clears the drop-in" >&2; return 124; }
+  return "$rc"
+}
+
 # Restores mode R on shell exit, including INT/TERM, so a driver that last ran T does not leave
 # the trimmed drop-in on the VM for the next install.sh to boot.
 kcm_mode_revert_on_exit() {
   KCM_REVERT_VM="$1"
-  trap 'trap - EXIT; kcm_mode_apply "$KCM_REVERT_VM" R >/dev/null || echo "kcm-mode: revert to R failed on $KCM_REVERT_VM" >&2' EXIT
+  trap 'trap - EXIT; kcm_mode_revert_bounded "$KCM_REVERT_VM" || echo "kcm-mode: revert to R failed on $KCM_REVERT_VM" >&2' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 }

@@ -25,6 +25,8 @@ STACK_ONLY=0
 SONOBUOY_ARGS=()
 RUST_LOG_FILTER=""
 KCM_MODE=""
+EXTRA_NODE=""
+EXTRA_KUBELET_PORT=""
 ORIGINAL_ARGV_JSON="[]"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +42,8 @@ while [[ $# -gt 0 ]]; do
     --workdir) WORKDIR="$2"; shift 2 ;;
     --rust-log) RUST_LOG_FILTER="$2"; shift 2 ;;
     --kcm-mode) KCM_MODE="$2"; shift 2 ;;
+    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+    --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
     --argv-json) ORIGINAL_ARGV_JSON="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -55,7 +59,7 @@ banner() {
 START=$SECONDS
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
-  bash "$DIR/reset.sh" --vm "$VM_NAME" --workdir "$WORKDIR" --port "$PORT"
+  bash "$DIR/reset.sh" --vm "$VM_NAME" --workdir "$WORKDIR" --port "$PORT" ${EXTRA_NODE:+--extra-node "$EXTRA_NODE"}
 fi
 
 banner "Install 1/3: build arm64 release tarball from this checkout"
@@ -69,6 +73,7 @@ NETWORK_ARG=()
 [ -z "$NETWORK" ] || NETWORK_ARG=(--network "$NETWORK")
 bash "$DIR/install-bringup.sh" --vm "$VM_NAME" --port "$PORT" --kubelet-port "$KUBELET_PORT" \
   --workdir "$WORKDIR" ${NETWORK_ARG[@]+"${NETWORK_ARG[@]}"} \
+  ${EXTRA_NODE:+--extra-node "$EXTRA_NODE" --extra-kubelet-port "$EXTRA_KUBELET_PORT"} \
   --tarball "$ARTIFACTS/u7s-gate-aarch64-unknown-linux-gnu.tar.gz" --rust-log "$RUST_LOG_FILTER"
 echo "install-mode timing: tarball build ${BUILT}s, VM provision + install.sh + add-ons $(( SECONDS - BRINGUP_START ))s"
 
@@ -100,11 +105,12 @@ export U7S_PORT="$PORT"
 export U7S_VM_NAME="$VM_NAME"
 rm -f "$(sonobuoy_results_dir_file "$WORKDIR" parallel)"
 SONOBUOY_RC=0
-bash "$DIR/06-run-sonobuoy.sh" --port "$PORT" --workdir "$WORKDIR" ${SONOBUOY_ARGS[@]+"${SONOBUOY_ARGS[@]}"} || SONOBUOY_RC=$?
+bash "$DIR/06-run-sonobuoy.sh" --port "$PORT" --workdir "$WORKDIR" ${EXTRA_NODE:+--extra-node "$EXTRA_NODE"} ${SONOBUOY_ARGS[@]+"${SONOBUOY_ARGS[@]}"} || SONOBUOY_RC=$?
 
 RUN_DIR=$(cat "$(sonobuoy_results_dir_file "$WORKDIR" parallel)" 2>/dev/null) || true
 if [ -n "$RUN_DIR" ]; then
-  bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "$VM_NAME" --argv-json "$ORIGINAL_ARGV_JSON"
+  bash "$DIR/write-build-provenance.sh" --run-dir "$RUN_DIR" --vm "$VM_NAME" ${EXTRA_NODE:+--extra-node "$EXTRA_NODE"} --argv-json "$ORIGINAL_ARGV_JSON"
+  run_meta_record_nodes "$RUN_DIR" "$(kubectl --kubeconfig "$KUBECONFIG" get nodes --no-headers | wc -l | tr -d ' ')"
   if [ -n "$KCM_MODE" ]; then
     echo "kcm_mode=$KCM_MODE" >> "$RUN_DIR/run-meta"
     printf 'kcm_mode=%s\nkcm_controllers_flag=%s\nkcm_restarts_before=%s\nkcm_restarts_after=%s\nkcm_active=%s\n' \

@@ -6,7 +6,13 @@
 #
 # Usage: scripts/conformance/install-bringup.sh --vm <name> --tarball <path under ~>
 #          [--port <N>] [--kubelet-port <N>] [--workdir <path>] [--network <name>]
-#          [--rust-log <filter>]
+#          [--rust-log <filter>] [--extra-node <vm> --extra-kubelet-port <N>]
+#          [--wipe-extra-node]
+#
+# --extra-node joins a 2nd VM through install.sh's own flow: --mint-join-token on the control
+# plane, then --join on the extra VM (same network, same tarball). A VM that already joined
+# is upgraded in place (install.sh with no --join); --wipe-extra-node instead deletes its
+# Node and state and re-joins it, logging the wipe.
 #
 # Writes <workdir>/kubeconfig (127.0.0.1:<port>, an ssh tunnel to the VM's apiserver, pid in
 # <workdir>/install-tunnel.pid) and <workdir>/e2e-ssh/ (key for [Disruptive] specs).
@@ -26,6 +32,9 @@ WORKDIR="$PWD/temp/u7s"
 NETWORK=""
 TARBALL=""
 RUST_LOG_FILTER=""
+EXTRA_NODE=""
+EXTRA_KUBELET_PORT=""
+WIPE_EXTRA_NODE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) VM_NAME="$2"; shift 2 ;;
@@ -35,10 +44,15 @@ while [[ $# -gt 0 ]]; do
     --network) NETWORK="$2"; shift 2 ;;
     --tarball) TARBALL="$2"; shift 2 ;;
     --rust-log) RUST_LOG_FILTER="$2"; shift 2 ;;
+    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+    --extra-kubelet-port) EXTRA_KUBELET_PORT="$2"; shift 2 ;;
+    --wipe-extra-node) WIPE_EXTRA_NODE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 [ -n "$TARBALL" ] || { echo "error: --tarball is required" >&2; exit 1; }
+[ -z "$EXTRA_NODE" ] || [ -n "$EXTRA_KUBELET_PORT" ] || { echo "error: --extra-node requires --extra-kubelet-port" >&2; exit 1; }
+[ -n "$EXTRA_NODE" ] || [ -z "$EXTRA_KUBELET_PORT" ] || { echo "error: --extra-kubelet-port requires --extra-node" >&2; exit 1; }
 [ -f "$TARBALL" ] || { echo "error: tarball not found: $TARBALL" >&2; exit 1; }
 
 mkdir -p "$WORKDIR"
@@ -52,34 +66,42 @@ banner() { echo ""; echo "--- $* ---"; }
 NETWORK="${NETWORK:-$(default_network_for_vm "$VM_NAME")}"
 
 # ── VM ───────────────────────────────────────────────────────────────────────
-banner "VM: provision or resume $VM_NAME"
 VM_DIR="${HOME}/.lima/${VM_NAME}"
-if [ -d "$VM_DIR" ]; then
-  assert_kubelet_port_matches_vm "$VM_NAME" "$KUBELET_PORT" || exit 1
-  if [ "$(limactl list --format '{{.Name}} {{.Status}}' | awk -v n="$VM_NAME" '$1 == n {print $2}')" != "Running" ]; then
-    check_port_free "$KUBELET_PORT" "kubelet"
-    lima_sync_provision "$VM_NAME" "$REPO/lima/kubelet.yaml"
-    limactl start "$VM_NAME"
-  fi
-else
-  check_port_free "$KUBELET_PORT" "kubelet"
-  GOLDEN_STATUS=$(limactl list --format '{{.Name}} {{.Status}}' | awk '$1 == "lima-golden" {print $2}')
-  if [ "$GOLDEN_STATUS" = "Stopped" ]; then
-    limactl clone lima-golden "$VM_NAME" \
-      --set ".networks[0].lima = \"${NETWORK}\"" \
-      --set ".portForwards[0].hostPort = ${KUBELET_PORT}" \
-      --tty=false
-    lima_sync_provision "$VM_NAME" "$REPO/lima/kubelet.yaml"
-    limactl start --tty=false "$VM_NAME"
-  else
-    sed -e "s/hostPort: 10250/hostPort: ${KUBELET_PORT}/" \
-        -e "s/lima: user-v2/lima: ${NETWORK}/" \
-        "$REPO/lima/kubelet.yaml" > "$WORKDIR/kubelet-patched.yaml"
-    limactl start --tty=false --timeout 30m --name="$VM_NAME" "$WORKDIR/kubelet-patched.yaml"
-  fi
-fi
 
-assert_vm_package_pins "$VM_NAME" "$REPO/lima/kubelet.yaml" "$REPO/scripts/lib/release-fetch.sh" || exit 1
+# Args: <vm> <kubelet host port>. Resumes an existing VM or provisions one on $NETWORK.
+provision_vm() {
+  local vm="$1" kubelet_port="$2" vm_dir="${HOME}/.lima/$1"
+  banner "VM: provision or resume $vm"
+  if [ -d "$vm_dir" ]; then
+    assert_kubelet_port_matches_vm "$vm" "$kubelet_port" || exit 1
+    if [ "$(limactl list --format '{{.Name}} {{.Status}}' | awk -v n="$vm" '$1 == n {print $2}')" != "Running" ]; then
+      check_port_free "$kubelet_port" "kubelet"
+      lima_sync_provision "$vm" "$REPO/lima/kubelet.yaml"
+      limactl start "$vm"
+    fi
+  else
+    check_port_free "$kubelet_port" "kubelet"
+    local golden_status
+    golden_status=$(limactl list --format '{{.Name}} {{.Status}}' | awk '$1 == "lima-golden" {print $2}')
+    if [ "$golden_status" = "Stopped" ]; then
+      limactl clone lima-golden "$vm" \
+        --set ".networks[0].lima = \"${NETWORK}\"" \
+        --set ".portForwards[0].hostPort = ${kubelet_port}" \
+        --tty=false
+      lima_sync_provision "$vm" "$REPO/lima/kubelet.yaml"
+      limactl start --tty=false "$vm"
+    else
+      sed -e "s/hostPort: 10250/hostPort: ${kubelet_port}/" \
+          -e "s/lima: user-v2/lima: ${NETWORK}/" \
+          "$REPO/lima/kubelet.yaml" > "$WORKDIR/kubelet-patched-${vm}.yaml"
+      limactl start --tty=false --timeout 30m --name="$vm" "$WORKDIR/kubelet-patched-${vm}.yaml"
+    fi
+  fi
+  assert_vm_package_pins "$vm" "$REPO/lima/kubelet.yaml" "$REPO/scripts/lib/release-fetch.sh" || exit 1
+}
+
+provision_vm "$VM_NAME" "$KUBELET_PORT"
+[ -z "$EXTRA_NODE" ] || provision_vm "$EXTRA_NODE" "$EXTRA_KUBELET_PORT"
 
 if [ -n "$RUST_LOG_FILTER" ]; then
   banner "VM: u7s-apiserver RUST_LOG drop-in (harness-written, not install.sh)"
@@ -121,13 +143,40 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" get --raw=/healthz >/dev/null \
   || { echo "error: apiserver not reachable through the tunnel (see $WORKDIR/install-tunnel.log)" >&2; exit 1; }
 kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$VM_NAME" --timeout=300s
 
+# ── extra node: install.sh's own join flow ───────────────────────────────────
+if [ -n "$EXTRA_NODE" ]; then
+  if [ "$WIPE_EXTRA_NODE" = 1 ]; then
+    banner "WIPING $EXTRA_NODE (--wipe-extra-node): deleting its Node and $VM_STATE_DIR; the upgrade-in-place path is NOT exercised"
+    kubectl --kubeconfig="$KUBECONFIG_PATH" delete "node/$EXTRA_NODE" --ignore-not-found --wait=false
+    limactl shell "$EXTRA_NODE" sudo bash -c "systemctl stop kubelet 2>/dev/null || true; rm -rf $VM_STATE_DIR"
+  fi
+  if limactl shell "$EXTRA_NODE" sudo test -s "$VM_STATE_DIR/kubeconfig"; then
+    banner "install.sh upgrade in place on $EXTRA_NODE (already joined; no token)"
+    bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- --tarball "$TARBALL" --node-name "$EXTRA_NODE"
+    kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$EXTRA_NODE" --timeout=300s
+  else
+    banner "install.sh --mint-join-token on $VM_NAME, then --join on $EXTRA_NODE"
+    mint="$(limactl shell "$VM_NAME" sudo bash "$REPO/scripts/install.sh" --mint-join-token)"
+    { read -r join_url; read -r join_token; read -r ca_hash; } < <(join_fields_from_mint_output <<<"$mint") \
+      || { echo "error: could not parse --mint-join-token output" >&2; exit 1; }
+    unset mint
+    # The token travels on stdin only, never argv.
+    printf '%s\n' "$join_token" | bash "$DIR/lima-install-test.sh" --vm "$EXTRA_NODE" -- \
+      --join "$join_url" --token - --ca-cert-hash "$ca_hash" --tarball "$TARBALL" --node-name "$EXTRA_NODE"
+    unset join_token
+    kubectl --kubeconfig="$KUBECONFIG_PATH" wait --for=condition=Ready "node/$EXTRA_NODE" --timeout=300s
+  fi
+fi
+
 # ── [Disruptive] ssh key (same credential the host rig provisions) ───────────
 SSH_KEY="$(e2e_ssh_key_path "$KUBECONFIG_PATH")"
 if [ ! -f "$SSH_KEY" ]; then
   mkdir -p "$(dirname "$SSH_KEY")"
   ssh-keygen -q -t ed25519 -N "" -C "$E2E_SSH_KEY_COMMENT" -f "$SSH_KEY"
 fi
-limactl shell "$VM_NAME" bash -c "$(authorized_keys_replace_cmd "$(cat "$SSH_KEY.pub")")"
+for vm in "$VM_NAME" ${EXTRA_NODE:+"$EXTRA_NODE"}; do
+  limactl shell "$vm" bash -c "$(authorized_keys_replace_cmd "$(cat "$SSH_KEY.pub")")"
+done
 
 # ── rig-only add-ons ─────────────────────────────────────────────────────────
 banner "RIG-ONLY add-ons (NOT shipped by install.sh; labelled $RIG_ONLY_LABEL): $RIG_ONLY_ADDONS"
@@ -141,6 +190,10 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" -n kube-system rollout status ds/kube-ne
 banner "RIG-ONLY setup (NOT shipped by install.sh): $RIG_ONLY_SETUP"
 rig_apply_apparmor_rig_setup "$VM_NAME"
 rig_apply_vm_rig_setup "$VM_NAME"
+if [ -n "$EXTRA_NODE" ]; then
+  rig_apply_apparmor_rig_setup "$EXTRA_NODE"
+  rig_apply_vm_rig_setup "$EXTRA_NODE"
+fi
 
 echo ""
 echo "Install-mode stack up: kubectl --kubeconfig $KUBECONFIG_PATH get pods -A"

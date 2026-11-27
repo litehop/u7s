@@ -18,6 +18,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$VM_NAME" ] || { echo "usage: $0 --vm <name> [-- <install.sh args>]" >&2; exit 2; }
 
-"$DIR/lima-unrig.sh" --vm "$VM_NAME"
-"$DIR/lima-unrig.sh" --vm "$VM_NAME" --check
+# </dev/null: install.sh may be fed a join token on stdin, which limactl would otherwise swallow.
+"$DIR/lima-unrig.sh" --vm "$VM_NAME" </dev/null
+"$DIR/lima-unrig.sh" --vm "$VM_NAME" --check </dev/null
 exec limactl shell "$VM_NAME" sudo bash "$DIR/../install.sh" "$@"

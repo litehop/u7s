@@ -171,7 +171,7 @@ assert_eq "given host-rig options are named" \
   "$(install_mode_incompatible_flags --binary=/x --profile= --extra-node=vm2 | paste -sd' ' -)" "--binary --extra-node"
 
 # 3. The real run-all.sh refuses them under --install, before touching a VM or building.
-for flag in "--binary /x" "--profile" "--extra-node vm2 --extra-kubelet-port 1" "--dual-stack" "--embedded-scheduler true" "--pki-test-lifetime 30"; do
+for flag in "--binary /x" "--profile" "--extra-node vm2" "--dual-stack" "--embedded-scheduler true" "--pki-test-lifetime 30"; do
   # shellcheck disable=SC2086
   rejection=$(bash "$REPO/scripts/conformance/run-all.sh" --install $flag 2>&1) && rc=0 || rc=$?
   if [ "$rc" -ne 0 ] && [[ "$rejection" == *"not supported with it"* || "$rejection" == *"mutually exclusive"* || "$rejection" == *"requires"* ]]; then
@@ -282,11 +282,17 @@ case "$out" in *"no leftover native u7s units") ok "a clean slot reports nothing
 # retires; a unit missing here (u7s-scheduler.service once was) survives on the slot and collides
 # with the rig's own processes.
 install_units=$({
-  grep -oE 'cat > /etc/systemd/system/u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | sed 's|.*/||'
-  grep -oE 'systemctl (enable|disable) u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | awk '{print $3}'
+  grep -oE 'cat > /etc/systemd/system/u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | sed 's|.*/||' || true
+  grep -oE 'systemctl (enable|disable) u7s-[a-z-]+\.[a-z]+' "$REPO/scripts/install.sh" | awk '{print $3}' || true
 } | sort -u)
 cleared_units=$(sed -n 's/^units="\(.*\)"$/\1/p' "$REPO/scripts/conformance/clear-native-units.sh" | tr ' ' '\n' | sort -u)
 [ -n "$install_units" ] && [ -n "$cleared_units" ] || bad "could not read the u7s unit lists (install: '$install_units', cleared: '$cleared_units')"
+for known in u7s-apiserver.service u7s-kcm.service u7s-scheduler.service; do
+  case $'\n'"$install_units"$'\n' in
+    *$'\n'"$known"$'\n'*) ok "install.sh unit discovery finds $known" ;;
+    *) bad "install.sh unit discovery missed $known, so the cleared-list check below compares against an incomplete set" ;;
+  esac
+done
 assert_eq "clear-native-units.sh clears exactly the u7s units install.sh writes or retires, so no install leftover survives a rig bring-up" \
   "$cleared_units" "$install_units"
 # install.sh's kubelet.service Requires=u7s-apiserver.service; left in place after the
