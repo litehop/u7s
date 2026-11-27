@@ -1,0 +1,32 @@
+{
+  "runs": {
+    "R": 3,
+    "T": 3
+  },
+  "stages": {
+    "idle": {
+      "R": {
+        "kcm_mib": 42.99,
+        "apiserver_mib": 20.57
+      },
+      "T": {
+        "kcm_mib": 34.87,
+        "apiserver_mib": 19.89
+      },
+      "kcm_diff_mib": 8.12
+    },
+    "wordpress": {
+      "R": {
+        "kcm_mib": 45.13,
+        "apiserver_mib": 22.00
+      },
+      "T": {
+        "kcm_mib": 35.99,
+        "apiserver_mib": 20.82
+      },
+      "kcm_diff_mib": 9.14
+    }
+  },
+  "min_diff_mib": 5,
+  "phase0_pass": true
+}
