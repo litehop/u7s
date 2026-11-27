@@ -637,10 +637,9 @@ fn report_scope_miss() {
         );
     }
     // Unit tests drive handlers directly, without the request middleware's scope.
-    debug_assert!(
-        cfg!(test),
-        "admission request options read outside the request scope"
-    );
+    if cfg!(debug_assertions) && !cfg!(test) {
+        panic!("admission request options read outside the request scope");
+    }
 }
 
 static SCOPE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
