@@ -120,6 +120,9 @@ check "install.sh writes the marker before its first mutation (systemd preflight
 check "install-teardown.sh removes the marker, so a torn-down VM is not torn down again" \
   "1" "$(grep -c "rm -f '\"\$INSTALL_STATE_MARKER\"'" "$DIR/install-teardown.sh")"
 
+check "install-teardown.sh removes the legacy rig kube-proxy unit (else a torn-down VM probes as rig state and is unrigged once)" \
+  "1" "$(grep -c "rm -f '\"\$RIG_STATE_LEGACY_UNIT\"'" "$DIR/install-teardown.sh")"
+
 reset_fixture
 echo vm-a > "$TMP/install-state"
 echo vm-a > "$TMP/teardown-fails"

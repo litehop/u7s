@@ -38,9 +38,13 @@ limactl shell "$VM_NAME" sudo bash -s < "$DIR/clear-native-units.sh"
 # kubelet.service is removed unconditionally on purpose: install.sh's unit runs against
 # /var/lib/u7s, which this script wipes, and the rig writes its own (rig_kubelet_unit_script)
 # on the next bring-up. The distro package's unit lives in /usr/lib, so it is untouched.
+# A legacy rig's kube-proxy.service is removed too: left behind it makes the VM probe as rig
+# state, so the next run-all.sh --install would unrig (and wipe the pods of) a torn-down VM.
 limactl shell "$VM_NAME" sudo bash -c '
   set -u
   systemctl disable --now kubelet.service 2>/dev/null || true
+  systemctl disable --now kube-proxy.service 2>/dev/null || true
+  rm -f '"$RIG_STATE_LEGACY_UNIT"'
   if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
   rm -f /etc/systemd/system/kubelet.service
   rm -rf /etc/systemd/system/kubelet.service.d
