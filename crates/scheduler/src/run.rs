@@ -257,6 +257,7 @@ async fn evict_victims(
         let Some((v_ns, v_name)) = victim.split_once('/') else {
             continue;
         };
+        // Best-effort: mirrors upstream kube-scheduler, which stamps
         // DisruptionTarget on the victim before deleting it. A patch
         // failure must not block the eviction itself — freeing the slot
         // for the higher-priority pod matters more than the condition.
