@@ -163,6 +163,32 @@ async fn delete_pod_honours_preconditions_on_soft_and_hard_delete() {
     }
 }
 
+/// The scheduler's preemption classifies a refused victim DELETE by this apiserver's real 409
+/// body; if the message text drifts, a recreated victim is no longer recognised as such.
+#[tokio::test]
+async fn delete_pod_uid_precondition_409_is_classified_by_the_scheduler() {
+    let mock = Arc::new(MockStore::new());
+    seed(&mock, &pod_key("p"), &pod("p")).await;
+    let r = super::pods::delete_pod(
+        State(state_of(&mock)),
+        Path(("default".to_string(), "p".to_string())),
+        Extension(user()),
+        HeaderMap::new(),
+        wrong_uid(),
+    )
+    .await;
+    let Err(e) = r else {
+        panic!("a mismatching uid must fail")
+    };
+    let body = serde_json::to_string(&e.1).unwrap();
+    assert!(
+        u7s_scheduler::is_uid_precondition_conflict(e.0.as_u16(), &body),
+        "the scheduler must recognise the apiserver's stale-UID DELETE 409, else preemption \
+         treats a recreated victim as a benign conflict and binds onto capacity that was never \
+         freed: {body}"
+    );
+}
+
 #[tokio::test]
 async fn delete_collection_pods_honours_preconditions() {
     let mock = Arc::new(MockStore::new());

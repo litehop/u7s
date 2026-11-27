@@ -4566,6 +4566,14 @@ pub fn is_bind_noop(err: &BindError) -> bool {
     matches!(err, BindError::AlreadyAssigned(_) | BindError::StalePod(_))
 }
 
+/// Whether a write was refused because its `metadata.uid` precondition named a pod incarnation
+/// that is no longer the stored one: the apiserver's 409 carries upstream's
+/// `Precondition failed: UID in precondition: ...` text. A resourceVersion precondition 409 is
+/// a different, retryable conflict and does not match.
+pub fn is_uid_precondition_conflict(status: u16, body: &str) -> bool {
+    status == 409 && body.contains("UID in precondition")
+}
+
 /// Classify a bind response status code and body, returning Err on non-2xx.
 ///
 /// Extracted as a pure function so the classification logic can be
@@ -4586,7 +4594,7 @@ pub fn check_bind_response(status: u16, body: &str) -> Result<(), BindError> {
             "bind rejected with HTTP 409 (pod already assigned elsewhere): {body}"
         )));
     }
-    if status == 409 && body.contains("UID in precondition") {
+    if is_uid_precondition_conflict(status, body) {
         return Err(BindError::StalePod(format!(
             "bind rejected with HTTP 409 (pod recreated since the decision): {body}"
         )));
@@ -5732,7 +5740,7 @@ pub async fn delete_pod(
     let (status, body) = http_delete(client, &path, &victim_delete_options(uid)).await?;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     debug!(pod = %pod_name, elapsed_ms, "delete_pod: DELETE completed");
-    if status == StatusCode::CONFLICT && body.contains("UID in precondition") {
+    if is_uid_precondition_conflict(status.as_u16(), &body) {
         bail!(
             "victim {namespace}/{pod_name} was recreated since the plan (uid {uid} is gone): {body}"
         );
@@ -5902,6 +5910,23 @@ mod tests {
             !is_bind_noop(&err),
             "a 409 without the already-assigned-to-node message must classify as Other, \
              not AlreadyAssigned"
+        );
+    }
+
+    #[test]
+    fn uid_precondition_conflict_requires_409_and_the_uid_text() {
+        let uid = "409 Precondition failed: UID in precondition: a, UID in object meta: b";
+        assert!(is_uid_precondition_conflict(409, uid));
+        assert!(
+            !is_uid_precondition_conflict(500, uid),
+            "only a 409 is a precondition refusal"
+        );
+        assert!(
+            !is_uid_precondition_conflict(
+                409,
+                "Precondition failed: ResourceVersion in precondition: 1, ResourceVersion in object meta: 2"
+            ),
+            "a stale resourceVersion means the same pod changed, not that it was recreated"
         );
     }
 
