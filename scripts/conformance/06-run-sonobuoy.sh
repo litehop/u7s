@@ -263,6 +263,15 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   --kubeconfig /tmp/sonobuoy-kubeconfig &>/dev/null; do
   sleep 2
 done
+# `sonobuoy delete` prints nothing useful when no previous run exists, so the
+# mayor's cleanup evidence is logged here, after verifying the namespace is gone.
+wait_sonobuoy_namespace_gone() {
+  until ! kubectl --kubeconfig="$KUBECONFIG" get namespace sonobuoy &>/dev/null; do
+    sleep 2
+  done
+  echo 'Namespace "sonobuoy" has been deleted'
+}
+wait_sonobuoy_namespace_gone
 
 # Pre-seed the sonobuoy namespace + a LimitRange (see
 # sonobuoy-namespace-limitrange.yaml for the full rationale) so u7s's own

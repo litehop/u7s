@@ -968,8 +968,9 @@ read the result from `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.l
 iteration.
 
 Your return MUST include, inline per "Final step": (a) the trimmed kubectl
-before/after output, and (b) the sonobuoy PASS line from `e2e.txt`. A return
-without both will be rejected.
+before/after output, (b) the sonobuoy PASS line from `e2e.txt`, and (c) the
+`Namespace "sonobuoy" has been deleted` line from the `run-all.sh` log. A return
+without all three will be rejected.
 
 For script-only beads (no server restart needed): run the commands via
 `limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
@@ -982,9 +983,10 @@ and include at least one `limactl shell` output in your return.
 ### Mayor enforcement at return-review time
 
 When a worker returns from a VM/sonobuoy-touching bead:
-- Check the return for sonobuoy delete output or `limactl shell <VM_NAME>` evidence.
+- Check the return for the `run-all.sh` log line `Namespace "sonobuoy" has been deleted`
+  or `limactl shell <VM_NAME>` evidence.
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
-  evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
+  evidence. Paste the `Namespace \"sonobuoy\" has been deleted` line from your run-all.sh log."
 - Confirm evacuation and inline facts per "Final step". If a return's evidence exists
   only as a temp/ path, do not merge; send the worker back to put the facts inline.
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
