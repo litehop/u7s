@@ -1070,6 +1070,22 @@ _probe_starting_stopped() {
   return "$rc"
 }
 
+# _refuse_if_both_states <probe fn> <label> <dir> <vm> <port>: returns 1 when the VM also carries
+# the other state, else 0 (2 when that probe itself fails). Clearing either state would wipe the
+# other's pods (lima-unrig.sh and install-teardown.sh both run crictl rmp -fa), so neither wins.
+_refuse_if_both_states() {
+  local probe="$1" label="$2" dir="$3" vm="$4" port="$5" rc=0
+  _probe_starting_stopped "$probe" "$label" "$dir" "$vm" "$port" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) echo "error: cannot determine whether $vm also carries $label" >&2; return 2 ;;
+  esac
+  echo "error: $vm carries both host-rig state ($RIG_STATE_MARKER or $RIG_STATE_LEGACY_UNIT) and install state ($INSTALL_STATE_MARKER or $INSTALL_STATE_LEGACY_UNIT); clearing either would wipe the other's pods." >&2
+  echo "       Resolve it with: scripts/conformance/run-all.sh --reset --vm $vm ... (deletes and reprovisions the VM)" >&2
+  return 1
+}
+
 # clear_rig_state_if_present <dir> <vm>=<kubelet port>...: runs lima-unrig.sh for each VM carrying
 # host-rig state and verifies it with --check; returns non-zero if a probe or a clear fails.
 clear_rig_state_if_present() {
@@ -1083,6 +1099,7 @@ clear_rig_state_if_present() {
       1) continue ;;
       *) echo "error: cannot determine whether $vm carries host-rig state; refusing to run install.sh on it" >&2; return 1 ;;
     esac
+    _refuse_if_both_states vm_install_state_probe "install state" "$dir" "$vm" "$port" || return 1
     echo "[run-all] $vm carries host-rig state; running lima-unrig.sh" >&2
     { bash "$dir/lima-unrig.sh" --vm "$vm" && bash "$dir/lima-unrig.sh" --vm "$vm" --check; } || {
       echo "error: lima-unrig.sh failed for $vm; install.sh cannot run on top of host-rig state" >&2
@@ -1104,6 +1121,7 @@ teardown_if_install_state() {
       1) continue ;;
       *) echo "error: cannot determine whether $vm is in install state; refusing to bring up the host rig" >&2; return 1 ;;
     esac
+    _refuse_if_both_states vm_rig_state_probe "host-rig state" "$dir" "$vm" "$port" || return 1
     echo "[run-all] $vm is in install state; running install-teardown.sh" >&2
     bash "$dir/install-teardown.sh" --vm "$vm" --workdir "$workdir" || {
       echo "error: install-teardown.sh failed for $vm; the host rig cannot run on top of install state" >&2

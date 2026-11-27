@@ -299,6 +299,38 @@ echo vm-a > "$TMP/rig-state"
 "$REAL_BASH" "$DIR/run-all.sh" --install --reset --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
 check "--install --reset skips the rig probe (the VM is deleted anyway)" "0" "$(unrigs)"
 
+# Both markers: either clear would crictl rmp -fa the other state's pods, so neither is chosen.
+for variant in marker legacy; do
+  reset_fixture
+  echo vm-a > "$TMP/install-state"
+  if [ "$variant" = marker ]; then echo vm-a > "$TMP/rig-state"; else echo vm-a > "$TMP/rig-legacy-state"; fi
+  clear_rig_state_if_present "$DIR" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+  check "[$variant] --install direction: a VM with both markers aborts (rc) instead of unrigging away the install's pods" "1" "$rc"
+  check "[$variant] --install direction: lima-unrig.sh is never invoked" "0" "$(unrigs)"
+  check "[$variant] --install direction: the message names both markers and the --reset resolution" \
+    "1|1|1" "$(grep -c -e "$RIG_STATE_MARKER" -e "$RIG_STATE_LEGACY_UNIT" "$TMP/err.log" | sed 's/^[1-9].*/1/')|$(grep -c "$INSTALL_STATE_MARKER" "$TMP/err.log")|$(grep -c 'run-all.sh --reset --vm vm-a' "$TMP/err.log")"
+
+  reset_fixture
+  echo vm-a > "$TMP/install-state"
+  if [ "$variant" = marker ]; then echo vm-a > "$TMP/rig-state"; else echo vm-a > "$TMP/rig-legacy-state"; fi
+  teardown_if_install_state "$DIR" "$TMP/wd" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+  check "[$variant] host-rig direction: a VM with both markers aborts (rc) instead of tearing down the rig's pods" "1" "$rc"
+  check "[$variant] host-rig direction: install-teardown.sh is never invoked" "0" "$(teardowns)"
+done
+
+reset_fixture
+echo vm-a > "$TMP/install-state"
+echo vm-a > "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh --install aborts on a both-markers VM before reaping or handing off" \
+  "1|0|0" "$rc|$(grep -c -e 'install-run.sh' -e 'reset.sh' "$TMP/calls.log" || true)|$(unrigs)"
+reset_fixture
+echo vm-a > "$TMP/install-state"
+echo vm-a > "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh (host rig) aborts on a both-markers VM before reset.sh or build" \
+  "1|0" "$rc|$(grep -c -e 'reset.sh' -e '01-build.sh' -e 'install-teardown.sh' "$TMP/calls.log" || true)"
+
 # reset.sh --store-only after install-teardown: /var/lib/kubelet is gone, and find on a missing
 # directory aborts the guest script, failing the whole bring-up. The dev host has no such dir;
 # refuse to run where it does, since the guest script names the real path.
