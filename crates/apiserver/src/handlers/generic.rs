@@ -1134,6 +1134,11 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
 /// removed when the stored object has none); on create they are cleared (`stored` = `None`).
 /// Without this a caller holding only update/patch could hard-delete, terminate or
 /// un-terminate an object without the delete verb.
+///
+/// Callers pin AFTER mutating admission, as upstream `rest.BeforeUpdate` does. Upstream copies
+/// `deletionGracePeriodSeconds` only when the new value is nil and then rejects any remaining
+/// difference as immutable; this overwrites unconditionally, which is the same result for every
+/// request upstream accepts.
 pub(crate) fn pin_server_owned_metadata(
     body: &mut serde_json::Value,
     stored: Option<&serde_json::Value>,

@@ -37,6 +37,8 @@ mod put_server_owned_metadata_tests;
 pub mod resource;
 pub mod scale;
 #[cfg(test)]
+mod server_owned_metadata_admission_tests;
+#[cfg(test)]
 mod stack_budget_tests;
 pub mod status;
 pub mod storage_versions;

@@ -918,14 +918,6 @@ pub(crate) async fn replace_resource<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-        // of completing the delete — persisting the object with deletionTimestamp gone and
-        // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
-
         if old_object.is_none() && !allows_create_on_update(&group, &plural) {
             return Err(Status::not_found(&group, &plural, &name));
         }
@@ -1023,6 +1015,11 @@ pub(crate) async fn replace_resource<S: Store>(
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        // Server-owned metadata is pinned after mutating admission (upstream rest.BeforeUpdate):
+        // a webhook patch must not clear creationTimestamp, and finalizer_drain_complete below
+        // (which reads obj.body, not the stored object) must not see a blank deletionTimestamp
+        // and resurrect a Terminating object as live.
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -1765,7 +1762,6 @@ pub(crate) async fn do_patch<S: Store>(
                 crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(Status::patch_error)?;
                 race_plan.remove_dropped_fields(&mut current.body);
-                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
@@ -1845,6 +1841,7 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
                 // Re-restore status after mutating webhooks — same rationale as the primary
                 // create path's post-webhook clear_create_status re-call above: a webhook's
                 // JSON patch can reinject a forged/scalar status the earlier restore already
@@ -2153,6 +2150,7 @@ pub(crate) async fn do_patch<S: Store>(
             plan.remove_dropped_fields(&mut current.body);
         }
         current.body["metadata"]["uid"] = stored_uid;
+        // Pinned here too: the finalizer-drain check below reads current.body before admission runs.
         pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
@@ -2379,6 +2377,8 @@ pub(crate) async fn do_patch<S: Store>(
         // Admission webhook pipeline (mutating then validating).
         current.body =
             run_mutating_webhooks(state, current.body, old_object.as_ref(), &admission_ctx).await?;
+        // Pinned again after mutating admission (upstream rest.BeforeUpdate).
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
         // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
         // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore (before this match block) already
@@ -4071,14 +4071,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-        // of completing the delete — persisting the object with deletionTimestamp gone and
-        // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
-
         // Allocate a clusterIP when a Service transitions away from ExternalName to a
         // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
         // handles initial allocation; the update path must also allocate when the type
@@ -4156,6 +4148,8 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        // Pinned after mutating admission (upstream rest.BeforeUpdate); see replace_resource.
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }

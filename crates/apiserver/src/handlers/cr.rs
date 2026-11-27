@@ -3654,6 +3654,7 @@ pub async fn replace_cr<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
@@ -4798,6 +4799,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         dry_run: is_dry_run_header(&headers),
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }

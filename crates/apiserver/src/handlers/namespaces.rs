@@ -418,7 +418,6 @@ pub(crate) async fn replace_namespace<S: Store>(
                 )));
             }
         }
-        crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, stored_obj.as_ref());
 
         // Admission webhook pipeline (mutating then validating), threading the pre-existing
         // namespace as oldObject — mirrors create_namespace's CREATE call above. Previously
@@ -591,7 +590,6 @@ pub(crate) async fn patch_namespace<S: Store>(
     crate::patch::merge_patch(&mut current.body, &patch);
 
     current.body["metadata"]["uid"] = stored_uid;
-    super::generic::pin_server_owned_metadata(&mut current.body, Some(&pre_patch_obj));
     super::json_patch::enforce_patch_identity(&mut current.body, &name, None)?;
 
     if stored_status.is_null() {
@@ -621,6 +619,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     };
     current.body =
         run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
+    super::generic::pin_server_owned_metadata(&mut current.body, Some(&pre_patch_obj));
 
     // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
     // forged/scalar status the earlier restore already discarded, and this is the last point

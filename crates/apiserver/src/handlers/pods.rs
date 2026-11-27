@@ -730,10 +730,6 @@ pub(crate) async fn replace_pod<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
-        // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
-        super::generic::pin_server_owned_metadata(&mut obj.body, Some(&stored_obj.body));
-
         // Admission webhook pipeline (mutating then validating).
         let admission_ctx = AdmissionContext {
             group: "",
@@ -753,6 +749,9 @@ pub(crate) async fn replace_pod<S: Store>(
         apply_default_toleration_seconds(&mut obj.body);
         obj.body =
             run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
+        // Pinned after mutating admission (upstream rest.BeforeUpdate): a PUT can neither
+        // un-terminate nor hard-delete a pod, and a webhook cannot clear creationTimestamp.
+        super::generic::pin_server_owned_metadata(&mut obj.body, Some(&stored_obj.body));
         validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
         run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
@@ -1592,7 +1591,6 @@ pub(crate) async fn patch_pod<S: Store>(
         }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
-        super::generic::pin_server_owned_metadata(&mut current_obj.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch
@@ -1627,6 +1625,7 @@ pub(crate) async fn patch_pod<S: Store>(
             &admission_ctx,
         )
         .await?;
+        super::generic::pin_server_owned_metadata(&mut current_obj.body, Some(&stored_deletion));
 
         // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore already discarded, and this is the last
