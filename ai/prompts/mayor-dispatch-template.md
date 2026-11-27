@@ -997,6 +997,9 @@ When a worker returns from a VM/sonobuoy-touching bead:
   subagent CWD stays at the repo root on branch main — causing path-resolution
   and permission bugs. Always include `isolation="worktree"` so the harness
   creates the worktree and pins the CWD to its root automatically.
+- **Workers hang on `until ! pgrep -f <pattern>` wait loops** (they match
+  themselves and never exit). `worker.md` prescribes wait-on-PID; do not
+  repeat it in briefs. `worktree-hygiene.sh` STEP I reaps orphans.
 - **Agents add back-compat shims by default.** Pre-alpha posture must be
   explicit in every preamble.
 - **Same-file races between concurrent agents.** "Concurrent agents on

@@ -1386,6 +1386,89 @@ assert "destructive steps label their output with the step so the log names what
   "$(printf '%s\n' "$P_OUT" | drain_grep -q 'STEP G: removing worktree .*agent-a3 and branch fix-lbl' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# STEP I: orphaned self-matching `until ! pgrep -f` wait loops (stubbed ps/pgrep).
+# ---------------------------------------------------------------------------
+WL_BIN="$SANDBOX_ROOT/wl-bin"
+mkdir -p "$WL_BIN"
+cat > "$WL_BIN/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-o" ]; then  # parent lookup: ps -o command= -p PPID
+  printf '%s\n' "${STUB_PARENTS:-}" | awk -v p="${@: -1}" '$1 == p { $1 = ""; print substr($0, 2) }'
+else
+  printf '%s\n' "$STUB_PS"
+fi
+STUB
+cat > "$WL_BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$STUB_PS" | grep -E -- "${@: -1}" | awk '{print $1}'
+STUB
+chmod +x "$WL_BIN/ps" "$WL_BIN/pgrep"
+wl_loop() {  # pid pattern [etime] [ppid] [command prefix]
+  echo "$1 ${4:-1} ${3:-01:00:00} ${5:-/bin/zsh -c} until ! pgrep -f \"$2\" >/dev/null; do sleep 15; done"
+}
+step_i_dry() {  # ps lines -> every "would run:" line of a dry-run STEP I
+  local out
+  out=$(
+    export DRY_RUN=1 WORKTREE_HYGIENE_REPO_ROOT="$SA_REAL" STUB_PS="$1" STUB_PARENTS="${2:-}"
+    export PATH="$WL_BIN:$PATH"
+    # shellcheck disable=SC1090
+    source "$SCRIPT"
+    step_i_orphaned_wait_loops 2>&1
+  )
+  printf '%s\n' "$out" | grep 'would run:' || true
+}
+WL_TARGET="9001 1 05:00:00 bash scripts/conformance/run-all.sh --vm alpha"
+assert "STEP I: a wait loop whose target exited is killed -- it matches only itself and would hang its worker forever" \
+  "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha')")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a wait loop whose target is still running is kept -- killing it would end a legitimate wait early" \
+  "$([ -z "$(step_i_dry "$WL_TARGET
+$(wl_loop 9100 'run-all.sh --vm alpha')")" ] && echo 1 || echo 0)"
+WL_TWO="$(wl_loop 9100 'run-all.sh --vm alpha')
+$(wl_loop 9101 'run-all.sh --vm alpha')"
+assert "STEP I: a pattern matched only by other wait loops counts as dead -- both loops are killed, not each keeping the other alive" \
+  "$([ "$(step_i_dry "$WL_TWO" | sort | tr '\n' ' ')" = "[dry-run] would run: kill 9100 [dry-run] would run: kill 9101 " ] && echo 1 || echo 0)"
+assert "STEP I: with two loops on different targets only the dead target's loop is killed" \
+  "$([ "$(step_i_dry "$WL_TARGET
+$(wl_loop 9100 'run-all.sh --vm alpha')
+$(wl_loop 9101 'run-all.sh --vm beta')")" = "[dry-run] would run: kill 9101" ] && echo 1 || echo 0)"
+assert "STEP I: a 'while pgrep -f' loop whose target exited is killed -- it self-matches and hangs forever just like the until form" \
+  "$([ "$(step_i_dry '9100 1 01:00:00 /bin/zsh -c while pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go')" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a 'while pgrep -f' loop with a live target is kept" \
+  "$([ -z "$(step_i_dry "$WL_TARGET"'
+9100 1 01:00:00 /bin/zsh -c while pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go')" ] && echo 1 || echo 0)"
+WL_COMPOUND='9100 1 01:00:00 /bin/zsh -c until [ -f /tmp/done ] && ! pgrep -f "run-all.sh --vm alpha" >/dev/null; do sleep 20; done; echo go'
+assert "STEP I: an 'until [ -f F ] && ! pgrep -f' loop whose target exited is killed -- the file test can't rescue a self-matching loop" \
+  "$([ "$(step_i_dry "$WL_COMPOUND")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a compound-condition loop with a live target is kept" \
+  "$([ -z "$(step_i_dry "$WL_TARGET
+$WL_COMPOUND")" ] && echo 1 || echo 0)"
+assert "STEP I: an unquoted pattern is never killed -- the target can't be read, so the loop might be legitimate" \
+  "$([ -z "$(step_i_dry "9100 1 01:00:00 /bin/zsh -c until ! pgrep -f run-all.sh >/dev/null; do sleep 15; done")" ] && echo 1 || echo 0)"
+assert "STEP I: a bracket-form loop with a live target is kept -- killing it would end a legitimate wait early" \
+  "$([ -z "$(step_i_dry "$WL_TARGET
+$(wl_loop 9100 '[r]un-all.sh --vm alpha')")" ] && echo 1 || echo 0)"
+assert "STEP I: a bracket-form loop with a dead target and old enough is killed" \
+  "$([ "$(step_i_dry "$(wl_loop 9100 '[r]un-all.sh --vm alpha')")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a non-shell process whose args contain the loop text is never killed -- it could be an editor or gh/bd with a body" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'gh pr create --body')")" ] && echo 1 || echo 0)"
+assert "STEP I: limactl shell ... until ! pgrep is never killed -- host pgrep can't see the guest target" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'limactl shell vm -- bash -c')")" ] && echo 1 || echo 0)"
+assert "STEP I: a shell bash -c loop containing ssh is never killed -- the target is on a remote host" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 1 'bash -c ssh host')")" ] && echo 1 || echo 0)"
+assert "STEP I: a loop whose parent is limactl is never killed -- the target is in the guest" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 01:00:00 8000)" "8000 limactl shell vm -- bash -c ...")" ] && echo 1 || echo 0)"
+assert "STEP I: a loop younger than the age guard is never killed -- its target may not have started yet" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 00:09:59)")" ] && echo 1 || echo 0)"
+assert "STEP I: a loop at exactly the age guard is killed" \
+  "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 10:00)")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a day-prefixed etime parses as old" \
+  "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 2-03:04:05)")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
+assert "STEP I: a line with a non-numeric pid never kills -- kill must not receive garbage" \
+  "$([ -z "$(step_i_dry "$(wl_loop abc 'run-all.sh --vm alpha')")" ] && echo 1 || echo 0)"
+assert "STEP I: a line with an unparsable etime never kills -- age is unknown so the loop is kept" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' soon)")" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
