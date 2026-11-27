@@ -54,6 +54,7 @@ State store: SQLite WAL (rusqlite bundled) — see docs/decisions/sqlite-over-lm
 - **CRD `pattern` compile budget (#2289):** 8 MiB per CRD and 1 MiB per
   pattern, with a 4 KiB per-pattern floor (so at most 2048 patterns per CRD),
   compiled off the async runtime. Upstream has only a per-pattern Go limit
-  (about 128 MiB). Real CRDs measured at most 357 KB summed and 81 KB for a
+  (Go `regexp/syntax/parse.go`: `maxSize = 128 << 20 / instSize`, `instSize =
+  5 * 8`, so about 128 MiB of instructions, plus `maxHeight = 1000`). Real CRDs measured at most 357 KB summed and 81 KB for a
   single pattern.
 - **Security fixes** are not backported or advised while there are zero users.

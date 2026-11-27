@@ -7,15 +7,13 @@ kind: initiative-state
 
 **AS OF 2026-11-28.** Decision record:
 `docs/decisions/kcm-rust-port-local-first-separate-process.md`. Phase 0 harness,
-trim validation and memory gate are done.
+trim validation and memory gate are done. Phase 2 design:
+`git show 900097c6:ai/findings/2026-11-24-mayor-w9xt5-kcm-port-phase2-design.md`.
 
 ## Operator decision (2026-11-25) and what follows
 
-Operator: no high-risk KCM operations; start small with a scalable design;
-verify locally; deliver to releases or `install.sh` only once verification
-shows a performance benefit and conformance parity, and not soon. The mapping
-below is the mayor's reading. Gates and phases are local verification, not a
-shipping plan.
+Operator: no high-risk KCM operations; start small, scalable; verify locally;
+ship only after measured benefit and conformance parity, and not soon. The mapping below is the mayor's reading.
 
 | # | Question | Status |
 |---|---|---|
@@ -28,29 +26,31 @@ shipping plan.
 | D7 | Multi-node specs | Lima, locally; no CI investment yet |
 | D8 | Cadence | Local phases merge on `--focus` plus unit gates; full 2-node suite before shipping |
 
-Ship gate: measured benefit versus the shipped Go KCM and full 2-node
-conformance. Until then nothing ships in `install.sh` or releases.
+Ship gate: measured benefit versus shipped Go KCM and full 2-node conformance.
 
 ## Phase 0 gate: PASS (#2300)
 
-On the validated 10-controller trim, R−T KCM `Pss_Anon` was 8.12 MiB idle and
-9.14 MiB WordPress, against the rule of at least 5. SHA 474d89af, lima-node-4,
-3 interleaved runs, no voids. The harness has no 50-pod burst stage; the
-operator accepted the two-stage pass on 2026-11-27 (burst stage:
-`mayor-84rmv`).
+R−T KCM `Pss_Anon` on the 10-controller trim was 8.12 MiB idle and 9.14
+WordPress (rule: at least 5). SHA 474d89af, lima-node-4, 3 interleaved runs, no
+voids. No 50-pod burst stage in the harness; operator accepted the two-stage
+pass 2026-11-27 (`mayor-84rmv`).
 
-KCM file-backed PSS (73 MiB binary): 9 MiB loaded, 50 idle. Noise about 3.
 Unmeasured: Rust fixed cost (target at most 8); Pod cache (at most N
 bytes/pod, provisionally 1024).
 
-Client stack: C, an own hyper informer, hardened. Bounded reserved seat pools
-for controller SAs landed in #2284.
+Numbers (MiB, KCM anon; branch `871d58e7`):
+- Untrimmed shipped Go: idle 40.2, WordPress 41.9, 50-pod burst 45.2.
+- 11-controller trim: 31.7 idle, 33.4 WordPress.
+- 10-controller trim (#2300): R 42.99 / 45.13 vs T 34.87 / 35.99.
+- File-backed PSS (73 MiB binary): 9 loaded, 50 idle.
+- Run-to-run noise about 3; rewrite-only residual after flags 10-22.
+
+Client stack: C, own hardened hyper informer; seat pools #2284.
 
 ## Phase plan
 
-Order is by coverage (breakage is loud) and risk (stateless, small,
-deterministic); heavy shared-Pod consumers go last to shorten the duplicate Go
-Pod cache.
+Ordered by coverage and risk; heavy shared-Pod consumers last to shorten the
+duplicate Go Pod cache.
 
 | Phase | Controllers | Why here |
 |---|---|---|
@@ -64,8 +64,8 @@ Pod cache.
 
 ## Memory gate (per phase)
 
-Metric: `Pss_Anon` from `smaps_rollup` for KCM-Go, KCM-Rust and the apiserver,
-in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
+Metric: `Pss_Anon` (`smaps_rollup`) for KCM-Go, KCM-Rust and apiserver,
+`--install` mode, Lima VM, three stages (idle, WordPress+MariaDB,
 50-pod burst). Run-meta records `kcm_mode`; the ported-controller list and
 `scripts/conformance/kcm-memory-projection.sh` are not yet written.
 
@@ -79,7 +79,9 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
   at every stage.
 - Phase 0 passes if `median(R) - median(T) >= 5`.
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
-  the projection `P = F + sum(m_c)` is at most the trimmed-Go total.
+  the projection `P = F + sum(m_c)` is at most 33.4 MiB (T WordPress KCM anon,
+  11-controller trim; the 10-controller trim measures 35.99, #2300;
+  re-baselining is an operator decision).
 - Verdicts are terminal per commit SHA; all runs are retained. A run is void
   only if it ended before any stage metric or spec report, with a harness or
   VM log naming an external cause, ruled before the replacement run. At most
@@ -122,13 +124,13 @@ two sets are disjoint and their union is the full set.
 
 ## Trim validation (release-1.37 sources)
 
-Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3), host rig
+Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3),
 `run-all.sh --extra-node --kcm-mode R`, two runs: 462 executed and passed, spec sets identical.
 The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
 it stays; the trim is 10 controllers. Two 2-node 10-controller trim runs
 (`--kcm-mode T`): spec and failure sets (empty) equal baseline. A tcp:8080 liveness-probe
-failure seen once on a single-node run did not reproduce in 4 two-node runs.
+failure seen once on a single-node run did not reproduce in 4 two-node runs; cause unestablished.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 
@@ -143,7 +145,7 @@ Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
 ## Kubelet
 
 Not decided. The Phase 1 audit judged a Rust kubelet not viable absent new
-evidence: about 139k non-test LOC, no Rust prior art for the real CRI path,
-and it would forfeit the unmodified-kubelet conformance-oracle role. Revisit
-after the capacity benchmark data (`mayor-jedol`); the reduced-gate
-conformance prerequisite is `mayor-omxmp`.
+evidence: about 139k non-test LOC, no Rust prior art for the real CRI path, and
+it forfeits the unmodified-kubelet conformance-oracle role. Revisit after
+capacity benchmark data (`mayor-jedol`); conformance prerequisite `mayor-omxmp`. Audit:
+`git show 900097c6:ai/findings/2026-09-16-mayor-vc844-kubelet-kcm-rust-eval.md`.
