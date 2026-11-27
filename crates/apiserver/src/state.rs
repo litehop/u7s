@@ -323,8 +323,9 @@ pub fn is_exempt_username(username: &str) -> bool {
 
 /// Identities with reserved capacity: they draw from the reserved watch pool and the
 /// reserved in-flight seats, so a tenant exhausting the ordinary pools cannot lock out the
-/// control plane, but each is still capped (`MAX_RESERVED_WATCHES_PER_CLIENT`, per-identity
-/// in-flight share). Kubelets (`system:node:<name>`, O=system:nodes), the controller-manager,
+/// control plane, but each is still capped (per-class watch caps from `watch_caps`:
+/// `MAX_KCM_WATCHES`, `MAX_SCHEDULER_WATCHES`, `MAX_CONTROLLER_SA_WATCHES`,
+/// `MAX_NODE_WATCHES`; per-identity in-flight share). Kubelets (`system:node:<name>`, O=system:nodes), the controller-manager,
 /// the scheduler and the kube-system ServiceAccounts the controller-manager runs its
 /// controllers as (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts
 /// (coredns, metrics-server, anything user-deployed) draw from the ordinary pools. Upstream
