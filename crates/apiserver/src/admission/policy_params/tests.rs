@@ -62,6 +62,7 @@ fn ctx(user: Option<Value>) -> AdmissionContext<'static> {
         operation: "CREATE",
         user_info: user,
         dry_run: false,
+        options: None,
     }
 }
 

@@ -3430,6 +3430,7 @@ pub async fn create_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -3502,6 +3503,7 @@ pub async fn create_cr<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: is_dry_run_header(&headers),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -3652,6 +3654,7 @@ pub async fn replace_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
     crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
@@ -3823,8 +3826,9 @@ pub async fn delete_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -4028,8 +4032,9 @@ pub async fn delete_collection_cr<S: Store>(
                     "extra": user.extra,
                 })),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.
@@ -4530,6 +4535,7 @@ pub async fn create_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -4626,6 +4632,7 @@ pub async fn create_cr_namespaced<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: is_dry_run_header(&headers),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj, None, &retry_ctx).await?;
             }
@@ -4797,6 +4804,7 @@ pub async fn replace_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
     crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
@@ -4917,8 +4925,9 @@ pub async fn delete_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     let owner_uid = obj.body["metadata"]["uid"]
         .as_str()
@@ -5135,8 +5144,9 @@ pub async fn delete_collection_cr_namespaced<S: Store>(
                     "extra": user.extra,
                 })),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (both the
             // soft-delete branch and the hard-delete fallback below) for this object.
@@ -5345,6 +5355,7 @@ pub async fn patch_cr<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -5514,6 +5525,7 @@ pub async fn patch_cr<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     if ctx.has_status_subresource {
@@ -5665,6 +5677,7 @@ pub async fn patch_cr_namespaced<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
         prepare_cr_for_create(&ctx, &state.cr_schema_cache, &mut obj).await?;
@@ -5876,6 +5889,7 @@ pub async fn patch_cr_namespaced<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&old), &admission_ctx).await?;
     if ctx.has_status_subresource {

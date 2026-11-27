@@ -226,6 +226,7 @@ pub(crate) async fn create_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run: is_dry_run_header(&headers),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks — see create_resource's identical call
@@ -437,6 +438,7 @@ pub(crate) async fn replace_namespace<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: is_dry_run_header(&headers),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, stored_obj.as_ref(), &admission_ctx).await?;
@@ -616,6 +618,7 @@ pub(crate) async fn patch_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run: patch_query.is_dry_run(),
+        options: None,
     };
     current.body =
         run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
@@ -1157,8 +1160,9 @@ pub(crate) async fn delete_namespace<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
-    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // apply_delete_policy already stamped status.phase=Terminating in place

@@ -398,6 +398,7 @@ async fn create_pod_from_object<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
     obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
@@ -505,6 +506,7 @@ async fn create_pod_from_object<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: false,
+                    options: None,
                 };
                 run_validating_webhooks(state, &obj.body, None, &retry_ctx).await?;
             }
@@ -745,6 +747,7 @@ pub(crate) async fn replace_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         apply_default_toleration_seconds(&mut obj.body);
         obj.body =
@@ -1128,8 +1131,9 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
             // a pod already Terminating (or force-deleted with an explicit gracePeriodSeconds=0)
@@ -1305,8 +1309,9 @@ pub(crate) async fn delete_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
@@ -1611,6 +1616,7 @@ pub(crate) async fn patch_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: patch_query.is_dry_run(),
+            options: None,
         };
         // Re-parsed from the stored bytes (current_obj.body was patched in place) only when
         // admission can read it, so a PATCH with no webhooks never holds a second full tree.

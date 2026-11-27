@@ -2225,4 +2225,107 @@ pub(crate) mod cases {
             }
         }
     }
+
+    /// Webhooks detect a DELETE by `object` being null and read the client's grace period and
+    /// propagation policy from `options`; sending the stored object as `object` or a bare options
+    /// stub makes a policy misclassify the request or lose the delete semantics it enforces.
+    /// Every delete family (built-in, cluster-scoped built-in, namespaced CR, cluster CR) and both
+    /// webhook kinds must see upstream's shape.
+    #[tokio::test]
+    async fn delete_review_has_null_object_stored_old_object_and_the_clients_delete_options() {
+        let sent =
+            json!({"gracePeriodSeconds": 7, "propagationPolicy": "Background", "dryRun": ["All"]});
+        for (group, resource, kind, create_uri, uri) in [
+            (
+                "",
+                "configmaps",
+                "ConfigMap",
+                "/api/v1/namespaces/default/configmaps",
+                "/api/v1/namespaces/default/configmaps/o",
+            ),
+            (
+                "",
+                "namespaces",
+                "Namespace",
+                "/api/v1/namespaces",
+                "/api/v1/namespaces/o",
+            ),
+            (
+                "example.com",
+                "widgets",
+                "Widget",
+                "/apis/example.com/v1/namespaces/default/widgets",
+                "/apis/example.com/v1/namespaces/default/widgets/o",
+            ),
+            (
+                "example.com",
+                "gadgets",
+                "Gadget",
+                "/apis/example.com/v1/gadgets",
+                "/apis/example.com/v1/gadgets/o",
+            ),
+        ] {
+            for mutating in [true, false] {
+                let c = Cluster::new().await;
+                if group == "example.com" {
+                    let scope = if resource == "widgets" {
+                        "Namespaced"
+                    } else {
+                        "Cluster"
+                    };
+                    c.create(
+                        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                        crd(resource, kind, scope),
+                    )
+                    .await;
+                }
+                let api_version = if group.is_empty() {
+                    "v1".to_string()
+                } else {
+                    format!("{group}/v1")
+                };
+                c.create(
+                    create_uri,
+                    json!({"apiVersion": api_version, "kind": kind, "metadata": {"name": "o"}}),
+                )
+                .await;
+                let hook = spawn_hook(|_| json!({"allowed": true})).await;
+                register_webhook(
+                    &c.store,
+                    mutating,
+                    "d",
+                    &hook.url,
+                    group,
+                    &[resource],
+                    &["DELETE"],
+                )
+                .await;
+
+                let (status, resp) = c
+                    .call("DELETE", uri, "application/json", sent.clone())
+                    .await;
+                let label = format!("{resource} mutating={mutating}: {status} {resp}");
+                assert!(status.is_success(), "{label}");
+
+                let reqs = hook.requests();
+                assert_eq!(reqs.len(), 1, "{label}: {reqs:?}");
+                let r = &reqs[0];
+                assert_eq!(r["operation"], "DELETE", "{label}");
+                assert!(
+                    r["object"].is_null(),
+                    "{label}: object must be null on DELETE: {r}"
+                );
+                assert_eq!(r["oldObject"]["metadata"]["name"], "o", "{label}: {r}");
+                assert_eq!(r["oldObject"]["kind"], kind, "{label}: {r}");
+                assert_eq!(r["dryRun"], true, "{label}: {r}");
+                assert_eq!(
+                    r["options"],
+                    json!({"apiVersion": "meta.k8s.io/v1", "kind": "DeleteOptions",
+                        "gracePeriodSeconds": 7, "propagationPolicy": "Background",
+                        "dryRun": ["All"]}),
+                    "{label}: options must be the full DeleteOptions the client sent"
+                );
+            }
+        }
+    }
 }

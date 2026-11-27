@@ -414,6 +414,7 @@ pub(crate) async fn create_resource<S: Store>(
             "extra": user.extra,
         })),
         dry_run: create_query.is_dry_run(),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     if is_csr {
@@ -500,6 +501,7 @@ pub(crate) async fn create_resource<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: create_query.is_dry_run(),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -1012,6 +1014,7 @@ pub(crate) async fn replace_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
@@ -1209,8 +1212,9 @@ pub(crate) async fn delete_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -1645,6 +1649,7 @@ pub(crate) async fn do_patch<S: Store>(
             operation: "CREATE",
             user_info: user_info.clone(),
             dry_run,
+            options: None,
         };
         obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
         if is_csr {
@@ -1838,6 +1843,7 @@ pub(crate) async fn do_patch<S: Store>(
                     operation: "CREATE",
                     user_info: user_info.clone(),
                     dry_run,
+                    options: None,
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
@@ -2254,6 +2260,7 @@ pub(crate) async fn do_patch<S: Store>(
             operation: "UPDATE",
             user_info: user_info.clone(),
             dry_run,
+            options: None,
         };
         // The pre-patch object is re-parsed from the stored bytes (current.body was patched in
         // place) and only when something reads it, so a PATCH of a kind with no old-object
@@ -3401,6 +3408,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             "extra": user.extra,
         })),
         dry_run: create_query.is_dry_run(),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks — see create_resource's identical call
@@ -3534,6 +3542,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: create_query.is_dry_run(),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -4145,6 +4154,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
@@ -4402,8 +4412,9 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let this_owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -4822,8 +4833,9 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // clusterIP release, soft/hard delete) for this object.
@@ -5009,8 +5021,9 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // soft/hard delete) for this object.
