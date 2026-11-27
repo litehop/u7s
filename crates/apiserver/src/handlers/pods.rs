@@ -807,16 +807,8 @@ pub(crate) async fn replace_pod<S: Store>(
     Ok(Json(obj.body))
 }
 
-/// Legacy `?gracePeriodSeconds=` query-param form of the grace period, for clients that
-/// still send it on the URL instead of (or as well as) in the DeleteOptions body.
-#[derive(Deserialize)]
-pub struct GracePeriodQuery {
-    #[serde(rename = "gracePeriodSeconds")]
-    pub grace_period_seconds: Option<i64>,
-}
-
 /// Resolve the grace period a delete should actually use: an explicit request value (body
-/// DeleteOptions takes precedence over the query param) beats the pod's own
+/// DeleteOptions) beats the pod's own
 /// spec.terminationGracePeriodSeconds, which beats the upstream default of 30s. Without this
 /// fallback chain, a plain `kubectl delete pod` (no explicit --grace-period) would stamp
 /// deletionGracePeriodSeconds=0 even though the pod's own spec says the kubelet needs up to
@@ -1038,7 +1030,6 @@ pub(crate) async fn delete_collection_pods<S: Store>(
     Path((raw_ns,)): Path<(String,)>,
     Extension(user): Extension<UserInfo>,
     Query(query): Query<super::generic::CollectionQuery>,
-    Query(grace_query): Query<GracePeriodQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1053,9 +1044,7 @@ pub(crate) async fn delete_collection_pods<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
-    let requested_grace = delete_opts
-        .grace_period_seconds
-        .or(grace_query.grace_period_seconds);
+    let requested_grace = delete_opts.grace_period_seconds;
     // client-go's typed DeleteCollection() sends DryRun in the DeleteOptions body; a
     // raw/proxied caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
@@ -1242,7 +1231,6 @@ pub(crate) async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
-    Query(grace_query): Query<GracePeriodQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1258,9 +1246,7 @@ pub(crate) async fn delete_pod<S: Store>(
     } else {
         serde_json::from_slice(&body).unwrap_or_default()
     };
-    let requested_grace = delete_opts
-        .grace_period_seconds
-        .or(grace_query.grace_period_seconds);
+    let requested_grace = delete_opts.grace_period_seconds;
     // client-go's typed Delete() sends DryRun in the DeleteOptions body; a raw/proxied
     // caller may instead send it as ?dryRun=All (caught by the router-wide
     // inject_dry_run_header layer) — accept either.
@@ -13193,6 +13179,64 @@ mod handler_tests {
             "deletionTimestamp must not be re-stamped on a no-op re-delete"
         );
     }
+    /// Upstream decodes `?gracePeriodSeconds` only when the DELETE body is empty; a body that
+    /// omits the period keeps the pod's own `terminationGracePeriodSeconds`. If pods read the
+    /// query themselves, `kubectl delete --raw` with a `propagationPolicy` body plus a stray
+    /// `?gracePeriodSeconds=5` would cut a 30s shutdown to 5s.
+    #[tokio::test]
+    async fn delete_pod_query_grace_period_never_overrides_a_non_empty_body() {
+        for (body, want) in [
+            (Some(serde_json::json!({})), 30),
+            (
+                Some(
+                    serde_json::json!({"kind": "DeleteOptions", "apiVersion": "v1", "propagationPolicy": "Background"}),
+                ),
+                30,
+            ),
+            (Some(serde_json::json!({"gracePeriodSeconds": 9})), 9),
+            (None, 5),
+        ] {
+            let (state, store) = make_state();
+            seed_namespace(&store, "default").await;
+            let key = "/registry/pods/default/q";
+            let pod = serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "q", "namespace": "default", "resourceVersion": "1",
+                             "finalizers": ["example.com/hold"]},
+                "spec": {"terminationGracePeriodSeconds": 30},
+                "status": {}
+            });
+            store
+                .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+                .await
+                .unwrap();
+            let app = Router::new()
+                .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+                .layer(axum::middleware::from_fn(
+                    crate::field_manager::resolve_field_manager,
+                ))
+                .layer(auth_layer())
+                .with_state(state.clone());
+            let mut req = Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/namespaces/default/pods/q?gracePeriodSeconds=5");
+            let req_body = match &body {
+                Some(b) => {
+                    req = req.header(header::CONTENT_TYPE, "application/json");
+                    json_body(b)
+                }
+                None => Body::empty(),
+            };
+            let resp = app.oneshot(req.body(req_body).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let stored = store.get(key).await.unwrap().expect("finalizer holds pod");
+            let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+            assert_eq!(
+                v["metadata"]["deletionGracePeriodSeconds"], want,
+                "body {body:?} with ?gracePeriodSeconds=5"
+            );
+        }
+    }
 
     /// A repeat DELETE with an explicit, shorter gracePeriodSeconds than what's already stored
     /// must still move deletionTimestamp earlier — mirroring real kube-apiserver's
@@ -24287,9 +24331,6 @@ mod admission_tests {
                     allow_watch_bookmarks: None,
                     timeout_seconds: None,
                 }),
-                axum::extract::Query(GracePeriodQuery {
-                    grace_period_seconds: None,
-                }),
                 axum::http::HeaderMap::new(),
                 Bytes::new(),
             )
@@ -24741,9 +24782,6 @@ mod admission_tests {
                 axum::extract::State(state.clone()),
                 axum::extract::Path(("default".to_string(), "pod-a".to_string())),
                 test_user(),
-                axum::extract::Query(GracePeriodQuery {
-                    grace_period_seconds: None
-                }),
                 headers.clone(),
                 force_body(),
             ),
@@ -24751,9 +24789,6 @@ mod admission_tests {
                 axum::extract::State(state.clone()),
                 axum::extract::Path(("default".to_string(), "pod-b".to_string())),
                 test_user(),
-                axum::extract::Query(GracePeriodQuery {
-                    grace_period_seconds: None
-                }),
                 headers.clone(),
                 force_body(),
             ),
@@ -24869,9 +24904,6 @@ mod admission_tests {
             axum::extract::State(state.clone()),
             axum::extract::Path(("default".to_string(), "pod-a".to_string())),
             test_user(),
-            axum::extract::Query(GracePeriodQuery {
-                grace_period_seconds: None,
-            }),
             headers.clone(),
             Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string()),
         )
@@ -25032,9 +25064,6 @@ mod admission_tests {
             axum::extract::State(state.clone()),
             axum::extract::Path(("default".to_string(), "high-a".to_string())),
             test_user(),
-            axum::extract::Query(GracePeriodQuery {
-                grace_period_seconds: None,
-            }),
             headers.clone(),
             Bytes::from(serde_json::json!({"gracePeriodSeconds": 0}).to_string()),
         )
