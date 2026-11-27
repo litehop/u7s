@@ -2003,10 +2003,6 @@ pub(crate) mod cases {
                         ("widgets/status", "UPDATE"),
                         ("widgets/scale", "UPDATE"),
                     ] {
-                        // u7s never runs mutating webhooks on DELETE (upstream does); tracked separately.
-                        if mutating && op == "DELETE" {
-                            continue;
-                        }
                         cells += 1;
                         let label = format!(
                             "mutating={mutating} policy={policy:?} request={request_version} \
@@ -2141,10 +2137,92 @@ pub(crate) mod cases {
                 }
             }
         }
-        assert_eq!(
-            cells,
-            (2 * 5 - 1) * 3 * 2,
-            "every matrix cell must have run"
-        );
+        assert_eq!(cells, 2 * 5 * 3 * 2, "every matrix cell must have run");
+    }
+
+    /// A DELETE writes no object, so a mutating webhook that returns a patch for it has
+    /// nothing to apply it to: upstream fails the request instead of silently dropping the
+    /// patch, and a webhook that patches nothing (`[]`) is still allowed. Checked on a built-in
+    /// and a custom resource, the two delete families with separate handlers.
+    #[tokio::test]
+    async fn mutating_webhook_patch_on_delete_is_rejected_and_the_object_survives() {
+        use base64::Engine as _;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let patch = b64(r#"[{"op":"add","path":"/metadata/labels","value":{"a":"b"}}]"#);
+        let empty = b64("[]");
+        for (kind, group, resource, uri, key) in [
+            (
+                "configmap",
+                "",
+                "configmaps",
+                "/api/v1/namespaces/default/configmaps/cm",
+                "/registry/configmaps/default/cm",
+            ),
+            (
+                "widget",
+                "example.com",
+                "widgets",
+                "/apis/example.com/v1/namespaces/default/widgets/w",
+                "/registry/cr/example.com/widgets/default/w",
+            ),
+        ] {
+            for (patch, rejected) in [(&patch, true), (&empty, false)] {
+                let c = Cluster::new().await;
+                if kind == "widget" {
+                    c.create(
+                        "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+                        widgets_v1_v2_crd(None),
+                    )
+                    .await;
+                    c.create(&widgets_at("v1"), widget_at("v1", json!({"size": 1})))
+                        .await;
+                } else {
+                    c.create(
+                        "/api/v1/namespaces/default/configmaps",
+                        json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cm"}}),
+                    )
+                    .await;
+                }
+                let patch = patch.clone();
+                let hook = spawn_hook(
+                    move |_| json!({"allowed": true, "patchType": "JSONPatch", "patch": patch}),
+                )
+                .await;
+                register_webhook_for(
+                    &c.store,
+                    true,
+                    "p",
+                    &hook.url,
+                    group,
+                    "v1",
+                    None,
+                    &[resource],
+                    &["DELETE"],
+                )
+                .await;
+                let (status, resp) = c.call("DELETE", uri, "application/json", json!({})).await;
+                let label = format!("{kind} patch rejected={rejected}: {status} {resp}");
+                assert_eq!(
+                    hook.requests().len(),
+                    1,
+                    "{label}: webhook must be called on DELETE"
+                );
+                if rejected {
+                    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{label}");
+                    assert_eq!(
+                        resp["message"],
+                        "Internal error occurred: admission webhook \"p.example.com\" attempted to modify the object, which is not supported for this operation",
+                        "{label}"
+                    );
+                    assert!(
+                        c.store.get(key).await.unwrap().is_some(),
+                        "{label}: object must survive"
+                    );
+                } else {
+                    assert!(status.is_success(), "{label}");
+                    assert!(c.store.get(key).await.unwrap().is_none(), "{label}");
+                }
+            }
+        }
     }
 }

@@ -1838,14 +1838,16 @@ async fn call_webhook(
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
-fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Result<(), StatusError> {
+fn decode_webhook_patch(patch_b64: &str) -> Result<serde_json::Value, StatusError> {
     let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, patch_b64)
         .map_err(|e| Status::bad_request(format!("webhook patch base64 decode error: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|e| Status::bad_request(format!("webhook patch JSON parse error: {e}")))?;
+    serde_json::from_slice(&decoded)
+        .map_err(|e| Status::bad_request(format!("webhook patch JSON parse error: {e}")))
+}
 
-    crate::handlers::json_patch::apply_json_patch(object, &patch)
+fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Result<(), StatusError> {
+    crate::handlers::json_patch::apply_json_patch(object, &decode_webhook_patch(patch_b64)?)
 }
 
 /// Run one webhook entry against the object. Returns the (possibly mutated) object
@@ -2030,6 +2032,20 @@ async fn invoke_mutating_webhook<S: Store>(
             // Apply patch if present.
             if let Some(patch_b64) = resp.patch.as_deref() {
                 if !patch_b64.is_empty() {
+                    // A DELETE has no object to persist a patch to; upstream refuses any
+                    // non-empty patch, whatever the webhook's failurePolicy.
+                    if ctx.operation == "DELETE" {
+                        if decode_webhook_patch(patch_b64)?
+                            .as_array()
+                            .is_some_and(|ops| !ops.is_empty())
+                        {
+                            return Err(Status::internal_actionable(format!(
+                                "admission webhook \"{}\" attempted to modify the object, which is not supported for this operation",
+                                webhook.name
+                            )));
+                        }
+                        return Ok((None, false));
+                    }
                     let mut mutated = seen.as_ref().clone();
                     apply_webhook_patch(&mut mutated, patch_b64)?;
                     if let RuleMatch::Equivalent { crd, .. } = &matched {
@@ -3721,6 +3737,18 @@ async fn run_validating_webhooks_inner<S: Store>(
 pub async fn mutating_admission_configured<S: Store>(state: &AppState<S>) -> bool {
     !fetch_mutating_configs(state).await.is_empty()
         || !fetch_mutating_policies(state).await.is_empty()
+}
+
+/// The one admission convergence point for DELETE: mutating webhooks (which may only allow or
+/// deny, never patch, as no object is written) then validating webhooks and policies, both
+/// seeing `existing` as the old object. `ctx.operation` must be "DELETE".
+pub async fn admit_delete<S: Store>(
+    state: &AppState<S>,
+    existing: &serde_json::Value,
+    ctx: &AdmissionContext<'_>,
+) -> Result<(), StatusError> {
+    run_mutating_webhooks(state, existing.clone(), Some(existing), ctx).await?;
+    run_validating_webhooks(state, existing, Some(existing), ctx).await
 }
 
 /// The request a write runs admission as: the GVR it is admitted under (`resource` is

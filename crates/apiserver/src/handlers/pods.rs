@@ -1105,8 +1105,8 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                 }
             }
 
-            // Admission webhook pipeline (validating only — mutating webhooks do not apply to
-            // DELETE), invoked per pod exactly like delete_pod and the generic
+            // Admission webhook pipeline (mutating then validating; a mutating
+            // webhook may only allow or deny a DELETE), invoked per pod exactly like delete_pod and the generic
             // delete_collection_resource/_namespaced. Without this, a validating webhook
             // registered for pods/DELETE was silently skipped on every DeleteCollection —
             // evadable by a client just switching from single-object DELETE to bulk delete.
@@ -1130,7 +1130,7 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                 user_info: user_info.clone(),
                 dry_run,
             };
-            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
 
             // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
             // a pod already Terminating (or force-deleted with an explicit gracePeriodSeconds=0)
@@ -1288,8 +1288,8 @@ pub(crate) async fn delete_pod<S: Store>(
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-        // Admission webhook pipeline (validating only — mutating webhooks do not apply to
-        // DELETE). Run against the freshest read on every attempt, before branching into
+        // Admission webhook pipeline (mutating then validating; a mutating
+        // webhook may only allow or deny a DELETE). Run against the freshest read on every attempt, before branching into
         // soft-delete vs hard-delete below, so a Fail-policy webhook can deny whichever delete
         // decision this request actually makes.
         let admission_ctx = AdmissionContext {
@@ -1307,7 +1307,7 @@ pub(crate) async fn delete_pod<S: Store>(
             })),
             dry_run,
         };
-        run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
         let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
