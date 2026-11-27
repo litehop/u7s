@@ -1847,6 +1847,15 @@ impl NodeTally {
         Some(removed)
     }
 
+    /// Drop `key` for a watch event about pod `uid`: an event for a deleted incarnation must not
+    /// erase the entry of a same-name pod already tallied under a different UID. An event
+    /// without a UID removes by name.
+    fn remove_event_pod(&mut self, key: &str, uid: &str) {
+        if uid.is_empty() || self.pods.get(key).is_some_and(|p| p.uid == uid) {
+            self.remove_pod(key);
+        }
+    }
+
     /// Update the tally from one raw pod watch event.
     ///
     /// A DELETED event, or an ADDED/MODIFIED event for a pod that is unbound
@@ -1881,7 +1890,7 @@ impl NodeTally {
         let key = format!("{namespace}/{name}");
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
-            self.remove_pod(&key);
+            self.remove_event_pod(&key, &uid);
             self.failures.clear(&key);
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
             self.pvc_waiters.remove_pod(&key);
@@ -1933,7 +1942,7 @@ impl NodeTally {
                 // container(s) it was running have actually stopped, so a
                 // preemption victim that completes this way (rather than
                 // being hard-deleted first) must resolve waiters too.
-                self.remove_pod(&key);
+                self.remove_event_pod(&key, &uid);
                 self.pvc_waiters.remove_pod(&key);
                 self.waiters.resolve(&key)
             }
@@ -9021,6 +9030,47 @@ mod tests {
                 "status": { "phase": phase }
             }
         })
+    }
+
+    fn uid_pod_event(event_type: &str, uid: &str) -> Value {
+        json!({
+            "type": event_type,
+            "object": {
+                "metadata": {"name": "web", "namespace": "default", "uid": uid},
+                "spec": {"nodeName": "worker-0", "containers": []},
+                "status": {"phase": "Running"}
+            }
+        })
+    }
+
+    /// A pod deleted and recreated under the same name: whichever order the old incarnation's
+    /// DELETED and the new one's ADDED are applied, the new pod's reservation survives, or a
+    /// full node looks free and a later pod is force-bound onto it.
+    #[test]
+    fn deleted_event_for_old_uid_never_erases_a_same_name_recreations_tally_entry() {
+        let mut tally = NodeTally::default();
+        tally.apply_event(&uid_pod_event("ADDED", "uid-old"));
+        tally.apply_event(&uid_pod_event("DELETED", "uid-old"));
+        tally.apply_event(&uid_pod_event("ADDED", "uid-new"));
+        assert_eq!(
+            tally.tallied_uid("default", "web"),
+            Some("uid-new".to_owned()),
+            "DELETED(old) then ADDED(new) must leave the new pod tallied"
+        );
+
+        tally.apply_event(&uid_pod_event("DELETED", "uid-old"));
+        assert_eq!(
+            tally.tallied_uid("default", "web"),
+            Some("uid-new".to_owned()),
+            "a late DELETED(old) must not erase the new pod's entry"
+        );
+
+        tally.apply_event(&uid_pod_event("DELETED", "uid-new"));
+        assert_eq!(
+            tally.tallied_uid("default", "web"),
+            None,
+            "the new pod's own DELETED must still free its slot"
+        );
     }
 
     /// NodeTally counts pods correctly, excluding Succeeded and Failed.
