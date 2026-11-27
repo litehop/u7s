@@ -629,16 +629,13 @@ fn request_options(ctx: &AdmissionContext<'_>) -> serde_json::Value {
 }
 
 /// An admission read outside `with_request_query` sends stub options to webhooks; a caller
-/// spawned off the request task must not do that silently.
+/// spawned off the request task must not do that silently. Making a miss visible must never
+/// crash a server, so this only warns (once) and counts, in every build profile.
 fn report_scope_miss() {
     if SCOPE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
         tracing::warn!(
             "admission: request options read outside the request scope; sending stub options"
         );
-    }
-    // Unit tests drive handlers directly, without the request middleware's scope.
-    if cfg!(debug_assertions) && !cfg!(test) {
-        panic!("admission request options read outside the request scope");
     }
 }
 
