@@ -1018,27 +1018,51 @@ is_install_tunnel_pid() {
   esac
 }
 
-# The unit file install.sh writes (and the rig never does): its presence means the VM still runs
-# an install.sh deployment that fights the host rig ("node has no IPv4 podCIDR").
-INSTALL_STATE_MARKER=/etc/systemd/system/u7s-apiserver.service
+# The file install.sh writes first thing in every mode (control plane, worker, partial run)
+# and install-teardown.sh removes last; the rig never writes it. Its presence means the VM
+# carries install.sh state that fights the host rig ("node has no IPv4 podCIDR").
+INSTALL_STATE_MARKER=/etc/u7s-install-started
 
-# vm_in_install_state <vm>: 0 if the VM exists and carries the install.sh unit. A stopped VM is
-# started first, since its units come back at boot; a missing VM is simply not in install state.
-vm_in_install_state() {
-  local vm="$1" status
+# vm_install_state_probe <vm>: never starts the VM. Returns 0 marker present, 1 marker absent
+# (or the VM does not exist), 2 the probe itself failed (ssh/shell error, unexpected output),
+# 3 the VM exists but is not Running.
+vm_install_state_probe() {
+  local vm="$1" status out
   status=$(limactl list --format '{{.Status}}' "$vm" 2>/dev/null) || return 1
   [ -n "$status" ] || return 1
-  [ "$status" = Running ] || limactl start "$vm" >&2 || return 1
-  limactl shell "$vm" test -e "$INSTALL_STATE_MARKER"
+  [ "$status" = Running ] || return 3
+  out=$(limactl shell "$vm" sh -c "if [ -e $INSTALL_STATE_MARKER ]; then echo present; else echo absent; fi") || {
+    echo "error: probing $vm for install state failed (limactl shell exited non-zero)" >&2
+    return 2
+  }
+  case "$out" in
+    present) return 0 ;;
+    absent) return 1 ;;
+    *) echo "error: probing $vm for install state returned '$out', expected present|absent" >&2; return 2 ;;
+  esac
 }
 
-# teardown_if_install_state <dir> <workdir> <vm>...: runs install-teardown.sh for each VM in
-# install state; returns non-zero if any teardown fails.
+# teardown_if_install_state <dir> <workdir> <vm>=<kubelet port>...: runs install-teardown.sh for
+# each VM in install state; returns non-zero if a probe or a teardown fails. A stopped VM is
+# started the way lima-start.sh does (port check, provision sync) before it is probed.
 teardown_if_install_state() {
-  local dir="$1" workdir="$2" vm
+  local dir="$1" workdir="$2" spec vm port rc
   shift 2
-  for vm in "$@"; do
-    vm_in_install_state "$vm" || continue
+  for spec in "$@"; do
+    vm="${spec%%=*}"; port="${spec#*=}"
+    rc=0; vm_install_state_probe "$vm" || rc=$?
+    if [ "$rc" -eq 3 ]; then
+      echo "[run-all] $vm is stopped; starting it to probe for install state" >&2
+      check_port_free "$port" "kubelet" || return 1
+      lima_sync_provision "$vm" "$dir/../../lima/kubelet.yaml" || return 1
+      limactl start "$vm" >&2 || return 1
+      rc=0; vm_install_state_probe "$vm" || rc=$?
+    fi
+    case "$rc" in
+      0) ;;
+      1) continue ;;
+      *) echo "error: cannot determine whether $vm is in install state; refusing to bring up the host rig" >&2; return 1 ;;
+    esac
     echo "[run-all] $vm is in install state; running install-teardown.sh" >&2
     bash "$dir/install-teardown.sh" --vm "$vm" --workdir "$workdir" || {
       echo "error: install-teardown.sh failed for $vm; the host rig cannot run on top of install state" >&2

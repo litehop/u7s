@@ -548,10 +548,11 @@ fi
 [ -n "$POD_CIDR" ] && export RIG_POD_CIDR_V4="$POD_CIDR"
 [ -n "$SERVICE_CIDR" ] && _SERVICE_CIDR_ARG="--service-cidr $SERVICE_CIDR"
 
-# --reset deletes the VMs; a kept VM may still run an install.sh deployment.
+# --reset deletes the VMs; a kept VM may still run an install.sh deployment. (--install exec's
+# into install-run.sh above and never reaches this point.)
 if [ "$RESET" -eq 0 ]; then
   source "$DIR/_lib.sh"
-  teardown_if_install_state "$DIR" "$WORKDIR" "${U7S_VM_NAME:-lima-node}" ${EXTRA_NODE:+"$EXTRA_NODE"} || exit 1
+  teardown_if_install_state "$DIR" "$WORKDIR" "${U7S_VM_NAME:-lima-node}=${KUBELET_PORT:-10250}" ${EXTRA_NODE:+"$EXTRA_NODE=$EXTRA_KUBELET_PORT"} || exit 1
 fi
 
 if [ "$RESET" -eq 1 ]; then
