@@ -672,7 +672,7 @@ pub struct NamespaceSpec {
 ///
 /// The apiserver reasons about propagationPolicy to gate cascade vs orphan
 /// behaviour, so it must flow through a typed struct rather than raw JSON map access.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOptions {
     /// "Orphan", "Background", or "Foreground". Absent/nil means: do not cascade synchronously.
@@ -692,18 +692,18 @@ pub struct DeleteOptions {
     #[serde(default, rename = "dryRun", skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<Vec<String>>,
     /// The delete only applies to an object that matches; see [`Preconditions`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preconditions: Option<Preconditions>,
 }
 
 /// Upstream `metav1.Preconditions`: the delete is refused with a 409 unless the stored object
 /// has this uid and resourceVersion.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preconditions {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<String>,
 }
 

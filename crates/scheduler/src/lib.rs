@@ -1430,6 +1430,9 @@ struct PreemptionPodListItem {
 /// — see `NodeTally::assume`'s doc comment for why the latter matters.
 #[derive(Debug, Clone)]
 struct TalliedPod {
+    /// `metadata.uid` of the pod this entry accounts for; lets a stale decision for a
+    /// same-name predecessor avoid releasing the recreated pod's reservation.
+    uid: String,
     node_name: String,
     namespace: String,
     labels: std::collections::HashMap<String, String>,
@@ -1873,6 +1876,7 @@ impl NodeTally {
             .metadata
             .namespace
             .unwrap_or_else(|| "default".to_owned());
+        let uid = watch_event.object.metadata.uid.unwrap_or_default();
         let labels = watch_event.object.metadata.labels;
         let key = format!("{namespace}/{name}");
 
@@ -1909,6 +1913,7 @@ impl NodeTally {
                 self.insert_pod(
                     key,
                     TalliedPod {
+                        uid,
                         node_name,
                         namespace,
                         labels,
@@ -1977,6 +1982,7 @@ impl NodeTally {
         &mut self,
         namespace: &str,
         pod_name: &str,
+        uid: &str,
         node_name: &str,
         priority: i32,
         requests: ResourceRequests,
@@ -1992,6 +1998,7 @@ impl NodeTally {
         self.insert_pod(
             format!("{namespace}/{pod_name}"),
             TalliedPod {
+                uid: uid.to_owned(),
                 node_name: node_name.to_owned(),
                 namespace: namespace.to_owned(),
                 labels,
@@ -2010,6 +2017,15 @@ impl NodeTally {
     /// anticipated does not actually go through.
     pub fn remove(&mut self, namespace: &str, pod_name: &str) {
         self.remove_pod(&format!("{namespace}/{pod_name}"));
+    }
+
+    /// Remove `namespace/pod_name` only if the tallied entry belongs to `uid`. A decision
+    /// for a deleted pod must not release the reservation of a same-name recreation.
+    pub fn remove_if_uid(&mut self, namespace: &str, pod_name: &str, uid: &str) {
+        let key = format!("{namespace}/{pod_name}");
+        if self.pods.get(&key).is_some_and(|p| p.uid == uid) {
+            self.remove_pod(&key);
+        }
     }
 
     /// Drop all tallied state. Called on watch reconnect: `POD_WATCH_PATH`'s
@@ -3887,6 +3903,7 @@ fn select_and_reserve_node(
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
+        &pod.uid,
         &node,
         pod.priority,
         pod.requests.clone(),
@@ -4270,6 +4287,7 @@ fn verify_and_reserve_preemption(
     tally_guard.assume(
         &pod.namespace,
         &pod.pod_name,
+        &pod.uid,
         &plan.node_name,
         pod.priority,
         pod.requests.clone(),
@@ -8897,6 +8915,7 @@ mod tests {
             tally.assume(
                 "default",
                 &format!("besteffort-{i}"),
+                "",
                 &chosen,
                 0,
                 ResourceRequests::default(),
@@ -9071,6 +9090,7 @@ mod tests {
         tally.assume(
             "default",
             "filler",
+            "",
             "worker-0",
             0,
             requests(5600, 0, 0),
@@ -9188,6 +9208,7 @@ mod tests {
             guard.assume(
                 "default",
                 "victim-a",
+                "",
                 "worker-0",
                 0,
                 requests(1000, 0, 0),
@@ -9198,6 +9219,7 @@ mod tests {
             guard.assume(
                 "default",
                 "victim-b",
+                "",
                 "worker-0",
                 0,
                 requests(1000, 0, 0),
@@ -9275,6 +9297,7 @@ mod tests {
                 guard.assume(
                     "default",
                     &format!("filler-{i}"),
+                    "",
                     "worker-0",
                     100,
                     requests(1000, 0, 0),
@@ -9386,6 +9409,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-a",
+                "",
                 "worker-0",
                 100,
                 requests(1000, 0, 0),
@@ -9396,6 +9420,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "worker-0",
                 100,
                 requests(1000, 0, 0),
@@ -9460,6 +9485,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "filler-a",
+            "",
             "worker-0",
             100,
             requests(1000, 0, 0),
@@ -9494,6 +9520,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "filler-a",
+            "",
             "worker-0",
             100,
             requests(1000, 0, 0),
@@ -9596,6 +9623,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a",
+                "",
                 "node-a",
                 0,
                 ResourceRequests::default(),
@@ -9610,6 +9638,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9698,6 +9727,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a1",
+                "",
                 "node-a1",
                 0,
                 ResourceRequests::default(),
@@ -9712,6 +9742,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a2",
+                "",
                 "node-a2",
                 1000,
                 ResourceRequests::default(),
@@ -9724,6 +9755,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9800,6 +9832,7 @@ mod tests {
             guard.assume(
                 "default",
                 "web-a",
+                "",
                 "node-a",
                 0,
                 ResourceRequests::default(),
@@ -9810,6 +9843,7 @@ mod tests {
             guard.assume(
                 "default",
                 "filler-b",
+                "",
                 "node-b",
                 0,
                 ResourceRequests::default(),
@@ -9851,6 +9885,7 @@ mod tests {
         tally.assume(
             "default",
             "filler",
+            "",
             "worker-0",
             0,
             requests(8000, 0, 0),
@@ -9931,6 +9966,7 @@ mod tests {
         tally.assume(
             "default",
             "c",
+            "",
             "worker-0",
             0,
             requests(500, 0, 0),
@@ -9978,6 +10014,7 @@ mod tests {
         tally.assume(
             "default",
             "d",
+            "",
             "worker-3",
             0,
             requests(500, 0, 0),
@@ -10009,6 +10046,7 @@ mod tests {
         tally.assume(
             "default",
             "e",
+            "",
             "worker-9",
             0,
             requests(500, 0, 0),
@@ -10074,6 +10112,7 @@ mod tests {
         tally.assume(
             "default",
             "preemptor",
+            "",
             "worker-0",
             1000,
             requests(1000, 0, 0),
@@ -10307,6 +10346,7 @@ mod tests {
         tally.assume(
             "default",
             "pod-a",
+            "",
             &chosen,
             0,
             ResourceRequests::default(),
@@ -10492,6 +10532,7 @@ mod tests {
         tally.assume(
             "default",
             "preemptor-pod",
+            "",
             "worker-0",
             1000,
             ResourceRequests::default(),
@@ -10626,6 +10667,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "preemptor",
+            "",
             "worker-0",
             1000,
             pod.requests.clone(),
@@ -10647,6 +10689,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "unrelated-pod",
+            "",
             "worker-0",
             0,
             requests(1000, 0, 0),
@@ -12715,6 +12758,7 @@ mod tests {
         tally.assume(
             "default",
             "pod-a",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -12997,6 +13041,7 @@ mod tests {
             tally.assume(
                 namespace,
                 "holder",
+                "",
                 "worker-0",
                 0,
                 ResourceRequests::default(),
@@ -13085,6 +13130,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "pod1",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13140,6 +13186,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "team-a",
             "pod1",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13207,6 +13254,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "low-priority-pod",
+            "",
             "worker-0",
             0,
             ResourceRequests::default(),
@@ -13274,6 +13322,7 @@ mod tests {
         tally.lock().expect("tally lock poisoned").assume(
             "default",
             "low-priority-pod",
+            "",
             "lima-node-3",
             0,
             ResourceRequests::default(),

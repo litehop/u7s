@@ -398,6 +398,7 @@ async fn create_pod_from_object<S: Store>(
             "extra": user.extra,
         })),
         dry_run,
+        options: None,
     };
     obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks: a webhook's JSON patch can reinject a
@@ -505,6 +506,7 @@ async fn create_pod_from_object<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: false,
+                    options: None,
                 };
                 run_validating_webhooks(state, &obj.body, None, &retry_ctx).await?;
             }
@@ -730,10 +732,6 @@ pub(crate) async fn replace_pod<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned: pinned to the stored
-        // values so a PUT can neither un-terminate nor hard-delete a pod without the delete verb.
-        super::generic::pin_server_owned_deletion_fields(&mut obj.body, Some(&stored_obj.body));
-
         // Admission webhook pipeline (mutating then validating).
         let admission_ctx = AdmissionContext {
             group: "",
@@ -749,10 +747,14 @@ pub(crate) async fn replace_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         apply_default_toleration_seconds(&mut obj.body);
         obj.body =
             run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
+        // Pinned after mutating admission (upstream rest.BeforeUpdate): a PUT can neither
+        // un-terminate nor hard-delete a pod, and a webhook cannot clear creationTimestamp.
+        super::generic::pin_server_owned_metadata(&mut obj.body, Some(&stored_obj.body));
         validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
         run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
@@ -1129,8 +1131,9 @@ pub(crate) async fn delete_collection_pods<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Mirror delete_pod's soft/hard-delete decision instead of always hard-deleting:
             // a pod already Terminating (or force-deleted with an explicit gracePeriodSeconds=0)
@@ -1306,8 +1309,9 @@ pub(crate) async fn delete_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let meta: ObjectMeta = ObjectMeta::deserialize(&obj.body["metadata"]).unwrap_or_default();
         let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
@@ -1565,7 +1569,7 @@ pub(crate) async fn patch_pod<S: Store>(
         // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
         // (Merge, StrategicMerge, JSON Patch).
         let stored_uid = current_obj.body["metadata"]["uid"].clone();
-        let stored_deletion = super::generic::snapshot_deletion_fields(&current_obj.body);
+        let stored_deletion = super::generic::snapshot_server_owned_metadata(&current_obj.body);
         let rv_before_patch = current_obj.resource_version().map(str::to_owned);
 
         match patch_type {
@@ -1592,10 +1596,6 @@ pub(crate) async fn patch_pod<S: Store>(
         }
         current_obj.body["status"] = stored_status.clone();
         current_obj.body["metadata"]["uid"] = stored_uid;
-        super::generic::pin_server_owned_deletion_fields(
-            &mut current_obj.body,
-            Some(&stored_deletion),
-        );
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch
@@ -1616,6 +1616,7 @@ pub(crate) async fn patch_pod<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: patch_query.is_dry_run(),
+            options: None,
         };
         // Re-parsed from the stored bytes (current_obj.body was patched in place) only when
         // admission can read it, so a PATCH with no webhooks never holds a second full tree.
@@ -1630,6 +1631,7 @@ pub(crate) async fn patch_pod<S: Store>(
             &admission_ctx,
         )
         .await?;
+        super::generic::pin_server_owned_metadata(&mut current_obj.body, Some(&stored_deletion));
 
         // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore already discarded, and this is the last
@@ -9018,24 +9020,27 @@ pub(crate) async fn bind_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Binding `metadata.uid` is a precondition, as upstream: a bind decided for a pod that
-    // has since been deleted and recreated under the same name must not land on the new pod.
-    if let Some(uid) = binding["metadata"]["uid"]
-        .as_str()
-        .filter(|u| !u.is_empty())
-    {
-        crate::types::Preconditions {
-            uid: Some(uid.to_owned()),
-            resource_version: None,
-        }
-        .check(&obj.body)
-        .map_err(|msg| {
-            Status::conflict(format!(
-                "Operation cannot be fulfilled on pods/binding \"{name}\": {msg}. \
-                 The object might have been deleted and then recreated"
-            ))
-        })?;
+    // Binding `metadata.uid` and `metadata.resourceVersion` are preconditions, as upstream's
+    // `setPodNodeAndMetadata`: a bind decided for a pod that has since been deleted and
+    // recreated under the same name must not land on the new pod. Upstream reports the
+    // failure through `InterpretUpdateError` against resource `pods` (not `pods/binding`).
+    let non_empty = |field: &str| {
+        binding["metadata"][field]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    crate::types::Preconditions {
+        uid: non_empty("uid"),
+        resource_version: non_empty("resourceVersion"),
     }
+    .check(&obj.body)
+    .map_err(|msg| {
+        Status::conflict(format!(
+            "Operation cannot be fulfilled on pods \"{name}\": StorageError: invalid object, \
+             Code: 4, Key: {key}, ResourceVersion: 0, AdditionalErrorMsg: {msg}"
+        ))
+    })?;
 
     // A pod may only be bound once. Rejecting unconditionally (not just on a
     // mismatched target) matches upstream kube-apiserver, which never allows a
@@ -17010,6 +17015,19 @@ mod handler_tests {
             StatusCode::CONFLICT,
             "a bind for the deleted pod's UID must not land on the recreated pod"
         );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            status["message"],
+            "Operation cannot be fulfilled on pods \"recreated\": StorageError: invalid object, \
+             Code: 4, Key: /registry/pods/default/recreated, ResourceVersion: 0, \
+             AdditionalErrorMsg: Precondition failed: UID in precondition: uid-old, UID in \
+             object meta: uid-new",
+            "the scheduler classifies a stale-pod bind by the substring `UID in precondition`; \
+             the message must stay upstream's text or stale binds become scheduling failures"
+        );
         let stored = store
             .get("/registry/pods/default/recreated")
             .await
@@ -17026,6 +17044,73 @@ mod handler_tests {
             resp.status(),
             StatusCode::CREATED,
             "a bind whose UID matches the stored pod must succeed"
+        );
+    }
+
+    /// Upstream honours `Binding.metadata.resourceVersion` as a precondition alongside the UID.
+    #[tokio::test]
+    async fn bind_with_stale_resource_version_returns_conflict_and_leaves_pod_unbound() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "rv-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+        let bind_with_rv = |rv: &str| {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/pods/rv-pod/binding")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json_body(&serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Binding",
+                    "metadata": {"name": "rv-pod", "namespace": "default", "resourceVersion": rv},
+                    "target": {"kind": "Node", "name": "worker-1"}
+                })))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+
+        let resp = bind_with_rv("999").await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a bind decided against a stale pod resourceVersion must be refused, as upstream"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            status["message"]
+                .as_str()
+                .unwrap()
+                .contains("Precondition failed: ResourceVersion in precondition: 999"),
+            "unexpected message: {status}"
+        );
+        let stored = store
+            .get("/registry/pods/default/rv-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(v["spec"].get("nodeName").is_none(), "pod must stay unbound");
+
+        let current = v["metadata"]["resourceVersion"].as_str().unwrap();
+        let resp = bind_with_rv(current).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a bind whose resourceVersion matches the stored pod must succeed: {}",
+            String::from_utf8_lossy(&body)
         );
     }
 

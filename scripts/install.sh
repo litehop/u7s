@@ -287,6 +287,10 @@ if [ ! -d /run/systemd/system ]; then
   exit 1
 fi
 
+# Written before any other change, in every mode, so a partial or worker-only install is
+# still detectable; the conformance rig's install-teardown.sh removes it last.
+: > /etc/u7s-install-started
+
 # beep, the DaemonSet that serves type=LoadBalancer Services, runs on every
 # node and needs kernel >= 6.6 (its eBPF dataplane's support floor).
 kernel_supports_beep() {

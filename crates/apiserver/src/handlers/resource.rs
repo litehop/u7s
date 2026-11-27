@@ -27,9 +27,9 @@ use super::field_selector::FieldSelector;
 use super::generic::{
     apply_delete_policy, apply_label_selector, check_clusterrole_escalation, check_crb_escalation,
     check_rb_escalation, check_role_escalation, clear_create_status, decode_continue,
-    generate_name, lookup, parse_label_selector, pin_server_owned_deletion_fields,
-    resolve_valid_name, stamp_metadata, store_err, validate_path_segment, wants_generate_name,
-    CollectionQuery, LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
+    generate_name, lookup, parse_label_selector, pin_server_owned_metadata, resolve_valid_name,
+    stamp_metadata, store_err, validate_path_segment, wants_generate_name, CollectionQuery,
+    LabelSelectorTerm, MAX_GENERATE_NAME_CREATE_ATTEMPTS, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, is_dry_run_header,
@@ -414,6 +414,7 @@ pub(crate) async fn create_resource<S: Store>(
             "extra": user.extra,
         })),
         dry_run: create_query.is_dry_run(),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     if is_csr {
@@ -500,6 +501,7 @@ pub(crate) async fn create_resource<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: create_query.is_dry_run(),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -918,14 +920,6 @@ pub(crate) async fn replace_resource<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-        // of completing the delete — persisting the object with deletionTimestamp gone and
-        // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
-
         if old_object.is_none() && !allows_create_on_update(&group, &plural) {
             return Err(Status::not_found(&group, &plural, &name));
         }
@@ -1020,9 +1014,15 @@ pub(crate) async fn replace_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        // Server-owned metadata is pinned after mutating admission (upstream rest.BeforeUpdate):
+        // a webhook patch must not clear creationTimestamp, and finalizer_drain_complete below
+        // (which reads obj.body, not the stored object) must not see a blank deletionTimestamp
+        // and resurrect a Terminating object as live.
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -1212,8 +1212,9 @@ pub(crate) async fn delete_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -1648,6 +1649,7 @@ pub(crate) async fn do_patch<S: Store>(
             operation: "CREATE",
             user_info: user_info.clone(),
             dry_run,
+            options: None,
         };
         obj.body = run_mutating_webhooks(state, obj.body, None, &admission_ctx).await?;
         if is_csr {
@@ -1761,11 +1763,10 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
-                let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
+                let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
                 crate::patch::strategic_merge_patch_ssa(&mut current.body, &patch)
                     .map_err(Status::patch_error)?;
                 race_plan.remove_dropped_fields(&mut current.body);
-                pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
                 super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
                 restore_or_strip_status(
                     meta.has_status_subresource,
@@ -1842,9 +1843,11 @@ pub(crate) async fn do_patch<S: Store>(
                     operation: "CREATE",
                     user_info: user_info.clone(),
                     dry_run,
+                    options: None,
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
                 // Re-restore status after mutating webhooks — same rationale as the primary
                 // create path's post-webhook clear_create_status re-call above: a webhook's
                 // JSON patch can reinject a forged/scalar status the earlier restore already
@@ -2132,7 +2135,7 @@ pub(crate) async fn do_patch<S: Store>(
         // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
         // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
         let stored_uid = current.body["metadata"]["uid"].clone();
-        let stored_deletion = super::generic::snapshot_deletion_fields(&current.body);
+        let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
 
         match patch_type {
             PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
@@ -2153,7 +2156,8 @@ pub(crate) async fn do_patch<S: Store>(
             plan.remove_dropped_fields(&mut current.body);
         }
         current.body["metadata"]["uid"] = stored_uid;
-        pin_server_owned_deletion_fields(&mut current.body, Some(&stored_deletion));
+        // Pinned here too: the finalizer-drain check below reads current.body before admission runs.
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
@@ -2256,6 +2260,7 @@ pub(crate) async fn do_patch<S: Store>(
             operation: "UPDATE",
             user_info: user_info.clone(),
             dry_run,
+            options: None,
         };
         // The pre-patch object is re-parsed from the stored bytes (current.body was patched in
         // place) and only when something reads it, so a PATCH of a kind with no old-object
@@ -2379,6 +2384,8 @@ pub(crate) async fn do_patch<S: Store>(
         // Admission webhook pipeline (mutating then validating).
         current.body =
             run_mutating_webhooks(state, current.body, old_object.as_ref(), &admission_ctx).await?;
+        // Pinned again after mutating admission (upstream rest.BeforeUpdate).
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
         // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
         // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore (before this match block) already
@@ -3401,6 +3408,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
             "extra": user.extra,
         })),
         dry_run: create_query.is_dry_run(),
+        options: None,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     // Re-clear status after mutating webhooks — see create_resource's identical call
@@ -3534,6 +3542,7 @@ pub(crate) async fn create_namespaced_resource<S: Store>(
                         "extra": user.extra,
                     })),
                     dry_run: create_query.is_dry_run(),
+                    options: None,
                 };
                 run_validating_webhooks(&state, &obj.body, None, &retry_ctx).await?;
             }
@@ -4071,14 +4080,6 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
             }
         }
 
-        // deletionTimestamp/deletionGracePeriodSeconds are server-owned, exactly like UID above:
-        // a client cannot un-terminate an object mid-deletion by omitting them on a PUT. Without
-        // this, finalizer_drain_complete below (which reads obj.body, not the stored object) would
-        // see a blank deletionTimestamp and treat a finalizer-removal PUT as a plain update instead
-        // of completing the delete — persisting the object with deletionTimestamp gone and
-        // finalizers empty, i.e. silently resurrecting it as a normal live object.
-        pin_server_owned_deletion_fields(&mut obj.body, old_object.as_ref());
-
         // Allocate a clusterIP when a Service transitions away from ExternalName to a
         // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
         // handles initial allocation; the update path must also allocate when the type
@@ -4153,9 +4154,12 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run: replace_query.is_dry_run(),
+            options: None,
         };
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
+        // Pinned after mutating admission (upstream rest.BeforeUpdate); see replace_resource.
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -4408,8 +4412,9 @@ pub(crate) async fn delete_namespaced_resource<S: Store>(
                 "extra": user.extra,
             })),
             dry_run,
+            options: None,
         };
-        crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
+        crate::admission::admit_delete(&state, &obj.body, &delete_opts, &admission_ctx).await?;
 
         let this_owner_uid = obj.body["metadata"]["uid"]
             .as_str()
@@ -4828,8 +4833,9 @@ pub(crate) async fn delete_collection_resource<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // clusterIP release, soft/hard delete) for this object.
@@ -5015,8 +5021,9 @@ pub(crate) async fn delete_collection_namespaced_resource<S: Store>(
                 operation: "DELETE",
                 user_info: user_info.clone(),
                 dry_run,
+                options: None,
             };
-            crate::admission::admit_delete(&state, &parsed, &admission_ctx).await?;
+            crate::admission::admit_delete(&state, &parsed, &delete_opts, &admission_ctx).await?;
 
             // Dry-run: validation passed; skip the actual write entirely (RBAC-index evict,
             // soft/hard delete) for this object.
