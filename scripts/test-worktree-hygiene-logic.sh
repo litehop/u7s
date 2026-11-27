@@ -1452,9 +1452,10 @@ assert "STEP I: a loop at exactly the age guard is killed" \
   "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 10:00)")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
 assert "STEP I: a day-prefixed etime parses as old" \
   "$([ "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' 2-03:04:05)")" = "[dry-run] would run: kill 9100" ] && echo 1 || echo 0)"
-assert "STEP I: malformed lines (bad pid, bad etime) never kill" \
-  "$([ -z "$(step_i_dry "abc 1 01:00:00 /bin/zsh -c until ! pgrep -f \"x\"; do :; done
-9100 1 soon /bin/zsh -c until ! pgrep -f \"x\"; do :; done")" ] && echo 1 || echo 0)"
+assert "STEP I: a line with a non-numeric pid never kills -- kill must not receive garbage" \
+  "$([ -z "$(step_i_dry "$(wl_loop abc 'run-all.sh --vm alpha')")" ] && echo 1 || echo 0)"
+assert "STEP I: a line with an unparsable etime never kills -- age is unknown so the loop is kept" \
+  "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' soon)")" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
