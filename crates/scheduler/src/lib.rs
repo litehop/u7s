@@ -5728,13 +5728,19 @@ pub fn nominated_node_name_patch(node_name: &str) -> Value {
 /// precondition is an error, so the caller rolls the plan back and re-plans
 /// instead of treating the freed capacity as real. Upstream's
 /// `util.DeletePod` (pkg/scheduler/util/utils.go) sends empty `DeleteOptions{}`;
-/// the precondition is a deliberate tightening.
+/// the precondition is a deliberate tightening. An empty `uid` (victim never
+/// tallied with one) sends no precondition, as the apiserver would refuse any
+/// stored UID against `""`.
+///
+/// Returns the UID of the incarnation deleted: `uid` itself, or for an empty `uid` the one
+/// the apiserver reports in its response (empty if it reports none), so a bind waiter can
+/// tell that incarnation's removal from a same-name recreation's.
 pub async fn delete_pod(
     client: &ApiClient,
     namespace: &str,
     pod_name: &str,
     uid: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let path = delete_pod_path(namespace, pod_name);
     let start = std::time::Instant::now();
     let (status, body) = http_delete(client, &path, &victim_delete_options(uid)).await?;
@@ -5748,16 +5754,23 @@ pub async fn delete_pod(
     check_delete_response(status.as_u16())
         .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
     info!("evicted pod {namespace}/{pod_name} (preemption)");
-    Ok(())
+    if !uid.is_empty() {
+        return Ok(uid.to_owned());
+    }
+    Ok(serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned))
+        .unwrap_or_default())
 }
 
-/// `DeleteOptions` pinning the DELETE to one pod incarnation.
+/// `DeleteOptions` pinning the DELETE to one pod incarnation, or unconditional when `uid` is
+/// unknown (empty).
 pub fn victim_delete_options(uid: &str) -> Value {
-    serde_json::json!({
-        "kind": "DeleteOptions",
-        "apiVersion": "v1",
-        "preconditions": { "uid": uid },
-    })
+    let mut options = serde_json::json!({ "kind": "DeleteOptions", "apiVersion": "v1" });
+    if !uid.is_empty() {
+        options["preconditions"] = serde_json::json!({ "uid": uid });
+    }
+    options
 }
 
 /// Build the status-subresource PATCH path for a pod.
@@ -10776,6 +10789,34 @@ mod tests {
     /// `evict_victims` returns `Ok(())`, without ever consulting this map),
     /// the scheduler would once again decide to bind before the real kubelet
     /// has freed the resource — exactly the failure this fix closes.
+    #[test]
+    fn victim_delete_options_omit_the_precondition_for_an_unknown_uid() {
+        assert!(
+            victim_delete_options("")["preconditions"].is_null(),
+            "preconditions.uid=\"\" is refused against any stored UID"
+        );
+        assert_eq!(victim_delete_options("u")["preconditions"]["uid"], "u");
+    }
+
+    #[test]
+    fn preemption_waiter_with_known_uid_ignores_a_same_name_recreations_removal() {
+        let mut tally = NodeTally::default();
+        tally.register_preemption_waiter(
+            empty_pending_pod(),
+            "worker-0".to_owned(),
+            &[("default/victim".to_owned(), "uid-old".to_owned())],
+        );
+        let gone = |uid: &str| {
+            json!({"type": "DELETED", "object": {"metadata": {
+                "name": "victim", "namespace": "default", "uid": uid}}})
+        };
+        assert!(
+            tally.apply_event(&gone("uid-new")).is_empty(),
+            "a recreated pod's removal must not release the bind onto capacity still held"
+        );
+        assert_eq!(tally.apply_event(&gone("uid-old")).len(), 1);
+    }
+
     #[test]
     fn preemption_waiter_only_resolves_once_its_own_victim_is_confirmed_gone() {
         let mut tally = NodeTally::default();

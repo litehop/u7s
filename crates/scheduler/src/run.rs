@@ -268,14 +268,14 @@ async fn evict_victims(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
             );
         }
-        delete_pod(client, v_ns, v_name, victim_uid).await?;
+        let deleted_uid = delete_pod(client, v_ns, v_name, victim_uid).await?;
         // By UID: a same-name pod recreated while the DELETE was in flight must keep its
         // reservation.
         tally
             .lock()
             .expect("tally lock poisoned")
-            .remove_if_uid(v_ns, v_name, victim_uid);
-        evicted.push((victim.clone(), victim_uid.clone()));
+            .remove_if_uid(v_ns, v_name, &deleted_uid);
+        evicted.push((victim.clone(), deleted_uid));
     }
     Ok(evicted)
 }
@@ -2400,7 +2400,11 @@ mod tests {
                                     sent_uid.unwrap_or_default()
                                 ),
                             ),
-                            _ => (
+                            Some(live) => (
+                                "200 OK".to_owned(),
+                                format!(r#"{{"kind":"Pod","metadata":{{"uid":"{live}"}}}}"#),
+                            ),
+                            None => (
                                 "200 OK".to_owned(),
                                 r#"{"kind":"Status","status":"Success"}"#.to_owned(),
                             ),
@@ -2547,6 +2551,38 @@ mod tests {
             tally.lock().unwrap().tallied_uid("default", "victim"),
             Some("uid-new".to_owned()),
             "the recreated pod's reservation must survive the refused eviction"
+        );
+    }
+
+    /// A victim whose UID the tally never learned: the apiserver refuses any stored UID against
+    /// `preconditions.uid=""`, so sending it would abort every such eviction. The DELETE goes
+    /// out unconditionally and the UID the apiserver reports for the deleted pod is what the
+    /// bind waiter is registered with, so a same-name recreation cannot release it.
+    #[tokio::test]
+    async fn victim_with_unknown_uid_is_evicted_without_precondition_and_learns_its_uid() {
+        let (client, counts) = spawn_bind_outcome_mock_server(201, "{}").await;
+        *counts.live_victim_uid.lock().unwrap() = Some("uid-live".to_owned());
+        let tally: Arc<Mutex<NodeTally>> = Arc::new(Mutex::new(NodeTally::default()));
+
+        let evicted = evict_victims(
+            &client,
+            &[("default/victim".to_owned(), String::new())],
+            &tally,
+            "preemptor",
+        )
+        .await
+        .expect("an unknown-UID victim must still be evictable");
+
+        let bodies = counts.delete_bodies.lock().unwrap().clone();
+        assert!(
+            !bodies[0].contains("preconditions"),
+            "an empty UID precondition always mismatches and would abort the eviction: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            evicted,
+            vec![("default/victim".to_owned(), "uid-live".to_owned())],
+            "the waiter must be keyed to the incarnation actually deleted"
         );
     }
 
