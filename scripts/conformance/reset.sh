@@ -177,6 +177,9 @@ wipe_store() {
   local workdir="$1"
   echo "[reset] Removing apiserver store $workdir/state.db* ..."
   rm -f "$workdir"/state.db "$workdir"/state.db-*
+  # Staged manifests carry the previous run's CIDRs; the apiserver boot-applies them
+  # before lima-start re-renders, and a Service IP outside the new range is a 422.
+  rm -f "$workdir"/manifests/*.yaml
 }
 
 # Everything on the guest that outlives the store and would mask a first boot:
@@ -200,6 +203,9 @@ wipe_guest_state() {
     pkill -f '[k]ube-controller-manager' || true
     pkill -f '[s]onobuoy' || true
     if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
+    rm -rf /var/lib/cni/networks /run/flannel/subnet.env
+    ip link delete cni0 2>/dev/null || true
+    ip link delete flannel.1 2>/dev/null || true
     findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
     find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   '
