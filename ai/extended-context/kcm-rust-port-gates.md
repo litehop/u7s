@@ -1,15 +1,19 @@
 ---
-as_of: 2026-11-28
+as_of: 2026-11-26
 kind: initiative-state
 ---
 
 # KCM Rust port gates
 
-**AS OF 2026-11-28.** Operator decision table, memory gate, verification
-protocol and trim validation. State, numbers and phase plan:
-`kcm-rust-port-state.md`.
+Initiative state, numbers, phase plan and open items: `kcm-rust-port-state.md`.
 
-## Operator decision table (2026-11-25)
+## Operator decision (2026-11-25) and what follows
+
+Operator: no high-risk KCM operations; start small with a scalable design;
+verify locally; deliver to releases or `install.sh` only once verification
+shows a performance benefit and conformance parity, and not soon. The mapping
+below is the mayor's reading of it. The gates and phases below are the local
+verification regime, not a shipping plan.
 
 | # | Question | Status |
 |---|---|---|
@@ -24,8 +28,8 @@ protocol and trim validation. State, numbers and phase plan:
 
 ## Memory gate (per phase)
 
-Metric: `Pss_Anon` (`smaps_rollup`) for KCM-Go, KCM-Rust and apiserver,
-`--install` mode, Lima VM, three stages (idle, WordPress+MariaDB,
+Metric: `Pss_Anon` from `smaps_rollup` for KCM-Go, KCM-Rust and the apiserver,
+in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 50-pod burst). Run-meta records `kcm_mode`; the ported-controller list and
 `scripts/conformance/kcm-memory-projection.sh` are not yet written.
 
@@ -39,9 +43,8 @@ Metric: `Pss_Anon` (`smaps_rollup`) for KCM-Go, KCM-Rust and apiserver,
   at every stage.
 - Phase 0 passes if `median(R) - median(T) >= 5`.
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
-  the projection `P = F + sum(m_c)` is at most 33.4 MiB (T WordPress KCM anon,
-  11-controller trim; the 10-controller trim measures 35.99, #2300;
-  re-baselining is an operator decision).
+- Continue only if the total gate passes, apiserver anon grew at most 2, and
+  the projection `P = F + sum(m_c)` is at most 33.4 MiB (T WordPress KCM anon, 11-controller trim; the 10-controller trim measures 35.99, #2300 — re-baselining is an operator decision).
 - Verdicts are terminal per commit SHA; all runs are retained. A run is void
   only if it ended before any stage metric or spec report, with a harness or
   VM log naming an external cause, ruled before the replacement run. At most
@@ -74,9 +77,7 @@ Layers: L0 `cargo test` reconcile tables from upstream unit cases; L1 local
 Never run Go and Rust copies of a controller together.
 Upstream `test/integration` runs its own in-process apiserver and Go
 controllers, so each ported controller needs black-box L1 scenarios
-(`mayor-anvu2`). Per-controller write attribution: the bounded `user` label on
-`apiserver_request_total` (controller-SA allowlist, else `other` or
-`unauthenticated`, #2301).
+(`mayor-anvu2`). Per-controller write attribution: the bounded `user` label on `apiserver_request_total` (controller-SA allowlist, else `other` or `unauthenticated`, #2301).
 
 Rollback: one env file renders Go's `--controllers=*,-<ported>` and Rust's
 `--controllers=<ported>`; an empty file is pure Go. A logic test asserts the
@@ -89,7 +90,8 @@ Baseline: untrimmed Go KCM, 2 nodes (lima-node-2 + lima-node-3, kubelet 1.37.3),
 The 11-controller trim failed the VAC lifecycle spec (the apiserver adds
 `kubernetes.io/vac-protection`; only `volumeattributesclass-protection-controller` removes it), so
 it stays; the trim is 10 controllers. Two 2-node 10-controller trim runs
-(`--kcm-mode T`): spec and failure sets (empty) equal baseline. A tcp:8080 liveness-probe
-failure seen once on a single-node run did not reproduce in 4 two-node runs (R 2/2, T 2/2); cause unestablished.
+(`--kcm-mode T`): spec and failure sets (empty) equal baseline. The tcp:8080 liveness-probe
+failure seen once on a single-node run did not reproduce in 4 two-node runs (R 2/2, T 2/2); cause
+unestablished.
 
 Spec-to-controller map: `scripts/conformance/kcm-trim-spec-map.txt`.
