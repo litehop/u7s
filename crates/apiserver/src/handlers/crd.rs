@@ -998,13 +998,6 @@ pub async fn replace_crd<S: Store>(
     reject_structural_field_change(&existing, &crd.spec, &name)?;
     validate_crd_schema(&crd.spec, Some(&existing))?;
 
-    // Preserve server-assigned creationTimestamp from stored copy if not present in incoming.
-    if crd.metadata.creation_timestamp.is_empty() {
-        if let Some(ts) = existing["metadata"]["creationTimestamp"].as_str() {
-            crd.metadata.creation_timestamp = ts.to_string();
-        }
-    }
-
     // metadata.uid is immutable identity, exactly like the generic replace_resource path
     // (resource.rs): a blank incoming uid is restored from the stored object, but a
     // non-blank incoming uid that mismatches the stored one is identity forgery, not a
@@ -1025,10 +1018,6 @@ pub async fn replace_crd<S: Store>(
             crd.metadata.uid
         )));
     }
-
-    crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
-        .as_str()
-        .map(str::to_string);
 
     crd.api_version = API_VERSION.to_string();
     crd.kind = KIND.to_string();
@@ -1058,8 +1047,9 @@ pub async fn replace_crd<S: Store>(
             dry_run: is_dry_run_header(&headers),
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
-        let mutated =
+        let mut mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
+        super::generic::pin_server_owned_metadata(&mut mutated, Some(&existing));
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
         crd = serde_json::from_value(mutated).map_err(|e| {
             Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
@@ -1821,10 +1811,6 @@ pub async fn patch_crd<S: Store>(
             .as_str()
             .unwrap_or("")
             .to_string();
-        crd.metadata.deletion_timestamp = existing["metadata"]["deletionTimestamp"]
-            .as_str()
-            .map(str::to_string);
-
         validate_crd_schema(&crd.spec, Some(&existing))?;
 
         // Admission webhook pipeline (mutating then validating).
@@ -1846,8 +1832,9 @@ pub async fn patch_crd<S: Store>(
             };
             let obj_val =
                 serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
-            let mutated =
+            let mut mutated =
                 run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
+            super::generic::pin_server_owned_metadata(&mut mutated, Some(&existing));
             run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
             crd = serde_json::from_value(mutated).map_err(|e| {
                 Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
@@ -6669,6 +6656,12 @@ mod ratchet_tests {
         assert!(
             crd["metadata"]["deletionTimestamp"].is_string(),
             "a client PUT must not un-terminate a CRD mid-finalization"
+        );
+        assert!(
+            crd["metadata"]["creationTimestamp"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "a PUT omitting creationTimestamp must keep the stored age"
         );
     }
 

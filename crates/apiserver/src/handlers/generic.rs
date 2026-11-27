@@ -1123,34 +1123,49 @@ pub(crate) async fn delete_collection_item<S: Store>(
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    pin_server_owned_deletion_fields(&mut obj.body, None);
+    pin_server_owned_metadata(&mut obj.body, None);
 }
 
+/// `metadata.creationTimestamp` is also pinned on update when the stored object has one
+/// (upstream `rest.BeforeUpdate`); create leaves it to `stamp_metadata`.
+///
 /// `metadata.deletionTimestamp` and `deletionGracePeriodSeconds` are server-owned: only the
 /// delete path may set them. On update they are overwritten with the stored values (or
 /// removed when the stored object has none); on create they are cleared (`stored` = `None`).
 /// Without this a caller holding only update/patch could hard-delete, terminate or
 /// un-terminate an object without the delete verb.
-pub(crate) fn pin_server_owned_deletion_fields(
+///
+/// Callers pin AFTER mutating admission, as upstream `rest.BeforeUpdate` does. Upstream copies
+/// `deletionGracePeriodSeconds` only when the new value is nil and then rejects any remaining
+/// difference as immutable; this overwrites unconditionally, which is the same result for every
+/// request upstream accepts.
+pub(crate) fn pin_server_owned_metadata(
     body: &mut serde_json::Value,
     stored: Option<&serde_json::Value>,
 ) {
-    pin_deletion_fields(body, stored.map(|s| &s["metadata"]));
+    pin_server_owned_fields(body, stored.map(|s| &s["metadata"]));
 }
 
 /// Cheap stand-in for the stored object when only its deletion fields are needed later
 /// (patch handlers mutate the stored body in place, so the originals must be copied out first).
-pub(crate) fn snapshot_deletion_fields(body: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn snapshot_server_owned_metadata(body: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"metadata": {
         "deletionTimestamp": body["metadata"]["deletionTimestamp"],
         "deletionGracePeriodSeconds": body["metadata"]["deletionGracePeriodSeconds"],
+        "creationTimestamp": body["metadata"]["creationTimestamp"],
     }})
 }
 
-fn pin_deletion_fields(body: &mut serde_json::Value, stored: Option<&serde_json::Value>) {
+fn pin_server_owned_fields(body: &mut serde_json::Value, stored: Option<&serde_json::Value>) {
     let Some(meta) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return;
     };
+    if let Some(ts) = stored
+        .map(|m| &m["creationTimestamp"])
+        .filter(|v| !v.is_null())
+    {
+        meta.insert("creationTimestamp".to_string(), ts.clone());
+    }
     for field in ["deletionTimestamp", "deletionGracePeriodSeconds"] {
         match stored.map(|m| &m[field]).filter(|v| !v.is_null()) {
             Some(v) => {
