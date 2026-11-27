@@ -1140,7 +1140,7 @@ pub(crate) async fn delete_namespace<S: Store>(
     )
     .map_err(|e| e.into_status("", "namespaces", &name, "Namespace"))?;
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     // Run once here, before branching into soft-delete/finalizer logic below, matching every
     // other delete handler's single admission point.
     let admission_ctx = AdmissionContext {
@@ -1158,7 +1158,7 @@ pub(crate) async fn delete_namespace<S: Store>(
         })),
         dry_run,
     };
-    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &obj.body, &admission_ctx).await?;
 
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // apply_delete_policy already stamped status.phase=Terminating in place

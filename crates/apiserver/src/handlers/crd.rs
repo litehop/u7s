@@ -1132,7 +1132,7 @@ pub async fn delete_crd<S: Store>(
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
 
-    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE).
     let admission_ctx = AdmissionContext {
         group: "apiextensions.k8s.io",
         version: "v1",
@@ -1148,7 +1148,7 @@ pub async fn delete_crd<S: Store>(
         })),
         dry_run,
     };
-    run_validating_webhooks(&state, &existing, Some(&existing), &admission_ctx).await?;
+    crate::admission::admit_delete(&state, &existing, &admission_ctx).await?;
 
     // Dry-run: validation passed; return the would-be Success status without persisting or
     // running any of the cascade side effects (schema/conversion-cache evict, watch-ring
