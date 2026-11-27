@@ -30632,7 +30632,9 @@ mod tests {
         #[derive(Clone, Copy, Debug)]
         enum Verb {
             MergePatch,
+            StrategicMerge,
             JsonPatch,
+            Apply,
             Put,
         }
 
@@ -30735,6 +30737,28 @@ mod tests {
                     );
                     serde_json::json!({ "metadata": metadata })
                 }
+                // Upstream's CR handler rejects strategic-merge with 415; this server accepts it,
+                // so the cell proves the accepted path cannot start a delete either.
+                Verb::StrategicMerge => {
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/strategic-merge-patch+json".parse().unwrap(),
+                    );
+                    serde_json::json!({ "metadata": metadata })
+                }
+                Verb::Apply => {
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/apply-patch+yaml".parse().unwrap(),
+                    );
+                    let mut meta = metadata.clone();
+                    meta["name"] = name.into();
+                    serde_json::json!({
+                        "apiVersion": format!("{group}/{version}"),
+                        "kind": if namespaced { "Application" } else { "Widget" },
+                        "metadata": meta,
+                    })
+                }
                 Verb::JsonPatch => {
                     headers.insert(
                         axum::http::header::CONTENT_TYPE,
@@ -30810,12 +30834,16 @@ mod tests {
             }
         }
 
-        const ALL: [(bool, Verb); 6] = [
+        const ALL: [(bool, Verb); 10] = [
             (true, Verb::MergePatch),
+            (true, Verb::StrategicMerge),
             (true, Verb::JsonPatch),
+            (true, Verb::Apply),
             (true, Verb::Put),
             (false, Verb::MergePatch),
+            (false, Verb::StrategicMerge),
             (false, Verb::JsonPatch),
+            (false, Verb::Apply),
             (false, Verb::Put),
         ];
 
@@ -30850,7 +30878,12 @@ mod tests {
 
         #[tokio::test]
         async fn removing_last_finalizer_on_a_terminating_cr_still_completes_the_delete() {
+            // Strategic-merge and apply with `finalizers: []` do not empty the stored list, so
+            // they cannot express a drain here.
             for (namespaced, verb) in ALL {
+                if matches!(verb, Verb::StrategicMerge | Verb::Apply) {
+                    continue;
+                }
                 let state = setup(namespaced, "w", &["example.com/hold"]).await;
                 mark_terminating(&state, namespaced, "w").await;
                 update(
