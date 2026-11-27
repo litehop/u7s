@@ -98,8 +98,10 @@
 #   is kept.
 # STEP G: reap fix-round worktrees on non-worker branch names (see below).
 # STEP I: kill `until ! pgrep -f "<pattern>"` wait loops whose pattern matches
-#   nothing but wait loops (they match themselves and never exit). Loops with
-#   a live target are never touched.
+#   nothing but wait loops (they match themselves and never exit). Only
+#   shell `-c` loops older than 10 minutes with no limactl/ssh/exec involvement
+#   are candidates; loops with a live target are never touched. Scope is every
+#   process of the invoking user, across sessions and repos.
 # STEP H: read-only. Report loudly when the latest completed `audit.yaml`
 #   decisive run on main is red (`failure`/`timed_out`/`startup_failure`) (run URL plus any RUSTSEC-/GHSA- ids from
 #   its log). The audit is deliberately non-blocking for PRs, so this is
@@ -933,13 +935,44 @@ step_h_main_audit() {
 # ---------------------------------------------------------------------------
 # STEP I -- orphaned self-matching wait loops.
 # `until ! pgrep -f "<pattern>"; do sleep N; done` matches its own command
-# line, so it never exits. Kill such a loop only when no process outside the
-# set of loops matches its pattern. A loop's owner can't be reliably read from
-# its command line, so --live-agents is not consulted: "the target is still
-# running" is the safety condition, and a live target is never touched.
+# line, so it never exits. Kill such a loop only when it is certainly an
+# orphan; every doubt means "keep". The process must be a shell running
+# `-c <script>`, must not involve limactl/ssh/docker exec/kubectl exec (host
+# pgrep can't see a guest or remote target), must be older than
+# WAIT_LOOP_MIN_AGE_SECS, and no process outside the loops may match its
+# pattern. Scope: every process of the invoking user, from any session or repo
+# (ownership can't be read from a command line, so --live-agents is not
+# consulted).
 # ---------------------------------------------------------------------------
+WAIT_LOOP_MIN_AGE_SECS=600
+WAIT_LOOP_REMOTE_RE='limactl|(^|[^[:alnum:]_])ssh([^[:alnum:]_]|$)|docker exec|kubectl exec'
+WAIT_LOOP_SHELL_RE='^([^ ]*/)?(bash|zsh|sh) (-[A-Za-z-]+ )*-[A-Za-z]*c '
+
+# Output: "pid ppid etime command" per candidate line.
 wait_loop_lines() {
-  ps -axo pid=,command= | grep -F 'until ! pgrep -f' | grep -v 'grep -F' || true
+  ps -u "$(id -u)" -o pid=,ppid=,etime=,command= | grep -F 'until ! pgrep -f' | grep -v 'grep -F' || true
+}
+
+# [[dd-]hh:]mm:ss -> seconds; prints nothing when malformed.
+etime_to_secs() {
+  local re='^(([0-9]+)-)?(([0-9]+):)?([0-9]+):([0-9]+)$'
+  [[ "$1" =~ $re ]] || return 0
+  echo $(( ((10#${BASH_REMATCH[2]:-0} * 24 + 10#${BASH_REMATCH[4]:-0}) * 60 + 10#${BASH_REMATCH[5]}) * 60 + 10#${BASH_REMATCH[6]} ))
+}
+
+# True for a well-formed, old-enough shell -c loop with no remote/VM
+# involvement. Arg: "pid ppid etime command".
+wait_loop_killable() {
+  local pid ppid etime cmd secs parent
+  read -r pid ppid etime cmd <<< "$1"
+  [[ "$pid" =~ ^[0-9]+$ && "$ppid" =~ ^[0-9]+$ ]] || return 1
+  secs=$(etime_to_secs "$etime")
+  [ -n "$secs" ] && [ "$secs" -ge "$WAIT_LOOP_MIN_AGE_SECS" ] || return 1
+  [[ "$cmd" =~ $WAIT_LOOP_SHELL_RE ]] || return 1
+  [[ "$cmd" =~ $WAIT_LOOP_REMOTE_RE ]] && return 1
+  parent=$(ps -o command= -p "$ppid" 2>/dev/null || true)
+  [[ "$parent" =~ $WAIT_LOOP_REMOTE_RE ]] && return 1
+  return 0
 }
 
 wait_loop_pattern() {
@@ -957,12 +990,14 @@ step_i_orphaned_wait_loops() {
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
+    wait_loop_killable "$line" || continue
     pid=$(awk '{print $1}' <<< "$line")
     loop_pids+="$pid "
   done <<< "$lines"
 
   while IFS= read -r line; do
     [ -z "$line" ] && continue
+    wait_loop_killable "$line" || continue
     pid=$(awk '{print $1}' <<< "$line")
     pattern=$(wait_loop_pattern "$line")
     [ -z "$pattern" ] && continue
