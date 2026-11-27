@@ -94,7 +94,7 @@ fn schema_with(patterns: &[&str]) -> serde_json::Value {
 #[test]
 fn pattern_over_nfa_budget_is_rejected_even_when_short() {
     let schema = schema_with(&["\\pL{244}"]);
-    let err = super::crd::check_pattern_compile_budget(&schema, "s")
+    let err = super::crd::check_pattern_compile_budget(&schema, "s", &mut 0)
         .expect_err("a pattern that compiles past the NFA budget must be rejected");
     let json = serde_json::to_value(&err.1).unwrap();
     assert_eq!(json["code"], 422);
@@ -115,8 +115,67 @@ fn realistic_patterns_stay_within_nfa_budget() {
         "^(\\d{1,3}\\.){3}\\d{1,3}(/\\d{1,2})?$",
         "(unclosed",
     ]);
-    super::crd::check_pattern_compile_budget(&schema, "s")
+    super::crd::check_pattern_compile_budget(&schema, "s", &mut 0)
         .expect("ordinary patterns, and invalid ones (left to boon), must pass");
+}
+
+/// Each `\pL{20}` compiles to ~0.8 MiB, under the 1 MiB per-pattern cap.
+const SUBCAP_PATTERN: &str = "\\pL{20}";
+
+/// Every property a CRD declares keeps its own compiled regex resident, so ten patterns
+/// that each pass the per-pattern cap can still pin ~8.6 MiB; without the aggregate
+/// bound one CRD could retain GiBs, and the same pattern repeated counts every time
+/// because boon compiles each occurrence separately.
+#[test]
+fn sum_of_subcap_patterns_over_total_budget_is_rejected_with_path_and_totals() {
+    let schema = schema_with(&[SUBCAP_PATTERN; 10]);
+    let err = super::crd::check_pattern_compile_budget(&schema, "s", &mut 0)
+        .expect_err("ten sub-cap patterns summing past 8 MiB must be rejected");
+    let json = serde_json::to_value(&err.1).unwrap();
+    assert_eq!(json["code"], 422);
+    let msg = json["message"].as_str().unwrap();
+    assert!(msg.contains("s.properties.f9.pattern"), "{msg}");
+    assert!(
+        msg.contains("CRD pattern compile budget exceeded (8.2 MiB > 8.0 MiB)"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn sum_under_total_budget_is_accepted() {
+    let schema = schema_with(&[SUBCAP_PATTERN; 9]);
+    let mut total = 0;
+    super::crd::check_pattern_compile_budget(&schema, "s", &mut total)
+        .expect("nine sub-cap patterns stay under 8 MiB");
+    assert!(
+        total > 7 << 20,
+        "total must actually be accumulated: {total}"
+    );
+}
+
+/// Representative of Cilium CiliumNetworkPolicy, the largest real CRD measured: many
+/// copies of CIDR / FQDN / port patterns. Must stay far below the budget so real
+/// installs keep working.
+#[test]
+fn cilium_style_pattern_set_is_accepted_with_headroom() {
+    let distinct = [
+        "^([-a-zA-Z0-9_]+[.]?)+$",
+        "^[-a-zA-Z0-9_*]+([.][-a-zA-Z0-9_*]+)*[.]?$",
+        "^(?:(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:3[0-2]|[12]?[0-9]))$",
+        "^([0-9]{1,5}|[a-z][a-z0-9-]{0,14}[a-z0-9])$",
+        "^[a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?$",
+        "^(\\d{1,3}\\.){3}\\d{1,3}$",
+        "^[0-9a-fA-F:]+(/\\d{1,3})?$",
+    ];
+    let patterns: Vec<&str> = (0..140).map(|i| distinct[i % distinct.len()]).collect();
+    let schema = schema_with(&patterns);
+    let mut total = 0;
+    super::crd::check_pattern_compile_budget(&schema, "s", &mut total)
+        .expect("a Cilium-style pattern set must be accepted");
+    assert!(
+        total * 4 < super::crd::MAX_CRD_PATTERN_TOTAL_NFA_BYTES,
+        "expected generous headroom, got {total}"
+    );
 }
 
 #[test]
