@@ -4,7 +4,8 @@
 # Why it matters: a VM that ran install.sh keeps u7s units running; a host-rig bring-up on
 # top of them fails with "node has no IPv4 podCIDR". Without the automatic teardown every
 # operator and agent must remember a manual step first, and a clean VM must never be torn
-# down (that would wipe a working rig VM's state for nothing).
+# down (that would wipe a working rig VM's state for nothing). The converse holds for
+# run-all.sh --install: a VM left in host-rig state is unrigged first, a clean one is not.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,7 +50,7 @@ case "\$1" in
     if [ "\$3" = sh ]; then
       [ ! -e "$TMP/probe-fails" ] || exit 255
       [ ! -e "$TMP/probe-garbage" ] || { echo "Permission denied"; exit 0; }
-      if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
+      if { case "\$5" in *"$INSTALL_STATE_MARKER"*) grep -qx "\$2" "$TMP/install-state" ;; *) false ;; esac; } || { case "\$5" in *"$INSTALL_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/legacy-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_MARKER"*) grep -qx "\$2" "$TMP/rig-state" ;; *) false ;; esac; } || { case "\$5" in *"$RIG_STATE_LEGACY_UNIT"*) grep -qx "\$2" "$TMP/rig-legacy-state" ;; *) false ;; esac; }; then echo present; else echo absent; fi
     elif [ "\$3" = sudo ]; then
       PATH="$TMP/guest-bin:\$PATH" $REAL_BASH -c "\$6"
     fi ;;
@@ -61,6 +62,7 @@ cat > "$TMP/bin/bash" <<EOF
 printf '%s\n' "\$*" >> "$TMP/calls.log"
 case "\$*" in
   *install-teardown.sh*) for v in \$(cat "$TMP/teardown-fails"); do case "\$*" in *"--vm \$v "*) exit 1 ;; esac; done ;;
+  *lima-unrig.sh*) for v in \$(cat "$TMP/unrig-fails"); do case "\$*" in *"--vm \$v") exit 1 ;; esac; done ;;
 esac
 EOF
 # Guest-side stubs for reset.sh's wipe script: find logs instead of deleting anything.
@@ -71,6 +73,7 @@ export PATH="$TMP/bin:$PATH"
 
 reset_fixture() {
   : > "$TMP/calls.log"; : > "$TMP/install-state"; : > "$TMP/legacy-state"; : > "$TMP/teardown-fails"
+  : > "$TMP/rig-state"; : > "$TMP/rig-legacy-state"; : > "$TMP/unrig-fails"
   rm -f "$TMP"/status-* "$TMP/probe-fails" "$TMP/probe-garbage" "$TMP/find.log"
 }
 teardowns() { grep -c 'install-teardown.sh' "$TMP/calls.log" || true; }
@@ -196,6 +199,98 @@ echo vm-a > "$TMP/install-state"
 "$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
 check "--install without --reset never tears down (re-running an install must keep its VM's install state)" "0" "$(teardowns)"
 check "--install without --reset still hands off to install-run.sh" "1" "$(grep -c 'install-run.sh' "$TMP/calls.log" || true)"
+
+unrigs() { grep -c 'lima-unrig.sh --vm [^ ]*$' "$TMP/calls.log" || true; }
+
+# Converse direction: run-all.sh --install on a VM left in host-rig state.
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+echo vm-b >> "$TMP/rig-state"
+clear_rig_state_if_present "$DIR" vm-a=$PORT vm-b=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+check "rig-state primary and extra node are both cleared before install.sh runs (rc)" "0" "$rc"
+check "unrig ran once per rig-state VM, each followed by its --check (a surviving drop-in would override install.sh's kubelet)" \
+  "2|2" "$(unrigs)|$(grep -c 'lima-unrig.sh --vm vm-[ab] --check' "$TMP/calls.log")"
+check "clearing is announced loudly so an operator sees why their rig VM was unrigged" \
+  "2" "$(grep -c '^\[run-all\] vm-[ab] carries host-rig state; running lima-unrig.sh' "$TMP/err.log")"
+check "RIG_CLEARED tells run-all.sh the host rig's processes need reaping" "1" "$RIG_CLEARED"
+
+reset_fixture
+echo vm-b > "$TMP/rig-state"
+clear_rig_state_if_present "$DIR" vm-a=$PORT vm-b=$PORT 2>/dev/null
+check "a VM without rig state is left untouched (only the rig-state one is unrigged)" \
+  "1|vm-b" "$(unrigs)|$(grep -o -e 'lima-unrig.sh --vm vm-.' "$TMP/calls.log" | sed -n 's/.*--vm //;1p')"
+
+reset_fixture
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null
+check "clean VM: unrig is not invoked and the host rig is not reaped" "0|0" "$(unrigs)|$RIG_CLEARED"
+
+reset_fixture
+echo vm-a > "$TMP/install-state"
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null
+check "an install-state VM is not mistaken for rig state (re-running an install must keep its install)" "0" "$(unrigs)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-legacy-state"
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null
+check "a pre-drop-in rig (kube-proxy unit only) is unrigged, not mistaken for a clean VM" "1" "$(unrigs)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+echo vm-a > "$TMP/unrig-fails"
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+check "a failed unrig returns non-zero (install.sh must not run on half-cleared rig state)" "1" "$rc"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+: > "$TMP/probe-fails"
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>"$TMP/err.log" && rc=0 || rc=$?
+check "a rig-state probe ssh failure is an error, not 'clean VM' (rc)" "1" "$rc"
+check "a rig-state probe ssh failure never reaches lima-unrig.sh" "0" "$(unrigs)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+echo Stopped > "$TMP/status-vm-a"
+clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null && rc=0 || rc=$?
+check "a stopped rig-state VM is provision-synced, started, then unrigged" \
+  "0|template|start|1" "$rc|$(grep -o -e '^limactl template' -e '^limactl start' "$TMP/calls.log" | awk '{print $2}' | uniq | paste -sd'|' -)|$(unrigs)"
+
+# End to end through run-all.sh --install.
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+echo vm-b >> "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --extra-node vm-b --extra-kubelet-port 10002 \
+  --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
+check "run-all.sh --install unrigs the primary and the extra node" "2" "$(unrigs)"
+check "run-all.sh --install reaps the host rig's processes after unrigging" \
+  "1" "$(grep -c "reset.sh --host-only --workdir $TMP/wd --port 6444" "$TMP/calls.log" || true)"
+first="$(grep -n -e lima-unrig.sh -e install-run.sh "$TMP/calls.log" | head -1)"
+check "run-all.sh --install unrigs before handing off to install-run.sh" \
+  "lima-unrig.sh" "$(grep -o -e lima-unrig.sh -e install-run.sh <<<"$first")"
+check "run-all.sh --install still hands off to install-run.sh after clearing" "1" "$(grep -c 'install-run.sh' "$TMP/calls.log" || true)"
+
+reset_fixture
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
+check "run-all.sh --install on a clean VM neither unrigs nor reaps host processes" \
+  "0|0" "$(unrigs)|$(grep -c 'reset.sh --host-only' "$TMP/calls.log" || true)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+echo vm-a > "$TMP/unrig-fails"
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh --install exits non-zero when the unrig fails (rc)" "1" "$rc"
+check "run-all.sh --install does not reach install-run.sh after a failed unrig" "0" "$(grep -c 'install-run.sh' "$TMP/calls.log" || true)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+: > "$TMP/probe-fails"
+"$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 && rc=0 || rc=$?
+check "run-all.sh --install exits non-zero when the rig-state probe fails (rc)" "1" "$rc"
+check "run-all.sh --install does not reach install-run.sh after a failed probe" "0" "$(grep -c 'install-run.sh' "$TMP/calls.log" || true)"
+
+reset_fixture
+echo vm-a > "$TMP/rig-state"
+"$REAL_BASH" "$DIR/run-all.sh" --install --reset --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
+check "--install --reset skips the rig probe (the VM is deleted anyway)" "0" "$(unrigs)"
 
 # reset.sh --store-only after install-teardown: /var/lib/kubelet is gone, and find on a missing
 # directory aborts the guest script, failing the whole bring-up. The dev host has no such dir;
