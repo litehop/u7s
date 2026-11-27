@@ -254,16 +254,83 @@ pub(crate) const KCM_CONTROLLER_SERVICE_ACCOUNTS: &[&str] = &[
     "volumeattributesclass-protection-controller",
 ];
 
-/// Identities whose watches bypass both the per-client and global caps, so a tenant
-/// exhausting the pool cannot lock out the control plane (and the controller-manager's
-/// 100+ watches fit): the provisioned admin (CN=admin, O=system:masters), kubelets
-/// (`system:node:<name>`, O=system:nodes), the controller-manager, the scheduler and the
-/// kube-system ServiceAccounts the controller-manager runs its controllers as
-/// (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts (coredns,
-/// metrics-server, anything user-deployed) draw from the ordinary pools: upstream maps them
-/// to the shared-seat workload-high level, not an exemption.
-/// Mirrors upstream APF's exempt (system:masters), system-nodes and system-leader-election
-/// flow schemas. Matched on username, which is only as trustworthy as the cluster CA's
+/// Concurrent watches the controller-manager identity may hold. One informer per type plus
+/// one garbage-collector watch per resource, so the count grows with the CRD count: 68 on a
+/// live single-node stack, ~2 more per namespaced CRD. A cap, not a reservation: the
+/// semaphore is created on first use and costs nothing until watches are open.
+pub const MAX_KCM_WATCHES: usize = 1024;
+
+/// Concurrent watches the scheduler may hold (7 measured).
+pub const MAX_SCHEDULER_WATCHES: usize = 64;
+
+/// Concurrent watches each controller-manager ServiceAccount may hold. The controllers watch
+/// through the controller-manager identity, so the measured peak is 0.
+pub const MAX_CONTROLLER_SA_WATCHES: usize = 8;
+
+/// Concurrent watches each kubelet may hold (14 measured).
+pub const MAX_NODE_WATCHES: usize = 64;
+
+/// Control-plane pool: the sum of every identity's cap, so the controller-manager can never
+/// be starved by the scheduler or the ServiceAccounts, whatever they hold.
+pub const MAX_CONTROL_PLANE_WATCHES_GLOBAL: usize = MAX_KCM_WATCHES
+    + MAX_SCHEDULER_WATCHES
+    + MAX_CONTROLLER_SA_WATCHES * KCM_CONTROLLER_SERVICE_ACCOUNTS.len();
+
+/// Node-only pool, separate from the control-plane pool so kubelets can never starve the
+/// controller-manager. 512 serves 36 nodes at the measured 14 watches each, or 8 at the
+/// 64-watch cap, against u7s's small-cluster target.
+pub const MAX_NODE_WATCHES_GLOBAL: usize = 512;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WatchClass {
+    Exempt,
+    Kcm,
+    Scheduler,
+    ControllerSa,
+    Node,
+    Ordinary,
+}
+
+pub fn watch_class(username: &str) -> WatchClass {
+    match username {
+        "admin" => WatchClass::Exempt,
+        "system:kube-controller-manager" => WatchClass::Kcm,
+        "system:kube-scheduler" => WatchClass::Scheduler,
+        _ if username.starts_with("system:node:") => WatchClass::Node,
+        _ if is_system_priority_username(username) => WatchClass::ControllerSa,
+        _ => WatchClass::Ordinary,
+    }
+}
+
+/// `(per-client, server-wide)` watch caps that apply to `username`; the second is the size
+/// of the pool its class draws from.
+pub fn watch_caps(username: &str) -> (usize, usize) {
+    match watch_class(username) {
+        WatchClass::Exempt | WatchClass::Ordinary => (MAX_WATCHES_PER_CLIENT, MAX_WATCHES_GLOBAL),
+        WatchClass::Kcm => (MAX_KCM_WATCHES, MAX_CONTROL_PLANE_WATCHES_GLOBAL),
+        WatchClass::Scheduler => (MAX_SCHEDULER_WATCHES, MAX_CONTROL_PLANE_WATCHES_GLOBAL),
+        WatchClass::ControllerSa => (MAX_CONTROLLER_SA_WATCHES, MAX_CONTROL_PLANE_WATCHES_GLOBAL),
+        WatchClass::Node => (MAX_NODE_WATCHES, MAX_NODE_WATCHES_GLOBAL),
+    }
+}
+
+/// The only identity exempt from watch and in-flight limits: the provisioned admin
+/// (CN=admin, O=system:masters), mirroring upstream's exempt level, which holds
+/// system:masters alone.
+pub fn is_exempt_username(username: &str) -> bool {
+    username == "admin"
+}
+
+/// Identities with reserved capacity: they draw from the reserved watch pool and the
+/// reserved in-flight seats, so a tenant exhausting the ordinary pools cannot lock out the
+/// control plane, but each is still capped (per-class watch caps from `watch_caps`:
+/// `MAX_KCM_WATCHES`, `MAX_SCHEDULER_WATCHES`, `MAX_CONTROLLER_SA_WATCHES`,
+/// `MAX_NODE_WATCHES`; per-identity in-flight share). Kubelets (`system:node:<name>`, O=system:nodes), the controller-manager,
+/// the scheduler and the kube-system ServiceAccounts the controller-manager runs its
+/// controllers as (`KCM_CONTROLLER_SERVICE_ACCOUNTS`). Other kube-system ServiceAccounts
+/// (coredns, metrics-server, anything user-deployed) draw from the ordinary pools. Upstream
+/// maps these to the shared-seat system and workload-high levels, not an exemption.
+/// Matched on username, which is only as trustworthy as the cluster CA's
 /// issuance: a principal allowed to approve and sign `kubernetes.io/kube-apiserver-client`
 /// CSRs can mint a certificate with any CN here (upstream's signer likewise forbids only
 /// O=system:masters), so that RBAC grant is effectively a control-plane grant. Likewise
@@ -286,6 +353,8 @@ pub fn is_system_priority_username(username: &str) -> bool {
 pub struct WatchLimitState {
     inner: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     global: Arc<Semaphore>,
+    control_plane: Arc<Semaphore>,
+    node: Arc<Semaphore>,
 }
 
 impl Default for WatchLimitState {
@@ -300,22 +369,45 @@ impl WatchLimitState {
     }
 
     pub fn with_global_capacity(capacity: usize) -> Self {
+        Self::with_capacities(
+            capacity,
+            MAX_CONTROL_PLANE_WATCHES_GLOBAL,
+            MAX_NODE_WATCHES_GLOBAL,
+        )
+    }
+
+    pub fn with_capacities(global: usize, control_plane: usize, node: usize) -> Self {
         WatchLimitState {
             inner: Arc::default(),
-            global: Arc::new(Semaphore::new(capacity)),
+            global: Arc::new(Semaphore::new(global)),
+            control_plane: Arc::new(Semaphore::new(control_plane)),
+            node: Arc::new(Semaphore::new(node)),
         }
     }
 
-    /// Take one slot from the server-wide pool, or `None` when it is exhausted.
-    pub fn try_acquire_global(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.global.clone().try_acquire_owned().ok()
+    /// Take one slot from the server-wide pool of `client_key`'s class (the control plane and
+    /// kubelets each draw from their own pool), or `None` when it is exhausted.
+    pub fn try_acquire_global(
+        &self,
+        client_key: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let pool = match watch_class(client_key) {
+            WatchClass::Kcm | WatchClass::Scheduler | WatchClass::ControllerSa => {
+                &self.control_plane
+            }
+            WatchClass::Node => &self.node,
+            WatchClass::Exempt | WatchClass::Ordinary => &self.global,
+        };
+        pool.clone().try_acquire_owned().ok()
     }
 
-    /// Return the Semaphore for the given client key, creating one if absent.
+    /// Return the Semaphore for the given client key, creating one if absent, sized by the
+    /// key's class (`watch_caps`).
     pub fn semaphore_for(&self, client_key: &str) -> Arc<Semaphore> {
+        let cap = watch_caps(client_key).0;
         let mut map = self.inner.lock().unwrap();
         map.entry(client_key.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(MAX_WATCHES_PER_CLIENT)))
+            .or_insert_with(|| Arc::new(Semaphore::new(cap)))
             .clone()
     }
 
@@ -2270,6 +2362,47 @@ mod tests {
         ] {
             assert!(!is_system_priority_username(u), "{u} is tenant-mintable");
         }
+    }
+
+    #[test]
+    fn watch_caps_follow_the_operator_class_table() {
+        let sa = "system:serviceaccount:kube-system:deployment-controller";
+        assert_eq!(watch_caps("system:kube-controller-manager").0, 1024);
+        assert_eq!(watch_caps("system:kube-scheduler").0, 64);
+        assert_eq!(watch_caps(sa).0, 8);
+        assert_eq!(watch_caps("system:node:n1").0, 64);
+        assert_eq!(watch_caps("alice").0, MAX_WATCHES_PER_CLIENT);
+    }
+
+    #[test]
+    fn control_plane_pool_holds_every_identity_at_its_cap() {
+        // If the pool were smaller than the sum, the scheduler and SAs at their caps could
+        // starve the controller-manager of watches it is entitled to.
+        let sum = MAX_KCM_WATCHES
+            + MAX_SCHEDULER_WATCHES
+            + MAX_CONTROLLER_SA_WATCHES * KCM_CONTROLLER_SERVICE_ACCOUNTS.len();
+        assert!(MAX_CONTROL_PLANE_WATCHES_GLOBAL >= sum);
+    }
+
+    #[test]
+    fn ordinary_watch_pool_is_unchanged() {
+        assert_eq!(MAX_WATCHES_GLOBAL, 512);
+        assert_eq!(MAX_WATCHES_PER_CLIENT, 256);
+        assert_eq!(WatchLimitState::new().global.available_permits(), 512);
+    }
+
+    #[test]
+    fn exhausting_the_node_pool_leaves_control_plane_and_ordinary_pools_untouched() {
+        let limits = WatchLimitState::with_capacities(1, 1, 1);
+        let _node = limits.try_acquire_global("system:node:n1").unwrap();
+        assert!(limits.try_acquire_global("system:node:n2").is_none());
+        assert!(
+            limits
+                .try_acquire_global("system:kube-controller-manager")
+                .is_some(),
+            "kubelets filling the node pool must not starve the controller-manager"
+        );
+        assert!(limits.try_acquire_global("alice").is_some());
     }
 
     // Regression test for the other half of the CrConversionCache memory-growth bug (the
