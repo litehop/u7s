@@ -474,8 +474,9 @@ if [ "$INSTALL" -eq 1 ]; then
   [ -z "$EXTRA_NODE" ] || _INSTALL_ARGS+=(--extra-node "$EXTRA_NODE" --extra-kubelet-port "$EXTRA_KUBELET_PORT")
   [ -z "${U7S_VM_NAME:-}" ] || _INSTALL_ARGS+=(--vm "$U7S_VM_NAME")
   [ "$VERBOSE" -lt 1 ] || _INSTALL_ARGS+=(--rust-log "$RUST_LOG")
-  # --reset deletes the VMs; a kept VM may still carry host-rig state that install.sh trips over
-  # ("Existing worker node detected"), and the rig's host apiserver may still hold the port.
+  # --reset deletes the VMs; a kept VM may still carry host-rig state whose kubelet drop-in
+  # overrides install.sh's kubelet, and the rig's host apiserver may still hold the port.
+  # (Unrigging does not touch /var/lib/u7s, so it does not cover "Existing worker node detected".)
   if [ "$RESET" -eq 0 ]; then
     clear_rig_state_if_present "$DIR" "${U7S_VM_NAME:-lima-node}=${KUBELET_PORT:-10250}" ${EXTRA_NODE:+"$EXTRA_NODE=$EXTRA_KUBELET_PORT"} || exit 1
     if [ "$RIG_CLEARED" -eq 1 ]; then
