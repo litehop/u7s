@@ -5,4 +5,4 @@
 | idle | 42.99 | 34.87 | 8.12 | 20.57 | 19.89 |
 | wordpress | 45.13 | 35.99 | 9.14 | 22.00 | 20.82 |
 
-Phase 0 (`median(R) - median(T) >= 5` at every stage): PASS
+Phase 0 (`median(R) - median(T) >= 5`): PASS on idle and wordpress. The 50-pod burst stage is not measured (the harness lacks it, `mayor-84rmv`); the two-stage pass is accepted by operator decision 2026-11-27.
