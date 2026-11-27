@@ -1451,6 +1451,13 @@ struct TalliedPod {
     pvc_names: Vec<String>,
 }
 
+/// Whether a watch event for pod UID `event_uid` may mutate state recorded for
+/// UID `known_uid` under the same ns/name. An empty UID on either side carries no identity
+/// and falls back to matching by name.
+fn same_incarnation(known_uid: &str, event_uid: &str) -> bool {
+    known_uid.is_empty() || event_uid.is_empty() || known_uid == event_uid
+}
+
 /// A preemption plan whose victims have all had their graceful DELETE issued
 /// (see `delete_pod`'s doc comment) but not yet confirmed PHYSICALLY gone by
 /// a real watch event from the kubelet actually running them.
@@ -1458,10 +1465,11 @@ struct TalliedPod {
 struct WaitingPlan {
     pod: PendingPod,
     node_name: String,
-    /// Victim keys ("namespace/name") not yet confirmed gone. Shrinks as
+    /// Victim keys ("namespace/name") mapped to the UID evicted (empty if
+    /// unknown), not yet confirmed gone. Shrinks as
     /// `PreemptionWaiters::resolve` observes each one's real removal; once
     /// empty, the plan is ready for `main.rs`'s deferred bind.
-    remaining_victims: std::collections::HashSet<String>,
+    remaining_victims: std::collections::HashMap<String, String>,
 }
 
 /// Preemption plans deferred by `main.rs`'s `preempt_and_pick_node` between
@@ -1491,7 +1499,7 @@ struct PreemptionWaiters {
 }
 
 impl PreemptionWaiters {
-    fn register(&mut self, pod: PendingPod, node_name: String, victims: &[String]) {
+    fn register(&mut self, pod: PendingPod, node_name: String, victims: &[(String, String)]) {
         self.plans.push(WaitingPlan {
             pod,
             node_name,
@@ -1503,9 +1511,15 @@ impl PreemptionWaiters {
     /// every plan for which this was the LAST still-awaited victim, each as
     /// `(pod, node_name)` — ready for the caller to attempt the deferred
     /// bind for (after re-verifying fit; see this struct's doc comment).
-    fn resolve(&mut self, victim_key: &str) -> Vec<(PendingPod, String)> {
+    fn resolve(&mut self, victim_key: &str, uid: &str) -> Vec<(PendingPod, String)> {
         for plan in &mut self.plans {
-            plan.remaining_victims.remove(victim_key);
+            if plan
+                .remaining_victims
+                .get(victim_key)
+                .is_some_and(|victim_uid| same_incarnation(victim_uid, uid))
+            {
+                plan.remaining_victims.remove(victim_key);
+            }
         }
         let mut ready = Vec::new();
         let mut i = 0;
@@ -1550,7 +1564,9 @@ impl PreemptionWaiters {
 /// the waiting pod, never a stuck-forever one.
 #[derive(Debug, Default)]
 struct PvcWaiters {
-    by_pvc: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Waiting pods as `(pod_key, uid)`; the UID keeps a late event for a deleted
+    /// incarnation from dropping a same-name recreation's registration.
+    by_pvc: std::collections::HashMap<String, std::collections::HashSet<(String, String)>>,
 }
 
 impl PvcWaiters {
@@ -1561,18 +1577,25 @@ impl PvcWaiters {
     /// forever, for a permanently-missing PVC. A plain `Vec::push` here
     /// would grow that one pod's entry once per tick without bound; the set
     /// makes re-registering the same pair a no-op instead.
-    fn register(&mut self, pvc_key: String, pod_key: String) {
-        self.by_pvc.entry(pvc_key).or_default().insert(pod_key);
+    fn register(&mut self, pvc_key: String, pod_key: String, uid: String) {
+        self.by_pvc
+            .entry(pvc_key)
+            .or_default()
+            .insert((pod_key, uid));
     }
 
     /// `pvc_key` was just observed as ADDED/MODIFIED (i.e. it now exists).
     /// Returns every pod key that was waiting on exactly this PVC, ready for
     /// the caller to re-drive.
     fn resolve(&mut self, pvc_key: &str) -> Vec<String> {
-        self.by_pvc
+        let mut keys: Vec<String> = self
+            .by_pvc
             .remove(pvc_key)
-            .map(|pods| pods.into_iter().collect())
-            .unwrap_or_default()
+            .map(|pods| pods.into_iter().map(|(key, _)| key).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     /// `pvc_key` was just observed as DELETED — drop its waiters outright,
@@ -1588,9 +1611,9 @@ impl PvcWaiters {
     /// other than this exact waiter resolving) or is deleted while still
     /// registered leaves a stale entry that `resolve` would otherwise hand
     /// back to a caller with nothing left to schedule.
-    fn remove_pod(&mut self, pod_key: &str) {
+    fn remove_pod(&mut self, pod_key: &str, uid: &str) {
         self.by_pvc.retain(|_, pods| {
-            pods.remove(pod_key);
+            pods.retain(|(key, waiter_uid)| key != pod_key || !same_incarnation(waiter_uid, uid));
             !pods.is_empty()
         });
     }
@@ -1680,8 +1703,16 @@ impl FailureBackoff {
             .collect()
     }
 
-    pub fn clear(&mut self, key: &str) {
-        self.entries.remove(key);
+    /// Drops `key`'s entry unless it belongs to a different pod UID than `uid`
+    /// (empty `uid` clears by name).
+    pub fn clear(&mut self, key: &str, uid: &str) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|s| same_incarnation(&s.uid, uid))
+        {
+            self.entries.remove(key);
+        }
     }
 
     /// Drops every entry whose `(key, uid)` is not in `pending` — the pods a
@@ -1851,7 +1882,11 @@ impl NodeTally {
     /// erase the entry of a same-name pod already tallied under a different UID. An event
     /// without a UID removes by name.
     fn remove_event_pod(&mut self, key: &str, uid: &str) {
-        if uid.is_empty() || self.pods.get(key).is_some_and(|p| p.uid == uid) {
+        if self
+            .pods
+            .get(key)
+            .is_some_and(|p| same_incarnation(&p.uid, uid))
+        {
             self.remove_pod(key);
         }
     }
@@ -1891,10 +1926,10 @@ impl NodeTally {
 
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.remove_event_pod(&key, &uid);
-            self.failures.clear(&key);
+            self.failures.clear(&key, &uid);
             // A deleted pod can never be re-driven — see `PvcWaiters::remove_pod`.
-            self.pvc_waiters.remove_pod(&key);
-            return self.waiters.resolve(&key);
+            self.pvc_waiters.remove_pod(&key, &uid);
+            return self.waiters.resolve(&key, &uid);
         }
         let terminal = matches!(
             watch_event.object.status.phase.as_str(),
@@ -1917,8 +1952,8 @@ impl NodeTally {
                 // Now bound — a waiter registered against it can never be
                 // re-driven off `resolve` any more (see
                 // `PvcWaiters::remove_pod`).
-                self.pvc_waiters.remove_pod(&key);
-                self.failures.clear(&key);
+                self.pvc_waiters.remove_pod(&key, &uid);
+                self.failures.clear(&key, &uid);
                 self.insert_pod(
                     key,
                     TalliedPod {
@@ -1943,8 +1978,8 @@ impl NodeTally {
                 // preemption victim that completes this way (rather than
                 // being hard-deleted first) must resolve waiters too.
                 self.remove_event_pod(&key, &uid);
-                self.pvc_waiters.remove_pod(&key);
-                self.waiters.resolve(&key)
+                self.pvc_waiters.remove_pod(&key, &uid);
+                self.waiters.resolve(&key, &uid)
             }
             None => {
                 // Still unbound: do NOT remove any existing entry. Live-
@@ -2101,7 +2136,7 @@ impl NodeTally {
         &mut self,
         pod: PendingPod,
         node_name: String,
-        victims: &[String],
+        victims: &[(String, String)],
     ) {
         self.waiters.register(pod, node_name, victims);
     }
@@ -2351,9 +2386,15 @@ impl NodeTally {
     /// missing-PVC branch right before it releases `pod_key` from
     /// `in_flight` and gives up on this scheduling attempt. See
     /// `PvcWaiters`'s doc comment for what re-drives it.
-    pub fn register_pvc_waiter(&mut self, namespace: &str, pvc_name: &str, pod_key: String) {
+    pub fn register_pvc_waiter(
+        &mut self,
+        namespace: &str,
+        pvc_name: &str,
+        pod_key: String,
+        uid: String,
+    ) {
         self.pvc_waiters
-            .register(pvc_key(namespace, pvc_name), pod_key);
+            .register(pvc_key(namespace, pvc_name), pod_key, uid);
     }
 
     /// Update the PV cache from one raw PersistentVolume watch event — see
@@ -10600,7 +10641,7 @@ mod tests {
         tally.register_preemption_waiter(
             preemptor,
             "worker-0".to_owned(),
-            &["default/victim".to_owned()],
+            &[("default/victim".to_owned(), String::new())],
         );
 
         let unrelated = tally.apply_event(&json!({
@@ -10641,7 +10682,10 @@ mod tests {
         tally.register_preemption_waiter(
             preemptor,
             "worker-0".to_owned(),
-            &["default/victim-a".to_owned(), "default/victim-b".to_owned()],
+            &[
+                ("default/victim-a".to_owned(), String::new()),
+                ("default/victim-b".to_owned(), String::new()),
+            ],
         );
 
         let after_first = tally.apply_event(&json!({
@@ -10683,7 +10727,7 @@ mod tests {
         tally.register_preemption_waiter(
             preemptor,
             "worker-0".to_owned(),
-            &["default/victim".to_owned()],
+            &[("default/victim".to_owned(), String::new())],
         );
 
         let abandoned = tally.clear();
@@ -10777,7 +10821,12 @@ mod tests {
     #[test]
     fn apply_pvc_event_resolves_the_pod_waiting_on_exactly_this_pvc() {
         let mut tally = NodeTally::default();
-        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        tally.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
 
         let ready = tally.apply_pvc_event(&json!({
             "type": "ADDED",
@@ -10805,7 +10854,12 @@ mod tests {
     #[test]
     fn apply_pvc_event_does_not_resolve_a_waiter_registered_for_a_different_pvc() {
         let mut tally = NodeTally::default();
-        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        tally.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
 
         let ready = tally.apply_pvc_event(&json!({
             "type": "ADDED",
@@ -10828,8 +10882,18 @@ mod tests {
     #[test]
     fn replace_pvc_cache_resolves_waiters_whose_pvc_arrived_in_the_replay() {
         let mut live = NodeTally::default();
-        live.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
-        live.register_pvc_waiter("default", "still-missing", "default/populate-b".to_owned());
+        live.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
+        live.register_pvc_waiter(
+            "default",
+            "still-missing",
+            "default/populate-b".to_owned(),
+            String::new(),
+        );
         let mut fresh = NodeTally::default();
         let _ = fresh.apply_pvc_event(&json!({
             "type": "ADDED",
@@ -10906,7 +10970,12 @@ mod tests {
     #[test]
     fn clear_pvc_cache_drops_registered_pvc_waiters() {
         let mut tally = NodeTally::default();
-        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        tally.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
 
         tally.clear_pvc_cache();
 
@@ -10930,7 +10999,12 @@ mod tests {
     #[test]
     fn node_tally_clear_drops_registered_pvc_waiters() {
         let mut tally = NodeTally::default();
-        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        tally.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
 
         let _ = tally.clear();
 
@@ -10952,7 +11026,12 @@ mod tests {
     #[test]
     fn apply_event_bound_pod_drops_its_pvc_waiter() {
         let mut tally = NodeTally::default();
-        tally.register_pvc_waiter("default", "prime-pvc", "default/populate-a".to_owned());
+        tally.register_pvc_waiter(
+            "default",
+            "prime-pvc",
+            "default/populate-a".to_owned(),
+            String::new(),
+        );
 
         let _ = tally.apply_event(&json!({
             "type": "MODIFIED",
@@ -10974,6 +11053,151 @@ mod tests {
             ready.is_empty(),
             "a bound pod's PVC waiter must be removed — got {ready:?}"
         );
+    }
+
+    fn pod_event(event_type: &str, uid: Option<&str>, extra: Value) -> Value {
+        let mut object = json!({ "metadata": { "name": "web-0", "namespace": "default" } });
+        if let Some(uid) = uid {
+            object["metadata"]["uid"] = json!(uid);
+        }
+        if let (Some(target), Some(extra)) = (object.as_object_mut(), extra.as_object()) {
+            target.extend(extra.clone());
+        }
+        json!({ "type": event_type, "object": object })
+    }
+
+    /// Registers failure backoff, a PVC waiter and a deferred-bind waiter for
+    /// `default/web-0` incarnation `uid`.
+    fn tally_with_per_pod_state(uid: &str) -> NodeTally {
+        let mut tally = NodeTally::default();
+        tally.failures.record_failure(
+            "default/web-0",
+            uid,
+            "0/1 nodes available",
+            std::time::Instant::now(),
+        );
+        tally.register_pvc_waiter(
+            "default",
+            "data",
+            "default/web-0".to_owned(),
+            uid.to_owned(),
+        );
+        let mut preemptor = empty_pending_pod();
+        preemptor.pod_name = "preemptor".to_owned();
+        tally.register_preemption_waiter(
+            preemptor,
+            "worker-0".to_owned(),
+            &[("default/web-0".to_owned(), uid.to_owned())],
+        );
+        tally
+    }
+
+    fn pvc_added() -> Value {
+        json!({
+            "type": "ADDED",
+            "object": { "metadata": { "name": "data", "namespace": "default" }, "spec": {} }
+        })
+    }
+
+    /// A late DELETED for the old incarnation must not wipe the recreated
+    /// pod's failure backoff: it would be retried immediately instead of
+    /// after its backoff, hot-looping an unschedulable pod.
+    #[test]
+    fn late_deleted_of_old_uid_keeps_recreated_pods_backoff_so_it_is_not_hot_looped() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        assert_eq!(
+            tally.failures.backed_off(std::time::Instant::now()).len(),
+            1,
+            "the recreated pod lost its backoff to a stale DELETED"
+        );
+    }
+
+    /// A late DELETED for the old incarnation must not drop the recreated
+    /// pod's PVC waiter: the pod would never be re-driven when its PVC
+    /// appears and would wait out the full resync interval.
+    #[test]
+    fn late_deleted_of_old_uid_keeps_recreated_pods_pvc_waiter_so_it_still_schedules() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        let _ = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        assert_eq!(
+            tally.apply_pvc_event(&pvc_added()),
+            vec!["default/web-0".to_owned()],
+            "the recreated pod's PVC waiter was dropped by a stale DELETED"
+        );
+    }
+
+    /// A late DELETED for the old incarnation must not confirm the evicted
+    /// victim gone: the preemptor would bind before the victim is really
+    /// removed and be rejected OutOfResource by the kubelet.
+    #[test]
+    fn late_deleted_of_old_uid_does_not_release_the_bind_waiting_on_the_new_uid() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        assert!(
+            tally
+                .apply_event(&pod_event("DELETED", Some("uid-old"), json!({})))
+                .is_empty(),
+            "a stale DELETED released a deferred bind"
+        );
+        assert_eq!(
+            tally
+                .apply_event(&pod_event("DELETED", Some("uid-new"), json!({})))
+                .len(),
+            1,
+            "the awaited incarnation's own DELETED must still release the bind"
+        );
+    }
+
+    /// A stale bound event for the old incarnation must not erase the
+    /// recreated pod's PVC waiter or backoff either.
+    #[test]
+    fn stale_bound_event_of_old_uid_keeps_recreated_pods_backoff_and_pvc_waiter() {
+        let mut tally = tally_with_per_pod_state("uid-new");
+        let bound = json!({ "spec": { "nodeName": "worker-0" }, "status": { "phase": "Running" } });
+        let _ = tally.apply_event(&pod_event("MODIFIED", Some("uid-old"), bound));
+        assert_eq!(
+            tally.failures.backed_off(std::time::Instant::now()).len(),
+            1,
+            "the recreated pod lost its backoff to a stale bound event"
+        );
+        assert_eq!(
+            tally.apply_pvc_event(&pvc_added()).len(),
+            1,
+            "the recreated pod lost its PVC waiter to a stale bound event"
+        );
+    }
+
+    /// The ordinary order (the registered incarnation is the one deleted) must
+    /// still clean everything up, or a deleted pod leaks backoff and waiters
+    /// forever.
+    #[test]
+    fn deleted_of_the_registered_uid_clears_backoff_pvc_waiter_and_bind_waiter() {
+        let mut tally = tally_with_per_pod_state("uid-old");
+        let ready = tally.apply_event(&pod_event("DELETED", Some("uid-old"), json!({})));
+        assert_eq!(ready.len(), 1, "the victim's DELETED must release the bind");
+        assert!(tally
+            .failures
+            .backed_off(std::time::Instant::now())
+            .is_empty());
+        assert!(tally.apply_pvc_event(&pvc_added()).is_empty());
+    }
+
+    /// A DELETED carrying no UID has no identity to compare, so it falls back
+    /// to matching by name and clears everything registered for that name.
+    #[test]
+    fn deleted_without_uid_falls_back_to_by_name_cleanup() {
+        let mut tally = tally_with_per_pod_state("uid-any");
+        let ready = tally.apply_event(&pod_event("DELETED", None, json!({})));
+        assert_eq!(
+            ready.len(),
+            1,
+            "a UID-less DELETED must still release the bind"
+        );
+        assert!(tally
+            .failures
+            .backed_off(std::time::Instant::now())
+            .is_empty());
+        assert!(tally.apply_pvc_event(&pvc_added()).is_empty());
     }
 
     // parse_quantity_milli tests — the resource-quantity arithmetic underlying
