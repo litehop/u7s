@@ -201,7 +201,7 @@ wipe_guest_state() {
     pkill -f '[s]onobuoy' || true
     if command -v crictl >/dev/null 2>&1; then crictl rmp -fa >/dev/null 2>&1 || true; fi
     findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
-    find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    [ ! -d /var/lib/kubelet ] || find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   '
 }
 

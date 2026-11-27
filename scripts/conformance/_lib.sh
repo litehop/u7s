@@ -1018,6 +1018,35 @@ is_install_tunnel_pid() {
   esac
 }
 
+# The unit file install.sh writes (and the rig never does): its presence means the VM still runs
+# an install.sh deployment that fights the host rig ("node has no IPv4 podCIDR").
+INSTALL_STATE_MARKER=/etc/systemd/system/u7s-apiserver.service
+
+# vm_in_install_state <vm>: 0 if the VM exists and carries the install.sh unit. A stopped VM is
+# started first, since its units come back at boot; a missing VM is simply not in install state.
+vm_in_install_state() {
+  local vm="$1" status
+  status=$(limactl list --format '{{.Status}}' "$vm" 2>/dev/null) || return 1
+  [ -n "$status" ] || return 1
+  [ "$status" = Running ] || limactl start "$vm" >&2 || return 1
+  limactl shell "$vm" test -e "$INSTALL_STATE_MARKER"
+}
+
+# teardown_if_install_state <dir> <workdir> <vm>...: runs install-teardown.sh for each VM in
+# install state; returns non-zero if any teardown fails.
+teardown_if_install_state() {
+  local dir="$1" workdir="$2" vm
+  shift 2
+  for vm in "$@"; do
+    vm_in_install_state "$vm" || continue
+    echo "[run-all] $vm is in install state; running install-teardown.sh" >&2
+    bash "$dir/install-teardown.sh" --vm "$vm" --workdir "$workdir" || {
+      echo "error: install-teardown.sh failed for $vm; the host rig cannot run on top of install state" >&2
+      return 1
+    }
+  done
+}
+
 # Prints the per-VM default Lima network. Single source for lima-start.sh and
 # install-bringup.sh; mirrors the Network column of the Lima VM protocol table in the
 # dispatch template doc. VMs outside the known set fall back to the flat "user-v2".
