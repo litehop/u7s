@@ -204,7 +204,7 @@ async fn preempt_and_pick_node(
             );
         }
         match evict_victims(client, &plan.victims, tally, pod_name).await {
-            Ok(()) => {
+            Ok(evicted) => {
                 // Every victim in `plan.victims` has had its graceful DELETE
                 // acknowledged — NOT confirmed physically gone (see this
                 // function's doc comment). Release the claim bookkeeping
@@ -214,11 +214,7 @@ async fn preempt_and_pick_node(
                 // victim's real removal.
                 let mut guard = tally.lock().expect("tally lock poisoned");
                 guard.release_victims(&plan.victims);
-                guard.register_preemption_waiter(
-                    pending.clone(),
-                    plan.node_name.clone(),
-                    &plan.victims,
-                );
+                guard.register_preemption_waiter(pending.clone(), plan.node_name.clone(), &evicted);
                 return Ok(());
             }
             Err(e) => {
@@ -247,13 +243,15 @@ async fn preempt_and_pick_node(
 /// DisruptionTarget condition on each first (best-effort, mirrors upstream
 /// kube-scheduler). Split out of `preempt_and_pick_node` so a mid-loop
 /// eviction failure is a single `?` there, making the reservation-rollback
-/// path easy to see.
+/// path easy to see. Returns each evicted victim as `(key, uid)` (empty uid if
+/// it was not tallied), so the deferred bind waits for that incarnation's removal.
 async fn evict_victims(
     client: &ApiClient,
     victims: &[String],
     tally: &Mutex<NodeTally>,
     pod_name: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut evicted = Vec::with_capacity(victims.len());
     for victim in victims {
         let Some((v_ns, v_name)) = victim.split_once('/') else {
             continue;
@@ -276,14 +274,15 @@ async fn evict_victims(
         delete_pod(client, v_ns, v_name).await?;
         // By UID: a same-name pod recreated while the DELETE was in flight must keep its
         // reservation.
-        if let Some(uid) = victim_uid {
+        if let Some(uid) = &victim_uid {
             tally
                 .lock()
                 .expect("tally lock poisoned")
-                .remove_if_uid(v_ns, v_name, &uid);
+                .remove_if_uid(v_ns, v_name, uid);
         }
+        evicted.push((victim.clone(), victim_uid.unwrap_or_default()));
     }
-    Ok(())
+    Ok(evicted)
 }
 
 /// Attempt the bind `preempt_and_pick_node` deferred, once
@@ -1072,7 +1071,7 @@ fn handle_pod_event(
                 tally_clone
                     .lock()
                     .expect("tally lock poisoned")
-                    .register_pvc_waiter(&namespace, &missing, key.clone());
+                    .register_pvc_waiter(&namespace, &missing, key.clone(), pending.uid.clone());
                 in_flight_clone
                     .lock()
                     .expect("in_flight lock poisoned")
@@ -1295,7 +1294,12 @@ fn handle_pod_event(
                     .lock()
                     .expect("tally lock poisoned")
                     .failures
-                    .clear(&key);
+                    .clear(
+                        &key,
+                        event["object"]["metadata"]["uid"]
+                            .as_str()
+                            .unwrap_or_default(),
+                    );
                 (
                     "Scheduled",
                     format!("Successfully assigned {namespace}/{pod_name} to {node}"),
@@ -3747,7 +3751,7 @@ mod tests {
             left(&b, Duration::from_secs(10)).is_none(),
             "backoff is capped at 10s"
         );
-        b.clear("default/p");
+        b.clear("default/p", "");
         assert!(
             b.backed_off(t0).is_empty(),
             "a bound or deleted pod must not stay backed off"
@@ -3826,7 +3830,7 @@ mod tests {
         let mut b = crate::FailureBackoff::default();
         let t0 = Instant::now();
         assert!(b.record_failure("default/web-0", "old", "no fit", t0));
-        b.clear("default/web-0");
+        b.clear("default/web-0", "");
         // The deleted pod's in-flight attempt finishes after the DELETED echo.
         b.record_failure("default/web-0", "old", "no fit", t0);
         assert!(
