@@ -207,7 +207,7 @@ wipe_guest_state() {
     ip link delete cni0 2>/dev/null || true
     ip link delete flannel.1 2>/dev/null || true
     findmnt -rn -o TARGET | grep -e "^/var/lib/kubelet/" -e "^/run/netns/" | sort -r | xargs -r umount -l 2>/dev/null || true
-    find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    [ ! -d /var/lib/kubelet ] || find /var/lib/kubelet -mindepth 1 -maxdepth 1 -exec rm -rf {} +
   '
 }
 
