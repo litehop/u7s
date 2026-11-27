@@ -9018,6 +9018,25 @@ pub(crate) async fn bind_pod<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // Binding `metadata.uid` is a precondition, as upstream: a bind decided for a pod that
+    // has since been deleted and recreated under the same name must not land on the new pod.
+    if let Some(uid) = binding["metadata"]["uid"]
+        .as_str()
+        .filter(|u| !u.is_empty())
+    {
+        crate::types::Preconditions {
+            uid: Some(uid.to_owned()),
+            resource_version: None,
+        }
+        .check(&obj.body)
+        .map_err(|msg| {
+            Status::conflict(format!(
+                "Operation cannot be fulfilled on pods/binding \"{name}\": {msg}. \
+                 The object might have been deleted and then recreated"
+            ))
+        })?;
+    }
+
     // A pod may only be bound once. Rejecting unconditionally (not just on a
     // mismatched target) matches upstream kube-apiserver, which never allows a
     // second bind even to the same node — a stray duplicate bind call must not
@@ -16942,6 +16961,71 @@ mod handler_tests {
         assert_eq!(
             v["spec"]["nodeName"], "worker-1",
             "bind_pod must set spec.nodeName to the target node"
+        );
+    }
+
+    /// A bind carrying the UID of a pod that was since deleted and recreated under the same
+    /// name must be refused: otherwise a scheduling decision made for the old pod silently
+    /// places the new, unrelated pod (wrong node, wrong resource accounting). A matching UID
+    /// must still bind.
+    #[tokio::test]
+    async fn bind_with_stale_uid_returns_conflict_and_leaves_recreated_pod_unbound() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "recreated",
+            serde_json::json!({"metadata": {
+                "name": "recreated", "namespace": "default",
+                "resourceVersion": "1", "uid": "uid-new"
+            }}),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+        let bind_with_uid = |uid: &str| {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/pods/recreated/binding")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json_body(&serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Binding",
+                    "metadata": {"name": "recreated", "namespace": "default", "uid": uid},
+                    "target": {"kind": "Node", "name": "worker-1"}
+                })))
+                .unwrap();
+            app.clone().oneshot(req)
+        };
+
+        let resp = bind_with_uid("uid-old").await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a bind for the deleted pod's UID must not land on the recreated pod"
+        );
+        let stored = store
+            .get("/registry/pods/default/recreated")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["spec"].get("nodeName").is_none(),
+            "the recreated pod must stay unbound after the stale-UID bind is rejected"
+        );
+
+        let resp = bind_with_uid("uid-new").await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a bind whose UID matches the stored pod must succeed"
         );
     }
 
