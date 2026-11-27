@@ -1072,11 +1072,9 @@ _probe_starting_stopped() {
 
 # clear_rig_state_if_present <dir> <vm>=<kubelet port>...: runs lima-unrig.sh for each VM carrying
 # host-rig state and verifies it with --check; returns non-zero if a probe or a clear fails.
-# Sets RIG_CLEARED=1 when any VM was cleared.
 clear_rig_state_if_present() {
   local dir="$1" spec vm port rc
   shift
-  RIG_CLEARED=0
   for spec in "$@"; do
     vm="${spec%%=*}"; port="${spec#*=}"
     rc=0; _probe_starting_stopped vm_rig_state_probe "rig state" "$dir" "$vm" "$port" || rc=$?
@@ -1090,7 +1088,6 @@ clear_rig_state_if_present() {
       echo "error: lima-unrig.sh failed for $vm; install.sh cannot run on top of host-rig state" >&2
       return 1
     }
-    RIG_CLEARED=1
   done
 }
 

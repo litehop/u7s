@@ -479,10 +479,10 @@ if [ "$INSTALL" -eq 1 ]; then
   # (Unrigging does not touch /var/lib/u7s, so it does not cover "Existing worker node detected".)
   if [ "$RESET" -eq 0 ]; then
     clear_rig_state_if_present "$DIR" "${U7S_VM_NAME:-lima-node}=${KUBELET_PORT:-10250}" ${EXTRA_NODE:+"$EXTRA_NODE=$EXTRA_KUBELET_PORT"} || exit 1
-    if [ "$RIG_CLEARED" -eq 1 ]; then
-      echo "[run-all] reaping the host rig's processes before install" >&2
-      bash "$DIR/reset.sh" --host-only --workdir "$WORKDIR" --port "${PORT:-6443}" || exit 1
-    fi
+    # Unconditional: an earlier run that unrigged and then aborted leaves a clean VM but a live
+    # rig apiserver on the port. reset.sh --host-only kills by this workdir's cmdline only.
+    echo "[run-all] reaping the host rig's processes before install" >&2
+    bash "$DIR/reset.sh" --host-only --workdir "$WORKDIR" --port "${PORT:-6443}" || exit 1
   fi
   exec bash "$DIR/install-run.sh" "${_INSTALL_ARGS[@]}"
 fi

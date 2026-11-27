@@ -215,7 +215,6 @@ check "unrig ran once per rig-state VM, each followed by its --check (a survivin
   "2|2" "$(unrigs)|$(grep -c 'lima-unrig.sh --vm vm-[ab] --check' "$TMP/calls.log")"
 check "clearing is announced loudly so an operator sees why their rig VM was unrigged" \
   "2" "$(grep -c '^\[run-all\] vm-[ab] carries host-rig state; running lima-unrig.sh' "$TMP/err.log")"
-check "RIG_CLEARED tells run-all.sh the host rig's processes need reaping" "1" "$RIG_CLEARED"
 
 reset_fixture
 echo vm-b > "$TMP/rig-state"
@@ -225,7 +224,7 @@ check "a VM without rig state is left untouched (only the rig-state one is unrig
 
 reset_fixture
 clear_rig_state_if_present "$DIR" vm-a=$PORT 2>/dev/null
-check "clean VM: unrig is not invoked and the host rig is not reaped" "0|0" "$(unrigs)|$RIG_CLEARED"
+check "clean VM: unrig is not invoked" "0" "$(unrigs)"
 
 reset_fixture
 echo vm-a > "$TMP/install-state"
@@ -273,8 +272,13 @@ check "run-all.sh --install still hands off to install-run.sh after clearing" "1
 
 reset_fixture
 "$REAL_BASH" "$DIR/run-all.sh" --install --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
-check "run-all.sh --install on a clean VM neither unrigs nor reaps host processes" \
-  "0|0" "$(unrigs)|$(grep -c 'reset.sh --host-only' "$TMP/calls.log" || true)"
+check "run-all.sh --install on a clean VM does not unrig but still reaps host processes (a retry after an aborted unrig leaves the rig apiserver on the port)" \
+  "0|1" "$(unrigs)|$(grep -c "reset.sh --host-only --workdir $TMP/wd --port 6444" "$TMP/calls.log" || true)"
+
+reset_fixture
+"$REAL_BASH" "$DIR/run-all.sh" --install --reset --stack-only --vm vm-a --port 6444 --workdir "$TMP/wd" >"$TMP/out.log" 2>&1 || true
+check "--install --reset does not take the host-only reap (the reset deletes the VM and wipes the workdir itself)" \
+  "0" "$(grep -c 'reset.sh --host-only' "$TMP/calls.log" || true)"
 
 reset_fixture
 echo vm-a > "$TMP/rig-state"
