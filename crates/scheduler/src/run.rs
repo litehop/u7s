@@ -37,7 +37,7 @@ use crate::{
     scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, unscheduled_pod_uids, ApiClient, BindError,
-    NodeTally, PendingPod, PodList,
+    NodeTally, PendingPod, PodList, PodRecreated,
 };
 
 /// Bind `pending` to `node`, which `pick_node` has already reserved in
@@ -269,6 +269,12 @@ async fn evict_victims(
         )
         .await
         {
+            if e.downcast_ref::<PodRecreated>().is_some() {
+                anyhow::bail!(
+                    "victim {v_ns}/{v_name} was recreated since the plan (uid {victim_uid} is \
+                     gone): {e}"
+                );
+            }
             error!(
                 "failed to set DisruptionTarget condition on preemption victim {v_ns}/{v_name}: {e}"
             );
@@ -2388,9 +2394,9 @@ mod tests {
                         let live = counts.live_victim_uid.lock().unwrap().clone();
                         match (live, sent_uid) {
                             (Some(live), Some(sent)) if sent != live => (
-                                "409 Conflict".to_owned(),
+                                "422 Unprocessable Entity".to_owned(),
                                 format!(
-                                    r#"{{"kind":"Status","reason":"Conflict","message":"Precondition failed: UID in precondition: {sent}, UID in object meta: {live}"}}"#
+                                    r#"{{"kind":"Status","reason":"Invalid","code":422,"message":"Pod \"p\" is invalid: metadata.uid: Invalid value: \"{sent}\": field is immutable"}}"#
                                 ),
                             ),
                             (live, _) => {
@@ -2571,15 +2577,10 @@ mod tests {
              predecessor: {stamped:?}"
         );
         let bodies = counts.delete_bodies.lock().unwrap().clone();
-        assert_eq!(
-            bodies.len(),
-            1,
-            "nothing may be evicted after the stale victim: {bodies:?}"
-        );
         assert!(
-            bodies[0].contains(r#""uid":"uid-old""#),
-            "the DELETE must carry the plan-time UID precondition: {}",
-            bodies[0]
+            bodies.is_empty(),
+            "the 422 on the DisruptionTarget patch already proves the victim was recreated, so \
+             nothing may be deleted, the stale victim or any later one: {bodies:?}"
         );
         assert_eq!(
             tally.lock().unwrap().tallied_uid("default", "victim"),

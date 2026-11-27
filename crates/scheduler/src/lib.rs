@@ -5820,7 +5820,29 @@ pub fn check_status_patch_response(status: u16, body: &str) -> anyhow::Result<()
     if (200..300).contains(&status) {
         return Ok(());
     }
+    if is_immutable_uid_rejection(status, body) {
+        return Err(PodRecreated(format!(
+            "status patch rejected with HTTP {status} (pod recreated since the decision): {body}"
+        ))
+        .into());
+    }
     bail!("status patch failed with HTTP {status}: {body}")
+}
+
+/// A status PATCH pinned to a pod's `metadata.uid` that the apiserver refused because the
+/// stored pod has another UID. Found in the error chain of `patch_pod_status`.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PodRecreated(pub String);
+
+/// Whether a PATCH was refused because its `metadata.uid` names a pod incarnation that is no
+/// longer the stored one. A PATCH carries no precondition upstream, so the changed UID fails
+/// update validation instead: a 422 whose message is
+/// `metadata.uid: Invalid value: "<uid>": field is immutable`.
+pub fn is_immutable_uid_rejection(status: u16, body: &str) -> bool {
+    status == 422
+        && body.contains("metadata.uid: Invalid value")
+        && body.contains("field is immutable")
 }
 
 /// PATCH a pod's `.status` via .../pods/:name/status.
@@ -5972,6 +5994,30 @@ mod tests {
             ),
             "a stale resourceVersion means the same pod changed, not that it was recreated"
         );
+    }
+
+    #[test]
+    fn immutable_uid_rejection_requires_422_and_the_immutable_uid_text() {
+        let body = r#"{"message":"Pod \"p\" is invalid: metadata.uid: Invalid value: \"a\": field is immutable"}"#;
+        assert!(is_immutable_uid_rejection(422, body));
+        assert!(
+            !is_immutable_uid_rejection(409, body),
+            "a PATCH has no precondition; only the 422 means the pod was recreated"
+        );
+        assert!(
+            !is_immutable_uid_rejection(
+                422,
+                r#"{"message":"Pod \"p\" is invalid: spec.nodeName: Invalid value: \"a\": field is immutable"}"#
+            ),
+            "another immutable field says nothing about the pod having been recreated"
+        );
+        let err = check_status_patch_response(422, body).expect_err("422 is an error");
+        assert!(
+            err.downcast_ref::<PodRecreated>().is_some(),
+            "evict_victims aborts on this marker; without it a recreated victim is evicted"
+        );
+        let other = check_status_patch_response(500, body).expect_err("500 is an error");
+        assert!(other.downcast_ref::<PodRecreated>().is_none());
     }
 
     #[test]
@@ -10811,15 +10857,6 @@ mod tests {
     // main.rs functions is unit-testable without a live API server.
     // ---------------------------------------------------------------------------
 
-    /// The core regression: registering a plan (mirroring what
-    /// `preempt_and_pick_node` now does instead of binding immediately) must
-    /// NOT resolve on an unrelated pod's DELETE, and must resolve on the
-    /// plan's own victim's DELETE — the real signal the kubelet emits only
-    /// once it has actually stopped the container. If this regressed back to
-    /// resolving eagerly (e.g. `preempt_and_pick_node` binding right after
-    /// `evict_victims` returns `Ok(())`, without ever consulting this map),
-    /// the scheduler would once again decide to bind before the real kubelet
-    /// has freed the resource — exactly the failure this fix closes.
     #[test]
     fn victim_delete_options_omit_the_precondition_for_an_unknown_uid() {
         assert!(
@@ -10848,6 +10885,15 @@ mod tests {
         assert_eq!(tally.apply_event(&gone("uid-old")).len(), 1);
     }
 
+    /// The core regression: registering a plan (mirroring what
+    /// `preempt_and_pick_node` now does instead of binding immediately) must
+    /// NOT resolve on an unrelated pod's DELETE, and must resolve on the
+    /// plan's own victim's DELETE — the real signal the kubelet emits only
+    /// once it has actually stopped the container. If this regressed back to
+    /// resolving eagerly (e.g. `preempt_and_pick_node` binding right after
+    /// `evict_victims` returns `Ok(())`, without ever consulting this map),
+    /// the scheduler would once again decide to bind before the real kubelet
+    /// has freed the resource — exactly the failure this fix closes.
     #[test]
     fn preemption_waiter_only_resolves_once_its_own_victim_is_confirmed_gone() {
         let mut tally = NodeTally::default();
@@ -12810,8 +12856,6 @@ mod tests {
         );
     }
 
-    /// The message must name the preemptor pod so a user reading `kubectl
-    /// describe pod` on the victim can tell which pod displaced it.
     #[test]
     fn disruption_target_patch_is_pinned_to_the_victim_uid_when_known() {
         assert_eq!(
@@ -12822,6 +12866,8 @@ mod tests {
         assert!(disruption_target_patch("p", "")["metadata"].is_null());
     }
 
+    /// The message must name the preemptor pod so a user reading `kubectl
+    /// describe pod` on the victim can tell which pod displaced it.
     #[test]
     fn disruption_target_patch_message_names_the_preemptor() {
         let patch = disruption_target_patch("high-priority-pod", "uid-v");
