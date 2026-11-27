@@ -5489,6 +5489,9 @@ pub async fn patch_cr<S: Store>(
     // instead of storing the update, or the CR stays stuck Terminating forever.
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
+    // The drain decision reads the stored deletionTimestamp, never the patch's: a patch-only
+    // caller must not be able to start a delete.
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
@@ -5844,6 +5847,9 @@ pub async fn patch_cr_namespaced<S: Store>(
     // the delete instead of storing the update, or the CR stays stuck Terminating forever.
     // dryRun=All must not actually delete the object — checked here, before the store
     // delete below, since this branch returns before this function's own later dry_run check.
+    // The drain decision reads the stored deletionTimestamp, never the patch's: a patch-only
+    // caller must not be able to start a delete.
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
@@ -30613,5 +30619,254 @@ mod tests {
         let mut obj = serde_json::json!({"l": [{"x": {"y": {}}}]});
         apply_crd_schema_defaults(&schema, &mut obj);
         assert_eq!(obj["l"][0]["x"]["y"]["p"], 7);
+    }
+
+    /// An update (PATCH or PUT) that carries `deletionTimestamp` + empty `finalizers` must not
+    /// hard-delete a live CR: starting deletion needs the `delete` verb, so only the STORED
+    /// deletionTimestamp may complete a finalizer drain. Covers all four CR update handlers.
+    mod deletion_from_update {
+        use super::*;
+
+        const DELETING: &str = "2021-01-01T00:00:00Z";
+
+        #[derive(Clone, Copy, Debug)]
+        enum Verb {
+            MergePatch,
+            JsonPatch,
+            Put,
+        }
+
+        fn group_ns(
+            namespaced: bool,
+        ) -> (
+            &'static str,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+        ) {
+            if namespaced {
+                ("argoproj.io", "v1alpha1", "applications", Some("argocd"))
+            } else {
+                ("example.io", "v1", "widgets", None)
+            }
+        }
+
+        async fn setup(namespaced: bool, name: &str, finalizers: &[&str]) -> AppState {
+            let state = make_state();
+            let (group, version, plural, ns) = group_ns(namespaced);
+            let body = |name: &str| {
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": format!("{group}/{version}"),
+                        "kind": if namespaced { "Application" } else { "Widget" },
+                        "metadata": { "name": name, "finalizers": finalizers },
+                        "spec": { "a": 1 }
+                    })
+                    .to_string(),
+                )
+            };
+            if let Some(ns) = ns {
+                install_namespaced_crd(&state).await;
+                create_cr_namespaced(
+                    State(state.clone()),
+                    Path((group.into(), version.into(), ns.into(), plural.into())),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    body(name),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("create: {e:?}"));
+            } else {
+                install_cluster_crd(&state).await;
+                create_cr(
+                    State(state.clone()),
+                    Path((group.into(), version.into(), plural.into())),
+                    test_user(),
+                    axum::http::HeaderMap::new(),
+                    body(name),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("create: {e:?}"));
+            }
+            state
+        }
+
+        async fn stored_cr(
+            state: &AppState,
+            namespaced: bool,
+            name: &str,
+        ) -> Option<serde_json::Value> {
+            let (group, _, plural, ns) = group_ns(namespaced);
+            let s = state
+                .store
+                .get(&cr_store_key(group, plural, ns, name))
+                .await
+                .unwrap()?;
+            Some(serde_json::from_slice(&s.value).unwrap())
+        }
+
+        async fn mark_terminating(state: &AppState, namespaced: bool, name: &str) {
+            let (group, _, plural, ns) = group_ns(namespaced);
+            let key = cr_store_key(group, plural, ns, name);
+            let s = state.store.get(&key).await.unwrap().unwrap();
+            let mut obj: serde_json::Value = serde_json::from_slice(&s.value).unwrap();
+            obj["metadata"]["deletionTimestamp"] = DELETING.into();
+            state
+                .store
+                .put(&key, Bytes::from(obj.to_string()), Some(s.revision))
+                .await
+                .unwrap();
+        }
+
+        async fn update(
+            state: &AppState,
+            namespaced: bool,
+            verb: Verb,
+            name: &str,
+            metadata: serde_json::Value,
+        ) {
+            let (group, version, plural, ns) = group_ns(namespaced);
+            let mut headers = axum::http::HeaderMap::new();
+            let body = match verb {
+                Verb::MergePatch => {
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/merge-patch+json".parse().unwrap(),
+                    );
+                    serde_json::json!({ "metadata": metadata })
+                }
+                Verb::JsonPatch => {
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/json-patch+json".parse().unwrap(),
+                    );
+                    let ops: Vec<_> = metadata
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| {
+                            serde_json::json!({"op": "add", "path": format!("/metadata/{k}"), "value": v})
+                        })
+                        .collect();
+                    serde_json::Value::Array(ops)
+                }
+                Verb::Put => {
+                    let mut full = stored_cr(state, namespaced, name).await.unwrap();
+                    for (k, v) in metadata.as_object().unwrap() {
+                        full["metadata"][k] = v.clone();
+                    }
+                    full
+                }
+            };
+            let body = Bytes::from(body.to_string());
+            let (g, v, p, n) = (
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            );
+            // Handlers may legitimately reject; the assertions are on stored state.
+            match (ns, verb) {
+                (Some(ns), Verb::Put) => {
+                    let _ = replace_cr_namespaced(
+                        State(state.clone()),
+                        Path((g, v, ns.into(), p, n)),
+                        test_user(),
+                        headers,
+                        body,
+                    )
+                    .await;
+                }
+                (Some(ns), _) => {
+                    let _ = patch_cr_namespaced(
+                        State(state.clone()),
+                        Path((g, v, ns.into(), p, n)),
+                        test_user(),
+                        headers,
+                        body,
+                    )
+                    .await;
+                }
+                (None, Verb::Put) => {
+                    let _ = replace_cr(
+                        State(state.clone()),
+                        Path((g, v, p, n)),
+                        test_user(),
+                        headers,
+                        body,
+                    )
+                    .await;
+                }
+                (None, _) => {
+                    let _ = patch_cr(
+                        State(state.clone()),
+                        Path((g, v, p, n)),
+                        test_user(),
+                        headers,
+                        body,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        const ALL: [(bool, Verb); 6] = [
+            (true, Verb::MergePatch),
+            (true, Verb::JsonPatch),
+            (true, Verb::Put),
+            (false, Verb::MergePatch),
+            (false, Verb::JsonPatch),
+            (false, Verb::Put),
+        ];
+
+        #[tokio::test]
+        async fn update_with_client_deletion_timestamp_never_deletes_a_live_cr() {
+            for (namespaced, verb) in ALL {
+                for finalizers in [&[][..], &["example.com/hold"][..]] {
+                    let state = setup(namespaced, "w", finalizers).await;
+                    update(
+                        &state,
+                        namespaced,
+                        verb,
+                        "w",
+                        serde_json::json!({"deletionTimestamp": DELETING, "finalizers": []}),
+                    )
+                    .await;
+                    let after = stored_cr(&state, namespaced, "w").await.unwrap_or_else(|| {
+                        panic!(
+                            "{verb:?} namespaced={namespaced} finalizers={finalizers:?}: a client \
+                             deletionTimestamp hard-deleted the CR, so an update-only user can \
+                             delete without the delete verb"
+                        )
+                    });
+                    assert!(
+                        after["metadata"]["deletionTimestamp"].is_null(),
+                        "{verb:?} namespaced={namespaced}: deletionTimestamp is server-owned and \
+                         must come from the stored object"
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn removing_last_finalizer_on_a_terminating_cr_still_completes_the_delete() {
+            for (namespaced, verb) in ALL {
+                let state = setup(namespaced, "w", &["example.com/hold"]).await;
+                mark_terminating(&state, namespaced, "w").await;
+                update(
+                    &state,
+                    namespaced,
+                    verb,
+                    "w",
+                    serde_json::json!({"finalizers": []}),
+                )
+                .await;
+                assert!(
+                    stored_cr(&state, namespaced, "w").await.is_none(),
+                    "{verb:?} namespaced={namespaced}: dropping the last finalizer of an object \
+                     already being deleted must remove it, or it stays Terminating forever"
+                );
+            }
+        }
     }
 }
