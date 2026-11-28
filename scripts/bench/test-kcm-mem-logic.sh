@@ -82,6 +82,12 @@ for s in $KCM_MEM_STAGES; do
   check "kcm-mem-run.sh writes the $s stage, otherwise the A/B silently passes without it" "1" \
     "$(grep -c -E "$s: \\\$[a-z]" "$REPO/scripts/bench/kcm-mem-run.sh")"
 done
+check "kcm-mem-run.sh applies the burst manifest, otherwise the burst stage samples WordPress alone" "1" \
+  "$(grep -c -E '^kcm_burst_manifest \| k apply -f -' "$REPO/scripts/bench/kcm-mem-run.sh")"
+check "kcm-mem-run.sh waits for every burst replica ready: Deployment Available passes at 38/50 and samples mid-start" "1" \
+  "$(grep -c -E 'readyReplicas.*\}' "$REPO/scripts/bench/kcm-mem-run.sh")"
+check "the burst wait compares against the full replica count, not a Deployment condition" "2" \
+  "$(grep -c -E '\-ge "\$KCM_MEM_BURST_REPLICAS"' "$REPO/scripts/bench/kcm-mem-run.sh")"
 burst="$(kcm_burst_manifest)"
 check "burst deploys the gate's 50 pause pods" "50 registry.k8s.io/pause:3.10" \
   "$(jq -r '"\(.spec.replicas) \(.spec.template.spec.containers[0].image)"' <<<"$burst")"

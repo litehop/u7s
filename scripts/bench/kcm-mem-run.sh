@@ -5,8 +5,8 @@
 #   idle       after the KCM restart and --settle seconds
 #   wordpress  after WordPress + MariaDB (examples/e2e/wordpress, MariaDB on emptyDir as in the
 #              release gate) are Ready and --settle seconds have passed
-#   burst      after a 50-replica pause Deployment (on top of WordPress) is Available and
-#              --settle seconds have passed
+#   burst      after a 50-replica pause Deployment (on top of WordPress) has all
+#              replicas ready and --settle seconds have passed
 # The cluster is left running; kcm-mem-ab.sh tears it down between runs.
 #
 # Usage: scripts/bench/kcm-mem-run.sh --vm <name> --mode R|T --out <dir> [--workdir <dir>]
@@ -78,8 +78,14 @@ wordpress="$(kcm_stage_sample "$VM" "$SAMPLES" "$INTERVAL")"
 
 echo "kcm-mem: deploying the $KCM_MEM_BURST_REPLICAS-pod burst"
 kcm_burst_manifest | k apply -f - >/dev/null
-k -n default wait --for=condition=Available deployment/kcm-mem-burst --timeout=600s >/dev/null \
-  || { echo "kcm-mem: kcm-mem-burst not Available in 600s" >&2; exit 1; }
+ready=0
+for _ in $(seq 1 300); do
+  ready="$(k -n default get deployment kcm-mem-burst -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  [ "${ready:-0}" -ge "$KCM_MEM_BURST_REPLICAS" ] && break
+  sleep 2
+done
+[ "${ready:-0}" -ge "$KCM_MEM_BURST_REPLICAS" ] \
+  || { echo "kcm-mem: kcm-mem-burst has ${ready:-0}/$KCM_MEM_BURST_REPLICAS ready after 600s" >&2; exit 1; }
 echo "kcm-mem: burst stage (settle ${SETTLE}s)"
 sleep "$SETTLE"
 burst="$(kcm_stage_sample "$VM" "$SAMPLES" "$INTERVAL")"
