@@ -486,13 +486,9 @@ mod immutable {
                 _ => Want::Invalid,
             };
         }
-        if verb == Verb::Json {
-            // A JSON Patch on /status may only target /status paths; pods/status takes none.
-            return if t.name == "pod" {
-                Want::Unsupported
-            } else {
-                Want::Invalid
-            };
+        if verb == Verb::Json && t.name != "pod" {
+            // A JSON Patch on a generic /status may only target /status paths.
+            return Want::Invalid;
         }
         if is_custom(t) {
             return Want::Ignored;
