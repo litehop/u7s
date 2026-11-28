@@ -361,9 +361,33 @@ OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S3" call classify_from_json "$JSON_MANY" 2>
 assert "a bead citing many symbols still classifies (no SIGPIPE 141 from taking only the first candidate) -- beads with several symbols were silently returning cannot-verify" \
   "$([ "$OUT" = "still-broken" ] && [ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
+JSON_PRESENT_PATH_BEHAVIOUR='[{"description":"Answer: crates/apiserver/src/lib.rs is missing the RBAC check on delete.","design":null,"acceptance_criteria":null}]'
+S13="$SANDBOX_ROOT/13-present-path-behaviour"
+new_sandbox "$S13"
+mkdir -p "$S13/crates/apiserver/src"
+printf 'fn delete() {}\n' > "$S13/crates/apiserver/src/lib.rs"
+commit_tree "$S13"
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_PRESENT_PATH_BEHAVIOUR" 2>"$ERR") || RC=$?
+assert "'<existing path> is missing <behaviour>' must be exit 2 with a reason, never exit 1 -- exit 1 closes a real bug as already landed without anyone working it" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR" ] && echo 1 || echo 0)"
+
+JSON_CREATE_BEHAVIOUR='[{"description":"Answer: create a regression test in crates/apiserver/src/lib.rs and add a new file-level check there.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_CREATE_BEHAVIOUR" 2>"$ERR") || RC=$?
+assert "'create <thing> in <existing path>' does not claim the file is absent, so it must not exit 1 -- only 'create <path>' / '<path> is missing.' about the file itself may" \
+  "$([ "$RC" -eq 2 ] && echo 1 || echo 0)"
+
+JSON_CREATE_FILE='[{"description":"Answer: create scripts/new-tool.sh so the loop can run.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S10" call classify_from_json "$JSON_CREATE_FILE" 2>/dev/null) || RC=$?
+assert "'create <path>' with the file now present still closes as landed (exit 1) -- the intended path rule survives the anchoring" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+
 STUB="$SANDBOX_ROOT/stub"
 mkdir -p "$STUB"
-printf '#!/bin/sh\nsleep 30\n' > "$STUB/bd"
+printf '#!/bin/sh\nsleep 30 &\necho $! > "%s/childpid"\nwait\n' "$STUB" > "$STUB/bd"
 chmod +x "$STUB/bd"
 START=$(date +%s)
 RC=0
@@ -371,6 +395,11 @@ OUT=$(PATH="$STUB:$PATH" BEAD_PREMISE_CHECK_TIMEOUT=1 bash "$SCRIPT" hung-bead 2
 ELAPSED=$(( $(date +%s) - START ))
 assert "a hung bd call is cut off by the per-bead cap: exit 2, reason 'timeout' on stderr, well under the stub's 30s sleep -- a loop over all beads must never stall" \
   "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ "$ELAPSED" -lt 10 ] && grep -qF 'timeout' "$ERR" && echo 1 || echo 0)"
+CHILD=$(cat "$STUB/childpid" 2>/dev/null || echo 0)
+assert "the timed-out bd's own sleep child is killed too, not orphaned -- leaked sleeps accumulate across a loop over every open bead" \
+  "$([ "$CHILD" -gt 0 ] && ! kill -0 "$CHILD" 2>/dev/null && echo 1 || echo 0)"
+assert "timeout stderr is exactly the one reason line, with no bash 'Terminated' job notice -- callers parse stderr as the reason" \
+  "$([ "$(wc -l < "$ERR" | tr -d ' ')" -eq 1 ] && ! grep -qF 'Terminated' "$ERR" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary

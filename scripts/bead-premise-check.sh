@@ -107,9 +107,12 @@ path_premise_wording() {
   after=${text#*"$path"}
   # bash 3.2: a negative offset longer than the string yields empty
   if [ "${#before}" -gt 28 ]; then before=${before: -28}; fi
-  after=${after:0:40}
+  after=${after:0:80}
+  after=${after%%$'\n'*}
+  # The word must END the clause: "<path> is missing the RBAC check" is a
+  # behavioural bug in an existing file, not a claim that the file is absent.
   if printf '%s' "$before" | grep -qiE '(missing|create|new file|new script|still need|need to create|no such) *`?$' \
-    || printf '%s' "$after" | grep -qiE "^\`?[:~0-9 -]*(is |are )?(still )?(missing|absent|does not exist|doesn't exist|not exist|is not there)"; then
+    || printf '%s' "$after" | grep -qiE "^\`?[:~0-9 -]*(is |are )?(still )?(missing|absent|does not exist|doesn't exist|not exist|is not there)( yet)? *([.,;:)]|\$)"; then
     printf 'absent-premise'
   fi
 }
@@ -325,13 +328,16 @@ main() {
   fi
 
   local wpid dog rc=0
+  # Job control gives each background job its own process group, so the
+  # timeout can kill a hung child together with its descendants.
+  set -m
   check_bead "$bead_id" &
   wpid=$!
-  ( sleep "$PREMISE_CAP"; pkill -P "$wpid" 2>/dev/null; kill "$wpid" 2>/dev/null ) >/dev/null 2>&1 &
+  ( sleep "$PREMISE_CAP"; kill -TERM -- "-$wpid" 2>/dev/null ) >/dev/null 2>&1 &
   dog=$!
-  wait "$wpid" || rc=$?
-  pkill -P "$dog" 2>/dev/null || true
-  kill "$dog" 2>/dev/null || true
+  { wait "$wpid" || rc=$?; } 2>/dev/null
+  kill -TERM -- "-$dog" 2>/dev/null || true
+  { wait "$dog" || true; } 2>/dev/null
   if [ "$rc" -gt 2 ]; then
     if [ "$rc" -eq 143 ]; then
       why "timeout after ${PREMISE_CAP}s"
