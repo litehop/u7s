@@ -311,7 +311,7 @@ new_sandbox "$S10"
 mkdir -p "$S10/scripts"
 printf '#!/bin/sh\n' > "$S10/scripts/new-tool.sh"
 commit_tree "$S10"
-JSON_MISSING_FILE='[{"description":"Answer: `scripts/new-tool.sh` is missing, so the loop cannot run.","design":null,"acceptance_criteria":null}]'
+JSON_MISSING_FILE='[{"description":"Answer: `scripts/new-tool.sh` is missing. The loop cannot run.","design":null,"acceptance_criteria":null}]'
 RC=0
 OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S10" call classify_from_json "$JSON_MISSING_FILE" 2>/dev/null) || RC=$?
 assert "a bead saying a file is missing, after that file landed, closes as no-longer-broken (exit 1) instead of being re-dispatched" \
@@ -371,6 +371,20 @@ RC=0
 OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_PRESENT_PATH_BEHAVIOUR" 2>"$ERR") || RC=$?
 assert "'<existing path> is missing <behaviour>' must be exit 2 with a reason, never exit 1 -- exit 1 closes a real bug as already landed without anyone working it" \
   "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR" ] && echo 1 || echo 0)"
+
+for TAIL in 'is missing: the RBAC check' 'is missing, so delete bypasses RBAC' 'is missing; handler bypasses auth' 'missing and delete bypasses RBAC'; do
+  J=$(jq -cn --arg d "Answer: crates/apiserver/src/lib.rs $TAIL" '[{description:$d,design:null,acceptance_criteria:null}]')
+  RC=0
+  OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$J" 2>"$ERR") || RC=$?
+  assert "'<existing path> $TAIL' continues the clause past 'missing', so it is a behavioural bug (exit 2 with reason), not an absent file -- exit 1 would close a real bug as landed" \
+    "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR" ] && echo 1 || echo 0)"
+done
+
+JSON_PRESENT_MISSING_DOT='[{"description":"Answer: crates/apiserver/src/lib.rs is missing.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_PRESENT_MISSING_DOT" 2>/dev/null) || RC=$?
+assert "'<path> is missing.' about the file itself, with the file now present, still exits 1 -- the file-absent premise has landed" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 JSON_CREATE_BEHAVIOUR='[{"description":"Answer: create a regression test in crates/apiserver/src/lib.rs and add a new file-level check there.","design":null,"acceptance_criteria":null}]'
 RC=0
