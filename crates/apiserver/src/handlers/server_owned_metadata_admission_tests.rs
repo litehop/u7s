@@ -97,10 +97,10 @@ mod admission {
         uri: &'static str,
     }
 
-    fn crd_body(plural: &str, kind: &str, name: &str) -> Value {
+    fn crd_body(plural: &str, kind: &str, name: &str, scope: &str) -> Value {
         json!({"apiVersion":"apiextensions.k8s.io/v1","kind":"CustomResourceDefinition",
             "metadata":{"name":name},
-            "spec":{"group":"example.com","scope":"Namespaced",
+            "spec":{"group":"example.com","scope":scope,
                 "names":{"plural":plural,"singular":plural,"kind":kind,
                     "listKind":format!("{kind}List")},
                 "versions":[{"name":"v1","served":true,"storage":true,
@@ -137,8 +137,11 @@ mod admission {
                 .await
             }
             "cr" => {
-                c.create(crd, crd_body("widgets", "Widget", "widgets.example.com"))
-                    .await;
+                c.create(
+                    crd,
+                    crd_body("widgets", "Widget", "widgets.example.com", "Namespaced"),
+                )
+                .await;
                 c.create(
                     "/apis/example.com/v1/namespaces/default/widgets",
                     json!({"apiVersion":"example.com/v1","kind":"Widget",
@@ -146,7 +149,23 @@ mod admission {
                 )
                 .await
             }
-            "crd" => c.create(crd, crd_body("os", "O", "os.example.com")).await,
+            "cluster-cr" => {
+                c.create(
+                    crd,
+                    crd_body("gadgets", "Gadget", "gadgets.example.com", "Cluster"),
+                )
+                .await;
+                c.create(
+                    "/apis/example.com/v1/gadgets",
+                    json!({"apiVersion":"example.com/v1","kind":"Gadget",
+                        "metadata":{"name":"o"},"spec":{"a":1}}),
+                )
+                .await
+            }
+            "crd" => {
+                c.create(crd, crd_body("os", "O", "os.example.com", "Namespaced"))
+                    .await
+            }
             other => unreachable!("{other}"),
         }
         c
@@ -179,6 +198,12 @@ mod admission {
                 "example.com",
                 "widgets",
                 "/apis/example.com/v1/namespaces/default/widgets/o",
+            ),
+            t(
+                "cluster-cr",
+                "example.com",
+                "gadgets",
+                "/apis/example.com/v1/gadgets/o",
             ),
             t(
                 "crd",
