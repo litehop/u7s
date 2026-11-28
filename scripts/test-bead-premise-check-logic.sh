@@ -248,7 +248,12 @@ for sentence in \
   'Namespace delete does not run `old_foo_fn`' \
   'To remove the finalizer, add `old_foo_fn`' \
   'PATCH drops managedFields; add `old_foo_fn`' \
-  'DELETE returns 200 and `old_foo_fn` is unused by the handler'; do
+  'DELETE returns 200 and `old_foo_fn` is unused by the handler' \
+  'a stale `old_foo_fn` cache entry causes the bug' \
+  'a leftover `old_foo_fn` finalizer blocks namespace delete' \
+  'the orphaned `old_foo_fn` objects are not GC-ed' \
+  'the unused `old_foo_fn` parameter should be wired up' \
+  '`old_foo_fn` is unused.'; do
   J=$(jq -cn --arg d "$sentence" '[{description:$d,design:null,acceptance_criteria:null}]')
   RC=0
   OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$J" 2>/dev/null) || RC=$?
@@ -258,7 +263,7 @@ done
 
 for sentence in \
   'remove the dead `old_foo_fn` helper' \
-  'delete stale `old_foo_fn`' \
+  'delete obsolete `old_foo_fn`' \
   '`old_foo_fn` is dead.' \
   '`old_foo_fn` is obsolete, drop it'; do
   J=$(jq -cn --arg d "$sentence" '[{description:$d,design:null,acceptance_criteria:null}]')
@@ -294,7 +299,7 @@ new_sandbox "$S6"
 mkdir -p "$S6/crates/apiserver/src/handlers"
 printf 'fn apply_defaults() {}\n' > "$S6/crates/apiserver/src/handlers/defaults.rs"
 commit_tree "$S6"
-JSON_PATH_EXISTS='[{"description":"`crates/apiserver/src/handlers/defaults.rs` still carries the stale `default_widget_spec_arm`","design":null,"acceptance_criteria":null}]'
+JSON_PATH_EXISTS='[{"description":"`crates/apiserver/src/handlers/defaults.rs` still carries the dead `default_widget_spec_arm`","design":null,"acceptance_criteria":null}]'
 RC=0
 OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S6" call classify_from_json "$JSON_PATH_EXISTS") || RC=$?
 assert "an EXISTING cited path does not short-circuit to still-broken -- it falls through to the (absent) symbol candidate, giving no-longer-broken" \

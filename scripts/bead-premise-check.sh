@@ -232,10 +232,10 @@ symbol_stale_wording() {
   # ("delete", "drop", "remove") routinely describe Kubernetes behaviour
   # ("namespace delete", "PATCH drops managedFields"), so they only count
   # via "rename `X` to"; the rest needs an adjective touching the symbol.
-  grep -qiE '(^|[^[:alnum:]_])(dead|stale|obsolete|unused|orphaned|leftover)[[:space:]]+$' <<<"$before" \
+  grep -qiE '(^|[^[:alnum:]_])(dead|obsolete)[[:space:]]+$' <<<"$before" \
     || { grep -qiE '(^|[^[:alnum:]_])rename[[:space:]]+$' <<<"$before" \
          && grep -qiE '^[[:space:]]+to([^[:alnum:]_]|$)' <<<"$after"; } \
-    || grep -qiE '^[[:space:]]+(is|are)[[:space:]]+(now |already )?(dead|stale|unused|obsolete|orphaned)([[:space:]]+code)?[[:space:]]*([.,;:)]|$)' <<<"$after"
+    || grep -qiE '^[[:space:]]+(is|are)[[:space:]]+(now |already )?(dead|obsolete)([[:space:]]+code)?[[:space:]]*([.,;:)]|$)' <<<"$after"
 }
 
 # Classifies a single `bd show <id> --json` result (a one-element array).
