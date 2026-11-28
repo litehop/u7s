@@ -2750,15 +2750,6 @@ pub(crate) async fn replace_pod_status<S: Store>(
     Ok(Json(current_obj.body))
 }
 
-/// Returns true if the content-type is acceptable for a pod status patch.
-/// Kubelet uses application/strategic-merge-patch+json; both strategic-merge-patch
-/// and merge-patch are accepted. JSON-patch (RFC 6902) is not supported for status.
-fn accepts_patch_content_type(ct: &str) -> bool {
-    ct.contains("application/strategic-merge-patch+json")
-        || ct.contains("application/merge-patch+json")
-        || ct.contains("application/apply-patch+yaml")
-}
-
 /// The two fields needed to enforce the hostNetwork/podIP status invariant below: a pod
 /// sharing the host's network namespace must report the node IP as its pod IP, not the
 /// pod-CIDR address the CNI sandbox actually assigned. Borrowed straight out of the pod
@@ -2994,13 +2985,8 @@ pub(crate) async fn patch_pod_status<S: Store>(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-
-    // Kubelet uses strategic-merge-patch; both patch types update only the status field.
-    if !accepts_patch_content_type(content_type) {
-        return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json or application/apply-patch+yaml"
-        )));
-    }
+    super::json_patch::detect_patch_type(&headers)?;
+    let is_json_patch = content_type.contains("application/json-patch+json");
 
     // Skip namespace existence check: KCM's pod-GC calls PATCH /status to mark a pod
     // Failed after the namespace is already deleted. Checking namespace existence here
@@ -3046,7 +3032,20 @@ pub(crate) async fn patch_pod_status<S: Store>(
             "v1",
             Some("Pod"),
         )?;
-        current_obj.body = apply_status_patch(&current_obj.body, &patch)?;
+        current_obj.body = if is_json_patch {
+            // RFC 6902 ops address the whole pod. Apply them, then take only status and
+            // metadata from the result, as the status strategy does. The base has no status so
+            // the patched status replaces it, which lets `remove` ops work.
+            let mut patched = before_write.clone();
+            super::json_patch::apply_json_patch(&mut patched, &patch)?;
+            let mut base = before_write.clone();
+            if let Some(obj) = base.as_object_mut() {
+                obj.remove("status");
+            }
+            apply_status_patch(&base, &patched)?
+        } else {
+            apply_status_patch(&current_obj.body, &patch)?
+        };
         if let Some(plan) = &ssa_plan {
             plan.remove_dropped_fields(&mut current_obj.body);
         }
@@ -4196,30 +4195,6 @@ mod status_tests {
         }
 
         assert_eq!(current["status"], original_status);
-    }
-
-    /// accepts_patch_content_type must accept strategic-merge-patch and merge-patch,
-    /// and must reject json-patch and empty strings.
-    /// Kubelet uses strategic-merge-patch+json; rejecting it would break node status
-    /// updates. Accepting json-patch would be incorrect (unsupported semantics for status).
-    #[test]
-    fn patch_content_type_acceptance() {
-        assert!(
-            accepts_patch_content_type("application/strategic-merge-patch+json"),
-            "strategic-merge-patch must be accepted — kubelet uses this type"
-        );
-        assert!(
-            accepts_patch_content_type("application/merge-patch+json"),
-            "merge-patch must be accepted"
-        );
-        assert!(
-            !accepts_patch_content_type("application/json-patch+json"),
-            "json-patch must be rejected — not supported for status subresource"
-        );
-        assert!(
-            !accepts_patch_content_type(""),
-            "empty content-type must be rejected"
-        );
     }
 
     /// apply_status_patch with {"status":{"phase":"Running"}} on a Pending pod must
@@ -16269,6 +16244,107 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    async fn json_patch_pod_status(
+        state: AppState<SqliteStore>,
+        ops: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .body(json_body(&ops))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    /// The pods/status conformance test appends a condition with a JSON patch (kubectl
+    /// `--subresource=status --type=json`); a 415 fails it. Spec ops in the same patch must
+    /// not land, as the status strategy resets spec.
+    #[tokio::test]
+    async fn patch_pod_status_json_patch_updates_status_and_ignores_spec() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"status": {"phase": "Pending", "conditions": []}}),
+        )
+        .await;
+
+        let (code, body) = json_patch_pod_status(
+            state,
+            serde_json::json!([
+                {"op": "add", "path": "/status/conditions/-",
+                 "value": {"type": "PodScheduled", "status": "True"}},
+                {"op": "replace", "path": "/status/phase", "value": "Running"},
+                {"op": "replace", "path": "/spec/containers/0/image", "value": "evil"}
+            ]),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["status"]["conditions"][0]["type"], "PodScheduled");
+        assert_eq!(body["status"]["phase"], "Running");
+        assert_eq!(
+            body["spec"]["containers"][0]["image"], "nginx",
+            "pods/status must not change spec"
+        );
+    }
+
+    /// A JSON patch is a replace, not a merge: `remove` of a status field must drop it.
+    #[tokio::test]
+    async fn patch_pod_status_json_patch_remove_drops_status_field() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"status": {"phase": "Pending", "message": "m"}}),
+        )
+        .await;
+        let (code, body) = json_patch_pod_status(
+            state,
+            serde_json::json!([{"op": "remove", "path": "/status/message"}]),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(body["status"].get("message").is_none(), "{body}");
+        assert_eq!(body["status"]["phase"], "Pending");
+    }
+
+    /// The immutable-metadata guard must hold for JSON patch too, or a client forges identity.
+    #[tokio::test]
+    async fn patch_pod_status_json_patch_forged_uid_is_422() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "my-pod",
+            serde_json::json!({"metadata": {"name": "my-pod", "namespace": "default",
+                "resourceVersion": "1", "uid": "real-uid"}}),
+        )
+        .await;
+        let (code, body) = json_patch_pod_status(
+            state,
+            serde_json::json!([{"op": "add", "path": "/metadata/uid", "value": "forged"}]),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
     /// A status patch pinned to `metadata.uid` must not land on a same-name recreation: the
     /// scheduler stamps DisruptionTarget on a preemption victim this way, and the new pod must
     /// not be marked as disrupted for a plan made about its predecessor.
@@ -17035,7 +17111,7 @@ mod handler_tests {
         let req = Request::builder()
             .method("PATCH")
             .uri("/api/v1/namespaces/default/pods/my-pod/status")
-            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .header(header::CONTENT_TYPE, "text/plain")
             .body(Body::from("[]"))
             .unwrap();
 
