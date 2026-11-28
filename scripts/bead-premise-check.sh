@@ -12,10 +12,14 @@
 # pattern is still present in the tracked tree. A bare code-span symbol or
 # fenced snippet is assumed to be cited AS EVIDENCE OF THE BUG -- so
 # presence means the bug is still there and absence means it's already
-# been fixed. A cited file path is weaker evidence in the other direction
-# only: its ABSENCE is a confident "still broken" (the bead expects it to
-# exist and it doesn't), but its mere PRESENCE proves nothing on its own --
-# see extract_path_candidates()'s doc comment for why.
+# been fixed. A cited file path only decides when the bead's own wording
+# next to it says the file is missing / to be created (see
+# path_premise_wording()): absent -> still broken, present -> landed. A path
+# merely cited (the usual `file:line` evidence) proves nothing -- a fix
+# rarely deletes the file it edits. Searches cover tracked files only and
+# skip .beads/, ai/worktrees/, target/ and temp/. Each run is capped
+# (BEAD_PREMISE_CHECK_TIMEOUT, default 20s) and every exit 2 prints its
+# reason on stderr.
 #
 # Multiple candidates are tried in priority order (most to least specific);
 # a real reviewed false positive (a NetworkPolicy-protocol-defaulting bug
@@ -76,10 +80,41 @@ extract_backtick_spans() {
 # existing before AND after the fix. A cited path's ABSENCE is still a
 # confident signal (see classify_from_json), so this bucket is checked
 # first for that half of the question only.
+#
+# Beads cite repo files both backticked and bare, usually with a line suffix
+# (`file:123`, `file ~:123`, `file:10-20`); the suffix is stripped. Only
+# paths rooted in a top-level repo directory count -- upstream Go paths
+# (`bootstrappolicy/policy.go`) and prose slashes (`kubelet/node`) don't
+# exist here and would read as "missing file". Paths inside the excluded
+# dirs are ignored.
 extract_path_candidates() {
-  local text="$1" spans
-  spans=$(extract_backtick_spans "$text")
-  printf '%s\n' "$spans" | grep -E '/' || true
+  local text="$1" tops
+  tops="crates|scripts|ai|docs|deploy|examples|lima|manifests|spikes|\\.github|\\.githooks"
+  printf '%s\n' "$text" \
+    | grep -oE "(^|[^A-Za-z0-9_./-])(${tops})/[A-Za-z0-9_./-]*[A-Za-z0-9_]" \
+    | sed -E 's/^[^A-Za-z0-9.]//' \
+    | grep -vE '^(ai/worktrees|temp|target)/' \
+    | awk '!seen[$0]++' || true
+}
+
+# Wording adjacent to a cited path that states the file is MISSING or must
+# be created: prints "absent-premise" if so. Only adjacency counts ("add X
+# to existing file Y" cites an existing Y and must not read as "Y missing").
+path_premise_wording() {
+  local path="$1" text="$2" before after
+  case "$text" in *"$path"*) ;; *) return 0 ;; esac
+  before=${text%%"$path"*}
+  after=${text#*"$path"}
+  # bash 3.2: a negative offset longer than the string yields empty
+  if [ "${#before}" -gt 28 ]; then before=${before: -28}; fi
+  after=${after:0:80}
+  after=${after%%$'\n'*}
+  # The word must END the clause: "<path> is missing the RBAC check" is a
+  # behavioural bug in an existing file, not a claim that the file is absent.
+  if grep -qiE '(missing|create|new file|new script|still need|need to create|no such) *`?$' <<<"$before" \
+    || grep -qiE "^\`?[:~0-9 -]*(is |are )?(still )?(missing|absent|does not exist|doesn't exist|not exist|is not there)( yet)? *(\.|\$)" <<<"$after"; then
+    printf 'absent-premise'
+  fi
 }
 
 # True (exit 0) iff a bare (non-path) code-span candidate is specific
@@ -144,8 +179,12 @@ path_exists_in_tree() {
 # report still-broken regardless of what the actual code looks like.
 content_present_in_tree() {
   local pattern="$1"
-  git -C "$REPO_ROOT" grep -qF -e "$pattern" -- . ':!.beads' 2>/dev/null
+  git -C "$REPO_ROOT" grep -qF -e "$pattern" -- . ':!.beads' ':!ai/worktrees' ':!target' ':!temp' 2>/dev/null
 }
+
+# Explains a cannot-verify / confident verdict on stderr so the mayor can
+# tell "behavioural bug, grep can't decide" from "extraction found nothing".
+why() { printf 'premise-check: %s\n' "$*" >&2; }
 
 # This repo's beads consistently label the prescribed remedy with a
 # "Fix:"/"FIX:" line starting its own paragraph. Everything from that
@@ -172,7 +211,7 @@ extract_fix_section_candidate() {
   local text="$1" fix_text
   fix_text=$(extract_fix_section_text "$text")
   [ -z "$fix_text" ] && { printf ''; return; }
-  extract_symbol_candidates "$fix_text" | head -1
+  extract_symbol_candidates "$fix_text" | awk 'NR==1'
 }
 
 # Classifies a single `bd show <id> --json` result (a one-element array).
@@ -183,43 +222,63 @@ extract_fix_section_candidate() {
 #
 # Tries candidates most-to-least specific, stopping at the first CONFIDENT
 # signal (see the header comment for why a path's mere existence is never
-# confident on its own): first path candidate absent -> still-broken; the
-# Fix section's own symbol candidate, INVERTED (present -> no-longer-
-# broken, absent -> still-broken); else a bug-description symbol
-# candidate's presence/absence -> still-broken / no-longer-broken; else
-# the first fenced-code-block line's presence/absence; else cannot-verify.
+# confident on its own): a cited path with adjacent "missing"/"create"
+# wording (absent -> still-broken, present -> no-longer-broken); the Fix
+# section's own symbol candidate, INVERTED (present -> no-longer-broken,
+# absent -> still-broken); else a bug-description symbol candidate's
+# presence/absence -> still-broken / no-longer-broken; else the first
+# fenced-code-block line's presence/absence; else cannot-verify, with the
+# reason on stderr.
 #
 # Prints still-broken / no-longer-broken / cannot-verify and returns
 # 0 / 1 / 2 respectively.
 classify_from_json() {
-  local json="$1" text first_path fix_symbol first_symbol fenced
+  local json="$1" text path paths fix_symbol first_symbol fenced notes=""
 
   text=$(printf '%s' "$json" | jq -r '
     [.[0].description, .[0].design, .[0].acceptance_criteria]
     | map(select(. != null)) | join("\n")')
 
-  first_path=$(extract_path_candidates "$text" | head -1)
-  if [ -n "$first_path" ] && ! path_exists_in_tree "$first_path"; then
-    printf 'still-broken\n'
-    return 0
-  fi
+  paths=$(extract_path_candidates "$text")
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if [ -n "$(path_premise_wording "$path" "$text")" ]; then
+      if path_exists_in_tree "$path"; then
+        why "$path is described as missing but is tracked now"
+        printf 'no-longer-broken\n'
+        return 1
+      fi
+      why "$path is described as missing and is still absent"
+      printf 'still-broken\n'
+      return 0
+    fi
+    if path_exists_in_tree "$path"; then
+      notes="$notes $path(exists)"
+    else
+      notes="$notes $path(absent,no-missing-wording)"
+    fi
+  done <<< "$paths"
 
   fix_symbol=$(extract_fix_section_candidate "$text")
   if [ -n "$fix_symbol" ]; then
     if content_present_in_tree "$fix_symbol"; then
+      why "Fix-section symbol '$fix_symbol' is present"
       printf 'no-longer-broken\n'
       return 1
     fi
+    why "Fix-section symbol '$fix_symbol' is absent"
     printf 'still-broken\n'
     return 0
   fi
 
-  first_symbol=$(extract_symbol_candidates "$text" | head -1)
+  first_symbol=$(extract_symbol_candidates "$text" | awk 'NR==1')
   if [ -n "$first_symbol" ]; then
     if content_present_in_tree "$first_symbol"; then
+      why "bug symbol '$first_symbol' is present"
       printf 'still-broken\n'
       return 0
     fi
+    why "bug symbol '$first_symbol' is absent"
     printf 'no-longer-broken\n'
     return 1
   fi
@@ -227,15 +286,37 @@ classify_from_json() {
   fenced=$(extract_fenced_code_pattern "$text")
   if [ -n "$fenced" ]; then
     if content_present_in_tree "$fenced"; then
+      why "fenced snippet '$fenced' is present"
       printf 'still-broken\n'
       return 0
     fi
+    why "fenced snippet '$fenced' is absent"
     printf 'no-longer-broken\n'
     return 1
   fi
 
+  if [ -n "$notes" ]; then
+    why "no decidable signal (no Fix: symbol, backticked symbol or fenced snippet); cited paths:$notes; likely a behavioural bug grep cannot verify"
+  else
+    why "nothing extractable: no repo path, no Fix: symbol, no backticked symbol (>=8 chars, snake_case/CamelCase), no fenced snippet"
+  fi
   printf 'cannot-verify\n'
   return 2
+}
+
+# Hard per-bead wall-clock cap (seconds); a hung `bd` or git call must not
+# stall a loop over every open bead.
+PREMISE_CAP="${BEAD_PREMISE_CHECK_TIMEOUT:-20}"
+
+check_bead() {
+  local json
+  json=$(bd show "$1" --json 2>/dev/null) || json=''
+  if [ -z "$json" ] || [ "$json" = "null" ]; then
+    why "bd show $1 returned nothing"
+    printf 'cannot-verify\n'
+    return 2
+  fi
+  classify_from_json "$json"
 }
 
 main() {
@@ -246,14 +327,26 @@ main() {
     exit 2
   fi
 
-  local json rc=0
-  json=$(bd show "$bead_id" --json 2>/dev/null) || json=''
-  if [ -z "$json" ] || [ "$json" = "null" ]; then
+  local wpid dog rc=0
+  # Job control gives each background job its own process group, so the
+  # timeout can kill a hung child together with its descendants.
+  set -m
+  check_bead "$bead_id" &
+  wpid=$!
+  ( sleep "$PREMISE_CAP"; kill -TERM -- "-$wpid" 2>/dev/null ) >/dev/null 2>&1 &
+  dog=$!
+  { wait "$wpid" || rc=$?; } 2>/dev/null
+  kill -TERM -- "-$dog" 2>/dev/null || true
+  { wait "$dog" || true; } 2>/dev/null
+  if [ "$rc" -gt 2 ]; then
+    if [ "$rc" -eq 143 ]; then
+      why "timeout after ${PREMISE_CAP}s"
+    else
+      why "internal error (rc=$rc)"
+    fi
     printf 'cannot-verify\n'
     exit 2
   fi
-
-  classify_from_json "$json" || rc=$?
   exit "$rc"
 }
 

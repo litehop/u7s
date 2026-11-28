@@ -295,6 +295,127 @@ assert "the same Fix-section symbol, when NOT yet present in the tree, correctly
   "$([ "$OUT" = "still-broken" ] && [ "$RC" -eq 0 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 8. Real-world citation shapes, exit-2 reasons, excluded dirs, time cap.
+# ---------------------------------------------------------------------------
+
+ERR="$SANDBOX_ROOT/stderr"
+
+assert "bare (un-backticked) repo paths are extracted and the :line / ~:line suffix is stripped -- real beads cite 'file.rs ~:1523', so a literal match never finds the file" \
+  "$([ "$(call extract_path_candidates 'see crates/apiserver/src/lib.rs ~:1523 and scripts/x.sh:10-20, also bootstrappolicy/policy.go and kubelet/node creds' | tr '\n' ' ')" = "crates/apiserver/src/lib.rs scripts/x.sh " ] && echo 1 || echo 0)"
+
+assert "paths under ai/worktrees/, target/ and temp/ are never extracted as cited files" \
+  "$([ -z "$(call extract_path_candidates 'see ai/worktrees/agent-1/crates/a.rs and temp/e2e/x.log')" ] && echo 1 || echo 0)"
+
+S10="$SANDBOX_ROOT/10-landed-file"
+new_sandbox "$S10"
+mkdir -p "$S10/scripts"
+printf '#!/bin/sh\n' > "$S10/scripts/new-tool.sh"
+commit_tree "$S10"
+JSON_MISSING_FILE='[{"description":"Answer: `scripts/new-tool.sh` is missing. The loop cannot run.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S10" call classify_from_json "$JSON_MISSING_FILE" 2>/dev/null) || RC=$?
+assert "a bead saying a file is missing, after that file landed, closes as no-longer-broken (exit 1) instead of being re-dispatched" \
+  "$([ "$OUT" = "no-longer-broken" ] && [ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S5" call classify_from_json "$JSON_MISSING_FILE" 2>/dev/null) || RC=$?
+assert "the same missing-file bead with the file still absent stays still-broken (exit 0) so it is dispatched" \
+  "$([ "$OUT" = "still-broken" ] && [ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+S11="$SANDBOX_ROOT/11-abstract"
+new_sandbox "$S11"
+mkdir -p "$S11/crates/apiserver/src/handlers"
+printf 'fn create_resource() {}\n' > "$S11/crates/apiserver/src/handlers/resource.rs"
+commit_tree "$S11"
+JSON_ABSTRACT='[{"description":"Answer: add the missing regression tests. Deleting either restrict_node_create call in crates/apiserver/src/handlers/resource.rs (create_resource, ~:516) keeps every test green.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S11" call classify_from_json "$JSON_ABSTRACT" 2>"$ERR") || RC=$?
+assert "a behavioural bead whose cited file exists exactly as described stays cannot-verify (exit 2), not a forced duplicate/dispatch verdict -- 'add the missing tests' near a path must not read as 'file missing'" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && echo 1 || echo 0)"
+assert "exit 2 explains itself on stderr, naming the cited path and why grep cannot decide, so the mayor knows it is behavioural and not a script failure" \
+  "$(grep -qF 'handlers/resource.rs(exists)' "$ERR" && grep -qF 'behavioural' "$ERR" && echo 1 || echo 0)"
+
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S11" call classify_from_json "$JSON_NO_PATTERN" 2>"$ERR") || RC=$?
+assert "exit 2 for a bead with nothing extractable says so on stderr" \
+  "$([ "$RC" -eq 2 ] && grep -qF 'nothing extractable' "$ERR" && echo 1 || echo 0)"
+
+S12="$SANDBOX_ROOT/12-excluded-dirs"
+new_sandbox "$S12"
+mkdir -p "$S12/crates" "$S12/ai/worktrees/agent-1/crates" "$S12/target" "$S12/temp"
+printf 'fn fixed_helper() {}\n' > "$S12/crates/lib.rs"
+for d in ai/worktrees/agent-1/crates target temp; do
+  printf 'fn old_broken_helper() {}\n' > "$S12/$d/copy.rs"
+done
+git -C "$S12" add -A -f
+git -C "$S12" commit -q -m snapshot
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S12" call classify_from_json "$JSON" 2>/dev/null) || RC=$?
+assert "a symbol present only in ai/worktrees/, target/ or temp/ copies does not count -- otherwise every fixed bead looks still-broken because worker worktrees hold stale copies of the repo" \
+  "$([ "$OUT" = "no-longer-broken" ] && [ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+MANY=$(for n in $(seq 1 3000); do printf '`other_symbol_%s` ' "$n"; done)
+JSON_MANY=$(jq -cn --arg d "calls \`old_broken_helper\` then $MANY" '[{description:$d,design:null,acceptance_criteria:null}]')
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S3" call classify_from_json "$JSON_MANY" 2>/dev/null) || RC=$?
+assert "a bead citing many symbols still classifies (no SIGPIPE 141 from taking only the first candidate) -- beads with several symbols were silently returning cannot-verify" \
+  "$([ "$OUT" = "still-broken" ] && [ "$RC" -eq 0 ] && echo 1 || echo 0)"
+
+JSON_PRESENT_PATH_BEHAVIOUR='[{"description":"Answer: crates/apiserver/src/lib.rs is missing the RBAC check on delete.","design":null,"acceptance_criteria":null}]'
+S13="$SANDBOX_ROOT/13-present-path-behaviour"
+new_sandbox "$S13"
+mkdir -p "$S13/crates/apiserver/src"
+printf 'fn delete() {}\n' > "$S13/crates/apiserver/src/lib.rs"
+commit_tree "$S13"
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_PRESENT_PATH_BEHAVIOUR" 2>"$ERR") || RC=$?
+assert "'<existing path> is missing <behaviour>' must be exit 2 with a reason, never exit 1 -- exit 1 closes a real bug as already landed without anyone working it" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR" ] && echo 1 || echo 0)"
+
+for TAIL in 'is missing: the RBAC check' 'is missing, so delete bypasses RBAC' 'is missing; handler bypasses auth' 'missing and delete bypasses RBAC'; do
+  J=$(jq -cn --arg d "Answer: crates/apiserver/src/lib.rs $TAIL" '[{description:$d,design:null,acceptance_criteria:null}]')
+  RC=0
+  OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$J" 2>"$ERR") || RC=$?
+  assert "'<existing path> $TAIL' continues the clause past 'missing', so it is a behavioural bug (exit 2 with reason), not an absent file -- exit 1 would close a real bug as landed" \
+    "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR" ] && echo 1 || echo 0)"
+done
+
+JSON_PRESENT_MISSING_DOT='[{"description":"Answer: crates/apiserver/src/lib.rs is missing.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_PRESENT_MISSING_DOT" 2>/dev/null) || RC=$?
+assert "'<path> is missing.' about the file itself, with the file now present, still exits 1 -- the file-absent premise has landed" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+JSON_CREATE_BEHAVIOUR='[{"description":"Answer: create a regression test in crates/apiserver/src/lib.rs and add a new file-level check there.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S13" call classify_from_json "$JSON_CREATE_BEHAVIOUR" 2>"$ERR") || RC=$?
+assert "'create <thing> in <existing path>' does not claim the file is absent, so it must not exit 1 -- only 'create <path>' / '<path> is missing.' about the file itself may" \
+  "$([ "$RC" -eq 2 ] && echo 1 || echo 0)"
+
+JSON_CREATE_FILE='[{"description":"Answer: create scripts/new-tool.sh so the loop can run.","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S10" call classify_from_json "$JSON_CREATE_FILE" 2>/dev/null) || RC=$?
+assert "'create <path>' with the file now present still closes as landed (exit 1) -- the intended path rule survives the anchoring" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+
+STUB="$SANDBOX_ROOT/stub"
+mkdir -p "$STUB"
+printf '#!/bin/sh\nsleep 30 &\necho $! > "%s/childpid"\nwait\n' "$STUB" > "$STUB/bd"
+chmod +x "$STUB/bd"
+START=$(date +%s)
+RC=0
+OUT=$(PATH="$STUB:$PATH" BEAD_PREMISE_CHECK_TIMEOUT=1 bash "$SCRIPT" hung-bead 2>"$ERR") || RC=$?
+ELAPSED=$(( $(date +%s) - START ))
+assert "a hung bd call is cut off by the per-bead cap: exit 2, reason 'timeout' on stderr, well under the stub's 30s sleep -- a loop over all beads must never stall" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ "$ELAPSED" -lt 10 ] && grep -qF 'timeout' "$ERR" && echo 1 || echo 0)"
+CHILD=$(cat "$STUB/childpid" 2>/dev/null || echo 0)
+assert "the timed-out bd's own sleep child is killed too, not orphaned -- leaked sleeps accumulate across a loop over every open bead" \
+  "$([ "$CHILD" -gt 0 ] && ! kill -0 "$CHILD" 2>/dev/null && echo 1 || echo 0)"
+assert "timeout stderr is exactly the one reason line, with no bash 'Terminated' job notice -- callers parse stderr as the reason" \
+  "$([ "$(wc -l < "$ERR" | tr -d ' ')" -eq 1 ] && ! grep -qF 'Terminated' "$ERR" && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
