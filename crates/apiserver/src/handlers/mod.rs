@@ -10,6 +10,10 @@ pub mod cr;
 pub mod crd;
 #[cfg(test)]
 mod crd_pattern_cost;
+#[cfg(test)]
+mod crd_pattern_parity;
+#[cfg(test)]
+mod crd_schema_parity;
 pub mod csr;
 pub mod defaults;
 #[cfg(test)]

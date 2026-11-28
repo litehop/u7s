@@ -684,15 +684,13 @@ impl DiscoveryCache {
     }
 }
 
-/// A compiled CRD `openAPIV3Schema`: the `boon::Schemas` set plus the root schema's
-/// index within it (both are required to call `Schemas::validate`), plus every
+/// A compiled CRD `openAPIV3Schema`: the `jsonschema::Validator`, plus every
 /// `x-kubernetes-validations` CEL rule/`messageExpression` string reachable from the
 /// schema, pre-parsed into a `cel::Program` — see `handlers/cr.rs::collect_cel_programs`.
 /// Keying by the CEL source text itself (rather than by field path) means two rules with
 /// identical text anywhere in the schema share one compiled program.
 pub struct CompiledCrSchema {
-    pub schemas: boon::Schemas,
-    pub index: boon::SchemaIndex,
+    pub validator: jsonschema::Validator,
     pub cel_programs: HashMap<String, Arc<cel::Program>>,
 }
 
@@ -700,7 +698,7 @@ pub struct CompiledCrSchema {
 /// identifies exactly one compiled `openAPIV3Schema`.
 pub type CrSchemaCacheKey = (String, String, String);
 
-/// Cache of compiled CRD schemas, so `boon::Compiler::compile` runs once per CRD
+/// Cache of compiled CRD schemas, so building the validator runs once per CRD
 /// generation instead of once per CR write.
 ///
 /// The resourceVersion is part of the key (not just group+version) because it comes
@@ -718,10 +716,10 @@ pub struct CrSchemaCache {
     #[cfg(test)]
     compile_count: std::sync::atomic::AtomicUsize,
     /// Counts `cel::Program::compile` calls made while building a `CompiledCrSchema`'s
-    /// `cel_programs` (i.e. CEL parses that happened on a boon-schema cache miss, not
+    /// `cel_programs` (i.e. CEL parses that happened on a schema cache miss, not
     /// reused from a cached entry). Separate from `compile_count` so a regression that
     /// moves CEL parsing back onto the per-request hot path is caught even though it
-    /// wouldn't touch the boon compile count at all.
+    /// wouldn't touch the jsonschema compile count at all.
     #[cfg(test)]
     cel_compile_count: std::sync::atomic::AtomicUsize,
 }
@@ -764,7 +762,7 @@ impl CrSchemaCache {
     }
 
     /// Records that `n` CEL programs were freshly parsed while building a
-    /// `CompiledCrSchema` (called once per boon-schema cache miss — see
+    /// `CompiledCrSchema` (called once per schema cache miss — see
     /// `handlers/cr.rs::validate_cr_schema`).
     #[cfg(test)]
     pub(crate) fn record_cel_compiles(&self, n: usize) {
