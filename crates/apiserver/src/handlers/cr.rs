@@ -12650,6 +12650,28 @@ mod tests {
         );
     }
 
+    /// A stored CRD whose pattern the engine cannot compile (Go accepts `a{,3}` as literal
+    /// text) must fail the CR write as a 422 naming the pattern, not as an opaque 500 on
+    /// every write.
+    #[test]
+    fn validate_cr_schema_cache_miss_rejects_uncompilable_stored_pattern_with_422() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "field": { "type": "string", "pattern": "a{,3}" } }
+        });
+        let err = check_schema(&serde_json::json!({ "field": "x" }), schema)
+            .expect_err("a pattern the engine cannot compile must reject the write");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "{json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a valid regular expression"),
+            "{json}"
+        );
+    }
+
     // A single high-privilege CRD install must not turn into a repeatable amplification
     // vector: without a cache, every CR create/update/patch against that CRD pays the
     // parse-and-regex-compile cost again (measured ~657ms for the max-allowed 1024-byte

@@ -10,6 +10,43 @@ proposed: Engine makes `\w`/`\d` Unicode, so Go-valid `^\w{1,253}$` needs ~16 Mi
 and is rejected at the 1 MiB limit. The prototype also makes PR #2317 (raise the
 1 KiB source cap) moot: the cap is deleted.
 
+## Option C (Unicode-off regex) was tried and rejected; option A stands
+
+`jsonschema` 0.63.2 `PatternOptions` exposes only `size_limit`, `dfa_size_limit` and
+`syntax(Ecma262 | Engine)`: no `unicode(false)`. The one hook is a custom `pattern`
+keyword (`ValidationOptions::with_keyword("pattern", ..)` overrides the built-in:
+`Compiler::is_keyword_overridden`), which lets us build the `regex` ourselves. Probed over
+the 66-pattern Go oracle (`regex` 1.13, 1 MiB size limit, count of rows differing from Go):
+
+| engine | divergent rows | note |
+|---|---|---|
+| boon (main) | 13 | |
+| jsonschema Ecma262 (chosen) | 15 | `\s`, `\b` Unicode |
+| jsonschema Engine (Unicode) | 17 | `\d \w \s \b` Unicode; `^\w{1,253}$` needs ~16 MiB |
+| `regex::Regex` + `unicode(false)` (str) | 20 | rejects 14 Go-valid rows: `.`, `[^a]`, `\D \W \S`, `\pL` ("pattern can match invalid UTF-8" / "Unicode not allowed here"), including the real 1199-byte Cilium pattern |
+| `regex::bytes::Regex` + `unicode(false)` | 15 | compiles `.` and `[^a]`, but byte-wise: `^.{1,5}$` on `日本` is false (Go: true), `^\w+$` on `é` false; `\pL`, `\p{Greek}` rejected; `\s` still diverges (regex `\s` includes `\v`, Go's does not) |
+
+`^\w{1,253}$` compiles under the 1 MiB limit with Ecma262 and with ASCII-only `regex`; it
+does not with Engine (Unicode). The bytes variant matches the divergence count of Ecma262
+but trades `\s` Unicode for silently rejecting valid multi-byte values on every `.`/`[^x]`
+pattern and refusing `\p{..}`; that is a worse failure than the NBSP case, so we keep
+Ecma262 (option A). Consequence: `^\S+$` against an NBSP value is rejected (Go accepts it).
+
+## Which Go-valid patterns 422 at CRD create
+
+Upstream never validates `pattern` at CRD create. Probed with `check_pattern_compile_budget`
+(plus the 1024-byte cap on main), `go_compiles == true` rows refused at create:
+
+| family | this PR | main (boon) |
+|---|---|---|
+| `\Q..\E`, `\a`, `{,n}` (literal braces) | 422 at create | admitted at create; boon fails to compile them, so every CR write fails |
+| class over 1 MiB compiled (`\pL{244}`) | 422 | 422 |
+| source over 1024 bytes (Cilium 1199 B) | accepted | 422 |
+
+Everything else Go accepts compiles. Go-invalid patterns accepted at create: this PR 5
+(`\cA`, `A`, `a++`, repeat counts above 1000), main 18 (those plus lookarounds,
+backreferences, `\Z`, unclosed groups: admitted at create, failing every CR write).
+
 ## Prototype
 
 boon removed; `build_schema_validator` (crd.rs) is the one build path: ECMA-262
@@ -26,7 +63,7 @@ library default (2020-12), same as boon.
 |---|---|---|
 | P1 | quadratic rewrite | PASS: `\s` 8 KiB 17 ms vs boon 20.5 s |
 | P2 | compiled-size blowup | PASS: 200 x `\pL{244}` rejected in 3.3 ms, RSS 38 MiB (boon 8.2 s) |
-| P3 | bisection CPU, many tiny patterns | PASS by existing tests; 2048-tiny admission cost NOT re-measured |
+| P3 | bisection CPU, many tiny patterns | PASS: 2048 tiny patterns admit in 81.5 ms (boon on main: 83.2 ms); see below |
 | P4 | async stall | PASS: `on_compile_stack` + blocking pool unchanged |
 | P5 | recompile per CR write | PASS: cache kept; live first write 334 ms, next 0 ms |
 | P6 | Cilium 1199 B rejected | PASS: cap deleted; builds, matches Go on 8 inputs; live CRD created |
@@ -52,13 +89,12 @@ library default (2020-12), same as boon.
 2. **Pattern acceptance vs Go RE2** (oracle: Go 1.26.3 `regexp`, 66 patterns,
    `testdata/crd_pattern_parity.json`). All real-world patterns (quantity,
    Prometheus durations, DNS-1123, semver, UUID, Cilium 1199 B) agree with Go.
-   Ecma262 diverges on 15 rows: Go accepts but we reject: `\Q..\E`, `{,n}`,
-   `\a`, `(?s)` semantics, POSIX classes, and `\pL{244}` (size limit, on
-   purpose); we accept but Go rejects: `\u`, `\cA`, `a++`, repeat counts above
-   1000; `\s`/`\b` are Unicode. boon diverged on 13 (same families, but it handles
-   `(?s)` and POSIX classes). Engine syntax diverges on 17: it adds Unicode `\d \w`
-   (5 more rows) and the size problem above. Neither syntax is Go; a CRD using an unsupported form
-   is now rejected at admission (422) instead of failing every CR write (500).
+   Ecma262 diverges on 15 rows. Go accepts but we refuse at create: `\Q..\E`, `{,n}`,
+   `\a`, `\pL{244}` (size limit, on purpose). Compiles but with a different verdict:
+   `(?s)` (`.` stays non-newline), POSIX classes, `\s`/`\b` (Unicode). We accept but Go
+   rejects: `\u`, `\cA`, `a++`, repeat counts above 1000. boon diverged on 13 (it handles
+   `(?s)` and POSIX classes). Engine syntax diverges on 17 (above). A CRD using an
+   unsupported form is now rejected at admission (422) instead of failing every CR write (500).
 3. **Wording.** `ValidationError` carries kind, instance and path, so every kind
    maps exactly. Implemented: enum ("Unsupported value"), required ("Required
    value"), pattern (`in body should match`), type (`must be of type`); other
@@ -113,13 +149,19 @@ should match '^[0-9]+$', spec.mode: Unsupported value: "z": supported values: "a
 
 - Dependency growth (+23 crates) against the minimal-dependency stance; 0.62 to
   0.63 broke API within two weeks, so pin and expect churn.
-- Unicode `\s`/`\b` accept inputs Go rejects (e.g. NBSP for `\s`); no fix
-  without our own rewrite.
-- Invalid or Go-only patterns now fail CRD creation, upstream accepts them.
+- Unicode `\s`/`\b` accept inputs Go rejects (e.g. NBSP for `\s`); the only fix is a
+  pattern rewrite or a byte-wise engine with worse trade-offs (see option C above).
+- `\Q..\E`, `\a`, `{,n}` and over-1-MiB patterns fail CRD creation; upstream accepts
+  them (boon never compiled the first three either).
 - `nullable`, format asserts, int32/int64/byte, boolean exclusive bounds: open
   parity gaps (same as boon); 2 are cheap (`should_validate_formats`,
   `with_format("byte")`) but untested against go-openapi quirks.
 - pattern errors are indistinguishable (too large vs invalid), so one message
   covers both.
 - Aggregate budget still needs our bisection (~1 build per 21 bits per
-  pattern above the floor); 2048-tiny case not re-measured.
+  pattern above the floor). Measured (release, `crd_pattern_cost.rs`): 2048 distinct
+  tiny patterns, check 81.5 ms, peak RSS 18 MiB (boon on main 83.2 ms, 16 MiB); 1900
+  near-floor (4168 B) patterns summing to 8.1 MB, check 0.64 s and 0.02 s validator
+  build, peak RSS 42 MiB (boon 0.40 s, 17 MiB; boon figure is the check only, ours includes the
+  retained validator). Linear in count, no regression on tiny
+  patterns, so no single-build rework.

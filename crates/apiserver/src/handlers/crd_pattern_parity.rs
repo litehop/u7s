@@ -92,6 +92,33 @@ fn crd_pattern_verdicts_match_go_regexp_except_the_documented_divergences() {
     );
 }
 
+/// Upstream never validates `pattern` at CRD create. Every Go-valid pattern we turn away
+/// with a 422 is a CRD a user can no longer install, so the set must stay exactly this one.
+#[test]
+fn go_valid_patterns_rejected_at_crd_create_are_exactly_the_documented_families() {
+    let mut rejected: Vec<String> = corpus()
+        .iter()
+        .filter(|c| c.go_compiles)
+        .filter(|c| {
+            let schema = serde_json::json!({"type": "string", "pattern": c.pattern});
+            super::crd::check_pattern_compile_budget(&schema, "s", &mut 0).is_err()
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    rejected.sort();
+    assert_eq!(
+        rejected,
+        [
+            "escape_bell_a",
+            "quote_Q_E",
+            "repeat_lower_missing",
+            "repeat_unicode_class_244"
+        ],
+        "`\\a`, `\\Q..\\E`, `{{,n}}` literal braces and >1 MiB classes are the only Go-valid \
+         pattern families refused at CRD create; a change here alters which CRDs install"
+    );
+}
+
 /// Real CRDs ship this 1199-byte pattern (Cilium `ciliumbgpclusterconfigs`); it must build
 /// under the per-pattern limit and classify addresses exactly as Go does.
 #[test]
