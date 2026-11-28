@@ -111,8 +111,8 @@ path_premise_wording() {
   after=${after%%$'\n'*}
   # The word must END the clause: "<path> is missing the RBAC check" is a
   # behavioural bug in an existing file, not a claim that the file is absent.
-  if printf '%s' "$before" | grep -qiE '(missing|create|new file|new script|still need|need to create|no such) *`?$' \
-    || printf '%s' "$after" | grep -qiE "^\`?[:~0-9 -]*(is |are )?(still )?(missing|absent|does not exist|doesn't exist|not exist|is not there)( yet)? *(\.|\$)"; then
+  if grep -qiE '(missing|create|new file|new script|still need|need to create|no such) *`?$' <<<"$before" \
+    || grep -qiE "^\`?[:~0-9 -]*(is |are )?(still )?(missing|absent|does not exist|doesn't exist|not exist|is not there)( yet)? *(\.|\$)" <<<"$after"; then
     printf 'absent-premise'
   fi
 }
