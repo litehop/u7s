@@ -30959,6 +30959,47 @@ mod tests {
         .await
         .expect("patching its own slice must succeed");
 
+        let apply = |name: &str, body: serde_json::Value| {
+            let state = state.clone();
+            let path = path(name);
+            async move {
+                let mut headers = json_headers();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+                );
+                patch_resource(
+                    State(state),
+                    path,
+                    Query(PatchQuery {
+                        field_manager: Some("kubectl".into()),
+                        ..Default::default()
+                    }),
+                    node_identity_user("node-a"),
+                    headers,
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        forbidden(
+            apply("forged-apply", slice("forged-apply", "node-b")).await,
+            "server-side apply creating a slice for another node must not bypass the POST check",
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/resource.k8s.io/resourceslices/forged-apply")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused apply-create must not persist the forged slice"
+        );
+        apply("mine-apply", slice("mine-apply", "node-a"))
+            .await
+            .expect("apply-creating its own node's slice must succeed");
+
         let delete = |name: &str| {
             let state = state.clone();
             let path = path(name);
@@ -30987,6 +31028,74 @@ mod tests {
         delete("mine")
             .await
             .expect("deleting its own slice must succeed");
+    }
+
+    /// An SSA apply that loses the create race merges onto the winner's object; a node must
+    /// not take over another node's slice by racing its create (the apply body names the
+    /// caller's own node, so only the check against the winner's stored object catches it).
+    #[tokio::test]
+    async fn ssa_create_race_fallback_binds_resource_slice_to_callers_node() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
+        let slice = |node: &str| {
+            serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": "raced" },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": "p", "generation": 1, "resourceSliceCount": 1 } }
+            })
+        };
+        let winner = bytes::Bytes::from(serde_json::to_vec(&slice("node-b")).unwrap());
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(inner.clone(), winner));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let result = patch_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "resource.k8s.io".to_string(),
+                "v1".to_string(),
+                "resourceslices".to_string(),
+                "raced".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl".into()),
+                ..Default::default()
+            }),
+            node_identity_user("node-a"),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&slice("node-a")).unwrap()),
+        )
+        .await;
+        let status = match result {
+            Ok(resp) => resp.into_response().status(),
+            Err(e) => e.0,
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "losing the create race must not let node-a re-home node-b's slice onto itself"
+        );
+        let stored = inner
+            .get("/registry/resource.k8s.io/resourceslices/raced")
+            .await
+            .unwrap()
+            .expect("winner persisted");
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(body["spec"]["nodeName"], "node-b");
     }
 
     /// A node forging its own taints can steer disallowed workloads onto (or away from)
