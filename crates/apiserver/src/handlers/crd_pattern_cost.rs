@@ -145,20 +145,50 @@ fn measure_admission_cost_of_patterns_just_above_the_floor() {
         "POC near-floor pattern {base} compiles to {} B",
         size_of(&base)
     );
-    let patterns: Vec<String> = (0..2000)
-        .map(|i| format!("{base}{}", "a".repeat(i % 3)))
-        .collect();
-    let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
-    let schema = schema_with(&refs);
-    let t0 = Instant::now();
-    let mut total = 0;
-    let res = super::crd::check_pattern_compile_budget(&schema, "s", &mut total);
-    eprintln!(
-        "POC near-floor x2000 budget_check={:.2}s total={total}B ok={}",
-        t0.elapsed().as_secs_f64(),
-        res.is_ok()
-    );
+    for n in [250usize, 500, 1000, 1900, 2000] {
+        let patterns: Vec<String> = (0..n).map(|i| format!("{base}{i}")).collect();
+        let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+        let schema = schema_with(&refs);
+        let t0 = Instant::now();
+        let mut total = 0;
+        let res = super::crd::check_pattern_compile_budget(&schema, "s", &mut total);
+        let check = t0.elapsed().as_secs_f64();
+        let t1 = Instant::now();
+        let built = super::crd::build_schema_validator(&schema);
+        eprintln!(
+            "POC near-floor x{n} budget_check={check:.2}s total={total}B ok={} \
+             build={:.2}s built={} peak_rss={:.0}MiB",
+            res.is_ok(),
+            t1.elapsed().as_secs_f64(),
+            built.is_ok(),
+            max_rss_mib()
+        );
+        assert!(global.elapsed() < WALL_CAP, "exceeded hard cap");
+    }
     assert!(global.elapsed() < WALL_CAP, "exceeded hard cap");
+}
+
+/// Admission cost of a CRD made of N distinct tiny patterns, N growing geometrically up to
+/// the 2048 pattern count the 8 MiB budget admits at the 4 KiB floor.
+#[test]
+#[ignore = "timing PoC; run with --release --ignored --nocapture"]
+fn measure_admission_cost_of_many_tiny_patterns() {
+    let global = Instant::now();
+    for n in [64usize, 256, 1024, 2048] {
+        let patterns: Vec<String> = (0..n).map(|i| format!("^f{i}[a-z]$")).collect();
+        let refs: Vec<&str> = patterns.iter().map(String::as_str).collect();
+        let schema = schema_with(&refs);
+        let t = Instant::now();
+        let mut total = 0;
+        let res = super::crd::check_pattern_compile_budget(&schema, "s", &mut total);
+        eprintln!(
+            "POC tiny x{n} budget_check={:.1}ms total={total}B ok={} peak_rss={:.0}MiB",
+            t.elapsed().as_secs_f64() * 1e3,
+            res.is_ok(),
+            max_rss_mib()
+        );
+        assert!(global.elapsed() < WALL_CAP, "exceeded hard cap");
+    }
 }
 
 fn short(e: &str) -> String {
