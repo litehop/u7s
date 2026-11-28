@@ -219,55 +219,24 @@ fn validate_crd_group(group: &str) -> Result<(), crate::status::StatusError> {
     Ok(())
 }
 
-/// Maximum length, in bytes, for a `pattern` string or a `patternProperties` key in a
-/// CRD's `openAPIV3Schema`. boon (the JSON-schema engine u7s compiles CRD schemas with)
-/// runs an ECMA-to-Rust-regex compatibility rewrite (boon-0.6.1 src/ecma.rs::convert)
-/// before `Regex::new` ever sees the pattern, and that rewrite is O(pattern_length^2) —
-/// so `regex::RegexBuilder::size_limit` cannot protect against it, since the shim's cost
-/// is paid before compilation. Real-world CRD patterns top out at 113 bytes (median 91);
-/// this cap gives ~9x headroom while keeping worst-case compile cost bounded.
-pub(crate) const MAX_CRD_PATTERN_BYTES: usize = 1024;
-
 /// Walk a single JSON-Schema node (and everything nested under it — `properties`,
-/// `items`, `additionalProperties`, `allOf`/`anyOf`/`oneOf`, etc.) rejecting the two
-/// `openAPIV3Schema` shapes that can blow up boon's ECMA-compat regex rewrite:
-/// `patternProperties` (forbidden outright, matching upstream K8s's structural-schema
-/// rule, apiextensions-apiserver release-1.36 validation.go:1493-1494) and any `pattern`
-/// longer than `MAX_CRD_PATTERN_BYTES`.
+/// `items`, `additionalProperties`, `allOf`/`anyOf`/`oneOf`, etc.) rejecting
+/// `patternProperties`, which is forbidden outright, matching upstream K8s's
+/// structural-schema rule (apiextensions-apiserver release-1.36 validation.go:1493-1494).
 pub(crate) fn walk_schema_dos_bounds(
     node: &serde_json::Value,
     field_path: &str,
 ) -> Result<(), crate::status::StatusError> {
     match node {
         serde_json::Value::Object(map) => {
-            if let Some(pp) = map.get("patternProperties").and_then(|v| v.as_object()) {
-                // Defense-in-depth: bound key length unconditionally, not only when
-                // patternProperties happens to be non-empty below — a future change that
-                // relaxes the outright rejection must not silently reopen the boon
-                // O(n^2) ReDoS via unbounded patternProperties keys.
-                for key in pp.keys() {
-                    if key.len() > MAX_CRD_PATTERN_BYTES {
-                        return Err(Status::unprocessable_entity(format!(
-                            "{field_path}.patternProperties key exceeds maximum length of \
-                             {MAX_CRD_PATTERN_BYTES} bytes (was {} bytes) — see ReDoS defense",
-                            key.len()
-                        )));
-                    }
-                }
-                if !pp.is_empty() {
-                    return Err(Status::unprocessable_entity(format!(
-                        "{field_path}.patternProperties: patternProperties is not supported"
-                    )));
-                }
-            }
-            if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
-                if pattern.len() > MAX_CRD_PATTERN_BYTES {
-                    return Err(Status::unprocessable_entity(format!(
-                        "{field_path}.pattern exceeds maximum length of {MAX_CRD_PATTERN_BYTES} \
-                         bytes (was {} bytes) — see ReDoS defense",
-                        pattern.len()
-                    )));
-                }
+            if map
+                .get("patternProperties")
+                .and_then(|v| v.as_object())
+                .is_some_and(|pp| !pp.is_empty())
+            {
+                return Err(Status::unprocessable_entity(format!(
+                    "{field_path}.patternProperties: patternProperties is not supported"
+                )));
             }
             for (key, value) in map {
                 walk_schema_dos_bounds(value, &format!("{field_path}.{key}"))?;
@@ -285,37 +254,33 @@ pub(crate) fn walk_schema_dos_bounds(
 }
 
 /// Upper bound on the compiled NFA of a single CRD `pattern`, matching CEL `matches()`
-/// (`cel_runtime/strlib.rs`). boon compiles `pattern` with `regex`'s 10 MiB default,
-/// which lets one 8-byte `\pL{244}` cost ~30 ms and ~15 MiB resident; a 200-property
-/// CRD of them cost ~6 s and ~2.9 GiB, all paid by the first CR write on a cache miss.
+/// (`cel_runtime/strlib.rs`). `regex`'s 10 MiB default lets one 8-byte `\pL{244}` cost
+/// ~30 ms and ~15 MiB resident; a 200-property CRD of them cost ~6 s and ~2.9 GiB.
 pub(crate) const MAX_CRD_PATTERN_NFA_BYTES: usize = 1 << 20;
 
-fn ascii_shorthands(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('d') => out.push_str("[0-9]"),
-            Some('D') => out.push_str("[^0-9]"),
-            Some('w') => out.push_str("[A-Za-z0-9_]"),
-            Some('W') => out.push_str("[^A-Za-z0-9_]"),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
+/// Patterns use jsonschema's ECMA-262 syntax translated once, linearly, to the `regex`
+/// crate: `\d`/`\w` stay ASCII as in Go's `regexp` (the engine's own syntax makes them
+/// Unicode, so `^\w{1,253}$` alone needs ~16 MiB), and matching is linear-time.
+fn validator_options(size_limit: usize) -> jsonschema::ValidationOptions<'static> {
+    use jsonschema::PatternOptions;
+    jsonschema::options().with_pattern_options(PatternOptions::regex().size_limit(size_limit))
 }
 
-/// Upper bound on the summed compiled size of every `pattern` in one CRD. boon compiles
-/// each occurrence separately (boon-0.6.1 compiler.rs `Regex::new` per schema node, no
-/// dedup), so retained memory grows with the sum. The largest real CRD sums to 357 KB
+/// Compiles a CRD `openAPIV3Schema` into a validator whose every `pattern` is bounded by
+/// `MAX_CRD_PATTERN_NFA_BYTES`.
+pub(crate) fn build_schema_validator(
+    schema: &serde_json::Value,
+) -> Result<jsonschema::Validator, String> {
+    crate::cel_runtime::format::on_compile_stack(|| {
+        validator_options(MAX_CRD_PATTERN_NFA_BYTES)
+            .build(schema)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Upper bound on the summed compiled size of every `pattern` in one CRD. Each distinct
+/// pattern stays resident in the cached validator, so retained memory grows with the sum;
+/// the per-pattern size limit alone cannot bound it. The largest real CRD sums to 357 KB
 /// (Cilium CiliumNetworkPolicy) and the largest single pattern is 81 KB; 8 MiB leaves
 /// ~20x headroom.
 pub(crate) const MAX_CRD_PATTERN_TOTAL_NFA_BYTES: usize = 8 << 20;
@@ -328,35 +293,29 @@ const PATTERN_SIZE_FLOOR: usize = 4 << 10;
 
 enum PatternSize {
     Bytes(usize),
-    TooBig,
-    Invalid,
+    Unbuildable,
 }
 
-fn build_under(pattern: &str, limit: usize) -> Result<(), regex::Error> {
-    regex::RegexBuilder::new(pattern)
-        .size_limit(limit)
-        .build()
-        .map(|_| ())
+fn builds_under(pattern: &str, limit: usize) -> bool {
+    validator_options(limit)
+        .build(&serde_json::json!({ "pattern": pattern }))
+        .is_ok()
 }
 
-/// The smallest `size_limit` under which the (ASCII-shorthand) pattern builds.
+/// The smallest `size_limit` under which the pattern builds. jsonschema reports a
+/// too-large and a syntactically invalid pattern identically, so both are `Unbuildable`.
 fn compiled_pattern_size(pattern: &str) -> PatternSize {
-    let pattern = ascii_shorthands(pattern);
     crate::cel_runtime::format::on_compile_stack(|| {
-        match build_under(&pattern, PATTERN_SIZE_FLOOR) {
-            Ok(()) => return PatternSize::Bytes(PATTERN_SIZE_FLOOR),
-            Err(regex::Error::CompiledTooBig(_)) => {}
-            Err(_) => return PatternSize::Invalid,
+        if builds_under(pattern, PATTERN_SIZE_FLOOR) {
+            return PatternSize::Bytes(PATTERN_SIZE_FLOOR);
         }
-        match build_under(&pattern, MAX_CRD_PATTERN_NFA_BYTES) {
-            Ok(()) => {}
-            Err(regex::Error::CompiledTooBig(_)) => return PatternSize::TooBig,
-            Err(_) => return PatternSize::Invalid,
+        if !builds_under(pattern, MAX_CRD_PATTERN_NFA_BYTES) {
+            return PatternSize::Unbuildable;
         }
         let (mut lo, mut hi) = (PATTERN_SIZE_FLOOR, MAX_CRD_PATTERN_NFA_BYTES);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if build_under(&pattern, mid).is_ok() {
+            if builds_under(pattern, mid) {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -373,9 +332,8 @@ fn mib(bytes: usize) -> String {
 /// Rejects any `pattern` in the schema whose compiled size exceeds
 /// `MAX_CRD_PATTERN_NFA_BYTES`, and any schema where `total` (running sum of compiled
 /// pattern sizes, shared across versions by the caller) passes
-/// `MAX_CRD_PATTERN_TOTAL_NFA_BYTES`. boon's ECMA rewrite is approximated by making
-/// `\d`/`\w` ASCII-only (as ECMA does), since Unicode `\w{253}` alone would exceed the
-/// budget; patterns boon cannot compile at all are left for boon to report.
+/// `MAX_CRD_PATTERN_TOTAL_NFA_BYTES`. A pattern that does not compile is rejected here too,
+/// since every CR write against it would otherwise fail.
 pub(crate) fn check_pattern_compile_budget(
     node: &serde_json::Value,
     field_path: &str,
@@ -385,11 +343,11 @@ pub(crate) fn check_pattern_compile_budget(
         serde_json::Value::Object(map) => {
             if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
                 match compiled_pattern_size(pattern) {
-                    PatternSize::TooBig => {
+                    PatternSize::Unbuildable => {
                         return Err(Status::unprocessable_entity(format!(
-                            "{field_path}.pattern compiles to more than \
-                             {MAX_CRD_PATTERN_NFA_BYTES} bytes; simplify the expression or \
-                             lower repetition counts"
+                            "{field_path}.pattern is not a valid regular expression, or \
+                             compiles to more than {MAX_CRD_PATTERN_NFA_BYTES} bytes; \
+                             simplify the expression or lower repetition counts"
                         )));
                     }
                     PatternSize::Bytes(n) => {
@@ -403,7 +361,6 @@ pub(crate) fn check_pattern_compile_budget(
                             )));
                         }
                     }
-                    PatternSize::Invalid => {}
                 }
             }
             for (key, value) in map {
@@ -590,8 +547,8 @@ fn validate_conversion_webhook(
     }
 }
 
-/// Validate a CRD's `openAPIV3Schema` (across all versions) against the boon-ReDoS
-/// class of bugs before persisting the CRD. `stored` is the previous CRD on update: its
+/// Validate a CRD's `openAPIV3Schema` (across all versions), including the pattern
+/// compile budget, before persisting the CRD. `stored` is the previous CRD on update: its
 /// expressions and unchanged version schemas are ratcheted so an unrelated write cannot
 /// start failing on a rule that was already accepted.
 pub(crate) fn validate_crd_schema(
@@ -5490,40 +5447,6 @@ mod tests {
         );
     }
 
-    // -- validate_crd_schema: pattern length cap (boon O(n^2) ReDoS defense) --
-
-    /// A `pattern` over MAX_CRD_PATTERN_BYTES must be rejected at CRD admission time —
-    /// otherwise any principal with mere create/update RBAC on the resulting Custom
-    /// Resource kind can retrigger boon's O(n^2) ECMA-compat rewrite on every CR write,
-    /// pinning a CPU core for the duration of the compile.
-    #[tokio::test]
-    async fn crd_admission_rejects_oversized_pattern_to_prevent_boon_o_n_squared_dos() {
-        let state = make_state();
-        let oversized = "a".repeat(MAX_CRD_PATTERN_BYTES + 1);
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "spec": {
-                    "type": "object",
-                    "properties": { "field": { "type": "string", "pattern": oversized } }
-                }
-            }
-        });
-        let body = crd_bytes_with_schema("widgets.example.io", schema);
-
-        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(
-            json["code"], 422,
-            "a pattern exceeding the {MAX_CRD_PATTERN_BYTES}-byte cap must be rejected"
-        );
-        let message = json["message"].as_str().unwrap_or("");
-        assert!(
-            message.contains("exceeds maximum length") && message.contains("1025 bytes"),
-            "error must report the actual oversized length so the CRD author can fix it: {message}"
-        );
-    }
-
     /// The pattern budget is per CRD, not per version: a CRD with several versions keeps
     /// every version's compiled schema resident, so each version staying under 8 MiB
     /// must not let the CRD as a whole exceed it.
@@ -5581,33 +5504,6 @@ mod tests {
             message.contains("spec.versions[v2].schema.openAPIV3Schema.properties.")
                 && message.contains("CRD pattern compile budget exceeded"),
             "two versions at ~4.9 MiB each must be rejected, naming the second version: {message}"
-        );
-    }
-
-    /// A `pattern` exactly at the MAX_CRD_PATTERN_BYTES boundary must be accepted —
-    /// an off-by-one here would reject legitimate schemas that happen to sit right at
-    /// the cap (e.g. hand-written alternation patterns).
-    #[tokio::test]
-    async fn crd_admission_accepts_at_cap_pattern() {
-        let state = make_state();
-        let at_cap = "a".repeat(MAX_CRD_PATTERN_BYTES);
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "spec": {
-                    "type": "object",
-                    "properties": { "field": { "type": "string", "pattern": at_cap } }
-                }
-            }
-        });
-        let body = crd_bytes_with_schema("widgets.example.io", schema);
-
-        assert!(
-            create_crd(State(state), test_user(), HeaderMap::new(), body)
-                .await
-                .is_ok(),
-            "a pattern exactly at the {MAX_CRD_PATTERN_BYTES}-byte cap must be accepted \
-             (off-by-one guard)"
         );
     }
 

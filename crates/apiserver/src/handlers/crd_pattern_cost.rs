@@ -4,8 +4,6 @@
 
 use std::time::{Duration, Instant};
 
-use super::crd::MAX_CRD_PATTERN_BYTES;
-
 const WALL_CAP: Duration = Duration::from_secs(120);
 const STOP_AFTER: Duration = Duration::from_secs(15);
 
@@ -30,17 +28,7 @@ fn compile(patterns: &[String]) -> (Duration, Result<(), String>) {
     }
     let schema = serde_json::json!({ "type": "object", "properties": props });
     let start = Instant::now();
-    let res = crate::cel_runtime::format::on_compile_stack(|| {
-        let mut schemas = boon::Schemas::new();
-        let mut compiler = boon::Compiler::new();
-        compiler
-            .add_resource("schema.json", schema)
-            .map_err(|e| e.to_string())?;
-        compiler
-            .compile("schema.json", &mut schemas)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    });
+    let res = super::crd::build_schema_validator(&schema).map(|_| ());
     (start.elapsed(), res)
 }
 
@@ -181,11 +169,6 @@ fn sweep(name: &str, sizes: &[usize], build: impl Fn(usize) -> String) {
     let global = Instant::now();
     for &n in sizes {
         let p = build(n);
-        assert!(
-            p.len() <= MAX_CRD_PATTERN_BYTES,
-            "{name} n={n} len={}",
-            p.len()
-        );
         let (t, res) = compile(std::slice::from_ref(&p));
         let outcome = match &res {
             Ok(()) => "ok".to_string(),
@@ -204,6 +187,80 @@ fn sweep(name: &str, sizes: &[usize], build: impl Fn(usize) -> String) {
     }
 }
 
+/// Pattern-compile cost on the shapes that were pathological under the previous validator
+/// (`\s` repeated to 1/2/4/8 KiB; 200 distinct `\pL{244}` properties), plus the hot-path
+/// per-write validate cost. Hard-capped at `WALL_CAP`.
+#[test]
+#[ignore = "timing PoC; run with --release --ignored --nocapture"]
+fn measure_jsonschema_compile_and_validate_cost() {
+    let global = Instant::now();
+    for kib in [1usize, 2, 4, 8] {
+        let p = "\\s".repeat(kib * 512);
+        let schema = schema_with(&[&p]);
+        let t = Instant::now();
+        let built = super::crd::build_schema_validator(&schema).is_ok();
+        let build = t.elapsed();
+        let t = Instant::now();
+        let budget = super::crd::check_pattern_compile_budget(&schema, "s", &mut 0).is_ok();
+        eprintln!(
+            "POC \\s x{} ({kib} KiB): build={:.2}ms built={built} budget_check={:.2}ms ok={budget}",
+            kib * 512,
+            build.as_secs_f64() * 1e3,
+            t.elapsed().as_secs_f64() * 1e3,
+        );
+        assert!(global.elapsed() < WALL_CAP, "exceeded hard cap");
+    }
+    let props: Vec<String> = (0..200).map(|_| "\\pL{244}".to_string()).collect();
+    let refs: Vec<&str> = props.iter().map(String::as_str).collect();
+    let schema = schema_with(&refs);
+    let t = Instant::now();
+    let built = super::crd::build_schema_validator(&schema).is_ok();
+    let build = t.elapsed();
+    let t = Instant::now();
+    let budget = super::crd::check_pattern_compile_budget(&schema, "s", &mut 0).is_ok();
+    eprintln!(
+        "POC 200 x \\pL{{244}}: build={:.2}ms built={built} budget_check={:.2}ms ok={budget} peak_rss={:.0}MiB",
+        build.as_secs_f64() * 1e3,
+        t.elapsed().as_secs_f64() * 1e3,
+        max_rss_mib()
+    );
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["spec"],
+        "properties": {
+            "spec": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string", "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"},
+                    "mode": {"type": "string", "enum": ["a", "b", "c"]},
+                    "cpu": {"type": "string", "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$"},
+                    "replicas": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "tags": {"type": "array", "items": {"type": "string", "maxLength": 63}},
+                }
+            }
+        }
+    });
+    let obj = serde_json::json!({"spec": {"name": "a.b-c", "mode": "b", "cpu": "500m",
+        "replicas": 3, "tags": ["x", "y", "z"]}});
+    let t = Instant::now();
+    let v = super::crd::build_schema_validator(&schema).unwrap();
+    eprintln!(
+        "POC representative schema build={:.2}ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    let n = 20_000;
+    let t = Instant::now();
+    for _ in 0..n {
+        assert_eq!(v.iter_errors(&obj).count(), 0);
+    }
+    eprintln!(
+        "POC representative CR validate: {:.2}us/op",
+        t.elapsed().as_secs_f64() * 1e6 / n as f64
+    );
+}
+
 fn schema_with(patterns: &[&str]) -> serde_json::Value {
     let props: serde_json::Map<_, _> = patterns
         .iter()
@@ -218,7 +275,7 @@ fn schema_with(patterns: &[&str]) -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": props })
 }
 
-/// An 8-byte `\pL{244}` is under boon's 10 MiB default yet costs ~15 MiB resident per
+/// An 8-byte `\pL{244}` is under the regex crate's 10 MiB default yet costs ~15 MiB resident per
 /// property; a CRD repeating it must be refused at admission instead of letting the
 /// first CR write pay seconds and GiB.
 #[test]
@@ -243,10 +300,23 @@ fn realistic_patterns_stay_within_nfa_budget() {
         "^\\w{1,253}$",
         "^[a-z]{1,63}$",
         "^(\\d{1,3}\\.){3}\\d{1,3}(/\\d{1,2})?$",
-        "(unclosed",
     ]);
     super::crd::check_pattern_compile_budget(&schema, "s", &mut 0)
-        .expect("ordinary patterns, and invalid ones (left to boon), must pass");
+        .expect("ordinary patterns must pass; `\\w{1,253}` is ASCII in Go, so it must stay small");
+}
+
+/// A pattern the regex engine cannot parse would make every CR write against the CRD fail
+/// with a 500; refusing it at admission puts the error where the author can see it.
+#[test]
+fn unparseable_pattern_is_rejected_at_admission() {
+    let err = super::crd::check_pattern_compile_budget(&schema_with(&["(unclosed"]), "s", &mut 0)
+        .expect_err("an invalid regex must be rejected when the CRD is created");
+    let json = serde_json::to_value(&err.1).unwrap();
+    assert_eq!(json["code"], 422);
+    assert!(json["message"]
+        .as_str()
+        .unwrap()
+        .contains("s.properties.f0.pattern is not a valid regular expression"));
 }
 
 /// Each `\pL{20}` compiles to ~0.8 MiB, under the 1 MiB per-pattern cap.
@@ -255,7 +325,7 @@ const SUBCAP_PATTERN: &str = "\\pL{20}";
 /// Every property a CRD declares keeps its own compiled regex resident, so ten patterns
 /// that each pass the per-pattern cap can still pin ~8.6 MiB; without the aggregate
 /// bound one CRD could retain GiBs, and the same pattern repeated counts every time
-/// because boon compiles each occurrence separately.
+/// because each distinct pattern stays resident.
 #[test]
 fn sum_of_subcap_patterns_over_total_budget_is_rejected_with_path_and_totals() {
     let schema = schema_with(&[SUBCAP_PATTERN; 10]);

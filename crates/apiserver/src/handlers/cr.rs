@@ -991,7 +991,7 @@ fn store_err_cr(
 // ---------------------------------------------------------------------------
 
 /// Validate `obj` against the CRD schema in `ctx`, if a schema is present.
-/// Uses boon for full openAPIV3Schema keyword coverage (enum, pattern, minimum,
+/// Uses jsonschema for full openAPIV3Schema keyword coverage (enum, pattern, minimum,
 /// maximum, format, items, oneOf, allOf, etc.), then evaluates any
 /// `x-kubernetes-validations` CEL rules the schema declares.
 ///
@@ -1047,34 +1047,23 @@ fn validate_cr_schema_with_budgets(
         return Ok(());
     };
     // Defense in depth: CRD admission (crd.rs::validate_crd_schema) already rejects
-    // oversized patterns and patternProperties, but a CRD that bypassed that check
-    // (installed before it existed, restored from backup, or written directly to the
-    // store) must not still be able to trigger boon's O(n^2) ECMA-compat rewrite on
-    // every CR write against it. This runs on every call, cache hit or miss.
+    // patternProperties, but a CRD that bypassed that check (restored from backup, or
+    // written directly to the store) must not be validated with it. This runs on every
+    // call, cache hit or miss.
     crate::handlers::crd::walk_schema_dos_bounds(schema, "openAPIV3Schema")?;
 
     let compiled = match cache.get(&ctx.schema_cache_key) {
         Some(compiled) => compiled,
         None => {
             crate::handlers::crd::check_pattern_compile_budget(schema, "openAPIV3Schema", &mut 0)?;
-            let (schemas, index) = crate::cel_runtime::format::on_compile_stack(|| {
-                let mut schemas = boon::Schemas::new();
-                let mut compiler = boon::Compiler::new();
-                compiler
-                    .add_resource("schema.json", schema.clone())
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let index = compiler
-                    .compile("schema.json", &mut schemas)
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                Ok::<_, crate::status::StatusError>((schemas, index))
-            })?;
+            let validator =
+                crate::handlers::crd::build_schema_validator(schema).map_err(Status::internal)?;
             let mut cel_programs = std::collections::HashMap::new();
             collect_cel_programs(schema, &mut cel_programs);
             #[cfg(test)]
             cache.record_cel_compiles(cel_programs.len());
             let compiled = std::sync::Arc::new(crate::state::CompiledCrSchema {
-                schemas,
-                index,
+                validator,
                 cel_programs,
             });
             cache.insert(ctx.schema_cache_key.clone(), compiled.clone());
@@ -1082,21 +1071,21 @@ fn validate_cr_schema_with_budgets(
         }
     };
 
-    compiled
-        .schemas
-        .validate(obj, compiled.index)
-        .map_err(|e| {
-            Status::unprocessable_entity(format!(
-                "CR schema validation failed: {}",
-                enum_violation_message(&e, obj)
-                    .or_else(|| required_violation_message(&e))
-                    .unwrap_or_else(|| e.to_string())
-            ))
-        })?;
+    let messages: Vec<String> = compiled
+        .validator
+        .iter_errors(obj)
+        .map(|e| field_error_message(&e))
+        .collect();
+    if !messages.is_empty() {
+        return Err(Status::unprocessable_entity(format!(
+            "CR schema validation failed: {}",
+            messages.join(", ")
+        )));
+    }
 
     // Only run CEL rules once the object is already structurally valid — evaluating a
     // rule like `self.foo > 0` against a body that doesn't even have `foo` typed as a
-    // number yet produces confusing CEL runtime errors instead of the clearer boon
+    // number yet produces confusing CEL runtime errors instead of the clearer jsonschema
     // "wrong type" error above.
     let crd = format!("{}/{}", ctx.schema_cache_key.0, ctx.kind);
     let run = CelRun::new(budgets, &crd);
@@ -1333,7 +1322,7 @@ fn collect_cel_rule_errors(
     }
 
     // `allOf` branches must all hold simultaneously, so every branch's rules apply
-    // unconditionally. `oneOf`/`anyOf` branches are alternatives — boon has already
+    // unconditionally. `oneOf`/`anyOf` branches are alternatives — jsonschema has already
     // confirmed `obj` satisfies the combinator as a whole (exactly one branch for
     // `oneOf`, at least one for `anyOf`) by the time this runs, so only the branch(es)
     // `obj` actually conforms to are evaluated; running a rule against a branch it
@@ -1364,7 +1353,7 @@ fn collect_cel_rule_errors(
 
 /// Best-effort check for whether `obj` conforms to `branch`, used to pick which
 /// `oneOf`/`anyOf` branch(es) a CEL rule should evaluate against. This deliberately
-/// does not re-implement full JSON Schema validation — boon already did that for the
+/// does not re-implement full JSON Schema validation — jsonschema already did that for the
 /// whole document before `validate_cel_rules` ever runs — it only checks the
 /// constraints real CRDs use to discriminate between branches (`type`, `required`,
 /// `enum`), e.g. cert-manager's Issuer backend union or Gateway API's filter-type union.
@@ -1580,7 +1569,7 @@ pub(crate) fn json_to_cel_value(
 /// pathological regex, or a nested `.all()`/`.filter()` comprehension over a large
 /// CR-author-controlled list) — at the point it actually runs, on every CR write, rather
 /// than trying to predict its cost statically. Mirrors `walk_schema_dos_bounds` (crd.rs),
-/// which bounds the equivalent risk for boon schema compilation.
+/// which bounds the equivalent risk for jsonschema schema compilation.
 ///
 /// Callers receive it through `CelBudgets` so tests can inject their own.
 const CEL_RULE_EVAL_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
@@ -2574,88 +2563,96 @@ fn cel_join(
     Ok(cel::Value::String(std::sync::Arc::new(parts.join(&sep))))
 }
 
-/// Depth-first search for an `enum` keyword violation in a boon validation-error tree,
-/// rendered in the k8s `field.Error` "Unsupported value" phrasing
-/// (`Unsupported value: "<bad>": supported values: "<a>", "<b>"`) instead of boon's own
-/// wording (`value must be one of 'a', 'b'`). kubectl and the upstream CRD-with-validation
-/// conformance test match on this exact phrasing, so a differently-worded rejection is
-/// treated as "did not reject" even though the CR was in fact rejected.
-///
-/// boon's `ErrorKind::Enum` carries only the allowed set, not the offending value, so the
-/// value is recovered by walking `instance_location` back into the original `obj`.
-fn enum_violation_message(e: &boon::ValidationError, obj: &serde_json::Value) -> Option<String> {
-    if let boon::ErrorKind::Enum { want } = &e.kind {
-        let got = resolve_instance_location(obj, &e.instance_location)
-            .map(json_value_as_display_string)
-            .unwrap_or_else(|| "<value>".to_string());
-        let supported = want
-            .iter()
-            .map(|v| format!("\"{}\"", json_value_as_display_string(v)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Some(format!(
-            "Unsupported value: \"{got}\": supported values: {supported}"
-        ));
-    }
-    e.causes
-        .iter()
-        .find_map(|cause| enum_violation_message(cause, obj))
-}
-
-/// Depth-first search for a `required` keyword violation in a boon validation-error tree,
-/// rendered in the k8s `field.Error` "Required value" phrasing (`<path>: Required value`)
-/// instead of boon's own wording (`missing properties 'name'`). kubectl and the upstream
-/// CRD-with-validation conformance test match on this exact phrasing (or the legacy
-/// client-side-validation wording `missing required field "name"`), so a differently-worded
-/// rejection is treated as "did not reject" even though the CR was in fact rejected.
-fn required_violation_message(e: &boon::ValidationError) -> Option<String> {
-    if let boon::ErrorKind::Required { want } = &e.kind {
-        let field = want.first()?;
-        let base = instance_location_as_field_path(&e.instance_location);
-        let path = if base.is_empty() {
-            (*field).to_string()
+/// Renders one jsonschema violation in the k8s `field.Error` phrasing kubectl and the
+/// upstream CRD-with-validation conformance tests match on: `<path>: Unsupported value:
+/// "<bad>": supported values: "<a>", "<b>"` for `enum`, `<path>.<field>: Required value`
+/// for `required`, `<path>: Invalid value: <detail>` for everything else. A violation at
+/// the object root has no `<path>: ` prefix.
+fn field_error_message(e: &jsonschema::ValidationError<'_>) -> String {
+    use jsonschema::error::ValidationErrorKind as Kind;
+    let base = instance_location_as_field_path(e.instance_path());
+    let at = |detail: String| {
+        if base.is_empty() {
+            detail
         } else {
-            format!("{base}.{field}")
-        };
-        return Some(format!("{path}: Required value"));
+            format!("{base}: {detail}")
+        }
+    };
+    match e.kind() {
+        Kind::Enum { options } => {
+            let supported = options
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| format!("\"{}\"", json_value_as_display_string(v)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let got = json_value_as_display_string(e.instance());
+            at(format!(
+                "Unsupported value: \"{got}\": supported values: {supported}"
+            ))
+        }
+        Kind::Required { property } => {
+            let field = json_value_as_display_string(property);
+            if base.is_empty() {
+                format!("{field}: Required value")
+            } else {
+                format!("{base}.{field}: Required value")
+            }
+        }
+        Kind::Pattern { pattern } => at(format!(
+            "Invalid value: {}: {base} in body should match '{pattern}'",
+            json_quoted(e.instance())
+        )),
+        Kind::Type {
+            kind: jsonschema::error::TypeKind::Single(want),
+        } => at(format!(
+            "Invalid value: \"{}\": {base} in body must be of type {want}: \"{}\"",
+            json_type_name(e.instance()),
+            json_type_name(e.instance()),
+        )),
+        _ => at(format!("Invalid value: {e}")),
     }
-    e.causes.iter().find_map(required_violation_message)
 }
 
-/// Renders a boon `InstanceLocation` as a k8s `field.Path`-style dotted/bracketed path
-/// (`spec.bars[0]`) rather than boon's JSON-pointer form (`/spec/bars/0`).
-fn instance_location_as_field_path(loc: &boon::InstanceLocation) -> String {
+fn json_quoted(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) if n.is_f64() => "number",
+        serde_json::Value::Number(_) => "integer",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Renders a jsonschema instance location as a k8s `field.Path`-style dotted/bracketed
+/// path (`spec.bars[0]`) rather than the JSON-pointer form (`/spec/bars/0`).
+fn instance_location_as_field_path(loc: &jsonschema::paths::Location) -> String {
+    use jsonschema::paths::LocationSegment as Seg;
     let mut path = String::new();
-    for tok in &loc.tokens {
-        match tok {
-            boon::InstanceToken::Prop(p) => {
+    for seg in loc {
+        match seg {
+            Seg::Property(p) => {
                 if !path.is_empty() {
                     path.push('.');
                 }
-                path.push_str(p);
+                path.push_str(&p);
             }
-            boon::InstanceToken::Item(i) => {
-                path.push_str(&format!("[{i}]"));
-            }
+            Seg::Index(i) => path.push_str(&format!("[{i}]")),
         }
     }
     path
-}
-
-/// Follows a boon `InstanceLocation`'s JSON-pointer tokens into `obj` to recover the value
-/// that failed validation at that location.
-fn resolve_instance_location<'a>(
-    obj: &'a serde_json::Value,
-    loc: &boon::InstanceLocation,
-) -> Option<&'a serde_json::Value> {
-    let mut cur = obj;
-    for tok in &loc.tokens {
-        cur = match tok {
-            boon::InstanceToken::Prop(p) => cur.get(p.as_ref())?,
-            boon::InstanceToken::Item(i) => cur.get(i)?,
-        };
-    }
-    Some(cur)
 }
 
 /// Renders a JSON value the way k8s's `field.Error` does for its `%q`/`%v` BadValue
@@ -12439,7 +12436,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // openAPIV3Schema validation tests (boon-based)
+    // openAPIV3Schema validation tests (jsonschema-based)
     // ---------------------------------------------------------------------------
 
     /// Wall-clock budgets no test host can reach, so a counted-cost verdict is never
@@ -12627,38 +12624,8 @@ mod tests {
         );
     }
 
-    /// Defense in depth: a CRD schema with an oversized `pattern` that somehow bypassed
-    /// crd.rs::validate_crd_schema (installed before that check existed, restored from
-    /// backup, or written directly to the store) must still be rejected here, before
-    /// boon::Compiler::compile ever sees it — otherwise every CR write against that CRD
-    /// retriggers boon's O(n^2) ECMA-compat rewrite, pinning a CPU core per request.
-    #[test]
-    fn validate_cr_schema_defense_in_depth_rejects_oversized_pattern_that_bypassed_crd_admission() {
-        let oversized = "a".repeat(crate::handlers::crd::MAX_CRD_PATTERN_BYTES + 1);
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": { "field": { "type": "string", "pattern": oversized } }
-        });
-        let err = match check_schema(&serde_json::json!({ "field": "x" }), schema) {
-            Ok(()) => panic!(
-                "an oversized pattern must be rejected before boon::Compiler::compile runs, \
-                 even when it reached validate_cr_schema without going through CRD admission"
-            ),
-            Err(e) => e,
-        };
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 422);
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("exceeds maximum length"),
-            "error must identify the oversized-pattern ReDoS defense, not a generic failure: {json}"
-        );
-    }
-
     /// A stored CRD whose short pattern compiles past the NFA budget (`\pL{244}` is 8
-    /// bytes but ~15 MiB resident, under boon's 10 MiB default) must be refused on the CR
+    /// bytes but ~15 MiB resident, under the regex crate's 10 MiB default) must be refused on the CR
     /// cache-miss path, or the first CR write pays the seconds and GiBs admission avoids.
     #[test]
     fn validate_cr_schema_cache_miss_rejects_pattern_over_nfa_budget_that_bypassed_crd_admission() {
@@ -12684,14 +12651,14 @@ mod tests {
     }
 
     // A single high-privilege CRD install must not turn into a repeatable amplification
-    // vector: without a cache, every CR create/update/patch against that CRD pays boon's
+    // vector: without a cache, every CR create/update/patch against that CRD pays the
     // parse-and-regex-compile cost again (measured ~657ms for the max-allowed 1024-byte
     // pattern) even though the schema never changed. This asserts the second write against
     // the same CRD generation reuses the compiled schema instead of recompiling — a compile
     // counter, not timing, because a real compile is slow enough to make timing-based
     // assertions flaky under CI load.
     #[test]
-    fn cr_schema_cache_avoids_boon_recompile_on_repeated_writes_against_same_crd_version() {
+    fn cr_schema_cache_avoids_jsonschema_recompile_on_repeated_writes_against_same_crd_version() {
         let schema = serde_json::json!({
             "type": "object",
             "properties": { "spec": { "type": "object" } }
@@ -12728,7 +12695,7 @@ mod tests {
             cache.compile_count(),
             1,
             "a second CR write against the same CRD generation (same group/version/resourceVersion) \
-             must reuse the cached compiled schema, not pay boon::Compiler::compile's cost again"
+             must reuse the cached compiled schema, not pay jsonschema validator build's cost again"
         );
     }
 
@@ -12736,10 +12703,10 @@ mod tests {
     // caching the pre-parsed cel::Program, a CRD with even a handful of CEL rules would
     // re-run cel::Program::compile (and the schema walk that finds every rule) on every
     // single CR create/update/patch, forever, even though the CRD's schema never changed.
-    // A dedicated CEL compile counter (not the boon one above, and not timing — a real CEL
+    // A dedicated CEL compile counter (not the jsonschema one above, and not timing — a real CEL
     // parse is fast enough that a timing assertion would be flaky) so a regression that
     // moves CEL compilation back onto the per-request path is caught even if it doesn't
-    // touch boon compilation at all.
+    // touch jsonschema compilation at all.
     #[test]
     fn cr_schema_cache_avoids_cel_reparse_on_repeated_writes_against_same_crd_version() {
         let schema = serde_json::json!({
@@ -13299,7 +13266,7 @@ mod tests {
     }
 
     // Unknown extension keywords must not cause a compile error (permissive).
-    // openAPIV3Schema CRDs use x-kubernetes-* extensions; boon must not reject them.
+    // openAPIV3Schema CRDs use x-kubernetes-* extensions; jsonschema must not reject them.
     #[test]
     fn schema_unknown_extension_keywords_do_not_fail_compile() {
         let schema = serde_json::json!({
@@ -13333,7 +13300,7 @@ mod tests {
 
     // enum violation: value not in the allowed set must be rejected.
     // The old hand-rolled validator silently accepted enum violations — this test
-    // ensures boon enforces enum correctly.
+    // ensures jsonschema enforces enum correctly.
     #[test]
     fn schema_enum_violation_fails() {
         let schema = serde_json::json!({
@@ -13345,12 +13312,12 @@ mod tests {
         let value = serde_json::json!({ "kind": "BadValue" });
         assert!(
             check_schema(&value, schema).is_err(),
-            "enum violation must be rejected by boon"
+            "enum violation must be rejected by jsonschema"
         );
     }
 
     // enum violation must render in the k8s field.Error "Unsupported value" phrasing, not
-    // boon's own wording. kubectl and the upstream CRD-with-validation-schema conformance
+    // jsonschema's own wording. kubectl and the upstream CRD-with-validation-schema conformance
     // test match the rejection error string against `Unsupported value: "<bad>"` — a
     // differently-worded (even if equally-rejecting) message makes those checks treat the
     // CR as accepted.
@@ -13377,7 +13344,7 @@ mod tests {
 
     // required-field violation nested inside an array item must render in the k8s
     // `field.Error` "Required value" phrasing (`spec.bars[0].name: Required value`), not
-    // boon's own wording (`missing properties 'name'`). The upstream CRD-with-validation-
+    // jsonschema's own wording (`missing properties 'name'`). The upstream CRD-with-validation-
     // schema conformance test matches the rejection error string against exactly this
     // phrasing (or the legacy `missing required field "name"` wording) — a differently-
     // worded (even if equally-rejecting) message makes that check treat the CR as accepted.
@@ -13414,7 +13381,7 @@ mod tests {
 
     // pattern violation: string not matching regex must be rejected.
     // The old hand-rolled validator silently accepted pattern violations — this test
-    // ensures boon enforces pattern correctly.
+    // ensures jsonschema enforces pattern correctly.
     #[test]
     fn schema_pattern_violation_fails() {
         let schema = serde_json::json!({
@@ -13426,14 +13393,48 @@ mod tests {
         let value = serde_json::json!({ "duration": "90days" });
         assert!(
             check_schema(&value, schema).is_err(),
-            "pattern violation must be rejected by boon"
+            "pattern violation must be rejected by jsonschema"
         );
+    }
+
+    // kubectl users read these strings; each violated keyword must be reported together (as
+    // upstream aggregates field errors) and in upstream's field.Error wording, with the
+    // dotted/bracketed path to the field.
+    #[test]
+    fn schema_violations_are_all_reported_in_upstream_field_error_wording() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["spec"],
+            "properties": {
+                "spec": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["a", "b"] },
+                        "code": { "type": "string", "pattern": "^[0-9]+$" },
+                        "replicas": { "type": "integer" }
+                    }
+                }
+            }
+        });
+        let value = serde_json::json!({
+            "spec": { "mode": "z", "code": "x1", "replicas": "three" }
+        });
+        let msg = check_schema(&value, schema).unwrap_err().1.message.clone();
+        for want in [
+            r#"spec.mode: Unsupported value: "z": supported values: "a", "b""#,
+            r#"spec.code: Invalid value: "x1": spec.code in body should match '^[0-9]+$'"#,
+            r#"spec.replicas: Invalid value: "string": spec.replicas in body must be of type integer: "string""#,
+            "spec.name: Required value",
+        ] {
+            assert!(msg.contains(want), "missing `{want}` in: {msg}");
+        }
     }
 
     // ---------------------------------------------------------------------------
     // x-kubernetes-validations (CEL) tests
     //
-    // Before this bead, boon-only structural validation meant x-kubernetes-validations
+    // Before this bead, jsonschema-only structural validation meant x-kubernetes-validations
     // rules were stored and round-tripped but never evaluated: a CR that violated every
     // CEL rule its CRD declared was still accepted. Fixtures below are drawn from the
     // real-world CEL surface an audit sampled (Gateway API, cert-manager,
@@ -13483,7 +13484,7 @@ mod tests {
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(
             json["code"], 422,
-            "a CEL rule violation must be a 422 Unprocessable Entity, matching the boon \
+            "a CEL rule violation must be a 422 Unprocessable Entity, matching the jsonschema \
              structural-validation failures this file already reports"
         );
         assert!(
@@ -15716,7 +15717,7 @@ mod tests {
     // this would hang the request-handling thread indefinitely instead of ever responding.
     // This proves the write is REJECTED by counted cost before the rule runs, mirroring
     // `validate_cr_schema_defense_in_depth_rejects_oversized_pattern...` above for the
-    // equivalent boon-schema risk. The verdict is a count, not a wall-clock measurement, so
+    // equivalent schema risk. The verdict is a count, not a wall-clock measurement, so
     // it holds on a loaded host.
     #[test]
     fn cel_rule_exceeding_evaluation_budget_is_rejected_not_left_to_hang() {
@@ -16978,7 +16979,7 @@ mod tests {
         assert_eq!(
             err.0,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "the rejection must be a 422 Unprocessable Entity, matching the boon \
+            "the rejection must be a 422 Unprocessable Entity, matching the jsonschema \
              structural-validation failures this file already reports"
         );
         assert!(
@@ -18698,11 +18699,11 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Additional boon schema validation coverage
+    // Additional jsonschema schema validation coverage
     // ---------------------------------------------------------------------------
 
     // type:string with null value must fail.
-    // Ensures boon catches null values where a string is expected.
+    // Ensures jsonschema catches null values where a string is expected.
     #[test]
     fn schema_null_value_type_error() {
         let schema = serde_json::json!({ "type": "string" });
@@ -18713,7 +18714,7 @@ mod tests {
     }
 
     // type:string with array value must fail.
-    // Ensures boon catches array values where a string is expected.
+    // Ensures jsonschema catches array values where a string is expected.
     #[test]
     fn schema_array_value_type_error() {
         let schema = serde_json::json!({ "type": "string" });
@@ -28604,74 +28605,6 @@ mod tests {
             "GET must apply the current schema's default even though the CR predates it — \
              without read-time defaulting, informers waiting on this field would hang forever"
         );
-    }
-
-    // Slow benchmark, not a regression gate — the real regression gates are the 3
-    // admission-cap tests (crd.rs and cr.rs). This is opt-in via `cargo test -- --ignored`
-    // and empirically confirms the audit's claim that boon's ECMA-compat rewrite (which
-    // runs before Regex::new, so regex::RegexBuilder::size_limit can't help) is O(n^2):
-    // each geometric doubling should roughly quadruple compile time, not double it. Each
-    // size is individually wall-clock-capped at 60s so this never turns into a multi-minute
-    // CI hang — a size that blows the cap is itself evidence of superlinear scaling.
-    #[test]
-    #[ignore]
-    fn poc_timing_boon_ecma_compat_shim_is_quadratic() {
-        use std::time::{Duration, Instant};
-
-        const CAP: Duration = Duration::from_secs(60);
-
-        // Baseline: a 1-byte pattern isolates boon::Compiler's fixed per-call setup cost
-        // (meta-schema/vocabulary loading) from the marginal, pattern-length-driven cost
-        // the geometric sweep below measures.
-        {
-            let start = Instant::now();
-            let mut schemas = boon::Schemas::new();
-            let mut compiler = boon::Compiler::new();
-            compiler
-                .add_resource(
-                    "baseline.json",
-                    serde_json::json!({ "type": "string", "pattern": "a" }),
-                )
-                .unwrap();
-            let _ = compiler.compile("baseline.json", &mut schemas);
-            eprintln!(
-                "PoC: 1 B baseline pattern compiled in {:?}",
-                start.elapsed()
-            );
-        }
-
-        let mut prev: Option<(usize, Duration)> = None;
-
-        for &size in &[1024usize, 4096, 16384, 65536, 262144, 1_048_576] {
-            let pattern = "\\d".repeat(size / 2);
-            let start = Instant::now();
-            let mut schemas = boon::Schemas::new();
-            let mut compiler = boon::Compiler::new();
-            compiler
-                .add_resource(
-                    "poc.json",
-                    serde_json::json!({ "type": "string", "pattern": pattern }),
-                )
-                .unwrap();
-            let _ = compiler.compile("poc.json", &mut schemas);
-            let elapsed = start.elapsed();
-            eprintln!("PoC: {size} B \\d-repeated pattern compiled in {elapsed:?}");
-
-            if elapsed > CAP {
-                eprintln!("PoC: {size} B exceeded the {CAP:?} cap — stopping (superlinear scaling confirmed)");
-                break;
-            }
-            if let Some((prev_size, prev_elapsed)) = prev {
-                let size_ratio = size as f64 / prev_size as f64;
-                let time_ratio = elapsed.as_secs_f64() / prev_elapsed.as_secs_f64().max(1e-9);
-                eprintln!(
-                    "PoC: {prev_size} B -> {size} B: size x{size_ratio:.1}, time x{time_ratio:.1} \
-                     (linear would be x{size_ratio:.1}, quadratic would be x{:.1})",
-                    size_ratio * size_ratio
-                );
-            }
-            prev = Some((size, elapsed));
-        }
     }
 
     // ---------------------------------------------------------------------------

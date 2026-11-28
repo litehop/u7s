@@ -1,0 +1,862 @@
+[
+  {
+    "name": "quantity",
+    "pattern": "^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$",
+    "inputs": [
+      "500m",
+      "2Gi",
+      "-1.5e3",
+      "abc",
+      "",
+      "1Zi"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  {
+    "name": "prom_duration",
+    "pattern": "^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$",
+    "inputs": [
+      "1h30m",
+      "0",
+      "5x",
+      "10ms"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "name": "dns1123_subdomain",
+    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+    "inputs": [
+      "a.b-c.d",
+      "A.b",
+      "-a",
+      "a..b",
+      ""
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  {
+    "name": "dns1123_empty_ok",
+    "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+    "inputs": [
+      "",
+      "a.b",
+      "_"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "name": "shorthand_d",
+    "pattern": "^\\d+$",
+    "inputs": [
+      "123",
+      "١٢٣",
+      "12a",
+      ""
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  {
+    "name": "shorthand_w",
+    "pattern": "^\\w+$",
+    "inputs": [
+      "abc_1",
+      "café",
+      "a b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  {
+    "name": "shorthand_s",
+    "pattern": "^a\\sb$",
+    "inputs": [
+      "a b",
+      "a\tb",
+      "a b",
+      "a b",
+      "a\u000bb",
+      "a\fb"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  {
+    "name": "shorthand_D_W_S",
+    "pattern": "^\\D\\W\\S$",
+    "inputs": [
+      "a-b",
+      "١-b",
+      "aéb",
+      "a b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  {
+    "name": "word_boundary",
+    "pattern": "\\bfoo\\b",
+    "inputs": [
+      "a foo b",
+      "éfoo",
+      "fooé",
+      "xfoo"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "name": "class_with_shorthand",
+    "pattern": "^[\\d\\s]+$",
+    "inputs": [
+      "1 2",
+      "١ ٢",
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  {
+    "name": "class_neg_shorthand",
+    "pattern": "^[^\\d]+$",
+    "inputs": [
+      "abc",
+      "a1",
+      "١"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "name": "unicode_letter",
+    "pattern": "^\\pL+$",
+    "inputs": [
+      "abc",
+      "éè",
+      "a1"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "name": "unicode_script",
+    "pattern": "^\\p{Greek}+$",
+    "inputs": [
+      "αβ",
+      "ab"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "unicode_class_negated",
+    "pattern": "^\\PL+$",
+    "inputs": [
+      "123",
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "flag_i",
+    "pattern": "(?i)^abc$",
+    "inputs": [
+      "ABC",
+      "abd"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "flag_s_dot",
+    "pattern": "(?s)^a.b$",
+    "inputs": [
+      "a\nb",
+      "axb"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true
+    ]
+  },
+  {
+    "name": "dot_no_s",
+    "pattern": "^a.b$",
+    "inputs": [
+      "a\nb",
+      "axb"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false,
+      true
+    ]
+  },
+  {
+    "name": "flag_m",
+    "pattern": "(?m)^b$",
+    "inputs": [
+      "a\nb\nc",
+      "ab"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "flag_U_ungreedy",
+    "pattern": "(?U)^a+",
+    "inputs": [
+      "aaa",
+      "b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "anchor_A_z",
+    "pattern": "\\Aabc\\z",
+    "inputs": [
+      "abc",
+      "abc\n"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "anchor_Z",
+    "pattern": "abc\\Z",
+    "inputs": [
+      "abc"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\Z`",
+    "go_matches": []
+  },
+  {
+    "name": "quote_Q_E",
+    "pattern": "\\Qa.b\\E",
+    "inputs": [
+      "a.b",
+      "axb"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "named_group_P",
+    "pattern": "(?P<n>a)b",
+    "inputs": [
+      "ab",
+      "b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "named_group_angle",
+    "pattern": "(?<n>a)b",
+    "inputs": [
+      "ab",
+      "b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "posix_class",
+    "pattern": "^[[:alpha:]]+$",
+    "inputs": [
+      "abc",
+      "ab1"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "posix_class_neg",
+    "pattern": "^[[:^digit:]]+$",
+    "inputs": [
+      "abc",
+      "a1"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "escape_underscore",
+    "pattern": "a\\_b",
+    "inputs": [
+      "a_b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "escape_bell_a",
+    "pattern": "a\\ab",
+    "inputs": [
+      "a\u0007b",
+      "aab"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "escape_ctrl_cA",
+    "pattern": "\\cA",
+    "inputs": [
+      "\u0001",
+      "cA"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\c`",
+    "go_matches": []
+  },
+  {
+    "name": "escape_u_ecma",
+    "pattern": "\\u0041",
+    "inputs": [
+      "A",
+      "u0041"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\u`",
+    "go_matches": []
+  },
+  {
+    "name": "escape_x_hex",
+    "pattern": "\\x41\\x{263A}",
+    "inputs": [
+      "A☺",
+      "x"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "escape_slash",
+    "pattern": "a\\/b",
+    "inputs": [
+      "a/b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "escape_dash_outside",
+    "pattern": "a\\-b",
+    "inputs": [
+      "a-b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "escape_lt_gt",
+    "pattern": "\\<a\\>",
+    "inputs": [
+      "<a>",
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "escape_C_byte",
+    "pattern": "\\C",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\C`",
+    "go_matches": []
+  },
+  {
+    "name": "backref",
+    "pattern": "(a)\\1",
+    "inputs": [
+      "aa",
+      "ab"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\1`",
+    "go_matches": []
+  },
+  {
+    "name": "lookahead",
+    "pattern": "a(?=b)",
+    "inputs": [
+      "ab",
+      "ac"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid or unsupported Perl syntax: `(?=`",
+    "go_matches": []
+  },
+  {
+    "name": "neg_lookahead",
+    "pattern": "a(?!b)",
+    "inputs": [
+      "ab",
+      "ac"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid or unsupported Perl syntax: `(?!`",
+    "go_matches": []
+  },
+  {
+    "name": "lookbehind",
+    "pattern": "(?<=a)b",
+    "inputs": [
+      "ab",
+      "b"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid named capture: `(?<=a)b`",
+    "go_matches": []
+  },
+  {
+    "name": "possessive",
+    "pattern": "a++b",
+    "inputs": [
+      "aab"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid nested repetition operator: `++`",
+    "go_matches": []
+  },
+  {
+    "name": "lazy_quant",
+    "pattern": "^a+?$",
+    "inputs": [
+      "aaa"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "repeat_1000",
+    "pattern": "^a{1000}$",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false
+    ]
+  },
+  {
+    "name": "repeat_1001",
+    "pattern": "^a{1001}$",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid repeat count: `{1001}`",
+    "go_matches": []
+  },
+  {
+    "name": "repeat_range_open",
+    "pattern": "^a{2,}$",
+    "inputs": [
+      "a",
+      "aa",
+      "aaaa"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false,
+      true,
+      true
+    ]
+  },
+  {
+    "name": "repeat_lower_missing",
+    "pattern": "^a{,3}$",
+    "inputs": [
+      "a{,3}",
+      "aaa"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "repeat_nested_big",
+    "pattern": "^(a{100}){100}$",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid repeat count: `{100}`",
+    "go_matches": []
+  },
+  {
+    "name": "repeat_unicode_class_244",
+    "pattern": "\\pL{244}",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false
+    ]
+  },
+  {
+    "name": "empty_class_ecma",
+    "pattern": "[^]",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: missing closing ]: `[^]`",
+    "go_matches": []
+  },
+  {
+    "name": "class_nested",
+    "pattern": "[a-z&&[^b]]",
+    "inputs": [
+      "b",
+      "a"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false,
+      false
+    ]
+  },
+  {
+    "name": "class_literal_bracket",
+    "pattern": "[\\]]",
+    "inputs": [
+      "]"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "class_unescaped_bracket_in_class",
+    "pattern": "[[]",
+    "inputs": [
+      "["
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true
+    ]
+  },
+  {
+    "name": "unclosed_paren",
+    "pattern": "(abc",
+    "inputs": [
+      "abc"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: missing closing ): `(abc`",
+    "go_matches": []
+  },
+  {
+    "name": "unclosed_class",
+    "pattern": "[abc",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: missing closing ]: `[abc`",
+    "go_matches": []
+  },
+  {
+    "name": "bad_repeat",
+    "pattern": "*a",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: missing argument to repetition operator: `*`",
+    "go_matches": []
+  },
+  {
+    "name": "bad_range",
+    "pattern": "[z-a]",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid character class range: `z-a`",
+    "go_matches": []
+  },
+  {
+    "name": "bad_escape_letter",
+    "pattern": "\\q",
+    "inputs": [
+      "q"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: invalid escape sequence: `\\q`",
+    "go_matches": []
+  },
+  {
+    "name": "trailing_backslash",
+    "pattern": "a\\",
+    "inputs": [
+      "a"
+    ],
+    "go_compiles": false,
+    "go_error": "error parsing regexp: trailing backslash at end of expression: ``",
+    "go_matches": []
+  },
+  {
+    "name": "empty_pattern",
+    "pattern": "",
+    "inputs": [
+      "",
+      "x"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true
+    ]
+  },
+  {
+    "name": "catastrophic",
+    "pattern": "^(a+)+$",
+    "inputs": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      false
+    ]
+  },
+  {
+    "name": "alternation_empty",
+    "pattern": "^(a|)$",
+    "inputs": [
+      "a",
+      "",
+      "b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "name": "non_capturing",
+    "pattern": "^(?:ab)+$",
+    "inputs": [
+      "abab",
+      "aba"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "email_like",
+    "pattern": "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$",
+    "inputs": [
+      "a@b.co",
+      "a@b"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "semver",
+    "pattern": "^v?(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+    "inputs": [
+      "v1.2.3",
+      "1.2",
+      "1.2.3-rc.1+b5"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false,
+      true
+    ]
+  },
+  {
+    "name": "cron_like",
+    "pattern": "^(\\*|[0-9]+)(\\s+(\\*|[0-9]+)){4}$",
+    "inputs": [
+      "* * * * *",
+      "1 2 3 4 5",
+      "1 2"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      false
+    ]
+  },
+  {
+    "name": "uuid",
+    "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    "inputs": [
+      "123e4567-e89b-12d3-a456-426614174000",
+      "x"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      false
+    ]
+  },
+  {
+    "name": "cilium_bgp_ip_1199B",
+    "pattern": "((^\\s*((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))\\s*$)|(^\\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}))|:)))(%.+)?\\s*$))",
+    "inputs": [
+      "10.0.0.1",
+      " 10.0.0.1 ",
+      "2001:db8::1",
+      "fe80::1%eth0",
+      "1.2.3.256",
+      "hello",
+      "::",
+      "1::2::3"
+    ],
+    "go_compiles": true,
+    "go_matches": [
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  }
+]
