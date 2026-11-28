@@ -754,7 +754,12 @@ pub(crate) async fn replace_pod<S: Store>(
             run_mutating_webhooks(&state, obj.body, Some(&stored_obj.body), &admission_ctx).await?;
         // Pinned after mutating admission (upstream rest.BeforeUpdate): a PUT can neither
         // un-terminate nor hard-delete a pod, and a webhook cannot clear creationTimestamp.
-        super::generic::pin_server_owned_metadata(&mut obj.body, Some(&stored_obj.body));
+        super::generic::pin_server_owned_metadata(
+            &mut obj.body,
+            Some(&stored_obj.body),
+            "",
+            "Pod",
+        )?;
         validate_pod_spec_immutable(&spec_before, &obj.body["spec"])
             .map_err(Status::unprocessable_entity)?;
         run_validating_webhooks(&state, &obj.body, Some(&stored_obj.body), &admission_ctx).await?;
@@ -1539,13 +1544,6 @@ pub(crate) async fn patch_pod<S: Store>(
         // status through this endpoint (e.g. fake a pod Ready+podIP), for ANY patch type
         // including JSON Patch, whose array shape can't be caught by an object-key strip.
         let stored_status = current_obj.body["status"].clone();
-        // Save the stored uid: metadata.uid is immutable identity, restored unconditionally
-        // after the patch is applied, exactly like do_patch (resource.rs) already does for the
-        // generic path. Without this, a caller holding only `patch pods` rights could forge
-        // uid to match a stale/foreign ownerReference and corrupt the garbage collector's
-        // cascade-GC decision for ReplicaSet/Job/DaemonSet controllers, for ANY patch type
-        // (Merge, StrategicMerge, JSON Patch).
-        let stored_uid = current_obj.body["metadata"]["uid"].clone();
         let stored_deletion = super::generic::snapshot_server_owned_metadata(&current_obj.body);
         let rv_before_patch = current_obj.resource_version().map(str::to_owned);
 
@@ -1572,7 +1570,6 @@ pub(crate) async fn patch_pod<S: Store>(
             plan.remove_dropped_fields(&mut current_obj.body);
         }
         current_obj.body["status"] = stored_status.clone();
-        current_obj.body["metadata"]["uid"] = stored_uid;
         super::json_patch::enforce_patch_identity(&mut current_obj.body, &name, Some(ns.as_str()))?;
 
         // Admission webhook pipeline (mutating then validating), threading the pre-patch
@@ -1608,7 +1605,12 @@ pub(crate) async fn patch_pod<S: Store>(
             &admission_ctx,
         )
         .await?;
-        super::generic::pin_server_owned_metadata(&mut current_obj.body, Some(&stored_deletion));
+        super::generic::pin_server_owned_metadata(
+            &mut current_obj.body,
+            Some(&stored_deletion),
+            "",
+            "Pod",
+        )?;
 
         // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore already discarded, and this is the last
@@ -2711,7 +2713,9 @@ pub(crate) async fn replace_pod_status<S: Store>(
             &mut current_obj.body,
             &incoming,
             Some("Pod"),
-        );
+            "",
+            crate::handlers::status::Write::Put,
+        )?;
         current_obj.body = admit_pod_status_update(
             &state,
             ns.as_str(),
@@ -2885,7 +2889,13 @@ pub(crate) fn apply_status_patch(
     // finalizer), so without this guard every kubelet status update would restore the
     // finalizer that KCM just removed, causing a livelock where the finalizer is never
     // permanently removed and pods stay Terminating forever.
-    crate::handlers::status::merge_incoming_metadata(&mut result, patch, Some("Pod"));
+    crate::handlers::status::merge_incoming_metadata(
+        &mut result,
+        patch,
+        Some("Pod"),
+        "",
+        crate::handlers::status::Write::Patch,
+    )?;
 
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
@@ -2972,20 +2982,6 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
     }
 }
 
-/// Upstream's 422 for a `metadata.uid` that differs from the stored one
-/// (`ValidateImmutableField` in `ValidateObjectMetaUpdate`).
-fn immutable_uid_error(name: &str, uid: &str) -> crate::status::StatusError {
-    let cause = format!("Invalid value: \"{uid}\": field is immutable");
-    let mut err =
-        Status::unprocessable_entity(format!("Pod \"{name}\" is invalid: metadata.uid: {cause}"));
-    err.1.details = Some(Box::new(serde_json::json!({
-        "name": name,
-        "kind": "Pod",
-        "causes": [{"reason": "FieldValueInvalid", "message": cause, "field": "metadata.uid"}]
-    })));
-    err
-}
-
 pub(crate) async fn patch_pod_status<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -3039,14 +3035,6 @@ pub(crate) async fn patch_pod_status<S: Store>(
 
         let mut current_obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-        // A PATCH carries no precondition upstream; a `metadata.uid` naming another incarnation
-        // fails `ValidateObjectMetaUpdate` as an immutable-field 422.
-        if let Some(uid) = patch["metadata"]["uid"].as_str().filter(|u| !u.is_empty()) {
-            if current_obj.body["metadata"]["uid"].as_str() != Some(uid) {
-                return Err(immutable_uid_error(&name, uid));
-            }
-        }
 
         let before_write = current_obj.body.clone();
         let ssa_plan = super::status::plan_status_apply(
@@ -15809,8 +15797,6 @@ mod handler_tests {
     /// persist the attacker-supplied uid and this assertion would fail.
     #[tokio::test]
     async fn patch_pod_cannot_change_uid() {
-        use axum::body::to_bytes;
-
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
         seed_pod(
@@ -15838,13 +15824,10 @@ mod handler_tests {
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], "real-uid-0001",
-            "a merge-patch carrying metadata.uid must not change the stored uid — a \
-             patch-only caller could otherwise forge ownerReference matches and hijack GC"
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a merge-patch carrying a different metadata.uid is upstream's immutable-field 422"
         );
 
         // Strategic merge patch.
@@ -15860,13 +15843,10 @@ mod handler_tests {
             ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], "real-uid-0001",
-            "a strategic-merge-patch carrying metadata.uid must not change the stored uid — \
-             a patch-only caller could otherwise forge ownerReference matches and hijack GC"
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a strategic-merge-patch carrying a different metadata.uid is a 422"
         );
 
         // JSON Patch — array-shaped, so an object-key strip on the incoming patch would never
@@ -15880,13 +15860,10 @@ mod handler_tests {
             ])))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], "real-uid-0001",
-            "a JSON Patch carrying metadata.uid must not change the stored uid — a \
-             patch-only caller could otherwise forge ownerReference matches and hijack GC"
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a JSON Patch carrying a different metadata.uid is a 422"
         );
 
         let stored = store
@@ -25359,15 +25336,12 @@ mod status_patch_metadata_tests {
             "metadata": { "uid": "attacker-uid", "annotations": { "safe": "yes" } },
             "status": { "phase": "Failed" }
         });
-        let result = apply_status_patch(&stored, &patch).unwrap();
+        let err = apply_status_patch(&stored, &patch)
+            .expect_err("a status patch changing uid is upstream's immutable-field 422");
         assert_eq!(
-            result["metadata"]["uid"], "real-uid",
-            "uid must not be overwritten by a status patch; \
-             uid changes via /status would corrupt object identity and break GC"
-        );
-        assert_eq!(
-            result["metadata"]["annotations"]["safe"], "yes",
-            "non-identity annotations must still land"
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "uid changes via /status would corrupt object identity and break GC"
         );
     }
 

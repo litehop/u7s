@@ -31,7 +31,7 @@ use crate::{
     handlers::json_patch::{
         apply_json_patch, detect_patch_type, is_dry_run_header, ssa_body_to_json, PatchType,
     },
-    handlers::status::{merge_incoming_metadata, status_write_strategy},
+    handlers::status::{merge_incoming_metadata, status_write_strategy, Write},
     keys::group_object_key,
     state::AppState,
     status::Status,
@@ -170,7 +170,13 @@ pub async fn put_approval<S: Store>(
             &old_body,
             &crate::util::utc_now_rfc3339(),
         );
-        merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
+        merge_incoming_metadata(
+            &mut current.body,
+            &incoming.body,
+            Some(KIND),
+            "certificates.k8s.io",
+            Write::Put,
+        )?;
         current.body =
             admit_approval(&state, &name, &user, &headers, &old_body, current.body).await?;
         record_approval_write(&headers, &old_body, &mut current.body, None);
@@ -273,7 +279,13 @@ pub async fn patch_approval<S: Store>(
                 }
                 // Merge metadata (labels/annotations) from the patch — kubectl certificate
                 // approve/deny and this conformance test also patch annotations via /approval.
-                merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
+                merge_incoming_metadata(
+                    &mut current.body,
+                    &patch,
+                    Some(KIND),
+                    "certificates.k8s.io",
+                    Write::Patch,
+                )?;
             }
         }
 
@@ -2086,6 +2098,52 @@ mod tests {
             .map(|_| ());
         out.push(("apply", r.err().map(|e| e.1.message)));
         out
+    }
+
+    /// /approval is a status-style write: another incarnation's uid is a 409 on PUT (storage
+    /// precondition) and a 422 on PATCH (immutable field), and nothing is stored either way.
+    #[tokio::test]
+    async fn approval_rejects_a_changed_uid_on_put_and_patch() {
+        let state = make_state();
+        let name = "uid-csr";
+        let key = seed_csr(&state.store, name, None).await;
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        body["metadata"]["uid"] = json!("real-uid");
+        let bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+        state.store.put(&key, bytes, None).await.unwrap();
+
+        let put_body =
+            json!({"metadata": {"name": name, "uid": "forged"}, "status": {"conditions": []}});
+        let put = put_approval(
+            axum::extract::State(state.clone()),
+            approver(&state),
+            axum::extract::Path(name.to_owned()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            put.err().map(|e| e.0),
+            Some(axum::http::StatusCode::CONFLICT)
+        );
+
+        let patch = patch_approval(
+            axum::extract::State(state.clone()),
+            approver(&state),
+            axum::extract::Path(name.to_owned()),
+            patch_headers("application/merge-patch+json"),
+            bytes::Bytes::from(r#"{"metadata":{"uid":"forged"}}"#),
+        )
+        .await;
+        assert_eq!(
+            patch.err().map(|e| e.0),
+            Some(axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+        );
+
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["metadata"]["uid"], "real-uid");
     }
 
     /// A signer approver must not be able to un-deny a CSR: if /approval could drop

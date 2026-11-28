@@ -277,7 +277,10 @@ async fn namespaced_patch_cannot_start_deletion_from_client_deletion_timestamp()
         ),
     )
     .await
-    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+    .err()
+    .map(|e| e.0)
+    .filter(|c| *c == axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+    .expect("a client-set deletionTimestamp on a live object is upstream's 422");
 
     let v = stored(&state, &key)
         .await
@@ -311,7 +314,10 @@ async fn pod_patch_cannot_start_deletion_from_client_deletion_timestamp() {
         ),
     )
     .await
-    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+    .err()
+    .map(|e| e.0)
+    .filter(|c| *c == axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+    .expect("a client-set deletionTimestamp on a live object is upstream's 422");
 
     let v = stored(&state, &key)
         .await
@@ -345,7 +351,10 @@ async fn namespace_patch_cannot_start_deletion_from_client_deletion_timestamp() 
         ),
     )
     .await
-    .unwrap_or_else(|e| panic!("patch: {e:?}"));
+    .err()
+    .map(|e| e.0)
+    .filter(|c| *c == axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+    .expect("a client-set deletionTimestamp on a live object is upstream's 422");
 
     let v = stored(&state, &key)
         .await
