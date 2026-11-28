@@ -1482,6 +1482,79 @@ assert "STEP I: a line with an unparsable etime never kills -- age is unknown so
   "$([ -z "$(step_i_dry "$(wl_loop 9100 'run-all.sh --vm alpha' soon)")" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# STEP J -- guarded bd Dolt GC (stub bd / pgrep; the real store is never touched).
+# ---------------------------------------------------------------------------
+J_DIR="$SANDBOX_ROOT/step-j"
+mkdir -p "$J_DIR/bin" "$J_DIR/repo/.beads/embeddeddolt"
+cat > "$J_DIR/bd" <<'STUB'
+#!/usr/bin/env bash
+# args: -C <dir> export -o <file> | -C <dir> gc ...
+shift 2
+case "$1" in
+  export)
+    if [ -f "$J_GC_DONE" ]; then printf '%s\n' "${J_EXPORT_AFTER:-same}" > "$3"; else printf 'same\n' > "$3"; fi ;;
+  gc)
+    echo "$*" >> "$J_GC_LOG"; touch "$J_GC_DONE"; exit "${J_GC_RC:-0}" ;;
+esac
+STUB
+chmod +x "$J_DIR/bd"
+printf '#!/usr/bin/env bash\n[ -n "${J_BD_PIDS:-}" ] && echo "$J_BD_PIDS" && exit 0\nexit 1\n' > "$J_DIR/bin/pgrep"
+chmod +x "$J_DIR/bin/pgrep"
+
+step_j_run() {  # LIVE_AGENTS value, then NAME=VALUE env -> stdout+stderr, "rc=N" last line
+  local live="$1"; shift
+  rm -f "$J_DIR/gc.log" "$J_DIR/gc.done"
+  local rc=0 out
+  out=$(env "$@" PATH="$J_DIR/bin:$PATH" HYGIENE_BD="$J_DIR/bd" WORKTREE_HYGIENE_REPO_ROOT="$J_DIR/repo" \
+    J_GC_LOG="$J_DIR/gc.log" J_GC_DONE="$J_DIR/gc.done" LIVE_AGENTS="$live" bash "$SCRIPT" __call step_j_bd_gc 2>&1) || rc=$?
+  printf '%s\nrc=%s\n' "$out" "$rc"
+}
+
+J_OUT=$(step_j_run "")
+assert "STEP J: with no live workers and no bd process, GC runs with the full flags (else the bloated store is never compacted)" \
+  "$([ "$(cat "$J_DIR/gc.log" 2>/dev/null)" = "gc --skip-decay --full --force" ] && echo 1 || echo 0)"
+assert "STEP J: a clean GC reports the unchanged export and exits 0 (else every idle tick cries wolf)" \
+  "$(grep -q 'export unchanged' <<< "$J_OUT" && grep -qx 'rc=0' <<< "$J_OUT" && echo 1 || echo 0)"
+
+J_OUT=$(step_j_run "abc123")
+assert "STEP J: live workers (--live-agents) skip the GC -- a worker's bd write would race the file-locked Dolt store" \
+  "$([ ! -f "$J_DIR/gc.log" ] && grep -q 'skipped -- live workers' <<< "$J_OUT" && grep -qx 'rc=0' <<< "$J_OUT" && echo 1 || echo 0)"
+
+J_OUT=$(step_j_run "" J_BD_PIDS=4242)
+assert "STEP J: a running bd process skips the GC and logs why -- GC under a live writer can corrupt or block the store" \
+  "$([ ! -f "$J_DIR/gc.log" ] && grep -q 'bd process is running' <<< "$J_OUT" && grep -qx 'rc=0' <<< "$J_OUT" && echo 1 || echo 0)"
+
+J_OUT=$(step_j_run "" J_EXPORT_AFTER=different)
+assert "STEP J: an export that changes across GC is an anomaly -- exit 1 with both hashes logged, so lost issues are noticed" \
+  "$(grep -qx 'rc=1' <<< "$J_OUT" && grep -q 'ALERT: bd export changed' <<< "$J_OUT" && [ "$(grep -oE '[0-9a-f]{64}' <<< "$J_OUT" | sort -u | wc -l)" -eq 2 ] && echo 1 || echo 0)"
+J_KEPT=$(grep -oE '\(/[^)]*hygiene-bd-export-[a-z]+\.[A-Za-z0-9]+\)' <<< "$J_OUT" | tr -d '()')
+assert "STEP J: the before/after export tmpfiles still exist after a mismatch -- the operator needs them to diff" \
+  "$([ "$(wc -l <<< "$J_KEPT")" -eq 2 ] && for f in $J_KEPT; do [ -f "$f" ] || exit 1; done && echo 1 || echo 0)"
+rm -f $J_KEPT
+
+J_OUT=$(step_j_run "" J_GC_RC=1)
+assert "STEP J: a failing bd gc warns and exits 1 -- the operator must look at a possibly half-compacted store" \
+  "$(grep -qx 'rc=1' <<< "$J_OUT" && grep -q "STEP J WARNING: 'bd gc' failed" <<< "$J_OUT" && echo 1 || echo 0)"
+
+# main(): a STEP J failure must not stop the steps around it, and must set exit 1.
+J_MAIN_RC=0
+J_MAIN=$(HYGIENE_BD="$J_DIR/bd" J_GC_RC=1 J_GC_LOG="$J_DIR/gc.log" J_GC_DONE="$J_DIR/gc.done" WORKTREE_HYGIENE_REPO_ROOT="$J_DIR/repo" PATH="$J_DIR/bin:$PATH" bash -c '
+  source "$1"
+  step_a_orphaned_processes() { echo ran-A; }
+  step_b_prune_worktrees() { echo ran-B; }
+  step_c_stale_worker_branches() { echo ran-C; }
+  step_d_gone_upstream_branches() { echo ran-D; }
+  step_e_stale_findings() { echo ran-E; }
+  step_f_orphaned_origin_branches() { echo ran-F; }
+  step_g_fix_round_worktrees() { echo ran-G; }
+  step_i_orphaned_wait_loops() { echo ran-I; }
+  step_h_main_audit() { echo ran-H; }
+  main --no-live-workers
+' hygiene "$SCRIPT" 2>&1) || J_MAIN_RC=$?
+assert "STEP J: a bd gc failure exits 1 yet every other step (destructive ones before, audit after) still runs" \
+  "$(for s in A B C D E F G I H; do grep -qx "ran-$s" <<< "$J_MAIN" || exit 1; done; [ "$J_MAIN_RC" = 1 ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
