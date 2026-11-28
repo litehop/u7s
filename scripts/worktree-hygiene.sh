@@ -1088,8 +1088,16 @@ step_j_bd_gc() {
     echo "worktree-hygiene: STEP J: skipped -- live workers (--live-agents) may be writing to the bd store"
     return 0
   fi
-  local running
-  running=$(pgrep -x bd 2>/dev/null || true)
+  if ! command -v pgrep >/dev/null 2>&1; then
+    echo "worktree-hygiene: STEP J: skipped -- pgrep not found, cannot tell whether a bd process is running"
+    return 0
+  fi
+  local running prc=0
+  running=$(pgrep -x bd 2>/dev/null) || prc=$?
+  if [ "$prc" -gt 1 ]; then
+    echo "worktree-hygiene: STEP J: skipped -- pgrep failed (rc $prc), cannot tell whether a bd process is running"
+    return 0
+  fi
   if [ -n "$running" ]; then
     echo "worktree-hygiene: STEP J: skipped -- a bd process is running (pid $(echo $running)); the embedded Dolt store is single-writer"
     return 0

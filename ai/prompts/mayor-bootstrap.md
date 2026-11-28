@@ -237,8 +237,12 @@ A worktree/branch whose agent-id is in `--live-agents` is protected from
 every destructive step unconditionally, regardless of dir existence or
 merge state; under `--no-live-workers`, STEP C's merge-state and open-PR
 checks still apply, so a branch with a pending PR is preserved even with
-zero live workers. STEP J runs `bd gc --skip-decay --full --force` only
-under `--no-live-workers` and only when no `bd` process is running.
+zero live workers. STEP D needs no such check — its scope (branches whose
+tracked upstream is literally `[gone]`) already excludes any branch an
+open PR keeps alive. STEP J runs `bd gc --skip-decay --full --force` only
+under `--no-live-workers` and only when pgrep confirms no `bd` process is
+running. See the script for the STEP A–D implementation and its design
+rationale.
 
 Auto-kill/auto-delete with no approval gate (operator decision) — the script
 logs loudly instead of asking. Exit 0 is a clean tick; 1 = a killed process

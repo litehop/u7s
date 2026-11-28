@@ -1524,6 +1524,30 @@ J_OUT=$(step_j_run "" J_BD_PIDS=4242)
 assert "STEP J: a running bd process skips the GC and logs why -- GC under a live writer can corrupt or block the store" \
   "$([ ! -f "$J_DIR/gc.log" ] && grep -q 'bd process is running' <<< "$J_OUT" && grep -qx 'rc=0' <<< "$J_OUT" && echo 1 || echo 0)"
 
+mkdir -p "$J_DIR/errbin"
+printf '#!/usr/bin/env bash\nexit 2\n' > "$J_DIR/errbin/pgrep"
+chmod +x "$J_DIR/errbin/pgrep"
+rm -f "$J_DIR/gc.log" "$J_DIR/gc.done"
+J_RC=0
+J_OUT=$(PATH="$J_DIR/errbin:$PATH" HYGIENE_BD="$J_DIR/bd" WORKTREE_HYGIENE_REPO_ROOT="$J_DIR/repo" J_GC_LOG="$J_DIR/gc.log" J_GC_DONE="$J_DIR/gc.done" LIVE_AGENTS="" bash "$SCRIPT" __call step_j_bd_gc 2>&1) || J_RC=$?
+assert "STEP J: an erroring pgrep skips the GC and logs why -- treating an error as 'no bd running' would GC under a live writer" \
+  "$([ ! -f "$J_DIR/gc.log" ] && grep -q 'pgrep failed' <<< "$J_OUT" && [ "$J_RC" = 0 ] && echo 1 || echo 0)"
+
+# PATH holding every tool the step needs except pgrep.
+mkdir -p "$J_DIR/nopgrep"
+for t in bash env tr sed awk grep cat mktemp du shasum rm date dirname basename id sort uniq head cut wc git; do
+  tp=$(command -v "$t" 2>/dev/null) && ln -sf "$tp" "$J_DIR/nopgrep/$t"
+done
+rm -f "$J_DIR/gc.log" "$J_DIR/gc.done"
+J_RC=0
+J_OUT=$(PATH="$J_DIR/nopgrep" HYGIENE_BD="$J_DIR/bd" WORKTREE_HYGIENE_REPO_ROOT="$J_DIR/repo" J_GC_LOG="$J_DIR/gc.log" J_GC_DONE="$J_DIR/gc.done" LIVE_AGENTS="" "$J_DIR/nopgrep/bash" "$SCRIPT" __call step_j_bd_gc 2>&1) || J_RC=$?
+assert "STEP J: a missing pgrep skips the GC and logs why -- failing open would GC without knowing whether bd is running" \
+  "$([ ! -f "$J_DIR/gc.log" ] && grep -q 'pgrep not found' <<< "$J_OUT" && [ "$J_RC" = 0 ] && echo 1 || echo 0)"
+
+J_OUT=$(step_j_run "" DRY_RUN=1)
+assert "STEP J: DRY_RUN=1 logs the would-run line and never invokes bd gc -- a dry run must not compact the store" \
+  "$([ ! -f "$J_DIR/gc.log" ] && grep -q '\[dry-run\] would run: bd gc' <<< "$J_OUT" && grep -qx 'rc=0' <<< "$J_OUT" && echo 1 || echo 0)"
+
 J_OUT=$(step_j_run "" J_EXPORT_AFTER=different)
 assert "STEP J: an export that changes across GC is an anomaly -- exit 1 with both hashes logged, so lost issues are noticed" \
   "$(grep -qx 'rc=1' <<< "$J_OUT" && grep -q 'ALERT: bd export changed' <<< "$J_OUT" && [ "$(grep -oE '[0-9a-f]{64}' <<< "$J_OUT" | sort -u | wc -l)" -eq 2 ] && echo 1 || echo 0)"
