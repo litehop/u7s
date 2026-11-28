@@ -4,7 +4,7 @@
   "ported_controllers": [],
   "kcm_controllers": "--controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller,-ttl-controller,-legacy-serviceaccount-token-cleaner-controller,-validatingadmissionpolicy-status-controller,-storage-version-migrator-controller,-storageversion-garbage-collector-controller,-kube-apiserver-serving-clustertrustbundle-publisher-controller,-podcertificaterequest-cleaner-controller,-podgroup-protection-controller,-resourcepoolstatusrequest-controller,-horizontal-pod-autoscaler-controller",
   "kcm_restarts": 0,
-  "git_sha": "f1052aec6a3e92eb0af2120ce73d7c51f89d6aab",
+  "git_sha": "f85b2873ed3500ada47bf172431e2c9d934eeca4",
   "git_dirty": false,
   "date": "2026-11-28",
   "vm": {
@@ -20,50 +20,50 @@
   },
   "stages": {
     "idle": {
-      "kcm_mib": 33.56,
-      "apiserver_mib": 19.43,
+      "kcm_mib": 33.24,
+      "apiserver_mib": 18.93,
       "samples_mib": {
         "kcm": [
-          33.45,
-          33.56,
-          33.57
+          33.14,
+          33.24,
+          33.26
         ],
         "apiserver": [
-          19.40,
-          19.43,
-          19.43
+          18.92,
+          18.93,
+          18.93
         ]
       }
     },
     "wordpress": {
-      "kcm_mib": 35.12,
-      "apiserver_mib": 20.00,
+      "kcm_mib": 34.76,
+      "apiserver_mib": 21.94,
       "samples_mib": {
         "kcm": [
-          34.96,
-          35.12,
-          35.12
+          34.72,
+          34.76,
+          34.78
         ],
         "apiserver": [
-          20.00,
-          20.00,
-          20.00
+          21.94,
+          21.94,
+          21.94
         ]
       }
     },
     "burst": {
-      "kcm_mib": 38.11,
-      "apiserver_mib": 23.79,
+      "kcm_mib": 37.89,
+      "apiserver_mib": 24.23,
       "samples_mib": {
         "kcm": [
-          38.04,
-          38.11,
-          38.24
+          37.88,
+          37.89,
+          37.94
         ],
         "apiserver": [
-          23.79,
-          23.79,
-          23.79
+          24.23,
+          24.23,
+          24.23
         ]
       }
     }

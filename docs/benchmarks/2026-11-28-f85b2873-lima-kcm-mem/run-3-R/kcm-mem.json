@@ -4,7 +4,7 @@
   "ported_controllers": [],
   "kcm_controllers": "--controllers=*,bootstrap-signer-controller,token-cleaner-controller,-clusterrole-aggregation-controller,-service-cidr-controller",
   "kcm_restarts": 0,
-  "git_sha": "78e40ee39d4ecc6a19f35415bf660d17e1877ef9",
+  "git_sha": "f85b2873ed3500ada47bf172431e2c9d934eeca4",
   "git_dirty": false,
   "date": "2026-11-28",
   "vm": {
@@ -20,50 +20,50 @@
   },
   "stages": {
     "idle": {
-      "kcm_mib": 43.96,
-      "apiserver_mib": 20.75,
+      "kcm_mib": 42.81,
+      "apiserver_mib": 21.33,
       "samples_mib": {
         "kcm": [
-          43.71,
-          43.96,
-          44.04
+          42.01,
+          42.81,
+          42.89
         ],
         "apiserver": [
-          20.75,
-          20.75,
-          20.76
+          21.31,
+          21.33,
+          21.33
         ]
       }
     },
     "wordpress": {
-      "kcm_mib": 44.82,
-      "apiserver_mib": 21.38,
+      "kcm_mib": 44.24,
+      "apiserver_mib": 21.93,
       "samples_mib": {
         "kcm": [
-          44.82,
-          44.82,
-          44.82
+          44.04,
+          44.24,
+          44.25
         ],
         "apiserver": [
-          21.38,
-          21.38,
-          21.38
+          21.93,
+          21.93,
+          21.93
         ]
       }
     },
     "burst": {
-      "kcm_mib": 48.80,
-      "apiserver_mib": 24.97,
+      "kcm_mib": 45.80,
+      "apiserver_mib": 23.80,
       "samples_mib": {
         "kcm": [
-          48.58,
-          48.80,
-          48.95
+          45.80,
+          45.80,
+          45.88
         ],
         "apiserver": [
-          24.97,
-          24.97,
-          24.97
+          23.80,
+          23.80,
+          23.80
         ]
       }
     }
