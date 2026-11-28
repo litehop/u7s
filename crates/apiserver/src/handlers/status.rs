@@ -5488,6 +5488,73 @@ mod tests {
             v["metadata"]["uid"], "real-uid-1",
             "allowing uid changes via /status would break GC and object identity guarantees"
         );
+        assert!(
+            v["metadata"]["annotations"]["safe"].is_null(),
+            "a refused /status write must persist nothing, including its annotations"
+        );
+    }
+
+    /// The /status PUT that echoes the stored uid is the normal controller path: identity is
+    /// kept and the non-identity annotations in the body still land.
+    #[tokio::test]
+    async fn put_namespaced_status_with_matching_uid_applies_annotations() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "uid-ok", "namespace": "default", "uid": "real-uid-1", "resourceVersion": "1" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/uid-ok";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "uid-ok", "namespace": "default", "uid": "real-uid-1", "annotations": { "safe": "yes" } },
+            "status": { "readyReplicas": 1 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "uid-ok".into(),
+            )),
+            None,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PUT /status echoing the stored uid must succeed"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["metadata"]["uid"], "real-uid-1");
+        assert_eq!(
+            v["metadata"]["annotations"]["safe"], "yes",
+            "non-identity annotations must still land"
+        );
+        assert_eq!(v["status"]["readyReplicas"], 1);
     }
 
     /// PUT /status on a cluster-scoped resource must not overwrite finalizers or deletionTimestamp.

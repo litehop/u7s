@@ -31093,6 +31093,89 @@ mod tests {
         assert_eq!(body["spec"]["nodeName"], "node-b");
     }
 
+    /// An SSA apply that loses the create race merges onto the winner's object; a forged
+    /// metadata.uid in the apply body must be the upstream 422 there too, not a silent re-pin or
+    /// a takeover of the winner's identity.
+    #[tokio::test]
+    async fn ssa_create_race_fallback_rejects_forged_uid() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
+        let winner = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "raced", "namespace": "default", "uid": "winner-uid",
+                          "creationTimestamp": "2024-01-01T00:00:00Z" },
+            "data": { "a": "1" }
+        });
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(
+            inner.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&winner).unwrap()),
+        ));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        crate::handlers::test_support::grant_create_everywhere(&state.rbac_index);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let apply = serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "raced", "namespace": "default", "uid": "forged-uid" },
+            "data": { "b": "2" }
+        });
+        let result = patch_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+                "raced".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl".into()),
+                ..Default::default()
+            }),
+            test_user(),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&apply).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Ok(resp) => panic!("forged uid on the race fallback must fail, got {}", {
+                use axum::response::IntoResponse;
+                resp.into_response().status()
+            }),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "a forged uid must not slip through the create-race merge: {err:?}"
+        );
+        assert!(
+            err.1.message.contains("metadata.uid") && err.1.message.contains("field is immutable"),
+            "{err:?}"
+        );
+
+        let stored = inner
+            .get("/registry/configmaps/default/raced")
+            .await
+            .unwrap()
+            .expect("winner persisted");
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(body["metadata"]["uid"], "winner-uid");
+        assert!(body["data"]["b"].is_null(), "refused apply must not merge");
+    }
+
     /// A node forging its own taints can steer disallowed workloads onto (or away from)
     /// itself, bypassing whatever scheduling constraints those taints exist to enforce.
     #[tokio::test]

@@ -232,6 +232,32 @@ mod admission {
                 )
                 .await
             }
+            "node" => {
+                c.create(
+                    "/api/v1/nodes",
+                    json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"o"}}),
+                )
+                .await
+            }
+            "service" => {
+                c.create(
+                    "/api/v1/namespaces/default/services",
+                    json!({"apiVersion":"v1","kind":"Service","metadata":{"name":"o"},
+                        "spec":{"ports":[{"port":80}]}}),
+                )
+                .await
+            }
+            "deployment" => {
+                let labels = json!({"app":"o"});
+                c.create(
+                    "/apis/apps/v1/namespaces/default/deployments",
+                    json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"o"},
+                        "spec":{"selector":{"matchLabels":labels},
+                            "template":{"metadata":{"labels":labels},
+                                "spec":{"containers":[{"name":"c","image":"i"}]}}}}),
+                )
+                .await
+            }
             other => unreachable!("{other}"),
         }
         c
@@ -284,6 +310,19 @@ mod admission {
                 "/api/v1/namespaces/default/resourcequotas/o",
             ),
             t("pv", "", "persistentvolumes", "/api/v1/persistentvolumes/o"),
+            t("node", "", "nodes", "/api/v1/nodes/o"),
+            t(
+                "service",
+                "",
+                "services",
+                "/api/v1/namespaces/default/services/o",
+            ),
+            t(
+                "deployment",
+                "apps",
+                "deployments",
+                "/apis/apps/v1/namespaces/default/deployments/o",
+            ),
         ]
     }
 
@@ -317,6 +356,17 @@ mod admission {
         .await;
     }
 
+    /// A mutating webhook that rewrites uid would let an admission plugin re-identify an object;
+    /// upstream's `BeforeUpdate` validation rejects it with a 422 and the stored uid stays.
+    #[tokio::test]
+    async fn mutating_webhook_rewriting_uid_is_rejected() {
+        webhook_edits_server_owned_metadata(
+            json!([{"op":"replace","path":"/metadata/uid","value":"forged-uid"}]),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+
     async fn webhook_edits_server_owned_metadata(ops: Value, expected: StatusCode) {
         let mut violations = Vec::new();
         for t in targets() {
@@ -324,6 +374,7 @@ mod admission {
                 let c = setup(&t).await;
                 let before = get(&c, t.uri).await;
                 let created = before["metadata"]["creationTimestamp"].clone();
+                let uid = before["metadata"]["uid"].clone();
                 assert!(
                     created.is_string(),
                     "{} {verb}: seeded object has an age",
@@ -361,6 +412,7 @@ mod admission {
                 let m = &get(&c, t.uri).await["metadata"];
                 if (expected == StatusCode::OK && m["labels"]["x"] != "y")
                     || m["creationTimestamp"] != created
+                    || m["uid"] != uid
                     || !m["deletionTimestamp"].is_null()
                     || !m["deletionGracePeriodSeconds"].is_null()
                 {
@@ -600,6 +652,26 @@ mod immutable {
                                     .push(format!("{cell}: 422 without immutable cause: {msg}"));
                             }
                         }
+                        if want == Want::Conflict && ok {
+                            let msg = resp["message"].as_str().unwrap_or_default();
+                            let stored_uid = before["uid"].as_str().unwrap_or_default();
+                            // /status PUT carries upstream's storage-precondition text; the main
+                            // PUT sites still word the same 409 their own way.
+                            let cause_ok = if status {
+                                msg.starts_with("Operation cannot be fulfilled on ")
+                                    && msg.contains(&format!(
+                                        "Precondition failed: UID in precondition: \
+                                         {FORGED_UID}, UID in object meta: {stored_uid}"
+                                    ))
+                            } else {
+                                msg.contains(FORGED_UID) && msg.contains(stored_uid)
+                            };
+                            if resp["reason"] != "Conflict" || !cause_ok {
+                                failures.push(format!(
+                                    "{cell}: 409 without the uid precondition cause: {resp}"
+                                ));
+                            }
+                        }
                         cells += 1;
                     }
                 }
@@ -630,15 +702,32 @@ mod immutable {
                     t.uri.to_owned()
                 };
                 let uid = get(&c, t.uri).await["metadata"]["uid"].clone();
+                let key = if status { "from-status" } else { "from-main" };
                 let (code, resp) = c
                     .call(
                         "PATCH",
                         &uri,
                         "application/merge-patch+json",
-                        json!({"metadata": {"uid": uid, "annotations": {"k": "v"}}}),
+                        json!({"metadata": {"uid": uid, "annotations": {key: "v"}}}),
                     )
                     .await;
                 assert_eq!(code, StatusCode::OK, "{} status={status}: {resp}", t.name);
+                let stored = &get(&c, t.uri).await["metadata"];
+                assert_eq!(
+                    stored["uid"], uid,
+                    "{} status={status}: identity must survive a write that echoes it",
+                    t.name
+                );
+                // A custom resource's /status strategy resets metadata, so only the main
+                // endpoint (and built-in status endpoints) may persist the annotation.
+                let lands = !(status && is_custom(&t));
+                assert_eq!(
+                    stored["annotations"][key] == "v",
+                    lands,
+                    "{} status={status}: non-identity metadata in a matching-uid write must \
+                     land exactly when the strategy keeps client metadata: {stored}",
+                    t.name
+                );
             }
         }
     }
