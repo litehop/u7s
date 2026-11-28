@@ -352,17 +352,56 @@ fn authorize_csinode(node_name: &str, req: &AuthzRequest<'_>) -> bool {
     req.verb == "create" || req.name == Some(node_name)
 }
 
-/// A node may only wipe the DRA slices it published, so deletecollection must carry
-/// `spec.nodeName=<node>` (the delete-collection handler filters by the same selector).
-/// Per-slice create/update/patch/delete are not granted to nodes at all.
+/// Mirrors upstream's `authorizeResourceSlice`: list/watch/deletecollection must carry
+/// `spec.nodeName=<node>` (the handlers filter by the same selector), and per-slice
+/// create/update/patch/delete are allowed here because the URL cannot name the owner node —
+/// `restrict_node_resource_slice` checks the object's `spec.nodeName` in the handlers.
+/// Unlike upstream, `get` is not granted (no object-keyed graph edge to key it off).
 fn authorize_resource_slice(
     node_name: &str,
     req: &AuthzRequest<'_>,
     raw_query: Option<&str>,
 ) -> bool {
-    req.subresource.is_empty()
-        && req.verb == "deletecollection"
-        && field_selector_selects_node(raw_query, node_name, "resource.k8s.io", "resourceslices")
+    if !req.subresource.is_empty() {
+        return false;
+    }
+    match req.verb {
+        "create" | "update" | "patch" | "delete" => true,
+        "list" | "watch" | "deletecollection" => {
+            field_selector_selects_node(raw_query, node_name, "resource.k8s.io", "resourceslices")
+        }
+        _ => false,
+    }
+}
+
+/// Object-dependent half of node scoping for ResourceSlices, mirroring upstream's
+/// NodeRestriction `admitResourceSlice` plus the node authorizer's graph edge: a node identity
+/// may only write a slice whose `spec.nodeName` is itself, both before (`old`) and after (`new`)
+/// the write, so it can neither touch another node's slice nor re-home its own onto another
+/// node. No-op for non-node identities and other resources.
+pub fn restrict_node_resource_slice(
+    username: &str,
+    groups: &[String],
+    api_group: &str,
+    resource: &str,
+    old: Option<&serde_json::Value>,
+    new: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(node_name) = node_identity(username, groups) else {
+        return Ok(());
+    };
+    if (api_group, resource) != ("resource.k8s.io", "resourceslices") {
+        return Ok(());
+    }
+    for body in [old, new].into_iter().flatten() {
+        if body["spec"]["nodeName"].as_str() != Some(node_name) {
+            return Err(
+                "can only access ResourceSlice with the same NodeName as the requesting node"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Body-dependent half of node scoping for create requests, where the URL carries no name:
@@ -1798,10 +1837,88 @@ mod tests {
         );
         for verb in ["create", "update", "patch", "delete"] {
             assert!(
-                !node_a_allowed(verb, group, rs, "", Some("slice-1"), None),
-                "{verb} on slices is not granted to nodes"
+                node_a_allowed(verb, group, rs, "", Some("slice-1"), None),
+                "{verb}: DRA drivers publish slices with node credentials; the handlers \
+                 bind the object to the node"
             );
         }
+        assert!(
+            !node_a_allowed("update", group, rs, "status", Some("slice-1"), None),
+            "slices have no node-writable subresource"
+        );
+        for verb in ["list", "watch"] {
+            assert!(
+                node_a_allowed(
+                    verb,
+                    group,
+                    rs,
+                    "",
+                    None,
+                    Some("fieldSelector=spec.nodeName%3Dnode-a")
+                ),
+                "{verb} scoped to own node is how a driver's slice informer starts"
+            );
+            assert!(
+                !node_a_allowed(verb, group, rs, "", None, None),
+                "unscoped {verb} would expose every node's devices"
+            );
+        }
+    }
+
+    #[test]
+    fn node_resource_slice_writes_must_stay_bound_to_the_requesting_node() {
+        let groups = vec![NODES_GROUP.to_owned()];
+        let slice = |node: &str| serde_json::json!({"spec": {"nodeName": node}});
+        let check = |old: Option<&serde_json::Value>, new: Option<&serde_json::Value>| {
+            restrict_node_resource_slice(
+                "system:node:node-a",
+                &groups,
+                "resource.k8s.io",
+                "resourceslices",
+                old,
+                new,
+            )
+        };
+        let (a, b) = (slice("node-a"), slice("node-b"));
+        assert!(check(None, Some(&a)).is_ok(), "own create");
+        assert!(check(Some(&a), Some(&a)).is_ok(), "own update");
+        assert!(check(Some(&a), None).is_ok(), "own delete");
+        assert!(
+            check(None, Some(&b)).is_err(),
+            "forging another node's slice"
+        );
+        assert!(
+            check(Some(&b), None).is_err(),
+            "deleting another node's slice"
+        );
+        assert!(
+            check(Some(&b), Some(&b)).is_err(),
+            "updating another node's slice"
+        );
+        assert!(
+            check(Some(&b), Some(&a)).is_err(),
+            "stealing another node's slice"
+        );
+        assert!(
+            check(Some(&a), Some(&b)).is_err(),
+            "re-homing own slice onto another node"
+        );
+        assert!(
+            check(None, Some(&serde_json::json!({"spec": {"allNodes": true}}))).is_err(),
+            "a node may not publish a cluster-wide slice"
+        );
+        assert!(
+            restrict_node_resource_slice(
+                "alice",
+                &[],
+                "resource.k8s.io",
+                "resourceslices",
+                None,
+                Some(&b)
+            )
+            .is_ok(),
+            "non-node identities are not restricted"
+        );
     }
 
     #[test]
