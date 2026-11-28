@@ -4801,7 +4801,7 @@ mod tests {
             "ClusterRole metadata must contain a non-null creationTimestamp"
         );
         // Must include rules for nodes, pods, events, configmaps, secrets, leases, and csinodes.
-        // Missing csinodes causes kubelet to get 403 for CSINode PATCH/WATCH, which client-go
+        // Missing csinodes causes kubelet to get 403 for CSINode PATCH, which client-go
         // surfaces as "invalid JSON: expected value at line 1 column 1".
         let rules = cr["rules"].as_array().expect("rules must be an array");
         assert!(!rules.is_empty(), "ClusterRole must have at least one rule");

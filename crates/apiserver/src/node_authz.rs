@@ -1805,6 +1805,50 @@ mod tests {
     }
 
     #[test]
+    fn slice_deletecollection_selector_shapes_that_could_widen_scope_are_refused() {
+        let denied = [
+            ("fieldSelector=spec.nodeName!%3Dnode-a", "!= is not an equality pin"),
+            ("fieldSelector=spec.nodeName%20in%20(node-a)", "set-based syntax is not a field selector"),
+            ("fieldSelector=spec.nodeName%20notin%20(node-b)", "set-based negation"),
+            (
+                "fieldSelector=spec.nodeName%3Dnode-a&fieldSelector=spec.driver%3Dx",
+                "duplicate params: the handler reads one, so the authorizer must not pick the other",
+            ),
+            (
+                "fieldSelector=spec.driver%3Dx&fieldSelector=spec.nodeName%3Dnode-a",
+                "duplicate params in the opposite order",
+            ),
+            ("fieldSelector=spec.driver%3Dx", "no nodeName term"),
+            ("labelSelector=spec.nodeName%3Dnode-a", "label selector is not a field selector"),
+            ("fieldSelector=", "empty selector selects everything"),
+        ];
+        for (query, why) in denied {
+            assert!(
+                !node_a_allowed(
+                    "deletecollection",
+                    "resource.k8s.io",
+                    "resourceslices",
+                    "",
+                    None,
+                    Some(query)
+                ),
+                "{query}: {why}"
+            );
+        }
+        assert!(
+            node_a_allowed(
+                "deletecollection",
+                "resource.k8s.io",
+                "resourceslices",
+                "",
+                None,
+                Some("fieldSelector=spec.driver%3Dx%2Cspec.nodeName%3Dnode-a")
+            ),
+            "extra ANDed terms only narrow the delete, so they stay allowed"
+        );
+    }
+
+    #[test]
     fn non_node_identity_gets_no_opinion_regardless_of_graph_state() {
         // A plain authenticated user (not system:node:*) must never be granted anything by
         // this authorizer — it must fall straight through to RBAC, unaffected.

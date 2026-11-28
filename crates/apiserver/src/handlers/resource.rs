@@ -30554,6 +30554,195 @@ mod tests {
         }
     }
 
+    /// The authorizer cannot see a POST body, so the handlers' `restrict_node_create` call is
+    /// the only thing stopping a compromised kubelet from pre-creating another node's CSINode
+    /// (cluster-scoped path) or Lease (namespaced path) before that node registers. The pure
+    /// `restrict_node_create` unit test stays green if either call site is deleted; these fail.
+    #[tokio::test]
+    async fn create_resource_refuses_node_identity_creating_another_nodes_csinode() {
+        use axum::extract::{Path, Query, State};
+        let state = make_state();
+        let post = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let body = serde_json::json!({
+                    "apiVersion": "storage.k8s.io/v1",
+                    "kind": "CSINode",
+                    "metadata": { "name": name },
+                    "spec": { "drivers": [] }
+                });
+                create_resource(
+                    State(state),
+                    Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+                    Query(CreateQuery::default()),
+                    node_identity_user("node-a"),
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        let err = post("node-b")
+            .await
+            .expect_err("node-a creating node-b's CSINode must be refused");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "a node forging another node's CSINode would pre-empt node-b's CSI registration"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/storage.k8s.io/csinodes/node-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused CSINode must not be persisted"
+        );
+        post("node-a")
+            .await
+            .expect("node-a must still create its own CSINode");
+    }
+
+    #[tokio::test]
+    async fn create_namespaced_resource_refuses_node_identity_creating_another_nodes_lease() {
+        use axum::extract::{Path, Query, State};
+        let state = make_state();
+        let post = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let body = serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": name, "namespace": "kube-node-lease" },
+                    "spec": { "holderIdentity": name }
+                });
+                create_namespaced_resource(
+                    State(state),
+                    Path((
+                        "coordination.k8s.io".into(),
+                        "v1".into(),
+                        "kube-node-lease".into(),
+                        "leases".into(),
+                    )),
+                    Query(CreateQuery::default()),
+                    node_identity_user("node-a"),
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        let err = post("node-b")
+            .await
+            .expect_err("node-a creating node-b's Lease must be refused");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "a forged node-b Lease would make the node lifecycle controller see node-b as alive"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/coordination.k8s.io/leases/kube-node-lease/node-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused Lease must not be persisted"
+        );
+        post("node-a")
+            .await
+            .expect("node-a must still create its own Lease");
+    }
+
+    /// For every selector shape the authorizer lets through to deletecollection, the handler
+    /// must delete only node-a's slices; shapes the authorizer refuses never reach it.
+    #[tokio::test]
+    async fn delete_collection_resourceslices_with_node_selector_never_touches_other_nodes() {
+        use axum::extract::{Path, Query, State};
+        let slice = |name: &str, node: &str, pool: &str| {
+            serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": name },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": pool, "generation": 1, "resourceSliceCount": 1 } }
+            })
+        };
+        // (selector, expected surviving slices)
+        let cases: [(&str, &[&str]); 4] = [
+            ("spec.nodeName=node-a", &["b1"]),
+            ("spec.nodeName=node-a,spec.driver=d.example.com", &["b1"]),
+            (
+                "spec.nodeName=node-a,spec.nodeName=node-b",
+                &["a1", "a2", "b1"],
+            ),
+            (
+                "spec.nodeName=node-a,spec.nodeName!=node-a",
+                &["a1", "a2", "b1"],
+            ),
+        ];
+        for (selector, survivors) in cases {
+            let state = make_state();
+            for (name, node) in [("a1", "node-a"), ("a2", "node-a"), ("b1", "node-b")] {
+                let key =
+                    crate::keys::group_object_key("resource.k8s.io", "resourceslices", None, name);
+                state
+                    .store
+                    .put(
+                        &key,
+                        bytes::Bytes::from(serde_json::to_vec(&slice(name, node, "p")).unwrap()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let result = delete_collection_resource(
+                State(state.clone()),
+                Path((
+                    "resource.k8s.io".into(),
+                    "v1".into(),
+                    "resourceslices".into(),
+                )),
+                Query(CollectionQuery {
+                    watch: None,
+                    resource_version: None,
+                    label_selector: None,
+                    field_selector: Some(selector.to_string()),
+                    limit: None,
+                    continue_token: None,
+                    send_initial_events: None,
+                    allow_watch_bookmarks: None,
+                    timeout_seconds: None,
+                }),
+                node_identity_user("node-a"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await;
+            result.unwrap_or_else(|e| panic!("{selector:?} must be accepted: {e:?}"));
+            let prefix = crate::keys::group_list_prefix("resource.k8s.io", "resourceslices", None);
+            let mut left: Vec<String> = state
+                .store
+                .list(&prefix, u7s_store::ListOptions::default())
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+                .map(|v| v["metadata"]["name"].as_str().unwrap_or("").to_string())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left, survivors,
+                "selector {selector:?}: ANDed terms may only narrow the delete; node-b's slice \
+                 must never be removed by node-a's scoped deletecollection"
+            );
+        }
+    }
+
     /// A node forging its own taints can steer disallowed workloads onto (or away from)
     /// itself, bypassing whatever scheduling constraints those taints exist to enforce.
     #[tokio::test]
