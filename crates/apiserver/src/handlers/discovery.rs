@@ -3011,6 +3011,7 @@ mod tests {
                 generation: 0,
                 finalizers: vec![],
                 deletion_timestamp: None,
+                deletion_grace_period_seconds: None,
                 managed_fields: None,
             },
             spec: CustomResourceDefinitionSpec {

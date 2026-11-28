@@ -1022,7 +1022,7 @@ pub(crate) async fn replace_resource<S: Store>(
         // a webhook patch must not clear creationTimestamp, and finalizer_drain_complete below
         // (which reads obj.body, not the stored object) must not see a blank deletionTimestamp
         // and resurrect a Terminating object as live.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref(), &group, &meta.kind)?;
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -1847,7 +1847,12 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
-                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+                pin_server_owned_metadata(
+                    &mut current.body,
+                    Some(&stored_deletion),
+                    group,
+                    &meta.kind,
+                )?;
                 // Re-restore status after mutating webhooks — same rationale as the primary
                 // create path's post-webhook clear_create_status re-call above: a webhook's
                 // JSON patch can reinject a forged/scalar status the earlier restore already
@@ -2127,14 +2132,11 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // metadata.uid is immutable identity, restored unconditionally after every patch
-        // type below (including JSON Patch, whose array shape can't be caught by an
-        // object-key strip). Without this, a caller holding only ordinary `patch` rights on
-        // any resource could forge uid to match a stale/foreign ownerReference and corrupt
+        // metadata.uid is immutable identity: pin_server_owned_metadata below rejects a patch
+        // (of any type, including JSON Patch whose array shape an object-key strip can't see)
+        // that changes it. A forged uid could match a stale/foreign ownerReference and corrupt
         // the garbage collector's cascade-GC decision, or defeat controllers' "same name,
-        // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
-        // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
-        let stored_uid = current.body["metadata"]["uid"].clone();
+        // different uid ⇒ different object" recreate-detection.
         let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
 
         match patch_type {
@@ -2155,9 +2157,8 @@ pub(crate) async fn do_patch<S: Store>(
         if let Some(plan) = &ssa_plan {
             plan.remove_dropped_fields(&mut current.body);
         }
-        current.body["metadata"]["uid"] = stored_uid;
         // Pinned here too: the finalizer-drain check below reads current.body before admission runs.
-        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion), group, &meta.kind)?;
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
@@ -2385,7 +2386,7 @@ pub(crate) async fn do_patch<S: Store>(
         current.body =
             run_mutating_webhooks(state, current.body, old_object.as_ref(), &admission_ctx).await?;
         // Pinned again after mutating admission (upstream rest.BeforeUpdate).
-        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion), group, &meta.kind)?;
         // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
         // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore (before this match block) already
@@ -4159,7 +4160,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
         // Pinned after mutating admission (upstream rest.BeforeUpdate); see replace_resource.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref(), &group, &meta.kind)?;
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -11988,7 +11989,6 @@ mod tests {
     /// different object" recreate-detection.
     #[tokio::test]
     async fn patch_resource_merge_patch_cannot_change_uid() {
-        use axum::body::to_bytes;
         use axum::extract::{Path, State};
         use std::sync::Arc;
         use u7s_store::SqliteStore;
@@ -12039,20 +12039,10 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
         .await;
-        let result = match patch_result {
-            Ok(r) => r.into_response(),
-            Err(_) => panic!(
-                "merge-patch attempting to set uid must still succeed (uid is \
-                just silently restored, not rejected)"
-            ),
-        };
-
-        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], real_uid,
-            "a merge-patch carrying metadata.uid must not change the stored uid — the \
-             response must reflect the original, server-assigned identity"
+            patch_result.err().map(|e| e.0),
+            Some(StatusCode::UNPROCESSABLE_ENTITY),
+            "a merge-patch changing metadata.uid is upstream's immutable-field 422"
         );
 
         let stored = store
@@ -13139,7 +13129,7 @@ mod tests {
         state: crate::state::AppState<u7s_store::SqliteStore>,
         name: &str,
         metadata: serde_json::Value,
-    ) {
+    ) -> Result<(), crate::status::StatusError> {
         use axum::extract::{Path, State};
         let mut metadata = metadata;
         let stored = state
@@ -13170,14 +13160,14 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
         .await
-        .expect("PUT must succeed (the server ignores the client's deletion fields)");
+        .map(|_| ())
     }
 
     async fn patch_lease(
         state: crate::state::AppState<u7s_store::SqliteStore>,
         name: &str,
         patch: serde_json::Value,
-    ) {
+    ) -> Result<(), crate::status::StatusError> {
         use axum::extract::{Path, State};
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -13199,7 +13189,7 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
         .await
-        .expect("PATCH must succeed (the server ignores the client's deletion fields)");
+        .map(|_| ())
     }
 
     /// PUT of an existing object without a resourceVersion: 422 for a kind whose strategy
@@ -13344,13 +13334,15 @@ mod tests {
     async fn put_with_client_deletion_timestamp_does_not_hard_delete_live_object() {
         let (store, state) = deletion_guard_state().await;
         let key = seed_lease(&store, "live", serde_json::json!({})).await;
-        put_lease(
+        let err = put_lease(
             state,
             "live",
             serde_json::json!({"name": "live", "namespace": "default",
                 "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0}),
         )
-        .await;
+        .await
+        .expect_err("a client-set deletionTimestamp on a live object is upstream's 422");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         let stored = store
             .get(&key)
             .await
@@ -13382,7 +13374,8 @@ mod tests {
             serde_json::json!({"metadata": {"deletionTimestamp": null,
                 "deletionGracePeriodSeconds": null}}),
         )
-        .await;
+        .await
+        .expect("un-terminating is silently pinned, not rejected");
         let v: serde_json::Value =
             serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
         assert_eq!(v["metadata"]["deletionTimestamp"], "2026-05-22T00:00:00Z");
@@ -13395,12 +13388,14 @@ mod tests {
     async fn patch_with_client_deletion_timestamp_does_not_terminate_or_delete_live_object() {
         let (store, state) = deletion_guard_state().await;
         let key = seed_lease(&store, "live2", serde_json::json!({})).await;
-        patch_lease(
+        let err = patch_lease(
             state,
             "live2",
             serde_json::json!({"metadata": {"deletionTimestamp": "2026-05-22T00:00:00Z"}}),
         )
-        .await;
+        .await
+        .expect_err("a client-set deletionTimestamp on a live object is upstream's 422");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         let v: serde_json::Value = serde_json::from_slice(
             &store
                 .get(&key)

@@ -802,7 +802,7 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     meta.generation = Some(1);
     meta.creation_timestamp = Some(utc_now_rfc3339());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_metadata(obj, None);
+    crate::handlers::generic::clear_server_owned_on_create(obj);
 }
 
 /// Upstream `customResourceStrategy.PrepareForCreate`, run after mutating admission: forces
@@ -907,6 +907,7 @@ fn resolve_cr_metadata(
     stored: &serde_json::Value,
     incoming: &mut serde_json::Value,
     name: &str,
+    group: &str,
     kind: &str,
 ) -> Result<(), crate::status::StatusError> {
     let stored_meta: crate::types::ObjectMeta =
@@ -946,7 +947,7 @@ fn resolve_cr_metadata(
         incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
     incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
-    crate::handlers::generic::pin_server_owned_metadata(incoming, Some(stored));
+    crate::handlers::generic::pin_server_owned_metadata(incoming, Some(stored), group, kind)?;
     Ok(())
 }
 
@@ -3598,7 +3599,7 @@ pub async fn replace_cr<S: Store>(
     // Preserve uid + creationTimestamp from stored.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
+    resolve_cr_metadata(&existing, &mut obj, &name, &group, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
     // update .status — clients must use PUT /status for that. Restore whatever is
@@ -3658,7 +3659,12 @@ pub async fn replace_cr<S: Store>(
         options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
+    crate::handlers::generic::pin_server_owned_metadata(
+        &mut obj,
+        Some(&existing),
+        &group,
+        &ctx.kind,
+    )?;
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
@@ -4740,7 +4746,7 @@ pub async fn replace_cr_namespaced<S: Store>(
 
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    resolve_cr_metadata(&existing, &mut obj, &name, &ctx.kind)?;
+    resolve_cr_metadata(&existing, &mut obj, &name, &group, &ctx.kind)?;
 
     // When the CRD declares a status subresource, the main PUT endpoint must not
     // update .status — clients must use PUT /status for that. Restore whatever is
@@ -4808,7 +4814,12 @@ pub async fn replace_cr_namespaced<S: Store>(
         options: None,
     };
     obj = run_mutating_webhooks(&state, obj, Some(&existing), &admission_ctx).await?;
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&existing));
+    crate::handlers::generic::pin_server_owned_metadata(
+        &mut obj,
+        Some(&existing),
+        &group,
+        &ctx.kind,
+    )?;
     if ctx.has_status_subresource {
         restore_stored_cr_status(&existing["status"], &mut obj);
     }
@@ -5503,7 +5514,7 @@ pub async fn patch_cr<S: Store>(
     // delete below, since this branch returns before this function's own later dry_run check.
     // The drain decision reads the stored deletionTimestamp, never the patch's: a patch-only
     // caller must not be able to start a delete.
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old), &group, &ctx.kind)?;
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
@@ -5535,17 +5546,7 @@ pub async fn patch_cr<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&old["status"], &mut obj);
     }
-    // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
-    // (stored) value here, after both the patch body and any mutating webhook have had a
-    // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
-    // and was a silent no-op in release, meaning a caller with only ordinary CR `patch`
-    // rights could forge uid to match a stale/foreign ownerReference (corrupting GC's
-    // owner-liveness check) or defeat controllers' recreate-detection, in every release
-    // build. Restoring (rather than rejecting with 409) matches do_patch's behavior for
-    // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
-    // value it carries.
-    obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old), &group, &ctx.kind)?;
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, None)?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -5863,7 +5864,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     // delete below, since this branch returns before this function's own later dry_run check.
     // The drain decision reads the stored deletionTimestamp, never the patch's: a patch-only
     // caller must not be able to start a delete.
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old), &group, &ctx.kind)?;
     if crate::handlers::resource::finalizer_drain_complete(&obj) {
         validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
         if !is_dry_run_header(&headers) {
@@ -5902,17 +5903,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     if ctx.has_status_subresource {
         restore_stored_cr_status(&old["status"], &mut obj);
     }
-    // metadata.uid is immutable identity: unconditionally restore it to the pre-patch
-    // (stored) value here, after both the patch body and any mutating webhook have had a
-    // chance to touch it — this used to be a debug_assert_eq! that panicked in debug builds
-    // and was a silent no-op in release, meaning a caller with only ordinary CR `patch`
-    // rights could forge uid to match a stale/foreign ownerReference (corrupting GC's
-    // owner-liveness check) or defeat controllers' recreate-detection, in every release
-    // build. Restoring (rather than rejecting with 409) matches do_patch's behavior for
-    // built-in resources: a PATCH is not permitted to change uid at all, regardless of what
-    // value it carries.
-    obj["metadata"]["uid"] = old["metadata"]["uid"].clone();
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old));
+    crate::handlers::generic::pin_server_owned_metadata(&mut obj, Some(&old), &group, &ctx.kind)?;
     crate::handlers::json_patch::enforce_patch_identity(&mut obj, &name, Some(&ns))?;
     validate_cr_schema(&obj, &ctx, &state.cr_schema_cache, Some(&old)).await?;
     run_validating_webhooks(&state, &obj, Some(&old), &admission_ctx).await?;
@@ -6071,7 +6062,9 @@ pub async fn put_cr_status<S: Store>(
             &mut current,
             &incoming,
             cr_ctx.is_none().then_some(kind.as_str()),
-        );
+            &group,
+            crate::handlers::status::Write::Put,
+        )?;
 
         if let Some(old) = &csr_before {
             crate::handlers::csr::guard_csr_status_write(&state, &user, old, &mut current)?;
@@ -6324,7 +6317,9 @@ pub async fn patch_cr_status<S: Store>(
                     &mut current,
                     &patch,
                     cr_ctx.is_none().then_some(kind.as_str()),
-                );
+                    &group,
+                    crate::handlers::status::Write::Patch,
+                )?;
             }
         }
         if let Some(plan) = &ssa_plan {
@@ -11040,15 +11035,9 @@ mod tests {
         assert_eq!(stored_resp.status(), StatusCode::OK);
     }
 
-    /// A merge-patch PATCH on a cluster-scoped CR attempting to change metadata.uid must
-    /// leave the stored uid unchanged. Before this fix, the only guard here was a
-    /// `debug_assert_eq!` — a panic in debug builds, but a silent no-op in release, meaning
-    /// a caller holding only ordinary CR `patch` rights could forge uid to match a
-    /// stale/foreign ownerReference (corrupting GC's owner-liveness check) or defeat
-    /// controllers' recreate-detection in every release build. This test runs in the
-    /// harness's default (debug) test profile specifically so a revert of the restore back
-    /// to the old debug_assert_eq! shows up as a hard panic, not just a silently-passing
-    /// release-mode gap.
+    /// A merge-patch PATCH on a cluster-scoped CR attempting to change metadata.uid is a 422 and
+    /// leaves the stored uid unchanged: a forged uid could match a stale/foreign ownerReference
+    /// (corrupting GC's owner-liveness check) or defeat controllers' recreate-detection.
     #[tokio::test]
     async fn patch_cr_merge_patch_cannot_change_uid() {
         let state = make_state();
@@ -11097,24 +11086,22 @@ mod tests {
             axum::http::header::CONTENT_TYPE,
             "application/merge-patch+json".parse().unwrap(),
         );
-        assert!(
-            patch_cr(
-                State(state.clone()),
-                Path((
-                    "example.io".into(),
-                    "v1".into(),
-                    "widgets".into(),
-                    name.clone()
-                )),
-                test_user(),
-                headers,
-                patch_body,
-            )
-            .await
-            .is_ok(),
-            "a patch attempting to set uid must still succeed (uid is silently restored, \
-             not rejected)"
-        );
+        let err = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                name.clone(),
+            )),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await
+        .err()
+        .expect("a patch changing uid is upstream's immutable-field 422");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let after = get_cr(
             State(state.clone()),
@@ -11533,7 +11520,7 @@ mod tests {
             }
         });
         let mut incoming = serde_json::json!({ "metadata": {} });
-        resolve_cr_metadata(&stored, &mut incoming, "widget-1", "Widget").unwrap();
+        resolve_cr_metadata(&stored, &mut incoming, "widget-1", "example.com", "Widget").unwrap();
         assert_eq!(
             incoming["metadata"]["uid"], "stored-uid-xyz",
             "uid must be copied from stored into incoming"
@@ -11545,20 +11532,21 @@ mod tests {
     }
 
     /// A CR PUT from a caller with only `update` must not carry its own deletionTimestamp onto
-    /// a live CR (hard-delete/terminate without the delete verb), nor erase the stored one.
+    /// a live CR (hard-delete/terminate without the delete verb: upstream's 422), nor erase the
+    /// stored one.
     #[test]
     fn resolve_cr_metadata_pins_deletion_fields_to_stored() {
         let stored = serde_json::json!({ "metadata": { "uid": "u" } });
         let mut incoming = serde_json::json!({ "metadata": {
             "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0 } });
-        resolve_cr_metadata(&stored, &mut incoming, "w", "Widget").unwrap();
-        assert!(incoming["metadata"]["deletionTimestamp"].is_null());
-        assert!(incoming["metadata"]["deletionGracePeriodSeconds"].is_null());
+        let err = resolve_cr_metadata(&stored, &mut incoming, "w", "example.com", "Widget")
+            .expect_err("a PUT starting a deletion is rejected");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let stored = serde_json::json!({ "metadata": { "uid": "u",
             "deletionTimestamp": "2026-01-01T00:00:00Z", "deletionGracePeriodSeconds": 5 } });
         let mut incoming = serde_json::json!({ "metadata": {} });
-        resolve_cr_metadata(&stored, &mut incoming, "w", "Widget").unwrap();
+        resolve_cr_metadata(&stored, &mut incoming, "w", "example.com", "Widget").unwrap();
         assert_eq!(
             incoming["metadata"]["deletionTimestamp"],
             "2026-01-01T00:00:00Z"
@@ -11587,7 +11575,8 @@ mod tests {
             "metadata": { "uid": "real-uid", "creationTimestamp": "2024-06-01T00:00:00Z" }
         });
         let mut incoming = serde_json::json!({ "metadata": { "uid": "attacker-uid" } });
-        let result = resolve_cr_metadata(&stored, &mut incoming, "widget-1", "Widget");
+        let result =
+            resolve_cr_metadata(&stored, &mut incoming, "widget-1", "example.com", "Widget");
         assert!(
             result.is_err(),
             "a mismatched non-blank uid must be rejected, not silently overwritten or accepted"

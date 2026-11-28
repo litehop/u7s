@@ -209,7 +209,7 @@ pub(crate) async fn create_namespace<S: Store>(
     }
 
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, None);
+    crate::handlers::generic::clear_server_owned_on_create(&mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -456,7 +456,12 @@ pub(crate) async fn replace_namespace<S: Store>(
             }
         }
 
-        crate::handlers::generic::pin_server_owned_metadata(&mut obj.body, stored_obj.as_ref());
+        crate::handlers::generic::pin_server_owned_metadata(
+            &mut obj.body,
+            stored_obj.as_ref(),
+            "",
+            "Namespace",
+        )?;
 
         run_validating_webhooks(&state, &obj.body, stored_obj.as_ref(), &admission_ctx).await?;
         crate::field_manager::WriteIdentity::new(None, &headers).record(
@@ -572,13 +577,7 @@ pub(crate) async fn patch_namespace<S: Store>(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // metadata.uid is immutable identity, restored unconditionally after the patch is
-    // applied — exactly like do_patch (resource.rs) already does for the generic path. This
-    // branch applies the merge-patch directly to the full stored object body (including
-    // metadata.uid) with no other uid handling, so without this a caller holding only
-    // ordinary namespace `patch` rights could forge uid to match a stale/foreign
-    // ownerReference and corrupt the garbage collector's cascade-GC decision.
-    let stored_uid = current.body["metadata"]["uid"].clone();
+    // metadata.uid is immutable: pin_server_owned_metadata below rejects a patch that changes it.
 
     // Snapshot .status before applying the patch: Namespace has a dedicated /status
     // subresource, so a patch on this main endpoint (merge or strategic-merge — both content
@@ -591,7 +590,6 @@ pub(crate) async fn patch_namespace<S: Store>(
 
     crate::patch::merge_patch(&mut current.body, &patch);
 
-    current.body["metadata"]["uid"] = stored_uid;
     super::json_patch::enforce_patch_identity(&mut current.body, &name, None)?;
 
     if stored_status.is_null() {
@@ -622,7 +620,12 @@ pub(crate) async fn patch_namespace<S: Store>(
     };
     current.body =
         run_mutating_webhooks(&state, current.body, Some(&pre_patch_obj), &admission_ctx).await?;
-    super::generic::pin_server_owned_metadata(&mut current.body, Some(&pre_patch_obj));
+    super::generic::pin_server_owned_metadata(
+        &mut current.body,
+        Some(&pre_patch_obj),
+        "",
+        "Namespace",
+    )?;
 
     // Re-restore status after mutating webhooks — a webhook's JSON patch can reinject a
     // forged/scalar status the earlier restore already discarded, and this is the last point
@@ -895,7 +898,9 @@ pub(crate) async fn put_namespace_status<S: Store>(
             &mut current.body,
             &incoming.body,
             Some("Namespace"),
-        );
+            "",
+            crate::handlers::status::Write::Put,
+        )?;
 
         current.body = admit_namespace_status(
             &state,
@@ -1006,7 +1011,9 @@ pub(crate) async fn patch_namespace_status<S: Store>(
                 &mut current.body,
                 &patch,
                 Some("Namespace"),
-            );
+                "",
+                crate::handlers::status::Write::Patch,
+            )?;
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -2520,20 +2527,18 @@ mod tests {
             "application/merge-patch+json".parse().unwrap(),
         );
 
-        assert!(
-            patch_namespace(
-                State(state.clone()),
-                Path("uid-forge-ns".to_string()),
-                axum::extract::Query(PatchQuery::default()),
-                test_user(),
-                headers,
-                patch_body,
-            )
-            .await
-            .is_ok(),
-            "a patch attempting to set uid must still succeed (uid is silently restored, \
-             not rejected — matches do_patch's PATCH semantics)"
-        );
+        let err = patch_namespace(
+            State(state.clone()),
+            Path("uid-forge-ns".to_string()),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            headers,
+            patch_body,
+        )
+        .await
+        .err()
+        .expect("a patch changing uid is upstream's immutable-field 422");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
 
         let after = state
             .store
