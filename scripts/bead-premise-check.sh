@@ -228,8 +228,14 @@ symbol_stale_wording() {
   if [ "${#before}" -gt 40 ]; then before=${before: -40}; fi
   after=${after:0:40}
   after=${after%%$'\n'*}
-  grep -qiE '(remove|delete|drop|rename|stale|dead|obsolete|unused|orphaned|leftover)[^`]*$' <<<"$before" \
-    || grep -qiE '^[ ]*(is|are) (now |already )?(dead|stale|unused|obsolete|orphaned)' <<<"$after"
+  # Only phrasing bound directly to the symbol counts. Generic verbs
+  # ("delete", "drop", "remove") routinely describe Kubernetes behaviour
+  # ("namespace delete", "PATCH drops managedFields"), so they only count
+  # via "rename `X` to"; the rest needs an adjective touching the symbol.
+  grep -qiE '(^|[^[:alnum:]_])(dead|stale|obsolete|unused|orphaned|leftover)[[:space:]]+$' <<<"$before" \
+    || { grep -qiE '(^|[^[:alnum:]_])rename[[:space:]]+$' <<<"$before" \
+         && grep -qiE '^[[:space:]]+to([^[:alnum:]_]|$)' <<<"$after"; } \
+    || grep -qiE '^[[:space:]]+(is|are)[[:space:]]+(now |already )?(dead|stale|unused|obsolete|orphaned)([[:space:]]+code)?[[:space:]]*([.,;:)]|$)' <<<"$after"
 }
 
 # Classifies a single `bd show <id> --json` result (a one-element array).

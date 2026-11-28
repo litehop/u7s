@@ -242,6 +242,32 @@ OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_RENAME" 
 assert "'rename <absent symbol> to' asserts the old name is stale, so its absence means landed (exit 1)" \
   "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
+for sentence in \
+  'On namespace delete, the controller must call `old_foo_fn`' \
+  'Pod deleted but finalizer stuck; add `old_foo_fn`' \
+  'Namespace delete does not run `old_foo_fn`' \
+  'To remove the finalizer, add `old_foo_fn`' \
+  'PATCH drops managedFields; add `old_foo_fn`' \
+  'DELETE returns 200 and `old_foo_fn` is unused by the handler'; do
+  J=$(jq -cn --arg d "$sentence" '[{description:$d,design:null,acceptance_criteria:null}]')
+  RC=0
+  OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$J" 2>/dev/null) || RC=$?
+  assert "ordinary Kubernetes wording ($sentence) must be exit 2, not a false 'already landed' that would close a real bug" \
+    "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && echo 1 || echo 0)"
+done
+
+for sentence in \
+  'remove the dead `old_foo_fn` helper' \
+  'delete stale `old_foo_fn`' \
+  '`old_foo_fn` is dead.' \
+  '`old_foo_fn` is obsolete, drop it'; do
+  J=$(jq -cn --arg d "$sentence" '[{description:$d,design:null,acceptance_criteria:null}]')
+  RC=0
+  OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$J" 2>/dev/null) || RC=$?
+  assert "adjacent stale phrasing ($sentence) still means landed (exit 1)" \
+    "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
+done
+
 JSON_NO_PATTERN='[{"description":"plain prose, no code spans describing this bug at all","design":null,"acceptance_criteria":null}]'
 RC=0
 OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_NO_PATTERN") || RC=$?
