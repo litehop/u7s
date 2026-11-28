@@ -87,3 +87,6 @@ A stored spec is already defaulted; an incoming update body is not. Comparing th
 
 ## Stale read-after-write in microseconds is the client's informer cache
 If a client reads stale state within ~5-12 µs of its own write (observed 5.8-12.7 µs syncs vs 1-2 ms for a real PUT), it read its watch-fed informer cache, not the apiserver: no server round trip is that fast. Use the timing as the diagnostic before suspecting a store or handler bug.
+
+## CRD `pattern` validation: never hand-roll regex rewriting (operator rule, 2026-11-28)
+Never hand-roll regex/pattern rewriting for CRD `pattern` validation; the chosen path is jsonschema 0.63 with Ecma262 syntax (#2325, awaiting operator un-draft; #2317 becomes moot on merge). Why: boon's ECMA-to-Rust rewrite is quadratic and hard-wired (mayor-gnceb). Settings: `PatternOptions::regex()` + `PatternSyntax::Ecma262`, 1 MiB per-pattern `size_limit`, #2289's 8 MiB aggregate budget kept. Unicode-off is unavailable: jsonschema has no `unicode(false)`, and a custom `pattern` keyword diverges further from Go. Known divergences from Go RE2: Unicode `\s`/`\b` (NBSP fails `^\S+$`, Go accepts); CRD create returns 422 for `\Q..\E`, `\a`, `{,n}` and classes over 1 MiB, where upstream never validates `pattern` at create.
