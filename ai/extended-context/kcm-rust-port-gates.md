@@ -44,7 +44,7 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 - Phase 0 passes if `median(R) - median(T) >= 5`.
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
-  the projection `P = F + sum(m_c)` is at most 33.4 MiB (T WordPress KCM anon, 11-controller trim; the 10-controller trim measures 35.99, #2300 — re-baselining is an operator decision).
+  the projection `P = F + sum(m_c)` is at most 35.99 MiB (T WordPress KCM anon, 10-controller trim, #2300).
 - Verdicts are terminal per commit SHA; all runs are retained. A run is void
   only if it ended before any stage metric or spec report, with a harness or
   VM log naming an external cause, ruled before the replacement run. At most
