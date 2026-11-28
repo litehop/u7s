@@ -218,9 +218,29 @@ mkdir -p "$S4/src"
 printf 'fn fixed_helper() {}\n' > "$S4/src/lib.rs"
 commit_tree "$S4"
 RC=0
-OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON") || RC=$?
-assert "a bug-description symbol no longer in the tree classifies as no-longer-broken with exit 1" \
+JSON_STALE='[{"description":"the handler still calls the dead `old_broken_helper` on every request","design":null,"acceptance_criteria":null}]'
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_STALE") || RC=$?
+assert "a symbol the bead calls dead, now gone from the tree, classifies as no-longer-broken with exit 1" \
   "$([ "$OUT" = "no-longer-broken" ] && [ "$RC" -eq 1 ] && echo 1 || echo 0)"
+
+ERR_SYM="$SANDBOX_ROOT/err-sym"
+JSON_UPSTREAM='[{"description":"our PUT handler skips the immutability check that upstream applies via `ValidateObjectMetaUpdate`","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_UPSTREAM" 2>"$ERR_SYM") || RC=$?
+assert "an absent quoted upstream Go identifier is exit 2 with a reason, never exit 1 -- exit 1 would close a real bug as already landed" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR_SYM" ] && echo 1 || echo 0)"
+
+JSON_PROPOSED='[{"description":"PATCH ignores managedFields; add `fooBarHelper` to merge them","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_PROPOSED" 2>"$ERR_SYM") || RC=$?
+assert "an absent function the bead proposes to add is exit 2 with a reason, never exit 1 -- its absence is the bug, not evidence it landed" \
+  "$([ "$OUT" = "cannot-verify" ] && [ "$RC" -eq 2 ] && [ -s "$ERR_SYM" ] && echo 1 || echo 0)"
+
+JSON_RENAME='[{"description":"rename `oldNameFn` to `newNameFn` everywhere","design":null,"acceptance_criteria":null}]'
+RC=0
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S4" call classify_from_json "$JSON_RENAME" 2>/dev/null) || RC=$?
+assert "'rename <absent symbol> to' asserts the old name is stale, so its absence means landed (exit 1)" \
+  "$([ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
 JSON_NO_PATTERN='[{"description":"plain prose, no code spans describing this bug at all","design":null,"acceptance_criteria":null}]'
 RC=0
@@ -248,7 +268,7 @@ new_sandbox "$S6"
 mkdir -p "$S6/crates/apiserver/src/handlers"
 printf 'fn apply_defaults() {}\n' > "$S6/crates/apiserver/src/handlers/defaults.rs"
 commit_tree "$S6"
-JSON_PATH_EXISTS='[{"description":"`crates/apiserver/src/handlers/defaults.rs` has no `default_widget_spec_arm` at all","design":null,"acceptance_criteria":null}]'
+JSON_PATH_EXISTS='[{"description":"`crates/apiserver/src/handlers/defaults.rs` still carries the stale `default_widget_spec_arm`","design":null,"acceptance_criteria":null}]'
 RC=0
 OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S6" call classify_from_json "$JSON_PATH_EXISTS") || RC=$?
 assert "an EXISTING cited path does not short-circuit to still-broken -- it falls through to the (absent) symbol candidate, giving no-longer-broken" \
@@ -350,7 +370,7 @@ done
 git -C "$S12" add -A -f
 git -C "$S12" commit -q -m snapshot
 RC=0
-OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S12" call classify_from_json "$JSON" 2>/dev/null) || RC=$?
+OUT=$(BEAD_PREMISE_CHECK_REPO_ROOT="$S12" call classify_from_json "$JSON_STALE" 2>/dev/null) || RC=$?
 assert "a symbol present only in ai/worktrees/, target/ or temp/ copies does not count -- otherwise every fixed bead looks still-broken because worker worktrees hold stale copies of the repo" \
   "$([ "$OUT" = "no-longer-broken" ] && [ "$RC" -eq 1 ] && echo 1 || echo 0)"
 
