@@ -214,6 +214,30 @@ extract_fix_section_candidate() {
   extract_symbol_candidates "$fix_text" | awk 'NR==1'
 }
 
+# True (exit 0) iff the wording around `symbol` in `text` asserts it is stale
+# or should be removed/renamed ("remove the dead `X`", "`X` is dead",
+# "rename `X` to"). Only then does the symbol's absence mean the bead
+# already landed; an absent upstream identifier or a function the bead
+# proposes to add says nothing about the bug.
+symbol_stale_wording() {
+  local sym="$1" text="$2" before after
+  case "$text" in *"\`$sym\`"*) ;; *) return 1 ;; esac
+  before=${text%%"\`$sym\`"*}
+  after=${text#*"\`$sym\`"}
+  before=${before//$'\n'/ }
+  if [ "${#before}" -gt 40 ]; then before=${before: -40}; fi
+  after=${after:0:40}
+  after=${after%%$'\n'*}
+  # Only phrasing bound directly to the symbol counts. Generic verbs
+  # ("delete", "drop", "remove") routinely describe Kubernetes behaviour
+  # ("namespace delete", "PATCH drops managedFields"), so they only count
+  # via "rename `X` to"; the rest needs an adjective touching the symbol.
+  grep -qiE '(^|[^[:alnum:]_])(dead|obsolete)[[:space:]]+$' <<<"$before" \
+    || { grep -qiE '(^|[^[:alnum:]_])rename[[:space:]]+$' <<<"$before" \
+         && grep -qiE '^[[:space:]]+to([^[:alnum:]_]|$)' <<<"$after"; } \
+    || grep -qiE '^[[:space:]]+(is|are)[[:space:]]+(now |already )?(dead|obsolete)([[:space:]]+code)?[[:space:]]*([.,;:)]|$)' <<<"$after"
+}
+
 # Classifies a single `bd show <id> --json` result (a one-element array).
 # Split out from main() so tests can feed synthetic JSON against a sandbox
 # git tree, without a live `bd` session or network access -- the same
@@ -278,9 +302,14 @@ classify_from_json() {
       printf 'still-broken\n'
       return 0
     fi
-    why "bug symbol '$first_symbol' is absent"
-    printf 'no-longer-broken\n'
-    return 1
+    if symbol_stale_wording "$first_symbol" "$text"; then
+      why "bug symbol '$first_symbol' is absent and the bead calls it stale/removable"
+      printf 'no-longer-broken\n'
+      return 1
+    fi
+    why "bug symbol '$first_symbol' is absent but the bead does not call it stale (upstream or proposed-new symbol?); grep cannot verify"
+    printf 'cannot-verify\n'
+    return 2
   fi
 
   fenced=$(extract_fenced_code_pattern "$text")
