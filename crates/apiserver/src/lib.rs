@@ -1427,7 +1427,7 @@ fn build_routes(state: AppState) -> Router {
         // Generic cluster-scoped resources — named
         .route(
             "/apis/{group}/{version}/{resource}/{name}",
-            get(handlers::resource::get_resource)
+            get(handlers::resource::get_resource_for_user)
                 .put(handlers::resource::replace_resource)
                 .delete(handlers::resource::delete_resource)
                 .patch(handlers::resource::patch_resource),
@@ -13188,7 +13188,7 @@ mod tests {
             .header("content-type", "application/merge-patch+json")
             .body(axum::body::Body::from(status_patch.to_string()))
             .expect("status PATCH request must build");
-        patch_req.extensions_mut().insert(admin);
+        patch_req.extensions_mut().insert(admin.clone());
         let patch_resp = router
             .call(patch_req)
             .await
@@ -13219,11 +13219,12 @@ mod tests {
 
         // A subsequent GET on the main resource must see the same split: status carries
         // the patch, spec is untouched.
-        let get_req = Request::builder()
+        let mut get_req = Request::builder()
             .method(Method::GET)
             .uri("/apis/example.io/v1/widgets/snap-content-1")
             .body(axum::body::Body::empty())
             .expect("GET request must build");
+        get_req.extensions_mut().insert(admin);
         let get_resp = router
             .call(get_req)
             .await

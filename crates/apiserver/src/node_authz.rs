@@ -354,9 +354,8 @@ fn authorize_csinode(node_name: &str, req: &AuthzRequest<'_>) -> bool {
 
 /// Mirrors upstream's `authorizeResourceSlice`: list/watch/deletecollection must carry
 /// `spec.nodeName=<node>` (the handlers filter by the same selector), and per-slice
-/// create/update/patch/delete are allowed here because the URL cannot name the owner node —
+/// get/create/update/patch/delete are allowed here because the URL cannot name the owner node —
 /// `restrict_node_resource_slice` checks the object's `spec.nodeName` in the handlers.
-/// Unlike upstream, `get` is not granted (no object-keyed graph edge to key it off).
 fn authorize_resource_slice(
     node_name: &str,
     req: &AuthzRequest<'_>,
@@ -366,7 +365,7 @@ fn authorize_resource_slice(
         return false;
     }
     match req.verb {
-        "create" | "update" | "patch" | "delete" => true,
+        "get" | "create" | "update" | "patch" | "delete" => true,
         "list" | "watch" | "deletecollection" => {
             field_selector_selects_node(raw_query, node_name, "resource.k8s.io", "resourceslices")
         }
@@ -376,8 +375,8 @@ fn authorize_resource_slice(
 
 /// Object-dependent half of node scoping for ResourceSlices, mirroring upstream's
 /// NodeRestriction `admitResourceSlice` plus the node authorizer's graph edge: a node identity
-/// may only write a slice whose `spec.nodeName` is itself, both before (`old`) and after (`new`)
-/// the write, so it can neither touch another node's slice nor re-home its own onto another
+/// may only read or write a slice whose `spec.nodeName` is itself, both before (`old`) and
+/// after (`new`) the write, so it can neither touch another node's slice nor re-home its own onto another
 /// node. No-op for non-node identities and other resources.
 pub fn restrict_node_resource_slice(
     username: &str,
@@ -1835,7 +1834,7 @@ mod tests {
             ),
             "scoping to another node's slices must be refused"
         );
-        for verb in ["create", "update", "patch", "delete"] {
+        for verb in ["get", "create", "update", "patch", "delete"] {
             assert!(
                 node_a_allowed(verb, group, rs, "", Some("slice-1"), None),
                 "{verb}: DRA drivers publish slices with node credentials; the handlers \
