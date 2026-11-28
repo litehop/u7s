@@ -1,0 +1,43 @@
+{
+  "runs": {
+    "R": 3,
+    "T": 3
+  },
+  "stages": {
+    "burst": {
+      "R": {
+        "kcm_mib": 45.99,
+        "apiserver_mib": 24.00
+      },
+      "T": {
+        "kcm_mib": 37.71,
+        "apiserver_mib": 24.41
+      },
+      "kcm_diff_mib": 8.28
+    },
+    "idle": {
+      "R": {
+        "kcm_mib": 42.81,
+        "apiserver_mib": 20.81
+      },
+      "T": {
+        "kcm_mib": 33.24,
+        "apiserver_mib": 20.03
+      },
+      "kcm_diff_mib": 9.57
+    },
+    "wordpress": {
+      "R": {
+        "kcm_mib": 45.22,
+        "apiserver_mib": 20.98
+      },
+      "T": {
+        "kcm_mib": 34.76,
+        "apiserver_mib": 20.93
+      },
+      "kcm_diff_mib": 10.46
+    }
+  },
+  "min_diff_mib": 5,
+  "phase0_pass": true
+}

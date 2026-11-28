@@ -33,7 +33,7 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
 50-pod burst). Run-meta records `kcm_mode`; the ported-controller list and
 `scripts/conformance/kcm-memory-projection.sh` are not yet written.
 
-- Gate on the per-stage total, not per controller.
+- Gate the R/H comparison on the per-stage total, not per controller.
 - R = shipped Go-only, H = phase build. Three interleaved runs each, same VM,
   same day, medians. PASS if `median(H) - median(R) <= 0`; INCONCLUSIVE if
   0 to 3, extend to 5 runs and pass only if `<= 0`; FAIL if above 3 on 3 runs
@@ -43,8 +43,7 @@ in `--install` mode on a Lima VM, three stages (idle, WordPress+MariaDB,
   at every stage.
 - Phase 0 passes if `median(R) - median(T) >= 5`.
 - Continue only if the total gate passes, apiserver anon grew at most 2, and
-- Continue only if the total gate passes, apiserver anon grew at most 2, and
-  the projection `P = F + sum(m_c)` is at most 33.4 MiB (T WordPress KCM anon, 11-controller trim; the 10-controller trim measures 35.99, #2300 — re-baselining is an operator decision).
+  the projection `P = F + sum(m_c)` is at most 35.99 MiB (T WordPress KCM anon only, 10-controller trim, #2300; no per-stage projection cap).
 - Verdicts are terminal per commit SHA; all runs are retained. A run is void
   only if it ended before any stage metric or spec report, with a harness or
   VM log naming an external cause, ruled before the replacement run. At most

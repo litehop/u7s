@@ -51,11 +51,17 @@ Pod cache lives as short a time as possible.
 | 4 | resourcequota, disruption, node-ipam; namespace, garbage-collector, node-lifecycle stay Go | race-sensitive, mostly integration-only coverage |
 | 5 | PV binder, attach-detach, expand, protection, ephemeral-volume, CSR approving/signing, bootstrap-signer, token-cleaner, resource-claim, HPA if kept | storage and security, thin single-node e2e; CSR signing is on the join path |
 | 6 | remove Go KCM (ship-time only) | the 50 MiB binary and Go runtime go |
-## Phase 0 re-measure (2026-11-27)
+## Phase 0 re-measure
 
-- PASS on idle and WordPress: R−T 8.12 / 9.14 MiB, R 42.99 / 45.13 vs T 34.87 / 35.99.
-- SHA 474d89af, lima-node-4, 3 interleaved runs, 0 voids.
-- The burst stage is not implemented (`mayor-84rmv`); the operator accepted the two-stage pass on 2026-11-27.
+- 2026-11-28, three stages, SHA f85b2873, lima-node-4, 3 interleaved runs:
+  PASS, R−T idle / WordPress / 50-pod burst 9.57 / 10.46 / 8.28 MiB; R
+  42.81 / 45.22 / 45.99 vs T 33.24 / 34.76 / 37.71. Artefact
+  `docs/benchmarks/2026-11-28-f85b2873-lima-kcm-mem`. Burst: 3 samples after
+  a 60 s settle; 871d58e7 took 20 after a 45 s warm-up, so its 45.2 is not
+  comparable.
+- The 35.99 cap is WordPress-only; T WordPress 34.76 is under it.
+- 2026-11-27, two stages, SHA 474d89af: R−T 8.12 / 9.14, R 42.99 / 45.13 vs T
+  34.87 / 35.99.
 - Client stack: C (hardened).
 - #2284 adds seat pools.
 

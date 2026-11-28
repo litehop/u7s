@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # One KCM memory run on an install-mode stack that is already up (run-all.sh --install
 # --stack-only, or install-bringup.sh): switches KCM to --mode, samples Pss_Anon of the KCM and
-# apiserver processes at two stages, and writes <out>/kcm-mem.json and <out>/run-meta.env.
+# apiserver processes at three stages, and writes <out>/kcm-mem.json and <out>/run-meta.env.
 #   idle       after the KCM restart and --settle seconds
 #   wordpress  after WordPress + MariaDB (examples/e2e/wordpress, MariaDB on emptyDir as in the
 #              release gate) are Ready and --settle seconds have passed
+#   burst      after a 50-replica pause Deployment (on top of WordPress) has all
+#              replicas ready and --settle seconds have passed
 # The cluster is left running; kcm-mem-ab.sh tears it down between runs.
 #
 # Usage: scripts/bench/kcm-mem-run.sh --vm <name> --mode R|T --out <dir> [--workdir <dir>]
@@ -74,13 +76,27 @@ echo "kcm-mem: wordpress stage (settle ${SETTLE}s)"
 sleep "$SETTLE"
 wordpress="$(kcm_stage_sample "$VM" "$SAMPLES" "$INTERVAL")"
 
+echo "kcm-mem: deploying the $KCM_MEM_BURST_REPLICAS-pod burst"
+kcm_burst_manifest | k apply -f - >/dev/null
+ready=0
+for _ in $(seq 1 300); do
+  ready="$(k -n default get deployment kcm-mem-burst -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  [ "${ready:-0}" -ge "$KCM_MEM_BURST_REPLICAS" ] && break
+  sleep 2
+done
+[ "${ready:-0}" -ge "$KCM_MEM_BURST_REPLICAS" ] \
+  || { echo "kcm-mem: kcm-mem-burst has ${ready:-0}/$KCM_MEM_BURST_REPLICAS ready after 600s" >&2; exit 1; }
+echo "kcm-mem: burst stage (settle ${SETTLE}s)"
+sleep "$SETTLE"
+burst="$(kcm_stage_sample "$VM" "$SAMPLES" "$INTERVAL")"
+
 restarts="$(limactl shell "$VM" sudo systemctl show -p NRestarts --value u7s-kcm.service | tr -d '[:space:]')"
 vm_json="$(limactl shell "$VM" bash -c 'echo "$(uname -r) $(nproc) $(awk "/^MemTotal:/ {print \$2}" /proc/meminfo) $(uname -m)"' \
   | jq -R -c 'split(" ") | {name: "'"$VM"'", kernel: .[0], vcpus: (.[1] | tonumber), mem_total_kb: (.[2] | tonumber), arch: .[3]}')"
 host_json="$(jq -n -c --arg os "$(uname -sr)" --argjson ncpu "$(sysctl -n hw.ncpu 2>/dev/null || nproc)" '{os: $os, ncpu: $ncpu}')"
-stages="$(jq -n -c --argjson i "$idle" --argjson w "$wordpress" '{idle: $i, wordpress: $w}')"
+stages="$(jq -n -c --argjson i "$idle" --argjson w "$wordpress" --argjson b "$burst" '{idle: $i, wordpress: $w, burst: $b}')"
 
 kcm_mem_json "$MODE" "$flag" "${restarts:-0}" "$sha" "$dirty" "$(date -u +%Y-%m-%d)" "$vm_json" "$host_json" "$stages" \
   > "$OUT/kcm-mem.json"
 echo "kcm-mem: wrote $OUT/kcm-mem.json (mode $MODE, restarts ${restarts:-0})"
-jq -c '{kcm_mode, idle: .stages.idle.kcm_mib, wordpress: .stages.wordpress.kcm_mib}' "$OUT/kcm-mem.json"
+jq -c '{kcm_mode, idle: .stages.idle.kcm_mib, wordpress: .stages.wordpress.kcm_mib, burst: .stages.burst.kcm_mib}' "$OUT/kcm-mem.json"

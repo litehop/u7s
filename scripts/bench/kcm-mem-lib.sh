@@ -59,6 +59,19 @@ kcm_stage_sample() {
     '{kcm_mib: $km, apiserver_mib: $am, samples_mib: {kcm: $kcm, apiserver: $api}}'
 }
 
+# The Phase 0 gate's stages, in run order. kcm-mem-run.sh must write every one of them.
+KCM_MEM_STAGES="idle wordpress burst"
+KCM_MEM_BURST_REPLICAS=50
+
+# $1 replicas (default KCM_MEM_BURST_REPLICAS). stdout: a Deployment of that many pause pods.
+kcm_burst_manifest() {
+  jq -n -c --argjson n "${1:-$KCM_MEM_BURST_REPLICAS}" \
+    '{apiVersion: "apps/v1", kind: "Deployment", metadata: {name: "kcm-mem-burst", namespace: "default"},
+      spec: {replicas: $n, selector: {matchLabels: {app: "kcm-mem-burst"}},
+        template: {metadata: {labels: {app: "kcm-mem-burst"}},
+          spec: {containers: [{name: "pause", image: "registry.k8s.io/pause:3.10"}]}}}}'
+}
+
 # $1 mode  $2 effective controllers flag  $3 restarts  $4 sha  $5 dirty 1|0  $6 date
 # $7 vm JSON  $8 host JSON  $9 stages JSON (object)
 kcm_mem_json() {
