@@ -1123,33 +1123,117 @@ pub(crate) async fn delete_collection_item<S: Store>(
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    pin_server_owned_metadata(&mut obj.body, None);
+    clear_server_owned_on_create(&mut obj.body);
 }
 
-/// `metadata.creationTimestamp` is also pinned on update when the stored object has one
-/// (upstream `rest.BeforeUpdate`); create leaves it to `stamp_metadata`.
+/// On create `metadata.deletionTimestamp` and `deletionGracePeriodSeconds` are cleared so nothing
+/// is born Terminating; `creationTimestamp` is left to `stamp_metadata`.
+pub(crate) fn clear_server_owned_on_create(body: &mut serde_json::Value) {
+    pin_server_owned_fields(body, None);
+}
+
+/// Upstream `rest.BeforeUpdate` + `ValidateObjectMetaUpdate` for the metadata only the create and
+/// delete paths may change, applied to the object an update is about to store. `stored` is the
+/// stored object or its `snapshot_server_owned_metadata`; `None` is a create, which only clears
+/// the deletion fields.
 ///
-/// `metadata.deletionTimestamp` and `deletionGracePeriodSeconds` are server-owned: only the
-/// delete path may set them. On update they are overwritten with the stored values (or
-/// removed when the stored object has none); on create they are cleared (`stored` = `None`).
-/// Without this a caller holding only update/patch could hard-delete, terminate or
-/// un-terminate an object without the delete verb.
+/// - `uid`: blank takes the stored value; a different one is a 422 (a PUT's body uid is rejected
+///   earlier as a 409 precondition, as upstream's `DefaultUpdatedObjectInfo` does; a PATCH has no
+///   precondition).
+/// - `creationTimestamp`: silently pinned to the stored value when it has one.
+/// - `deletionTimestamp`: silently pinned once set; setting it on a live object is a 422.
+/// - `deletionGracePeriodSeconds`: restored when the body omits it; any other difference is 422.
 ///
-/// Callers pin AFTER mutating admission, as upstream `rest.BeforeUpdate` does. Upstream copies
-/// `deletionGracePeriodSeconds` only when the new value is nil and then rejects any remaining
-/// difference as immutable; this overwrites unconditionally, which is the same result for every
-/// request upstream accepts.
+/// Without this a caller holding only update/patch could hard-delete, terminate or un-terminate
+/// an object without the delete verb. Callers pin right after applying the client's write and
+/// again after mutating admission, as upstream's `BeforeUpdate` follows both.
 pub(crate) fn pin_server_owned_metadata(
     body: &mut serde_json::Value,
     stored: Option<&serde_json::Value>,
-) {
-    pin_server_owned_fields(body, stored.map(|s| &s["metadata"]));
+    group: &str,
+    kind: &str,
+) -> Result<(), crate::status::StatusError> {
+    let Some(stored) = stored else {
+        clear_server_owned_on_create(body);
+        return Ok(());
+    };
+    check_immutable_metadata(group, kind, &stored["metadata"], &body["metadata"])?;
+    pin_server_owned_fields(body, Some(&stored["metadata"]));
+    if let Some(uid) = stored["metadata"]["uid"].as_str().filter(|u| !u.is_empty()) {
+        if let Some(meta) = body.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.insert("uid".to_string(), uid.into());
+        }
+    }
+    Ok(())
 }
 
-/// Cheap stand-in for the stored object when only its deletion fields are needed later
+/// Upstream's 422 for a changed immutable field `rest.BeforeUpdate` does not pin first
+/// (`ValidateObjectMetaUpdate` -> `ValidateImmutableField`). `stored` and `new` are `metadata`
+/// objects.
+pub(crate) fn check_immutable_metadata(
+    group: &str,
+    kind: &str,
+    stored: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let blank = |v: &serde_json::Value| v.as_str().map(str::is_empty).unwrap_or(v.is_null());
+    let mut changed = Vec::new();
+    if !blank(&new["uid"]) && !blank(&stored["uid"]) && new["uid"] != stored["uid"] {
+        changed.push("uid");
+    }
+    let (stored_ts, ts) = (&stored["deletionTimestamp"], &new["deletionTimestamp"]);
+    if stored_ts.is_null() && !ts.is_null() {
+        changed.push("deletionTimestamp");
+    }
+    let (stored_grace, grace) = (
+        &stored["deletionGracePeriodSeconds"],
+        &new["deletionGracePeriodSeconds"],
+    );
+    if !grace.is_null() && grace != stored_grace {
+        changed.push("deletionGracePeriodSeconds");
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let cause = |field: &str| format!("Invalid value: {}: field is immutable", new[field]);
+    let name = stored["name"]
+        .as_str()
+        .or(new["name"].as_str())
+        .unwrap_or_default();
+    let qualified = if group.is_empty() {
+        kind.to_owned()
+    } else {
+        format!("{kind}.{group}")
+    };
+    let messages: Vec<String> = changed
+        .iter()
+        .map(|f| format!("metadata.{f}: {}", cause(f)))
+        .collect();
+    let joined = match messages.as_slice() {
+        [one] => one.clone(),
+        many => format!("[{}]", many.join(", ")),
+    };
+    let mut err =
+        Status::unprocessable_entity(format!("{qualified} \"{name}\" is invalid: {joined}"));
+    err.1.details = Some(Box::new(serde_json::json!({
+        "name": name,
+        "group": group,
+        "kind": kind,
+        "causes": changed.iter().map(|f| serde_json::json!({
+            "reason": "FieldValueInvalid",
+            "message": cause(f),
+            "field": format!("metadata.{f}"),
+        })).collect::<Vec<_>>(),
+    })));
+    Err(err)
+}
+
+/// Cheap stand-in for the stored object when only its server-owned metadata is needed later
 /// (patch handlers mutate the stored body in place, so the originals must be copied out first).
 pub(crate) fn snapshot_server_owned_metadata(body: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"metadata": {
+        "name": body["metadata"]["name"],
+        "uid": body["metadata"]["uid"],
         "deletionTimestamp": body["metadata"]["deletionTimestamp"],
         "deletionGracePeriodSeconds": body["metadata"]["deletionGracePeriodSeconds"],
         "creationTimestamp": body["metadata"]["creationTimestamp"],

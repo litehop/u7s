@@ -102,6 +102,9 @@
 #   shell `-c` loops older than 10 minutes with no limactl/ssh/exec involvement
 #   are candidates; loops with a live target are never touched. Scope is every
 #   process of the invoking user, across sessions and repos.
+# STEP J: `bd gc --skip-decay --full --force` on the shared Dolt store, only
+#   under --no-live-workers and only when no bd process is running; verifies
+#   the `bd export` hash is unchanged (see STEP J below). Runs after STEP I.
 # STEP H: read-only. Report loudly when the latest completed `audit.yaml`
 #   decisive run on main is red (`failure`/`timed_out`/`startup_failure`) (run URL plus any RUSTSEC-/GHSA- ids from
 #   its log). The audit is deliberately non-blocking for PRs, so this is
@@ -111,7 +114,8 @@
 # Exit codes (OR-able bits, plus the refusal code):
 #   0 = clean tick, nothing found.
 #   1 = an anomaly for the mayor to look at (STEP A kill-verify failure, STEP G
-#       could not remove a worktree/branch).
+#       could not remove a worktree/branch, STEP J `bd gc`/export failure or
+#       export-hash mismatch).
 #   2 = refusal: missing/conflicting --live-agents / --no-live-workers (no
 #       step ran).
 #   4 = STEP H: main's latest decisive audit run is red (`failure`,
@@ -1063,6 +1067,65 @@ step_i_orphaned_wait_loops() {
   done <<< "$lines"
 }
 
+# ---------------------------------------------------------------------------
+# STEP J -- guarded bd Dolt GC.
+# The embedded Dolt store bloats (1.3G for 9M of data) and every bd read slows
+# with it; `bd gc --skip-decay --full --force` reclaims it in seconds. The store
+# is single-writer and file-locked, so it runs only when no worker can be
+# writing (--no-live-workers) and no bd process is running. The issue export is
+# hashed before and after; a difference is an anomaly (exit 1) and both tmpfiles
+# are kept. Runs after the steps that invoke bd (STEP E) and after the
+# destructive steps, so a GC failure can't block them.
+# ---------------------------------------------------------------------------
+BD="${HYGIENE_BD:-bd}"
+
+bd_store_kb() {
+  du -sk "$REPO_ROOT/.beads/embeddeddolt" 2>/dev/null | awk '{print $1}'
+}
+
+step_j_bd_gc() {
+  if [ -n "$(normalize_live_agents "${LIVE_AGENTS:-}")" ]; then
+    echo "worktree-hygiene: STEP J: skipped -- live workers (--live-agents) may be writing to the bd store"
+    return 0
+  fi
+  local running
+  running=$(pgrep -x bd 2>/dev/null || true)
+  if [ -n "$running" ]; then
+    echo "worktree-hygiene: STEP J: skipped -- a bd process is running (pid $(echo $running)); the embedded Dolt store is single-writer"
+    return 0
+  fi
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[dry-run] would run: bd gc --skip-decay --full --force"
+    return 0
+  fi
+  local before after before_kb after_kb tmp_before tmp_after
+  tmp_before=$(mktemp "${TMPDIR:-/tmp}/hygiene-bd-export-before.XXXXXX")
+  tmp_after=$(mktemp "${TMPDIR:-/tmp}/hygiene-bd-export-after.XXXXXX")
+  if ! "$BD" -C "$REPO_ROOT" export -o "$tmp_before" >/dev/null 2>&1; then
+    echo "worktree-hygiene: STEP J WARNING: pre-GC 'bd export' failed; GC not run (cannot verify it) -- investigate ($tmp_before)" >&2
+    return 1
+  fi
+  before=$(shasum -a 256 < "$tmp_before" | awk '{print $1}')
+  before_kb=$(bd_store_kb)
+  if ! "$BD" -C "$REPO_ROOT" gc --skip-decay --full --force >/dev/null 2>&1; then
+    echo "worktree-hygiene: STEP J WARNING: 'bd gc' failed -- investigate (store may be mid-GC)" >&2
+    rm -f "$tmp_before" "$tmp_after"
+    return 1
+  fi
+  after_kb=$(bd_store_kb)
+  if ! "$BD" -C "$REPO_ROOT" export -o "$tmp_after" >/dev/null 2>&1; then
+    echo "worktree-hygiene: STEP J ALERT: post-GC 'bd export' failed; GC result unverified -- investigate (pre-GC export: $tmp_before)" >&2
+    return 1
+  fi
+  after=$(shasum -a 256 < "$tmp_after" | awk '{print $1}')
+  if [ "$before" != "$after" ]; then
+    echo "worktree-hygiene: STEP J ALERT: bd export changed across GC: before=$before ($tmp_before) after=$after ($tmp_after) -- investigate" >&2
+    return 1
+  fi
+  rm -f "$tmp_before" "$tmp_after"
+  echo "worktree-hygiene: STEP J: bd gc ok, export unchanged (sha256 $before); store ${before_kb:-?}K -> ${after_kb:-?}K"
+}
+
 main() {
   local live_agents_provided=0 no_live_workers=0
   while [ "$#" -gt 0 ]; do
@@ -1126,6 +1189,7 @@ main() {
   step_f_orphaned_origin_branches
   step_g_fix_round_worktrees || rc=1
   step_i_orphaned_wait_loops
+  step_j_bd_gc || rc=1
   local audit_rc=0
   step_h_main_audit || audit_rc=$?
   exit $(( rc | audit_rc ))

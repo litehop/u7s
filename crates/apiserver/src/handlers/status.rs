@@ -46,13 +46,19 @@ use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 /// `kind` is the built-in kind; `None` is a custom resource, whose `/status` strategy
 /// resets all of `metadata`. Metadata the kind's status strategy resets (see
 /// `field_manager::reset_fields`) is dropped from `incoming` too.
+///
+/// What the strategy does not reset and the write changes anyway is upstream's immutable-field
+/// rejection (`check_immutable_metadata`): 422 for a PATCH, and for a PUT a `uid` naming another
+/// incarnation is the storage precondition's 409.
 pub(crate) fn merge_incoming_metadata(
     current: &mut serde_json::Value,
     incoming: &serde_json::Value,
     kind: Option<&str>,
-) {
+    group: &str,
+    write: Write,
+) -> Result<(), crate::status::StatusError> {
     let Some(kind) = kind else {
-        return;
+        return Ok(());
     };
     let mut incoming = incoming.clone();
     crate::field_manager::strip_paths(
@@ -61,11 +67,37 @@ pub(crate) fn merge_incoming_metadata(
     );
     let incoming_meta = &incoming["metadata"];
     if !incoming_meta.is_object() {
-        return;
+        return Ok(());
     }
+    if write == Write::Put {
+        if let Some(uid) = incoming_meta["uid"].as_str().filter(|u| !u.is_empty()) {
+            crate::types::Preconditions {
+                uid: Some(uid.to_owned()),
+                resource_version: None,
+            }
+            .check(current)
+            .map_err(|msg| {
+                let name = current["metadata"]["name"].as_str().unwrap_or_default();
+                Status::conflict(format!(
+                    "Operation cannot be fulfilled on {kind} \"{name}\": StorageError: invalid \
+                     object, Code: 4, AdditionalErrorMsg: {msg}"
+                ))
+            })?;
+        }
+    }
+    super::generic::check_immutable_metadata(group, kind, &current["metadata"], incoming_meta)?;
     let saved = protected_metadata(&current["metadata"], kind);
     crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
     restore_metadata(&mut current["metadata"], saved);
+    Ok(())
+}
+
+/// Whether a status write is a PUT (its body `uid` is a storage precondition upstream) or a
+/// PATCH (no precondition, so a differing `uid` fails validation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Write {
+    Put,
+    Patch,
 }
 
 /// What a status-subresource write takes from `patch`, and so what an apply to it owns:
@@ -351,7 +383,13 @@ pub async fn put_resource_status<S: Store>(
                 None => replace_status_field(&mut current.body, incoming_status)?,
             }
         }
-        merge_incoming_metadata(&mut current.body, &incoming.body, Some(meta.kind.as_str()));
+        merge_incoming_metadata(
+            &mut current.body,
+            &incoming.body,
+            Some(meta.kind.as_str()),
+            &group,
+            Write::Put,
+        )?;
 
         if let Some(ref old_node) = node_before {
             crate::node_authz::restrict_node_self_write(
@@ -498,7 +536,13 @@ pub async fn patch_resource_status<S: Store>(
                         }
                     }
                 }
-                merge_incoming_metadata(&mut current.body, &patch, Some(meta.kind.as_str()));
+                merge_incoming_metadata(
+                    &mut current.body,
+                    &patch,
+                    Some(meta.kind.as_str()),
+                    &group,
+                    Write::Patch,
+                )?;
             }
         }
         if let Some(plan) = &ssa_plan {
@@ -749,7 +793,9 @@ pub(crate) async fn put_namespaced_resource_status_guarded<S: Store>(
             &mut current.body,
             &incoming.body,
             cr_ctx.is_none().then_some(kind.as_str()),
-        );
+            &group,
+            Write::Put,
+        )?;
 
         if let (Some(guard), Some(stored_body)) = (guard, &stored_body) {
             guard(stored_body, &current.body)?;
@@ -941,7 +987,9 @@ pub(crate) async fn patch_namespaced_resource_status_guarded<S: Store>(
                     &mut current.body,
                     &patch,
                     cr_ctx.is_none().then_some(kind.as_str()),
-                );
+                    &group,
+                    Write::Patch,
+                )?;
             }
         }
         if let Some(plan) = &ssa_plan {
@@ -5428,18 +5476,17 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
         .await;
-        assert!(result.is_ok(), "PUT /status must succeed");
+        assert_eq!(
+            result.err().map(|e| e.0),
+            Some(axum::http::StatusCode::CONFLICT),
+            "a PUT /status naming another incarnation's uid is the storage precondition's 409"
+        );
 
         let stored = store.get(key).await.unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
             v["metadata"]["uid"], "real-uid-1",
-            "uid must not be overwritten by a status write; \
-             allowing uid changes via /status would break GC and object identity guarantees"
-        );
-        assert_eq!(
-            v["metadata"]["annotations"]["safe"], "yes",
-            "non-identity annotations must still land"
+            "allowing uid changes via /status would break GC and object identity guarantees"
         );
     }
 

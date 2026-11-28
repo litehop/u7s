@@ -151,6 +151,8 @@ pub struct CrdMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion_grace_period_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_fields: Option<serde_json::Value>,
 }
 
@@ -1159,7 +1161,12 @@ pub async fn replace_crd<S: Store>(
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mut mutated =
             run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
-        super::generic::pin_server_owned_metadata(&mut mutated, Some(&existing));
+        super::generic::pin_server_owned_metadata(
+            &mut mutated,
+            Some(&existing),
+            "apiextensions.k8s.io",
+            KIND,
+        )?;
         run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
         crd = serde_json::from_value(mutated).map_err(|e| {
             Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
@@ -1911,17 +1918,6 @@ pub async fn patch_crd<S: Store>(
         // Reject rather than silently drop: a patch that changes a structural identity field
         // is a client error the caller must correct, not something to merge-and-ignore.
         reject_structural_field_change(&existing, &crd.spec, &name)?;
-
-        // metadata.uid is immutable identity, restored unconditionally after every patch type
-        // above — mirrors do_patch (resource.rs) and patch_cr's restore, since
-        // CustomResourceDefinition routes around the generic PATCH path entirely and previously
-        // had no uid handling at all. Without this, a caller holding only ordinary CRD `patch`
-        // rights could forge uid to match a stale/foreign ownerReference and corrupt
-        // the garbage collector's cascade-GC decision.
-        crd.metadata.uid = existing["metadata"]["uid"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
         validate_crd_schema_blocking(&crd.spec, Some(&existing)).await?;
 
         // Admission webhook pipeline (mutating then validating).
@@ -1946,7 +1942,12 @@ pub async fn patch_crd<S: Store>(
                 serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
             let mut mutated =
                 run_mutating_webhooks(&state, obj_val, Some(&existing), &admission_ctx).await?;
-            super::generic::pin_server_owned_metadata(&mut mutated, Some(&existing));
+            super::generic::pin_server_owned_metadata(
+                &mut mutated,
+                Some(&existing),
+                "apiextensions.k8s.io",
+                KIND,
+            )?;
             run_validating_webhooks(&state, &mutated, Some(&existing), &admission_ctx).await?;
             crd = serde_json::from_value(mutated).map_err(|e| {
                 Status::internal_actionable(format!("admission mutated CRD is invalid: {e}"))
@@ -2059,7 +2060,13 @@ pub async fn put_crd_status<S: Store>(
         &incoming.body["status"],
     )?;
 
-    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body, Some(KIND));
+    crate::handlers::status::merge_incoming_metadata(
+        &mut current.body,
+        &incoming.body,
+        Some(KIND),
+        "apiextensions.k8s.io",
+        crate::handlers::status::Write::Put,
+    )?;
     current.body = admit_crd_status(
         &state,
         &name,
@@ -2167,7 +2174,13 @@ pub async fn patch_crd_status<S: Store>(
                     }
                 }
             }
-            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch, Some(KIND));
+            crate::handlers::status::merge_incoming_metadata(
+                &mut current.body,
+                &patch,
+                Some(KIND),
+                "apiextensions.k8s.io",
+                crate::handlers::status::Write::Patch,
+            )?;
         }
     }
     if let Some(plan) = &ssa_plan {
@@ -3926,8 +3939,6 @@ mod tests {
     /// would be persisted and this assertion would fail.
     #[tokio::test]
     async fn patch_crd_cannot_change_uid() {
-        use axum::response::IntoResponse;
-
         let state = make_state();
         let name = "widgets.example.com";
         create_crd(
@@ -3961,7 +3972,7 @@ mod tests {
             "application/merge-patch+json".parse().unwrap(),
         );
 
-        let result = patch_crd(
+        let err = patch_crd(
             State(state.clone()),
             Path(name.to_string()),
             test_user(),
@@ -3969,19 +3980,20 @@ mod tests {
             patch_bytes,
         )
         .await
-        .expect(
-            "a patch attempting to set uid must still succeed (uid is silently restored, \
-             not rejected — matches do_patch's PATCH semantics)",
-        )
-        .into_response();
+        .err()
+        .expect("a patch changing uid is upstream's immutable-field 422");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
 
-        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+        let stored = state
+            .store
+            .get(&store_key(name))
             .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .unwrap()
+            .expect("must exist");
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], real_uid,
-            "a merge-patch carrying metadata.uid must not change the stored uid"
+            stored_val["metadata"]["uid"], real_uid,
+            "a rejected merge-patch must not change the stored uid"
         );
     }
 

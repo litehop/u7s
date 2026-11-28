@@ -360,6 +360,15 @@ pub(crate) async fn create_resource<S: Store>(
     let mut name = resolve_valid_name(&mut obj, &group, &plural, &meta.kind)?;
     crate::node_authz::restrict_node_create(&user.username, &user.groups, &group, &plural, &name)
         .map_err(Status::forbidden)?;
+    crate::node_authz::restrict_node_resource_slice(
+        &user.username,
+        &user.groups,
+        &group,
+        &plural,
+        None,
+        Some(&obj.body),
+    )
+    .map_err(Status::forbidden)?;
     stamp_metadata(&mut obj);
     if meta.kind == "VolumeAttributesClass" {
         add_vac_protection_finalizer(&mut obj);
@@ -994,6 +1003,15 @@ pub(crate) async fn replace_resource<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
+        crate::node_authz::restrict_node_resource_slice(
+            &user.username,
+            &user.groups,
+            &group,
+            &plural,
+            old_object.as_ref(),
+            Some(&obj.body),
+        )
+        .map_err(Status::forbidden)?;
 
         // Admission webhook pipeline (mutating then validating).
         let admission_ctx = AdmissionContext {
@@ -1022,7 +1040,7 @@ pub(crate) async fn replace_resource<S: Store>(
         // a webhook patch must not clear creationTimestamp, and finalizer_drain_complete below
         // (which reads obj.body, not the stored object) must not see a blank deletionTimestamp
         // and resurrect a Terminating object as live.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref(), &group, &meta.kind)?;
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -1193,6 +1211,15 @@ pub(crate) async fn delete_resource<S: Store>(
 
         let mut obj = Object::from_bytes(&stored.value)
             .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+        crate::node_authz::restrict_node_resource_slice(
+            &user.username,
+            &user.groups,
+            &group,
+            &plural,
+            Some(&obj.body),
+            None,
+        )
+        .map_err(Status::forbidden)?;
 
         // Admission webhook pipeline (mutating then validating; a mutating
         // webhook may only allow or deny a DELETE). Run against the freshest read on every attempt, before the soft/hard-delete
@@ -1623,6 +1650,15 @@ pub(crate) async fn do_patch<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
+        crate::node_authz::restrict_node_resource_slice(
+            &user.username,
+            &user.groups,
+            group,
+            plural,
+            None,
+            Some(&obj.body),
+        )
+        .map_err(Status::forbidden)?;
         // ResourceQuota: an SSA apply-create is a create just like create_resource /
         // create_namespaced_resource, so it must be checked against count/* and compute
         // quotas too — otherwise `kubectl apply --server-side` on a not-yet-existing name
@@ -1737,6 +1773,8 @@ pub(crate) async fn do_patch<S: Store>(
                 } else {
                     None
                 };
+                let slice_before = (group == "resource.k8s.io" && plural == "resourceslices")
+                    .then(|| current.body.clone());
                 let pcr_before = (group == "certificates.k8s.io"
                     && plural == "podcertificaterequests")
                     .then(|| current.body.clone());
@@ -1829,6 +1867,15 @@ pub(crate) async fn do_patch<S: Store>(
                     )
                     .map_err(Status::forbidden)?;
                 }
+                crate::node_authz::restrict_node_resource_slice(
+                    &user.username,
+                    &user.groups,
+                    group,
+                    plural,
+                    slice_before.as_ref(),
+                    Some(&current.body),
+                )
+                .map_err(Status::forbidden)?;
 
                 // Admission webhook pipeline (mutating then validating) — same rationale as
                 // the primary create path above: this branch lost the create/create race but
@@ -1847,7 +1894,12 @@ pub(crate) async fn do_patch<S: Store>(
                 };
                 current.body =
                     run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
-                pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+                pin_server_owned_metadata(
+                    &mut current.body,
+                    Some(&stored_deletion),
+                    group,
+                    &meta.kind,
+                )?;
                 // Re-restore status after mutating webhooks — same rationale as the primary
                 // create path's post-webhook clear_create_status re-call above: a webhook's
                 // JSON patch can reinject a forged/scalar status the earlier restore already
@@ -1989,6 +2041,9 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
+        let slice_before_patch = (group == "resource.k8s.io" && plural == "resourceslices")
+            .then(|| current.body.clone());
+
         // Capture PVC storage request + StorageClass before patch: growing storage is only
         // allowed when the bound StorageClass explicitly opts in via allowVolumeExpansion,
         // checked against the post-patch value below.
@@ -2127,14 +2182,11 @@ pub(crate) async fn do_patch<S: Store>(
             None
         };
 
-        // metadata.uid is immutable identity, restored unconditionally after every patch
-        // type below (including JSON Patch, whose array shape can't be caught by an
-        // object-key strip). Without this, a caller holding only ordinary `patch` rights on
-        // any resource could forge uid to match a stale/foreign ownerReference and corrupt
+        // metadata.uid is immutable identity: pin_server_owned_metadata below rejects a patch
+        // (of any type, including JSON Patch whose array shape an object-key strip can't see)
+        // that changes it. A forged uid could match a stale/foreign ownerReference and corrupt
         // the garbage collector's cascade-GC decision, or defeat controllers' "same name,
-        // different uid ⇒ different object" recreate-detection — see stamp_metadata (create)
-        // and replace_resource's uid-mismatch check (PUT) for the other two mutation paths.
-        let stored_uid = current.body["metadata"]["uid"].clone();
+        // different uid ⇒ different object" recreate-detection.
         let stored_deletion = super::generic::snapshot_server_owned_metadata(&current.body);
 
         match patch_type {
@@ -2155,9 +2207,8 @@ pub(crate) async fn do_patch<S: Store>(
         if let Some(plan) = &ssa_plan {
             plan.remove_dropped_fields(&mut current.body);
         }
-        current.body["metadata"]["uid"] = stored_uid;
         // Pinned here too: the finalizer-drain check below reads current.body before admission runs.
-        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion), group, &meta.kind)?;
         super::json_patch::enforce_patch_identity(&mut current.body, name, ns)?;
 
         restore_or_strip_status(
@@ -2205,6 +2256,15 @@ pub(crate) async fn do_patch<S: Store>(
             )
             .map_err(Status::forbidden)?;
         }
+        crate::node_authz::restrict_node_resource_slice(
+            &user.username,
+            &user.groups,
+            group,
+            plural,
+            slice_before_patch.as_ref(),
+            Some(&current.body),
+        )
+        .map_err(Status::forbidden)?;
 
         if let Some((ref old_size, ref sc_name)) = pvc_before_patch {
             reject_disallowed_pvc_resize(
@@ -2385,7 +2445,7 @@ pub(crate) async fn do_patch<S: Store>(
         current.body =
             run_mutating_webhooks(state, current.body, old_object.as_ref(), &admission_ctx).await?;
         // Pinned again after mutating admission (upstream rest.BeforeUpdate).
-        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion));
+        pin_server_owned_metadata(&mut current.body, Some(&stored_deletion), group, &meta.kind)?;
         // Re-restore status after mutating webhooks — same rationale as the SSA-create-race
         // fallback's post-webhook re-call above: a webhook's JSON patch can reinject a
         // forged/scalar status the earlier restore (before this match block) already
@@ -4159,7 +4219,7 @@ pub(crate) async fn replace_namespaced_resource<S: Store>(
         obj.body =
             run_mutating_webhooks(&state, obj.body, old_object.as_ref(), &admission_ctx).await?;
         // Pinned after mutating admission (upstream rest.BeforeUpdate); see replace_resource.
-        pin_server_owned_metadata(&mut obj.body, old_object.as_ref());
+        pin_server_owned_metadata(&mut obj.body, old_object.as_ref(), &group, &meta.kind)?;
         if let Some(old) = old_object.as_ref() {
             super::defaults::prepare_generation_for_update(&group, &plural, old, &mut obj.body);
         }
@@ -4817,6 +4877,17 @@ pub(crate) async fn delete_collection_resource<S: Store>(
 
             check_preconditions(delete_opts.preconditions.as_ref(), &obj.key, &obj.value)
                 .map_err(|e| e.into_status(&group, &plural, &name, &plural))?;
+            // Per-object backstop behind the authorizer's selector check, as upstream's
+            // NodeRestriction checks each object of a DeleteCollection.
+            crate::node_authz::restrict_node_resource_slice(
+                &user.username,
+                &user.groups,
+                &group,
+                &plural,
+                Some(&parsed),
+                None,
+            )
+            .map_err(Status::forbidden)?;
 
             // Admission webhook pipeline (mutating then validating; a mutating webhook may only allow or deny a DELETE), invoked per object exactly like the single-delete handlers above.
             // Upstream kube-apiserver's DeleteCollection runs admission per object too; a
@@ -11988,7 +12059,6 @@ mod tests {
     /// different object" recreate-detection.
     #[tokio::test]
     async fn patch_resource_merge_patch_cannot_change_uid() {
-        use axum::body::to_bytes;
         use axum::extract::{Path, State};
         use std::sync::Arc;
         use u7s_store::SqliteStore;
@@ -12039,20 +12109,10 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
         .await;
-        let result = match patch_result {
-            Ok(r) => r.into_response(),
-            Err(_) => panic!(
-                "merge-patch attempting to set uid must still succeed (uid is \
-                just silently restored, not rejected)"
-            ),
-        };
-
-        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            v["metadata"]["uid"], real_uid,
-            "a merge-patch carrying metadata.uid must not change the stored uid — the \
-             response must reflect the original, server-assigned identity"
+            patch_result.err().map(|e| e.0),
+            Some(StatusCode::UNPROCESSABLE_ENTITY),
+            "a merge-patch changing metadata.uid is upstream's immutable-field 422"
         );
 
         let stored = store
@@ -13139,7 +13199,7 @@ mod tests {
         state: crate::state::AppState<u7s_store::SqliteStore>,
         name: &str,
         metadata: serde_json::Value,
-    ) {
+    ) -> Result<(), crate::status::StatusError> {
         use axum::extract::{Path, State};
         let mut metadata = metadata;
         let stored = state
@@ -13170,14 +13230,14 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
         .await
-        .expect("PUT must succeed (the server ignores the client's deletion fields)");
+        .map(|_| ())
     }
 
     async fn patch_lease(
         state: crate::state::AppState<u7s_store::SqliteStore>,
         name: &str,
         patch: serde_json::Value,
-    ) {
+    ) -> Result<(), crate::status::StatusError> {
         use axum::extract::{Path, State};
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -13199,7 +13259,7 @@ mod tests {
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
         .await
-        .expect("PATCH must succeed (the server ignores the client's deletion fields)");
+        .map(|_| ())
     }
 
     /// PUT of an existing object without a resourceVersion: 422 for a kind whose strategy
@@ -13344,13 +13404,15 @@ mod tests {
     async fn put_with_client_deletion_timestamp_does_not_hard_delete_live_object() {
         let (store, state) = deletion_guard_state().await;
         let key = seed_lease(&store, "live", serde_json::json!({})).await;
-        put_lease(
+        let err = put_lease(
             state,
             "live",
             serde_json::json!({"name": "live", "namespace": "default",
                 "deletionTimestamp": "2026-05-22T00:00:00Z", "deletionGracePeriodSeconds": 0}),
         )
-        .await;
+        .await
+        .expect_err("a client-set deletionTimestamp on a live object is upstream's 422");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         let stored = store
             .get(&key)
             .await
@@ -13382,7 +13444,8 @@ mod tests {
             serde_json::json!({"metadata": {"deletionTimestamp": null,
                 "deletionGracePeriodSeconds": null}}),
         )
-        .await;
+        .await
+        .expect("un-terminating is silently pinned, not rejected");
         let v: serde_json::Value =
             serde_json::from_slice(&store.get(&key).await.unwrap().unwrap().value).unwrap();
         assert_eq!(v["metadata"]["deletionTimestamp"], "2026-05-22T00:00:00Z");
@@ -13395,12 +13458,14 @@ mod tests {
     async fn patch_with_client_deletion_timestamp_does_not_terminate_or_delete_live_object() {
         let (store, state) = deletion_guard_state().await;
         let key = seed_lease(&store, "live2", serde_json::json!({})).await;
-        patch_lease(
+        let err = patch_lease(
             state,
             "live2",
             serde_json::json!({"metadata": {"deletionTimestamp": "2026-05-22T00:00:00Z"}}),
         )
-        .await;
+        .await
+        .expect_err("a client-set deletionTimestamp on a live object is upstream's 422");
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
         let v: serde_json::Value = serde_json::from_slice(
             &store
                 .get(&key)
@@ -30552,6 +30617,480 @@ mod tests {
                 resp.status()
             ),
         }
+    }
+
+    /// The authorizer cannot see a POST body, so the handlers' `restrict_node_create` call is
+    /// the only thing stopping a compromised kubelet from pre-creating another node's CSINode
+    /// (cluster-scoped path) or Lease (namespaced path) before that node registers. The pure
+    /// `restrict_node_create` unit test stays green if either call site is deleted; these fail.
+    #[tokio::test]
+    async fn create_resource_refuses_node_identity_creating_another_nodes_csinode() {
+        use axum::extract::{Path, Query, State};
+        let state = make_state();
+        let post = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let body = serde_json::json!({
+                    "apiVersion": "storage.k8s.io/v1",
+                    "kind": "CSINode",
+                    "metadata": { "name": name },
+                    "spec": { "drivers": [] }
+                });
+                create_resource(
+                    State(state),
+                    Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+                    Query(CreateQuery::default()),
+                    node_identity_user("node-a"),
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        let err = post("node-b")
+            .await
+            .expect_err("node-a creating node-b's CSINode must be refused");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "a node forging another node's CSINode would pre-empt node-b's CSI registration"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/storage.k8s.io/csinodes/node-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused CSINode must not be persisted"
+        );
+        post("node-a")
+            .await
+            .expect("node-a must still create its own CSINode");
+    }
+
+    #[tokio::test]
+    async fn create_namespaced_resource_refuses_node_identity_creating_another_nodes_lease() {
+        use axum::extract::{Path, Query, State};
+        let state = make_state();
+        let post = |name: &'static str| {
+            let state = state.clone();
+            async move {
+                let body = serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": name, "namespace": "kube-node-lease" },
+                    "spec": { "holderIdentity": name }
+                });
+                create_namespaced_resource(
+                    State(state),
+                    Path((
+                        "coordination.k8s.io".into(),
+                        "v1".into(),
+                        "kube-node-lease".into(),
+                        "leases".into(),
+                    )),
+                    Query(CreateQuery::default()),
+                    node_identity_user("node-a"),
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        let err = post("node-b")
+            .await
+            .expect_err("node-a creating node-b's Lease must be refused");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "a forged node-b Lease would make the node lifecycle controller see node-b as alive"
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/coordination.k8s.io/leases/kube-node-lease/node-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused Lease must not be persisted"
+        );
+        post("node-a")
+            .await
+            .expect("node-a must still create its own Lease");
+    }
+
+    /// For every selector shape the authorizer lets through to deletecollection, the handler
+    /// must delete only node-a's slices; shapes the authorizer refuses never reach it.
+    #[tokio::test]
+    async fn delete_collection_resourceslices_with_node_selector_never_touches_other_nodes() {
+        use axum::extract::{Path, Query, State};
+        let slice = |name: &str, node: &str, pool: &str| {
+            serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": name },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": pool, "generation": 1, "resourceSliceCount": 1 } }
+            })
+        };
+        // (selector, expected surviving slices)
+        let cases: [(&str, &[&str]); 4] = [
+            ("spec.nodeName=node-a", &["b1"]),
+            ("spec.nodeName=node-a,spec.driver=d.example.com", &["b1"]),
+            (
+                "spec.nodeName=node-a,spec.nodeName=node-b",
+                &["a1", "a2", "b1"],
+            ),
+            (
+                "spec.nodeName=node-a,spec.nodeName!=node-a",
+                &["a1", "a2", "b1"],
+            ),
+        ];
+        for (selector, survivors) in cases {
+            let state = make_state();
+            for (name, node) in [("a1", "node-a"), ("a2", "node-a"), ("b1", "node-b")] {
+                let key =
+                    crate::keys::group_object_key("resource.k8s.io", "resourceslices", None, name);
+                state
+                    .store
+                    .put(
+                        &key,
+                        bytes::Bytes::from(serde_json::to_vec(&slice(name, node, "p")).unwrap()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let result = delete_collection_resource(
+                State(state.clone()),
+                Path((
+                    "resource.k8s.io".into(),
+                    "v1".into(),
+                    "resourceslices".into(),
+                )),
+                Query(CollectionQuery {
+                    watch: None,
+                    resource_version: None,
+                    label_selector: None,
+                    field_selector: Some(selector.to_string()),
+                    limit: None,
+                    continue_token: None,
+                    send_initial_events: None,
+                    allow_watch_bookmarks: None,
+                    timeout_seconds: None,
+                }),
+                node_identity_user("node-a"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .await;
+            result.unwrap_or_else(|e| panic!("{selector:?} must be accepted: {e:?}"));
+            let prefix = crate::keys::group_list_prefix("resource.k8s.io", "resourceslices", None);
+            let mut left: Vec<String> = state
+                .store
+                .list(&prefix, u7s_store::ListOptions::default())
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .filter_map(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+                .map(|v| v["metadata"]["name"].as_str().unwrap_or("").to_string())
+                .collect();
+            left.sort();
+            assert_eq!(
+                left, survivors,
+                "selector {selector:?}: ANDed terms may only narrow the delete; node-b's slice \
+                 must never be removed by node-a's scoped deletecollection"
+            );
+        }
+    }
+
+    /// The authorizer lets a node identity create/update/patch/delete ResourceSlices by URL
+    /// alone (DRA drivers publish with node credentials); these handler checks are the only
+    /// thing binding each write to the node's own slices. Each case fails if its call site
+    /// is removed.
+    #[tokio::test]
+    async fn resource_slice_writes_by_node_identity_are_bound_to_its_own_node() {
+        use axum::extract::{Path, Query, State};
+        let state = make_state();
+        let slice = |name: &str, node: &str| {
+            serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": name },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": "p", "generation": 1, "resourceSliceCount": 1 } }
+            })
+        };
+        let path = |name: &str| {
+            Path((
+                "resource.k8s.io".to_string(),
+                "v1".to_string(),
+                "resourceslices".to_string(),
+                name.to_string(),
+            ))
+        };
+        let forbidden = |r: Result<Response, crate::status::StatusError>, what: &str| {
+            let status = match r {
+                Ok(resp) => resp.status(),
+                Err(e) => e.0,
+            };
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{what}");
+        };
+        let create = |body: serde_json::Value, user| {
+            let state = state.clone();
+            async move {
+                create_resource(
+                    State(state),
+                    Path((
+                        "resource.k8s.io".into(),
+                        "v1".into(),
+                        "resourceslices".into(),
+                    )),
+                    Query(CreateQuery::default()),
+                    user,
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+
+        create(slice("mine", "node-a"), node_identity_user("node-a"))
+            .await
+            .expect("a driver publishing its own node's slice must succeed");
+        create(slice("theirs", "node-b"), test_user())
+            .await
+            .expect("admin seed");
+        forbidden(
+            create(slice("forged", "node-b"), node_identity_user("node-a")).await,
+            "creating a slice for another node would advertise devices on a node the caller does not own",
+        );
+        let mut cluster_wide = slice("wide", "node-a");
+        cluster_wide["spec"] = serde_json::json!({ "allNodes": true, "driver": "d.example.com",
+            "pool": { "name": "p", "generation": 1, "resourceSliceCount": 1 } });
+        forbidden(
+            create(cluster_wide, node_identity_user("node-a")).await,
+            "a node may not publish a slice without its own nodeName",
+        );
+
+        let put = |name: &'static str, body: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                replace_resource(
+                    State(state),
+                    Path((
+                        "resource.k8s.io".into(),
+                        "v1".into(),
+                        "resourceslices".into(),
+                        name.into(),
+                    )),
+                    Query(ReplaceQuery::default()),
+                    node_identity_user("node-a"),
+                    json_headers(),
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        forbidden(
+            put("theirs", slice("theirs", "node-b")).await,
+            "PUT over another node's slice",
+        );
+        forbidden(
+            put("theirs", slice("theirs", "node-a")).await,
+            "PUT that re-homes another node's slice onto the caller",
+        );
+        forbidden(
+            put("mine", slice("mine", "node-b")).await,
+            "PUT that re-homes the caller's slice onto another node",
+        );
+        put("mine", slice("mine", "node-a"))
+            .await
+            .expect("updating its own slice must succeed");
+
+        let patch = |name: &str, p: serde_json::Value| {
+            let state = state.clone();
+            let path = path(name);
+            async move {
+                let mut headers = json_headers();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/merge-patch+json"),
+                );
+                patch_resource(
+                    State(state),
+                    path,
+                    Query(PatchQuery::default()),
+                    node_identity_user("node-a"),
+                    headers,
+                    bytes::Bytes::from(serde_json::to_vec(&p).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        forbidden(
+            patch(
+                "theirs",
+                serde_json::json!({"metadata": {"labels": {"x": "y"}}}),
+            )
+            .await,
+            "PATCH of another node's slice",
+        );
+        forbidden(
+            patch("mine", serde_json::json!({"spec": {"nodeName": "node-b"}})).await,
+            "PATCH re-homing the caller's slice onto another node",
+        );
+        patch(
+            "mine",
+            serde_json::json!({"metadata": {"labels": {"x": "y"}}}),
+        )
+        .await
+        .expect("patching its own slice must succeed");
+
+        let apply = |name: &str, body: serde_json::Value| {
+            let state = state.clone();
+            let path = path(name);
+            async move {
+                let mut headers = json_headers();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+                );
+                patch_resource(
+                    State(state),
+                    path,
+                    Query(PatchQuery {
+                        field_manager: Some("kubectl".into()),
+                        ..Default::default()
+                    }),
+                    node_identity_user("node-a"),
+                    headers,
+                    bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        forbidden(
+            apply("forged-apply", slice("forged-apply", "node-b")).await,
+            "server-side apply creating a slice for another node must not bypass the POST check",
+        );
+        assert!(
+            state
+                .store
+                .get("/registry/resource.k8s.io/resourceslices/forged-apply")
+                .await
+                .unwrap()
+                .is_none(),
+            "the refused apply-create must not persist the forged slice"
+        );
+        apply("mine-apply", slice("mine-apply", "node-a"))
+            .await
+            .expect("apply-creating its own node's slice must succeed");
+
+        let delete = |name: &str| {
+            let state = state.clone();
+            let path = path(name);
+            async move {
+                delete_resource(
+                    State(state),
+                    path,
+                    node_identity_user("node-a"),
+                    HeaderMap::new(),
+                    bytes::Bytes::new(),
+                )
+                .await
+                .map(IntoResponse::into_response)
+            }
+        };
+        forbidden(delete("theirs").await, "DELETE of another node's slice");
+        assert!(
+            state
+                .store
+                .get("/registry/resource.k8s.io/resourceslices/theirs")
+                .await
+                .unwrap()
+                .is_some(),
+            "the refused DELETE must leave node-b's slice in place"
+        );
+        delete("mine")
+            .await
+            .expect("deleting its own slice must succeed");
+    }
+
+    /// An SSA apply that loses the create race merges onto the winner's object; a node must
+    /// not take over another node's slice by racing its create (the apply body names the
+    /// caller's own node, so only the check against the winner's stored object catches it).
+    #[tokio::test]
+    async fn ssa_create_race_fallback_binds_resource_slice_to_callers_node() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::handlers::test_support::seed_namespace_in(&*inner, "default").await;
+        let slice = |node: &str| {
+            serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": "raced" },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": "p", "generation": 1, "resourceSliceCount": 1 } }
+            })
+        };
+        let winner = bytes::Bytes::from(serde_json::to_vec(&slice("node-b")).unwrap());
+        let store = Arc::new(RaceWinnerAlreadyExistsStore::new(inner.clone(), winner));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+        let result = patch_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "resource.k8s.io".to_string(),
+                "v1".to_string(),
+                "resourceslices".to_string(),
+                "raced".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl".into()),
+                ..Default::default()
+            }),
+            node_identity_user("node-a"),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&slice("node-a")).unwrap()),
+        )
+        .await;
+        let status = match result {
+            Ok(resp) => resp.into_response().status(),
+            Err(e) => e.0,
+        };
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "losing the create race must not let node-a re-home node-b's slice onto itself"
+        );
+        let stored = inner
+            .get("/registry/resource.k8s.io/resourceslices/raced")
+            .await
+            .unwrap()
+            .expect("winner persisted");
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(body["spec"]["nodeName"], "node-b");
     }
 
     /// A node forging its own taints can steer disallowed workloads onto (or away from)
