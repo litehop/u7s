@@ -223,6 +223,29 @@ pub(crate) async fn get_resource<S: Store>(
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, crate::status::StatusError> {
+    get_resource_as(state, group, version, plural, name, headers, None).await
+}
+
+/// Routed GET handler: same as `get_resource`, plus node scoping of ResourceSlices by the
+/// object's `spec.nodeName`, which the authorizer cannot see from the URL.
+pub(crate) async fn get_resource_for_user<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+) -> Result<Response, crate::status::StatusError> {
+    get_resource_as(state, group, version, plural, name, headers, Some(&user)).await
+}
+
+async fn get_resource_as<S: Store>(
+    state: AppState<S>,
+    group: String,
+    version: String,
+    plural: String,
+    name: String,
+    headers: HeaderMap,
+    user: Option<&UserInfo>,
+) -> Result<Response, crate::status::StatusError> {
     validate_path_segment("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -242,6 +265,17 @@ pub(crate) async fn get_resource<S: Store>(
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    if let Some(user) = user {
+        crate::node_authz::restrict_node_resource_slice(
+            &user.username,
+            &user.groups,
+            &group,
+            &plural,
+            Some(&obj),
+            None,
+        )
+        .map_err(Status::forbidden)?;
+    }
     super::defaults::apply_defaults(&group, &plural, &mut obj);
     inject_type_meta(&mut obj, &group, &version, &meta.kind);
 
@@ -30806,6 +30840,50 @@ mod tests {
                  must never be removed by node-a's scoped deletecollection"
             );
         }
+    }
+
+    /// The authorizer grants `get` on any ResourceSlice name; this handler check is what keeps
+    /// a node (e.g. `kubectl patch`'s pre-GET) able to read its own slice and unable to read
+    /// another node's.
+    #[tokio::test]
+    async fn resource_slice_get_by_node_identity_is_bound_to_its_own_node() {
+        use axum::extract::{Path, State};
+        let state = make_state();
+        for (name, node) in [("a1", "node-a"), ("b1", "node-b")] {
+            let slice = serde_json::json!({
+                "apiVersion": "resource.k8s.io/v1",
+                "kind": "ResourceSlice",
+                "metadata": { "name": name },
+                "spec": { "nodeName": node, "driver": "d.example.com",
+                          "pool": { "name": "p", "generation": 1, "resourceSliceCount": 1 } }
+            });
+            let key =
+                crate::keys::group_object_key("resource.k8s.io", "resourceslices", None, name);
+            state
+                .store
+                .put(&key, Bytes::from(serde_json::to_vec(&slice).unwrap()), None)
+                .await
+                .unwrap();
+        }
+        let get = |name: &str| {
+            get_resource_for_user(
+                State(state.clone()),
+                Path((
+                    "resource.k8s.io".to_string(),
+                    "v1".to_string(),
+                    "resourceslices".to_string(),
+                    name.to_string(),
+                )),
+                node_identity_user("node-a"),
+                HeaderMap::new(),
+            )
+        };
+        let own = get("a1").await.expect("node-a must read its own slice");
+        assert_eq!(own.status(), axum::http::StatusCode::OK);
+        let other = get("b1")
+            .await
+            .expect_err("node-a reading node-b's slice must be refused");
+        assert_eq!(other.0, axum::http::StatusCode::FORBIDDEN);
     }
 
     /// The authorizer lets a node identity create/update/patch/delete ResourceSlices by URL

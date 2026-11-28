@@ -148,12 +148,12 @@ const PROBES: &[(&str, Shape, &str)] = &[
         "/apis/example.io/v1/gadgets",
     ),
     (
-        "resource::get_resource",
+        "resource::get_resource_for_user",
         Object,
         "/apis/storage.k8s.io/v1/csinodes/worker-1",
     ),
     (
-        "resource::get_resource",
+        "resource::get_resource_for_user",
         Object,
         "/apis/example.io/v1/gadgets/g1",
     ),
