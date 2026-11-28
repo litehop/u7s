@@ -41,12 +41,12 @@ check "a stage without the apiserver is an error, not a zero: a missing process 
 check "median of an odd count" "7" "$(printf '9\n7\n3\n' | kcm_median)"
 check "median of an even count is the mean of the middle two" "6" "$(printf '10\n2\n8\n4\n' | kcm_median)"
 
-run() { # mode idle_kcm wp_kcm idle_api wp_api
-  local st; st="$(jq -n -c --argjson ik "$2" --argjson wk "$3" --argjson ia "$4" --argjson wa "$5" \
-    '{idle: {kcm_mib: $ik, apiserver_mib: $ia}, wordpress: {kcm_mib: $wk, apiserver_mib: $wa}}')"
+run() { # mode idle_kcm wp_kcm idle_api wp_api [burst_kcm, default wp_kcm]
+  local st; st="$(jq -n -c --argjson ik "$2" --argjson wk "$3" --argjson ia "$4" --argjson wa "$5" --argjson bk "${6:-$3}" \
+    '{idle: {kcm_mib: $ik, apiserver_mib: $ia}, wordpress: {kcm_mib: $wk, apiserver_mib: $wa}, burst: {kcm_mib: $bk, apiserver_mib: $wa}}')"
   kcm_mem_json "$1" "--controllers=x" 0 deadbeef 0 2026-11-25 '{"name":"vm"}' '{"os":"h"}' "$st"
 }
-mkdir -p "$T/pass" "$T/fail"
+mkdir -p "$T/pass" "$T/fail" "$T/passb" "$T/failb"
 # R medians 40/42 (runs 40,44,38 / 42,45,41); T medians 33/35 (33,31,36 / 35,34,38). apiserver is not a gate input.
 i=0; for v in "R 40 42" "R 44 45" "R 38 41" "T 33 35" "T 31 34" "T 36 41"; do
   set -- $v; i=$((i + 1)); run "$1" "$2" "$3" 28 30 > "$T/pass/$i.json"
@@ -63,6 +63,31 @@ i=0; for v in "R 40 42" "R 44 45" "R 38 41" "T 33 41" "T 31 40" "T 36 41"; do
 done
 agg="$(kcm_aggregate "$T"/fail/*.json)"
 check "Phase 0 fails when one stage saves under 5 MiB even if the other passes" "false" "$(jq '.phase0_pass' <<<"$agg")"
+
+i=0; for v in "R 40 42 46" "R 44 45 47" "R 38 41 45" "T 33 35 38" "T 31 34 36" "T 36 41 44"; do
+  set -- $v; i=$((i + 1)); run "$1" "$2" "$3" 28 30 "$4" > "$T/passb/$i.json"
+done
+i=0; for v in "R 40 42 46" "R 44 45 47" "R 38 41 45" "T 33 35 44" "T 31 34 43" "T 36 41 45"; do
+  set -- $v; i=$((i + 1)); run "$1" "$2" "$3" 28 30 "$4" > "$T/failb/$i.json"
+done
+agg="$(kcm_aggregate "$T"/passb/*.json)"
+check "burst R and T medians are aggregated and gate-passing at 7 MiB" "46 38 true" \
+  "$(jq -r '"\(.stages.burst.R.kcm_mib) \(.stages.burst.T.kcm_mib) \(.phase0_pass)"' <<<"$agg")"
+agg="$(kcm_aggregate "$T"/failb/*.json)"
+check "Phase 0 fails when only the burst stage saves under 5 MiB: the gate needs all three stages" "false" "$(jq '.phase0_pass' <<<"$agg")"
+check "the failing burst diff is reported on the burst stage" "true" "$(jq '.stages.burst.kcm_diff_mib < 5 and .stages.idle.kcm_diff_mib >= 5' <<<"$agg")"
+
+check "the gate has exactly idle, wordpress and burst stages" "idle wordpress burst" "$KCM_MEM_STAGES"
+for s in $KCM_MEM_STAGES; do
+  check "kcm-mem-run.sh writes the $s stage, otherwise the A/B silently passes without it" "1" \
+    "$(grep -c -E "$s: \\\$[a-z]" "$REPO/scripts/bench/kcm-mem-run.sh")"
+done
+burst="$(kcm_burst_manifest)"
+check "burst deploys the gate's 50 pause pods" "50 registry.k8s.io/pause:3.10" \
+  "$(jq -r '"\(.spec.replicas) \(.spec.template.spec.containers[0].image)"' <<<"$burst")"
+check "burst replica count is overridable" "5" "$(kcm_burst_manifest 5 | jq '.spec.replicas')"
+check "burst pods are the Deployment's own, so the Deployment and ReplicaSet controllers are exercised" "true" \
+  "$(jq '.kind == "Deployment" and (.spec.selector.matchLabels == .spec.template.metadata.labels)' <<<"$burst")"
 
 j="$(cat "$T/pass/1.json")"
 check "kcm-mem.json carries the schema version" "1" "$(jq '.schema_version' <<<"$j")"
