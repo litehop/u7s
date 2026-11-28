@@ -224,11 +224,13 @@ fn validate_crd_group(group: &str) -> Result<(), crate::status::StatusError> {
 /// Maximum length, in bytes, for a `pattern` string or a `patternProperties` key in a
 /// CRD's `openAPIV3Schema`. boon (the JSON-schema engine u7s compiles CRD schemas with)
 /// runs an ECMA-to-Rust-regex compatibility rewrite (boon-0.6.1 src/ecma.rs::convert)
-/// before `Regex::new` ever sees the pattern, and that rewrite is O(pattern_length^2) —
-/// so `regex::RegexBuilder::size_limit` cannot protect against it, since the shim's cost
-/// is paid before compilation. Real-world CRD patterns top out at 113 bytes (median 91);
-/// this cap gives ~9x headroom while keeping worst-case compile cost bounded.
-pub(crate) const MAX_CRD_PATTERN_BYTES: usize = 1024;
+/// before `Regex::new` ever sees the pattern, and that rewrite is super-linear (it
+/// re-parses the whole pattern once per `\d`/`\w`/`\s`; release timings for a source made
+/// only of `\d`: 1 KiB 74 ms, 4 KiB 1.1 s, 8 KiB 4.6 s; of `\s`: 1 KiB 0.2 s, 4 KiB 3.6 s,
+/// 8 KiB 18 s) — so `regex::RegexBuilder::size_limit` cannot protect against it, since the
+/// shim's cost is paid before compilation. The longest real pattern measured is 1199 bytes
+/// (Cilium `CiliumBGPClusterConfig` IP validator); this cap leaves ~1.7x headroom over it.
+pub(crate) const MAX_CRD_PATTERN_BYTES: usize = 2048;
 
 /// Walk a single JSON-Schema node (and everything nested under it — `properties`,
 /// `items`, `additionalProperties`, `allOf`/`anyOf`/`oneOf`, etc.) rejecting the two
@@ -5531,7 +5533,8 @@ mod tests {
         );
         let message = json["message"].as_str().unwrap_or("");
         assert!(
-            message.contains("exceeds maximum length") && message.contains("1025 bytes"),
+            message.contains("exceeds maximum length")
+                && message.contains(&format!("{} bytes", MAX_CRD_PATTERN_BYTES + 1)),
             "error must report the actual oversized length so the CRD author can fix it: {message}"
         );
     }
@@ -5594,6 +5597,24 @@ mod tests {
                 && message.contains("CRD pattern compile budget exceeded"),
             "two versions at ~4.9 MiB each must be rejected, naming the second version: {message}"
         );
+    }
+
+    /// The IPv4/IPv6 validator Cilium v1.20.5 ships in `ciliumbgpclusterconfigs.cilium.io`
+    /// (1199 bytes) must be admitted: rejecting it makes the CRD uninstallable, so Cilium
+    /// BGP cannot be used at all.
+    #[tokio::test]
+    async fn crd_admission_accepts_real_cilium_bgp_ip_pattern() {
+        const CILIUM_IP_PATTERN: &str = r"((^\s*((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))\s*$)|(^\s*((([0-9A-Fa-f]{1,4}:){7}([0-9A-Fa-f]{1,4}|:))|(([0-9A-Fa-f]{1,4}:){6}(:[0-9A-Fa-f]{1,4}|((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){5}(((:[0-9A-Fa-f]{1,4}){1,2})|:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3})|:))|(([0-9A-Fa-f]{1,4}:){4}(((:[0-9A-Fa-f]{1,4}){1,3})|((:[0-9A-Fa-f]{1,4})?:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){3}(((:[0-9A-Fa-f]{1,4}){1,4})|((:[0-9A-Fa-f]{1,4}){0,2}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){2}(((:[0-9A-Fa-f]{1,4}){1,5})|((:[0-9A-Fa-f]{1,4}){0,3}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(([0-9A-Fa-f]{1,4}:){1}(((:[0-9A-Fa-f]{1,4}){1,6})|((:[0-9A-Fa-f]{1,4}){0,4}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:))|(:(((:[0-9A-Fa-f]{1,4}){1,7})|((:[0-9A-Fa-f]{1,4}){0,5}:((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}))|:)))(%.+)?\s*$))";
+        assert_eq!(CILIUM_IP_PATTERN.len(), 1199);
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "peerAddress": { "type": "string", "pattern": CILIUM_IP_PATTERN } }
+        });
+        let body = crd_bytes_with_schema("widgets.example.io", schema);
+
+        create_crd(State(make_state()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("the real 1199-byte Cilium pattern must be admitted");
     }
 
     /// A `pattern` exactly at the MAX_CRD_PATTERN_BYTES boundary must be accepted —
